@@ -166,6 +166,7 @@ const MORE_DESTS: Dest[] = [
 const SETTINGS_LINKS = [
   { href: '/accounts', label: 'Accounts & API keys' },
   { href: '/providers', label: 'Providers & models' },
+  { href: '/usage', label: 'Usage & costs' },
   { href: '/preferences', label: 'Preferences' },
   { href: '/more', label: 'Modules hub' },
 ];
