@@ -410,6 +410,22 @@ async function resolveModels(providerId: string): Promise<ModelInfo[]> {
   // which have no catalog) and a key is present; catalog fallback otherwise.
   const wantLive = preset?.liveModels === true || preset?.id.startsWith('custom-') === true;
   if (wantLive && isConfigured(providerId)) {
+    // For CLI bridges (codex/opencode), try the CLI's native model list first.
+    if (preset?.bridge) {
+      try {
+        const { getBridgeModels } = await import('@mvp/agent-runtime/dist/providers/cli-bridge.js');
+        const cliModels = getBridgeModels(preset.bridge);
+        if (cliModels.length > 0) {
+          return cliModels.map((m) => ({
+            id: m.id,
+            name: m.name,
+            free: isFreeModel(providerId, m.id),
+          }));
+        }
+      } catch {
+        // fall through to provider listModels
+      }
+    }
     try {
       const live = await createProvider(providerId).listModels();
       if (live.length > 0) return live;

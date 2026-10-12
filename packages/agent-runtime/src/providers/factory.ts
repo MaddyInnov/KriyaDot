@@ -79,6 +79,14 @@ export function createProvider(providerId: string, opts?: { apiKey?: string }): 
     );
   }
 
+  // Codex bridge: the ChatGPT OAuth token does not work with api.openai.com
+  // (it needs the Codex backend or CLI). Shell out to the `codex` CLI directly,
+  // which uses the user's own login. The model is selected per-request via the UI.
+  if (preset.bridge === 'codex') {
+    const defaultModel = getDefaultModel(preset.id) || 'gpt-5';
+    return createAgentCliProvider(`agent/codex/${defaultModel}`);
+  }
+
   const apiKey = opts?.apiKey ?? resolveApiKey(providerId);
   // Local providers (Ollama): no API key, ever. Skip the key requirement.
   if (preset.local) {

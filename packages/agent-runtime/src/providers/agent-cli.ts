@@ -233,7 +233,9 @@ export class AgentCliProvider implements LLMProvider {
   ): Promise<{ content: string; toolCalls: []; usage: TokenUsage }> {
     const prompt = flattenMessagesForCli(messages);
     const spec = getAgentCliSpec(this.cliId);
-    const args = spec ? spec.buildArgs(this.model, prompt) : [prompt];
+    // Use the per-request model if provided (bridge mode), else the constructor model.
+    const model = opts.model || this.model;
+    const args = spec ? spec.buildArgs(model, prompt) : [prompt];
     const text = await runCli(this.command, args, this.timeoutMs, opts.signal);
     const marked = `${untrustedCliPrefix(this.cliId)}\n${text}`;
     if (opts.onToken && marked) {

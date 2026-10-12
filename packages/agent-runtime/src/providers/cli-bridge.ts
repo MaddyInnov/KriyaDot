@@ -241,3 +241,61 @@ export function bridgeConnectable(id: CliBridgeId, opts: DetectOptions = {}): { 
     if (!wasConnected) revokeBridgeConsent(id);
   }
 }
+
+/**
+ * Get available models by shelling out to the CLI.
+ * For codex: `codex debug models` lists available models.
+ * For claude: not yet implemented (returns empty).
+ * For opencode: `opencode models` lists available models.
+ * Returns empty array on failure (caller falls back to catalog).
+ */
+export function getBridgeModels(id: CliBridgeId): Array<{ id: string; name: string }> {
+  const spec = BRIDGE_PATHS[id];
+  if (!spec) return [];
+  
+  try {
+    const { execSync } = require('node:child_process');
+    let output: string;
+    
+    if (id === 'codex') {
+      output = execSync('codex debug models', { encoding: 'utf8', timeout: 10000, windowsHide: true });
+      // Parse the output - it lists models, one per line or in a table
+      // Try to extract model IDs (lines containing gpt-, o1, o3, o4)
+      const models: Array<{ id: string; name: string }> = [];
+      const lines = output.split('\n');
+      for (const line of lines) {
+        // Match common OpenAI model patterns
+        const match = line.match(/\b(gpt-[\w.-]+|o\d[\w.-]*)\b/i);
+        if (match) {
+          const modelId = match[1].toLowerCase();
+          // Avoid duplicates
+          if (!models.some(m => m.id === modelId)) {
+            models.push({ id: modelId, name: modelId });
+          }
+        }
+      }
+      return models;
+    }
+    
+    if (id === 'opencode') {
+      output = execSync('opencode models', { encoding: 'utf8', timeout: 10000, windowsHide: true });
+      // Similar parsing
+      const models: Array<{ id: string; name: string }> = [];
+      const lines = output.split('\n');
+      for (const line of lines) {
+        const match = line.match(/\b([\w-]+\/[\w.-]+)\b/);
+        if (match) {
+          const modelId = match[1];
+          if (!models.some(m => m.id === modelId)) {
+            models.push({ id: modelId, name: modelId });
+          }
+        }
+      }
+      return models;
+    }
+    
+    return [];
+  } catch {
+    return [];
+  }
+}
