@@ -190,7 +190,10 @@ function readLocalOverrides(): Record<string, unknown> {
  */
 export function resolveApiKey(providerId: string): string | undefined {
   const preset = resolvePreset(providerId);
-  if (!preset) return undefined;
+  if (!preset) {
+    console.log(`[debug] resolveApiKey(${providerId}): no preset found`);
+    return undefined;
+  }
   if (preset.bridge) {
     // Consent-gated: undefined until the user clicks Connect in the Providers
     // UI. The token is read from the CLI's credential file at request time and
@@ -198,9 +201,11 @@ export function resolveApiKey(providerId: string): string | undefined {
     return loadBridgeToken(preset.bridge);
   }
   const fromEnv = process.env[preset.envKey];
+  console.log(`[debug] resolveApiKey(${providerId}): envKey=${preset.envKey}, fromEnv=${fromEnv ? `present(${fromEnv.length} chars, prefix=${fromEnv.slice(0, 7)})` : 'MISSING'}`);
   if (fromEnv && fromEnv.length > 0) return fromEnv;
   const local = readLocalOverrides();
   const fromFile = local[preset.envKey];
+  console.log(`[debug] resolveApiKey(${providerId}): fromFile=${fromFile ? 'present' : 'MISSING'}`);
   return typeof fromFile === 'string' && fromFile.length > 0 ? fromFile : undefined;
 }
 
