@@ -164,6 +164,11 @@ export interface RunTurnOptions {
    */
   sandboxMode?: SandboxMode;
   /**
+   * Reasoning effort for models that support it (low/medium/high).
+   * Passed through to the provider's chat() as reasoning_effort.
+   */
+  reasoningEffort?: 'low' | 'medium' | 'high';
+  /**
    * Persistent E2B sandbox ID (Dot environments). When set, `run_command`
    * executes inside this persistent sandbox instead of a fresh ephemeral
    * one, giving the agent a stable "own computer" across turns.
@@ -586,6 +591,7 @@ export class AgentRuntime {
             onRetry: () => {
               if (telRunId) this.telemetry?.noteRetry(telRunId);
             },
+            reasoningEffort: opts.reasoningEffort,
           });
           llmStep?.end({ ok: true });
         } catch (err) {

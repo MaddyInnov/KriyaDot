@@ -1123,6 +1123,7 @@ export function createRouter(deps: RouteDeps): express.Router {
         message: chatMessage,
         provider: typeof body.provider === 'string' && body.provider.trim() ? body.provider.trim() : undefined,
         model: typeof body.model === 'string' && body.model.trim() ? body.model.trim() : undefined,
+        reasoningEffort: body.reasoningEffort === 'low' || body.reasoningEffort === 'medium' || body.reasoningEffort === 'high' ? body.reasoningEffort : undefined,
         taskType,
         autoApprove: body.autoApprove === true,
         planMode: body.planMode === true,
@@ -1200,6 +1201,7 @@ export function createRouter(deps: RouteDeps): express.Router {
       providerId?: string; model?: string; taskType?: 'code' | 'chat' | 'reasoning' | 'simple-qa';
       autoApprove?: boolean; planMode?: boolean; maxBudgetUsd?: number;
       sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
+      reasoningEffort?: 'low' | 'medium' | 'high';
     }): Promise<void> => {
       terminalEmitted = false;
       // Tiered memory: reset per-turn accumulators; recall relevant atoms.
@@ -1233,6 +1235,7 @@ export function createRouter(deps: RouteDeps): express.Router {
           planMode: turnOpts.planMode,
           maxBudgetUsd: turnOpts.maxBudgetUsd,
           sandboxMode: turnOpts.sandboxMode,
+          reasoningEffort: turnOpts.reasoningEffort,
           memoryContext,
           // Learning-from-corrections routing (feature #4): stored rules
           // reloaded per turn so a recorded correction changes routing.
@@ -1301,6 +1304,7 @@ export function createRouter(deps: RouteDeps): express.Router {
     const firstTurnOpts = {
       providerId: typeof body.provider === 'string' && body.provider.trim() ? body.provider.trim() : undefined,
       model: typeof body.model === 'string' && body.model.trim() ? body.model.trim() : undefined,
+      reasoningEffort: body.reasoningEffort === 'low' || body.reasoningEffort === 'medium' || body.reasoningEffort === 'high' ? body.reasoningEffort : undefined,
       taskType,
       autoApprove: body.autoApprove === true,
       planMode: body.planMode === true,

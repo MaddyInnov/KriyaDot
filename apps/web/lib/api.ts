@@ -781,6 +781,8 @@ export interface ChatRequest {
   sessionId?: string;
   provider?: string;
   model?: string;
+  /** Reasoning effort for models that support it (low/medium/high). */
+  reasoningEffort?: 'low' | 'medium' | 'high';
   /** Sandbox mode: read-only | workspace-write | danger-full-access. */
   sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
   /** Steering mode: 'interrupt' (default) aborts in-flight turn; 'queue' waits for boundary. */

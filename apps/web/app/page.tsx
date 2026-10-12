@@ -363,7 +363,11 @@ function ChatPageInner() {
   type QueueMode = 'interrupt' | 'queue';
   const [queueMode, setQueueMode] = useState<QueueMode>('interrupt');
   const queueModeRef = useRef(queueMode);
+  type ReasoningEffort = 'low' | 'medium' | 'high';
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>('medium');
+  const reasoningEffortRef = useRef(reasoningEffort);
   queueModeRef.current = queueMode;
+  reasoningEffortRef.current = reasoningEffort;
   // Queued messages waiting for the turn boundary (queue-at-boundary mode).
   const [queuedCount, setQueuedCount] = useState(0);
   const [blocks, setBlocks] = useState<ChatBlock[]>([]);
@@ -809,6 +813,7 @@ function ChatPageInner() {
         sessionId: cid,
         provider: providerIdRef.current || undefined,
         model: modelIdRef.current || undefined,
+        reasoningEffort: reasoningEffortRef.current,
         sandboxMode: sandboxModeRef.current,
         queueMode: queueModeRef.current,
         autoApprove: autoApproveRef.current,
@@ -1242,6 +1247,18 @@ function ChatPageInner() {
               <option value="workspace-write">🛡️ Workspace</option>
               <option value="read-only">🔒 Read-only</option>
               <option value="danger-full-access">⚠️ Full access</option>
+            </select>
+            <span className="mp-sep" aria-hidden="true">·</span>
+            <select
+              className="mp-select mp-effort"
+              value={reasoningEffort}
+              onChange={(e) => setReasoningEffort(e.target.value as ReasoningEffort)}
+              aria-label="Reasoning effort"
+              title="Reasoning effort: how hard the model thinks (low = fast, high = thorough). Applies to reasoning models."
+            >
+              <option value="low">🧠 Low</option>
+              <option value="medium">🧠 Med</option>
+              <option value="high">🧠 High</option>
             </select>
           </div>
           <select

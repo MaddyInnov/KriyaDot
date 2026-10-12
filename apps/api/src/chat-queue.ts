@@ -37,6 +37,7 @@ export interface EnqueueInput {
   message: string;
   provider?: string;
   model?: string;
+  reasoningEffort?: 'low' | 'medium' | 'high';
   taskType?: 'code' | 'chat' | 'reasoning' | 'simple-qa';
   autoApprove?: boolean;
   planMode?: boolean;
