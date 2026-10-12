@@ -38,6 +38,7 @@ export interface EnqueueInput {
   provider?: string;
   model?: string;
   reasoningEffort?: 'low' | 'medium' | 'high';
+  fileIds?: string[];
   taskType?: 'code' | 'chat' | 'reasoning' | 'simple-qa';
   autoApprove?: boolean;
   planMode?: boolean;

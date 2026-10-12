@@ -15,6 +15,8 @@ import {
   getSlashCommands,
   saveSlashCommand,
   streamChat,
+  uploadFile,
+  deleteUploadedFile,
 } from '../lib/api';
 import type {
   BotConfig,
@@ -24,6 +26,7 @@ import type {
   StreamEvent,
   TokenUsage,
   ToolCall,
+  UploadedFile,
 } from '../lib/api';
 import { COST_ESTIMATE_TOOLTIP, contextMeter, costOfUsage, formatTokens, formatUsd } from '../lib/usage';
 import { WidgetRenderer, validateWidget } from '../components/widgets';
@@ -374,6 +377,9 @@ function ChatPageInner() {
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [loadError, setLoadError] = useState('');
+  const [attachedFiles, setAttachedFiles] = useState<UploadedFile[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [sessionUsage, setSessionUsage] = useState<Record<string, TokenUsage>>({});
   const [sessionCost, setSessionCost] = useState<Record<string, number>>({});
   const [modelPrices, setModelPrices] = useState<ModelPriceInfo[]>([]);
@@ -773,9 +779,10 @@ function ChatPageInner() {
    * used by voice notes, which render as an audio bubble while the
    * transcript drives the turn.
    */
-  const sendImpl = async (rawText: string, leadBlock?: ChatBlock) => {
+  const sendImpl = async (rawText: string, leadBlock?: ChatBlock, fileIds?: string[]) => {
     const text = rawText.trim();
-    if (!text || !selectedBot) return;
+    const files = fileIds ?? attachedFiles.map((f) => f.id);
+    if ((!text && files.length === 0) || !selectedBot) return;
     // A new message supersedes any in-flight turn on this session
     // (backend aborts the previous turn; we drop our old reader).
     stopTurn();
@@ -814,6 +821,7 @@ function ChatPageInner() {
         provider: providerIdRef.current || undefined,
         model: modelIdRef.current || undefined,
         reasoningEffort: reasoningEffortRef.current,
+        fileIds: files,
         sandboxMode: sandboxModeRef.current,
         queueMode: queueModeRef.current,
         autoApprove: autoApproveRef.current,
@@ -860,9 +868,11 @@ function ChatPageInner() {
   /** Text composer send. */
   const send = () => {
     const text = input.trim();
-    if (!text) return;
+    if (!text && attachedFiles.length === 0) return;
+    const fileIds = attachedFiles.map((f) => f.id);
     setInput('');
-    void sendImpl(text);
+    setAttachedFiles([]);
+    void sendImpl(text, undefined, fileIds);
   };
 
   /** Voice-note send: the audio bubble leads, its transcript drives the turn. */
@@ -1625,6 +1635,60 @@ function ChatPageInner() {
               sessionId={selectedBotId ? (activeConvo[selectedBotId] ?? '') : ''}
               disabled={!selectedBot}
             />
+            {/* File upload: attach files to the chat message. */}
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              style={{ display: 'none' }}
+              onChange={async (e) => {
+                const files = Array.from(e.target.files ?? []);
+                if (files.length === 0) return;
+                setUploading(true);
+                try {
+                  for (const f of files) {
+                    const uploaded = await uploadFile(f);
+                    setAttachedFiles((prev) => [...prev, uploaded]);
+                  }
+                } catch (err) {
+                  setLoadError(`Upload failed: ${err instanceof Error ? err.message : String(err)}`);
+                } finally {
+                  setUploading(false);
+                  if (fileInputRef.current) fileInputRef.current.value = '';
+                }
+              }}
+            />
+            <button
+              className="btn btn-icon"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={!selectedBot || uploading}
+              title="Attach files to this message"
+              aria-label="Attach files"
+            >
+              {uploading ? '⏳' : '📎'}
+            </button>
+            {attachedFiles.length > 0 && (
+              <div className="attached-files">
+                {attachedFiles.map((f) => (
+                  <span key={f.id} className="file-chip">
+                    📄 {f.name}
+                    <button
+                      onClick={async () => {
+                        try {
+                          await deleteUploadedFile(f.id);
+                        } catch {
+                          // ignore
+                        }
+                        setAttachedFiles((prev) => prev.filter((x) => x.id !== f.id));
+                      }}
+                      aria-label={`Remove ${f.name}`}
+                    >
+                      ✕
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
             <textarea
               ref={inputRef}
               className="input composer"

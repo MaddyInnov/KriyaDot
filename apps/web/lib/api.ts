@@ -783,6 +783,8 @@ export interface ChatRequest {
   model?: string;
   /** Reasoning effort for models that support it (low/medium/high). */
   reasoningEffort?: 'low' | 'medium' | 'high';
+  /** Attached file IDs (from /api/files/upload). */
+  fileIds?: string[];
   /** Sandbox mode: read-only | workspace-write | danger-full-access. */
   sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
   /** Steering mode: 'interrupt' (default) aborts in-flight turn; 'queue' waits for boundary. */
@@ -872,4 +874,47 @@ export async function* streamRunUpdates(runId: string): AsyncGenerator<WorkflowR
       }
     }
   }
+}
+
+/** File upload for chat attachments. */
+export interface UploadedFile {
+  id: string;
+  name: string;
+  size: number;
+  mimeType: string;
+  uploadedAt: string;
+}
+
+export async function uploadFile(file: File): Promise<UploadedFile> {
+  // Read as base64
+  const data = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      // Remove data: prefix
+      const base64 = result.split(',')[1] ?? '';
+      resolve(base64);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+  const res = await apiFetch('/api/files/upload', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: file.name,
+      mimeType: file.type || 'application/octet-stream',
+      data,
+    }),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '');
+    throw new Error(`Upload failed (${res.status}): ${detail || res.statusText}`);
+  }
+  return (await res.json()) as UploadedFile;
+}
+
+export async function deleteUploadedFile(id: string): Promise<void> {
+  const res = await apiFetch(`/api/files/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  if (!res.ok) throw new Error(`Delete failed (${res.status})`);
 }

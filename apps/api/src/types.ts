@@ -16,6 +16,8 @@ export interface ChatRequestBody {
   model?: string;
   /** Reasoning effort for models that support it (low/medium/high). */
   reasoningEffort?: 'low' | 'medium' | 'high';
+  /** Attached file IDs (from /api/files/upload). Content is injected into the turn. */
+  fileIds?: string[];
   /** Task type for Phase 3 smart model routing (only used when no model is pinned). */
   taskType?: 'code' | 'chat' | 'reasoning' | 'simple-qa';
   /** Session auto-approve: skip approval cards for this turn (audited). */

@@ -103,8 +103,9 @@ import type { LearnedRoutingRule } from '@mvp/agent-runtime';
 // The marketplace registry ships inside the compiled binary via this JSON
 // import (resolveJsonModule); it is seeded into the data dir at boot.
 import marketplaceRegistryJson from '@mvp/marketplace/registry/registry.json' with { type: 'json' };
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync, createReadStream } from 'node:fs';
+import { join, basename } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import {
   connectBridge,
   disconnectBridge,
@@ -1124,6 +1125,7 @@ export function createRouter(deps: RouteDeps): express.Router {
         provider: typeof body.provider === 'string' && body.provider.trim() ? body.provider.trim() : undefined,
         model: typeof body.model === 'string' && body.model.trim() ? body.model.trim() : undefined,
         reasoningEffort: body.reasoningEffort === 'low' || body.reasoningEffort === 'medium' || body.reasoningEffort === 'high' ? body.reasoningEffort : undefined,
+        fileIds: Array.isArray(body.fileIds) ? body.fileIds.filter((x): x is string => typeof x === 'string') : undefined,
         taskType,
         autoApprove: body.autoApprove === true,
         planMode: body.planMode === true,
@@ -1202,11 +1204,48 @@ export function createRouter(deps: RouteDeps): express.Router {
       autoApprove?: boolean; planMode?: boolean; maxBudgetUsd?: number;
       sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
       reasoningEffort?: 'low' | 'medium' | 'high';
+      fileIds?: string[];
     }): Promise<void> => {
       terminalEmitted = false;
       // Tiered memory: reset per-turn accumulators; recall relevant atoms.
       turnAssistantText = '';
       turnToolCalls = [];
+      // Inject attached file contents into the message.
+      let messageWithFiles = turnMessage;
+      if (turnOpts.fileIds && turnOpts.fileIds.length > 0) {
+        const fileSections: string[] = [];
+        for (const fid of turnOpts.fileIds) {
+          if (!/^[0-9a-f-]{36}$/.test(fid)) continue;
+          try {
+            const files = readdirSync(join(config.dataDir, 'uploads'));
+            const match = files.find((f) => f.startsWith(`${fid}-`) && !f.endsWith('.meta.json'));
+            if (!match) continue;
+            const filePath = join(config.dataDir, 'uploads', match);
+            const metaPath = `${filePath}.meta.json`;
+            let name = match;
+            let mimeType = 'application/octet-stream';
+            try {
+              const meta = JSON.parse(readFileSync(metaPath, 'utf8')) as { name?: string; mimeType?: string };
+              if (meta.name) name = meta.name;
+              if (meta.mimeType) mimeType = meta.mimeType;
+            } catch {
+              // ignore
+            }
+            // Text files: inject content (up to 100KB). Others: note presence.
+            if (mimeType.startsWith('text/') || /\.(txt|md|json|js|ts|py|csv|log)$/i.test(name)) {
+              const content = readFileSync(filePath, 'utf8').slice(0, 100_000);
+              fileSections.push(`[Attached file: ${name}]\n${content}`);
+            } else {
+              fileSections.push(`[Attached file: ${name} (${mimeType}) — binary file, use read_file tool to access if needed]`);
+            }
+          } catch {
+            // ignore unreadable files
+          }
+        }
+        if (fileSections.length > 0) {
+          messageWithFiles = `${fileSections.join('\n\n')}\n\n${turnMessage}`;
+        }
+      }
       let memoryContext: string | undefined;
       try {
         memoryContext = tieredMemoryStore.recallForPrompt(bot.id, turnMessage) || undefined;
@@ -1223,7 +1262,7 @@ export function createRouter(deps: RouteDeps): express.Router {
       try {
         turnUsage = await agentRuntime.runTurn({
           bot,
-          message: turnMessage,
+          message: messageWithFiles,
           sessionId: body.sessionId,
           providerId: turnOpts.providerId,
           // Spaces: an explicit call-site model wins; otherwise the space's
@@ -1305,6 +1344,7 @@ export function createRouter(deps: RouteDeps): express.Router {
       providerId: typeof body.provider === 'string' && body.provider.trim() ? body.provider.trim() : undefined,
       model: typeof body.model === 'string' && body.model.trim() ? body.model.trim() : undefined,
       reasoningEffort: body.reasoningEffort === 'low' || body.reasoningEffort === 'medium' || body.reasoningEffort === 'high' ? body.reasoningEffort : undefined,
+      fileIds: Array.isArray(body.fileIds) ? body.fileIds.filter((x): x is string => typeof x === 'string') : undefined,
       taskType,
       autoApprove: body.autoApprove === true,
       planMode: body.planMode === true,
@@ -1542,6 +1582,110 @@ export function createRouter(deps: RouteDeps): express.Router {
       res.json({ ok: true });
     } catch (err) {
       res.status(500).json(errorBody('Failed to remove provider key', err instanceof Error ? err.message : String(err)));
+    }
+  });
+
+  // ---- File uploads (chat attachments) ------------------------------------
+  // POST /api/files/upload { name, mimeType, data (base64) } → { id, name, size, mimeType }
+  // Files are stored under <dataDir>/uploads and can be attached to chat messages.
+  const uploadsDir = join(config.dataDir, 'uploads');
+  try {
+    mkdirSync(uploadsDir, { recursive: true });
+  } catch {
+    // ignore
+  }
+
+  router.post('/files/upload', (req, res) => {
+    const body = (req.body ?? {}) as { name?: unknown; mimeType?: unknown; data?: unknown };
+    if (typeof body.name !== 'string' || !body.name.trim()) {
+      res.status(400).json(errorBody('name is required'));
+      return;
+    }
+    if (typeof body.data !== 'string' || !body.data) {
+      res.status(400).json(errorBody('data (base64) is required'));
+      return;
+    }
+    // 10MB limit (base64 inflates ~33%)
+    if (body.data.length > 14_000_000) {
+      res.status(400).json(errorBody('File too large (max 10MB)'));
+      return;
+    }
+    const id = randomUUID();
+    const safeName = basename(body.name).slice(0, 100) || 'file';
+    const storedName = `${id}-${safeName}`;
+    const filePath = join(uploadsDir, storedName);
+    try {
+      const buffer = Buffer.from(body.data, 'base64');
+      writeFileSync(filePath, buffer);
+      const meta = {
+        id,
+        name: safeName,
+        size: buffer.length,
+        mimeType: typeof body.mimeType === 'string' ? body.mimeType : 'application/octet-stream',
+        uploadedAt: new Date().toISOString(),
+      };
+      writeFileSync(`${filePath}.meta.json`, JSON.stringify(meta));
+      res.json(meta);
+    } catch (err) {
+      res.status(500).json(errorBody('Failed to save file', err instanceof Error ? err.message : String(err)));
+    }
+  });
+
+  router.get('/files/:id', (req, res) => {
+    const id = req.params.id;
+    if (!/^[0-9a-f-]{36}$/.test(id)) {
+      res.status(400).json(errorBody('Invalid file id'));
+      return;
+    }
+    try {
+      const files = readdirSync(uploadsDir);
+      const match = files.find((f) => f.startsWith(`${id}-`) && !f.endsWith('.meta.json'));
+      if (!match) {
+        res.status(404).json(errorBody('File not found'));
+        return;
+      }
+      const filePath = join(uploadsDir, match);
+      const metaPath = `${filePath}.meta.json`;
+      let mimeType = 'application/octet-stream';
+      let name = match;
+      try {
+        const meta = JSON.parse(readFileSync(metaPath, 'utf8')) as { mimeType?: string; name?: string };
+        if (meta.mimeType) mimeType = meta.mimeType;
+        if (meta.name) name = meta.name;
+      } catch {
+        // ignore
+      }
+      res.setHeader('Content-Type', mimeType);
+      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(name)}"`);
+      createReadStream(filePath).pipe(res);
+    } catch (err) {
+      res.status(500).json(errorBody('Failed to read file', err instanceof Error ? err.message : String(err)));
+    }
+  });
+
+  router.delete('/files/:id', (req, res) => {
+    const id = req.params.id;
+    if (!/^[0-9a-f-]{36}$/.test(id)) {
+      res.status(400).json(errorBody('Invalid file id'));
+      return;
+    }
+    try {
+      const files = readdirSync(uploadsDir);
+      const match = files.find((f) => f.startsWith(`${id}-`) && !f.endsWith('.meta.json'));
+      if (!match) {
+        res.status(404).json(errorBody('File not found'));
+        return;
+      }
+      const filePath = join(uploadsDir, match);
+      unlinkSync(filePath);
+      try {
+        unlinkSync(`${filePath}.meta.json`);
+      } catch {
+        // ignore
+      }
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json(errorBody('Failed to delete file', err instanceof Error ? err.message : String(err)));
     }
   });
 
