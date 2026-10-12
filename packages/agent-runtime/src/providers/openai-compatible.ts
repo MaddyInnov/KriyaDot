@@ -152,12 +152,13 @@ export class OpenAICompatibleProvider implements LLMProvider {
   async chat(
     messages: ChatMessage[],
     tools: ToolDefinition[],
-    opts: { model: string; onToken?: (t: string) => void; signal?: AbortSignal; onRetry?: (attempt: number, error: Error) => void },
+    opts: { model: string; onToken?: (t: string) => void; signal?: AbortSignal; onRetry?: (attempt: number, error: Error) => void; reasoningEffort?: 'low' | 'medium' | 'high' },
   ): Promise<{ content: string; toolCalls: ToolCall[]; usage: TokenUsage }> {
     const body = {
       model: opts.model,
       messages: toOpenAIMessages(messages),
       ...(tools.length > 0 ? { tools: toFunctionTools(tools) } : {}),
+      ...(opts.reasoningEffort ? { reasoning_effort: opts.reasoningEffort } : {}),
       stream: true,
       stream_options: { include_usage: true },
     };

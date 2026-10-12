@@ -267,6 +267,13 @@ function injectEnvKey(name: string, value: string): void {
  */
 export function syncProviderKeysToEnv(dataDir: string): void {
   const file = readKeyFile(dataDir);
+  // Remove env vars for keys no longer in the file (handles deletes).
+  const currentKeys = new Set(Object.keys(file));
+  const toRemove: string[] = [];
+  for (const name of apiManagedEnvKeys.keys()) {
+    if (!currentKeys.has(name)) toRemove.push(name);
+  }
+  if (toRemove.length > 0) uninjectEnvKeys(toRemove);
   for (const [k, v] of Object.entries(file)) injectEnvKey(k, v);
 }
 

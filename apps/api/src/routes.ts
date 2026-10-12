@@ -112,6 +112,7 @@ import {
   listProviders,
   removeProviderKey,
   saveProviderKey,
+  syncProviderKeysToEnv,
 } from './providers.js';
 import type {
   ApiError,
@@ -1511,6 +1512,8 @@ export function createRouter(deps: RouteDeps): express.Router {
         baseUrl: body.baseUrl,
         headers: body.headers,
       });
+      // Sync the new key into process.env immediately so it works without a restart.
+      syncProviderKeysToEnv(config.dataDir);
       console.log(`[providers] stored key for provider "${body.providerId}"`);
       res.json({ ok: true });
     } catch (err) {
@@ -1530,6 +1533,8 @@ export function createRouter(deps: RouteDeps): express.Router {
         return;
       }
       console.log(`[providers] removed key for provider "${req.params.providerId}"`);
+      // Sync removal into process.env immediately.
+      syncProviderKeysToEnv(config.dataDir);
       res.json({ ok: true });
     } catch (err) {
       res.status(500).json(errorBody('Failed to remove provider key', err instanceof Error ? err.message : String(err)));

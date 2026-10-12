@@ -153,6 +153,8 @@ export interface LLMProvider {
       signal?: AbortSignal;
       /** Fired on each provider-level retry (attempt ≥ 1) of the request. */
       onRetry?: (attempt: number, error: Error) => void;
+      /** Reasoning effort for models that support it (OpenAI reasoning_effort). */
+      reasoningEffort?: 'low' | 'medium' | 'high';
     },
   ): Promise<{ content: string; toolCalls: ToolCall[]; usage: TokenUsage }>;
   listModels(): Promise<ModelInfo[]>;

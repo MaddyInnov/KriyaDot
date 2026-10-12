@@ -59,7 +59,7 @@
       "liveModels": false,
       "models": [],
       "name": "OmniRush (bring your own)",
-      "notes": "Bring-your-own preset. Paste YOUR OWN OmniRush API key/token from your own OmniRush account — never a shared or pooled key. Set the base URL from your OmniRush app/account; no endpoint is pre-configured."
+      "notes": "Bring-your-own preset. Paste YOUR OWN OmniRush API key/token from your own OmniRush account \u2014 never a shared or pooled key. Set the base URL from your OmniRush app/account; no endpoint is pre-configured."
     },
     "openai": {
       "api": "openai-compatible",
@@ -157,7 +157,7 @@
       ],
       "id": "opencode-zen",
       "name": "OpenCode Zen (bring your own)",
-      "notes": "Bring-your-own preset. Sign up at opencode.ai/zen for your own API key (no card needed for the free rotation). Free roster checked 2026-10-09 — it rotates, so the live /models fetch is authoritative; only -free models are zero-cost, most other Zen models are pay-as-you-go."
+      "notes": "Bring-your-own preset. Sign up at opencode.ai/zen for your own API key (no card needed for the free rotation). Free roster checked 2026-10-09 \u2014 it rotates, so the live /models fetch is authoritative; only -free models are zero-cost, most other Zen models are pay-as-you-go."
     },
     "openrouter": {
       "api": "openai-compatible",
@@ -181,16 +181,21 @@
       "bridge": "claude",
       "models": [
         {
-          "id": "claude-sonnet-4-5",
-          "name": "Claude Sonnet 4.5",
+          "id": "claude-opus-4-1",
+          "name": "Claude Opus 4.1",
           "default": true
+        },
+        {
+          "id": "claude-sonnet-4-5",
+          "name": "Claude Sonnet 4.5"
         },
         {
           "id": "claude-haiku-4-5",
           "name": "Claude Haiku 4.5"
         }
       ],
-      "notes": "Uses YOUR Claude Code CLI login (~/.claude/.credentials.json) — no API key needed. Shown only when the CLI is detected; requires your explicit Connect consent. Token is read at request time and never stored or logged."
+      "notes": "Uses YOUR Claude Code CLI login (~/.claude/.credentials.json) \u2014 no API key needed. Shown only when the CLI is detected; requires your explicit Connect consent. Token is read at request time and never stored or logged.",
+      "liveModels": true
     },
     "codex-subscription": {
       "id": "codex-subscription",
@@ -208,9 +213,30 @@
         {
           "id": "gpt-5-mini",
           "name": "GPT-5 mini"
+        },
+        {
+          "id": "gpt-5-nano",
+          "name": "GPT-5 nano"
+        },
+        {
+          "id": "gpt-4.1",
+          "name": "GPT-4.1"
+        },
+        {
+          "id": "gpt-4.1-mini",
+          "name": "GPT-4.1 mini"
+        },
+        {
+          "id": "o3",
+          "name": "o3"
+        },
+        {
+          "id": "o4-mini",
+          "name": "o4-mini"
         }
       ],
-      "notes": "Uses YOUR Codex CLI login (~/.codex/auth.json) — no API key needed. Shown only when the CLI is detected; requires your explicit Connect consent. Token is read at request time and never stored or logged."
+      "notes": "Uses YOUR Codex CLI login (~/.codex/auth.json) \u2014 no API key needed. Shown only when the CLI is detected; requires your explicit Connect consent. Token is read at request time and never stored or logged.",
+      "liveModels": true
     },
     "ollama": {
       "api": "ollama",
@@ -221,7 +247,7 @@
       "liveModels": true,
       "models": [],
       "name": "Ollama (local)",
-      "notes": "Fully local models via Ollama — no API key needed, ever. Install from https://ollama.com/download, pull a model (e.g. \"ollama pull llama3.1\"), and it just works. Set OLLAMA_HOST if Ollama runs on another host."
+      "notes": "Fully local models via Ollama \u2014 no API key needed, ever. Install from https://ollama.com/download, pull a model (e.g. \"ollama pull llama3.1\"), and it just works. Set OLLAMA_HOST if Ollama runs on another host."
     }
   }
 }

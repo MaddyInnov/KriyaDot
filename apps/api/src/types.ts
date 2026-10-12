@@ -14,6 +14,8 @@ export interface ChatRequestBody {
   sessionId?: string;
   provider?: string;
   model?: string;
+  /** Reasoning effort for models that support it (low/medium/high). */
+  reasoningEffort?: 'low' | 'medium' | 'high';
   /** Task type for Phase 3 smart model routing (only used when no model is pinned). */
   taskType?: 'code' | 'chat' | 'reasoning' | 'simple-qa';
   /** Session auto-approve: skip approval cards for this turn (audited). */
