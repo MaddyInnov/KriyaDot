@@ -97,7 +97,7 @@ export function createProvider(providerId: string, opts?: { apiKey?: string }): 
   }
   if (!apiKey) {
     if (preset.bridge) {
-      const label = preset.bridge === 'claude' ? 'Claude Code' : 'Codex CLI';
+      const label = preset.bridge === 'claude' ? 'Claude Code' : preset.bridge === 'opencode' ? 'OpenCode' : 'Codex CLI';
       throw new Error(
         `${preset.name} is not connected: click Connect in the Providers settings page to use your ${label} login. ` +
           `The token is read from your CLI's own credential file at request time and never stored.`,

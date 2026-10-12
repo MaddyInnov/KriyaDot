@@ -66,10 +66,10 @@ export interface ProviderInfo {
   /** Latest rate-limit/quota snapshot captured from response headers (null when unknown). */
   rateLimit: RateLimitSnapshot | null;
   /**
-   * Subscription/CLI bridge (MausBot parity): 'claude' | 'codex'. Set only on
-   * bridge presets (claude-subscription / codex-subscription).
+   * Subscription/CLI bridge (MausBot parity): 'claude' | 'codex' | 'opencode'. Set only on
+   * bridge presets (claude-subscription / codex-subscription / opencode-subscription).
    */
-  bridge?: 'claude' | 'codex';
+  bridge?: 'claude' | 'codex' | 'opencode';
   /** Bridge only: a matching CLI or credential file was detected on this machine. */
   detected?: boolean;
   /** Bridge only: the user granted Connect consent (token readable in memory). */

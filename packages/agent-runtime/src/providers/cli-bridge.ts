@@ -19,7 +19,7 @@ import { accessSync, constants, existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, join } from 'node:path';
 
-export type CliBridgeId = 'claude' | 'codex';
+export type CliBridgeId = 'claude' | 'codex' | 'opencode';
 
 export interface BridgeDetection {
   id: CliBridgeId;
@@ -64,6 +64,7 @@ function executableOnPath(name: string, pathDirs: string[]): boolean {
 const BRIDGE_PATHS: Record<CliBridgeId, { cli: string; credentialsRel: string }> = {
   claude: { cli: 'claude', credentialsRel: join('.claude', '.credentials.json') },
   codex: { cli: 'codex', credentialsRel: join('.codex', 'auth.json') },
+  opencode: { cli: 'opencode', credentialsRel: join('.local', 'share', 'opencode', 'auth.json') },
 };
 
 function detectOne(id: CliBridgeId, homeDir: string, pathDirs: string[]): BridgeDetection {
@@ -163,6 +164,41 @@ function codexTokenFromFile(parsed: unknown): string | undefined {
 }
 
 /**
+ * Extract a token from an OpenCode CLI auth file
+ * (~/.local/share/opencode/auth.json). The file maps provider names to
+ * credential objects, e.g. { "opencode": { "api_key": "…" }, "anthropic": { "api_key": "…" } }.
+ * We prefer the "opencode" provider's key, falling back to the first usable
+ * api_key found. OAuth blobs are returned as-is (caller decides the scheme).
+ */
+function opencodeTokenFromFile(parsed: unknown): string | undefined {
+  if (typeof parsed !== 'object' || parsed === null) return undefined;
+  const obj = parsed as Record<string, unknown>;
+  // Prefer the native opencode provider entry.
+  const preferred = obj['opencode'];
+  if (typeof preferred === 'object' && preferred !== null) {
+    const p = preferred as Record<string, unknown>;
+    const key =
+      (typeof p['api_key'] === 'string' && p['api_key']) ||
+      (typeof p['apiKey'] === 'string' && p['apiKey']) ||
+      (typeof p['access_token'] === 'string' && p['access_token']) ||
+      undefined;
+    if (key) return key;
+  }
+  // Fallback: first api_key under any provider entry.
+  for (const v of Object.values(obj)) {
+    if (typeof v === 'object' && v !== null) {
+      const p = v as Record<string, unknown>;
+      const key =
+        (typeof p['api_key'] === 'string' && p['api_key']) ||
+        (typeof p['apiKey'] === 'string' && p['apiKey']) ||
+        undefined;
+      if (key) return key;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Load the bridge's bearer token from the CLI's stored credentials.
  * Returns undefined unless the user granted consent AND a token is readable.
  * The token is returned in memory only — callers must never persist or log it.
@@ -172,7 +208,9 @@ export function loadBridgeToken(id: CliBridgeId, homeDir?: string): string | und
   const home = homeDir ?? defaultHomeDir();
   const parsed = readJsonFile(join(home, BRIDGE_PATHS[id].credentialsRel));
   if (parsed === undefined) return undefined;
-  return id === 'claude' ? claudeTokenFromFile(parsed) : codexTokenFromFile(parsed);
+  if (id === 'claude') return claudeTokenFromFile(parsed);
+  if (id === 'opencode') return opencodeTokenFromFile(parsed);
+  return codexTokenFromFile(parsed);
 }
 
 /**

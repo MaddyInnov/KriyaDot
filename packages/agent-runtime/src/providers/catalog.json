@@ -248,6 +248,23 @@
       "models": [],
       "name": "Ollama (local)",
       "notes": "Fully local models via Ollama \u2014 no API key needed, ever. Install from https://ollama.com/download, pull a model (e.g. \"ollama pull llama3.1\"), and it just works. Set OLLAMA_HOST if Ollama runs on another host."
+    },
+    "opencode-subscription": {
+      "id": "opencode-subscription",
+      "name": "OpenCode subscription (CLI login)",
+      "api": "openai-compatible",
+      "baseUrl": "https://opencode.ai/zen/v1",
+      "envKey": "OPENCODE_SUBSCRIPTION_TOKEN",
+      "bridge": "opencode",
+      "liveModels": true,
+      "models": [
+        {
+          "id": "big-pickle",
+          "name": "Big Pickle",
+          "default": true
+        }
+      ],
+      "notes": "Uses YOUR OpenCode CLI login (~/.local/share/opencode/auth.json) \u2014 no API key needed. Shown only when the CLI is detected; requires your explicit Connect consent. Token is read at request time and never stored or logged."
     }
   }
 }
