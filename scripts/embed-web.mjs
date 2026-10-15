@@ -19,26 +19,38 @@ const header =
 mkdirSync(GEN_DIR, { recursive: true });
 
 if (!existsSync(OUT_DIR)) {
-  console.warn(`[embed-web] ${OUT_DIR} missing — writing empty asset map (run the web build first)`);
-  writeFileSync(
-    GEN_FILE,
-    header +
-      `export interface WebAsset { contentType: string; gzipBase64: string; }\n` +
-      `export const WEB_ASSETS: Record<string, WebAsset> = {};\n`,
-  );
-  process.exit(0);
+  // Fail loud in CI/production builds: an empty asset map would ship a blank UI.
+  // Devs can pass ALLOW_EMPTY_WEB=1 for API-only work.
+  if (process.env.ALLOW_EMPTY_WEB === '1') {
+    console.warn(`[embed-web] ${OUT_DIR} missing — ALLOW_EMPTY_WEB=1, writing empty asset map`);
+    writeFileSync(
+      GEN_FILE,
+      header +
+        `export interface WebAsset { contentType: string; gzipBase64: string; }\n` +
+        `export const WEB_ASSETS: Record<string, WebAsset> = {};\n`,
+    );
+    process.exit(0);
+  }
+  console.error(`[embed-web] ${OUT_DIR} missing — run the web build first (npm run build --workspace=@mvp/web)`);
+  process.exit(1);
 }
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json',
+  '.map': 'application/json',
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
+  '.avif': 'image/avif',
+  '.webp': 'image/webp',
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
+  '.mp4': 'video/mp4',
+  '.wasm': 'application/wasm',
   '.woff': 'font/woff',
   '.woff2': 'font/woff2',
   '.txt': 'text/plain; charset=utf-8',

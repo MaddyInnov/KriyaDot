@@ -212,10 +212,20 @@ export class MCPClient {
 
   async connectStdio(config: MCPStdioConfig): Promise<void> {
     this.label = `mcp-stdio:${config.command}`;
+    // Never hand provider keys to untrusted MCP children: syncProviderKeysToEnv
+    // mirrors decrypted keys into process.env, so strip secret-like vars here.
+    // Explicit config.env may still add non-secret vars (or its own auth).
+    const safeEnv: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (v === undefined) continue;
+      if (/api[_-]?key|token|secret|password|passwd|authorization|bearer|cookie|credential|private[_-]?key/i.test(k)) continue;
+      if (k.endsWith('_HEADERS') || k.endsWith('_BASE_URL')) continue;
+      safeEnv[k] = v;
+    }
     const transport = new StdioClientTransport({
       command: config.command,
       args: config.args ?? [],
-      env: { ...process.env, ...(config.env ?? {}) } as Record<string, string>,
+      env: { ...safeEnv, ...(config.env ?? {}) } as Record<string, string>,
     });
     await this.connectWith(transport, `stdio command "${config.command}"`);
   }

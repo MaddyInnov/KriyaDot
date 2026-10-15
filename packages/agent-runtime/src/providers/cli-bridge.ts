@@ -16,6 +16,7 @@
 //   with their explicit consent.
 
 import { accessSync, constants, existsSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { delimiter, join } from 'node:path';
 
@@ -221,7 +222,7 @@ export function loadBridgeToken(id: CliBridgeId, homeDir?: string): string | und
 export function bridgeConnectable(id: CliBridgeId, opts: DetectOptions = {}): { ok: boolean; reason?: string } {
   const detection = detectCliBridge(id, opts);
   if (!detection.detected) {
-    const label = id === 'claude' ? 'Claude Code' : 'Codex CLI';
+    const label = id === 'claude' ? 'Claude Code' : id === 'opencode' ? 'OpenCode CLI' : 'Codex CLI';
     return { ok: false, reason: `No ${label} installation or credential file found on this machine.` };
   }
   if (!detection.credentialsPresent) {
@@ -254,11 +255,10 @@ export function getBridgeModels(id: CliBridgeId): Array<{ id: string; name: stri
   if (!spec) return [];
   
   try {
-    const { execSync } = require('node:child_process');
     let output: string;
     
     if (id === 'codex') {
-      output = execSync('codex debug models', { encoding: 'utf8', timeout: 10000, windowsHide: true });
+      output = execFileSync('codex', ['debug', 'models'], { encoding: 'utf8', timeout: 10000, windowsHide: true });
       // Parse the output - it lists models, one per line or in a table
       // Try to extract model IDs (lines containing gpt-, o1, o3, o4)
       const models: Array<{ id: string; name: string }> = [];
@@ -278,7 +278,7 @@ export function getBridgeModels(id: CliBridgeId): Array<{ id: string; name: stri
     }
     
     if (id === 'opencode') {
-      output = execSync('opencode models', { encoding: 'utf8', timeout: 10000, windowsHide: true });
+      output = execFileSync('opencode', ['models'], { encoding: 'utf8', timeout: 10000, windowsHide: true });
       // Similar parsing
       const models: Array<{ id: string; name: string }> = [];
       const lines = output.split('\n');

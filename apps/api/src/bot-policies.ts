@@ -65,6 +65,23 @@ export function validatePolicyRules(value: unknown): BotPolicyRule[] {
       toolPattern: r.toolPattern,
       effect: r.effect,
     };
+    // Local-first safety: per-bot rules can never auto-allow privileged tools.
+    // A bot-policy writer could otherwise prepend allow:^mcp: and bypass the
+    // global deny-by-default floor (first-match-wins).
+    if (r.effect === 'allow') {
+      try {
+        const re = new RegExp(r.toolPattern, 'i');
+        const probes = ['mcp:server:tool', 'run_command', 'exec', 'shell', 'write_file', 'delete_file'];
+        if (probes.some((p) => re.test(p))) {
+          throw new Error(
+            `policy.rules[${i}]: "allow" must never match privileged tools (mcp:*, run_command/exec/shell, file writes). Use "require-approval" instead.`,
+          );
+        }
+      } catch (err) {
+        if (err instanceof Error && err.message.includes('"allow" must never match')) throw err;
+        // Invalid regex already rejected above; ignore here.
+      }
+    }
     if (r.reason !== undefined) {
       if (typeof r.reason !== 'string') {
         throw new Error(`policy.rules[${i}].reason: must be a string`);
@@ -152,6 +169,13 @@ export function rememberAllowedTool(
 ): BotPolicy {
   const bot = bots.find((b) => b.id === botId);
   if (!bot) throw new Error(`Unknown bot "${botId}"`);
+  // Local-first safety: privileged tools can never be "always allow".
+  // They must pass full policy evaluation every time.
+  const blocked = /^(mcp:|run_command$|exec$|shell$|write_file$|edit_file$|create_file$|delete_file$|remove_file$)/.test(tool)
+    || /delete|remove|drop|exec/.test(tool);
+  if (blocked) {
+    throw new Error(`Tool "${tool}" is privileged and cannot be set to always-allow. Approve each call instead.`);
+  }
   const file = loadBotPolicies(dataDir);
   const existing = file[botId]?.rules ?? bot.policy?.rules ?? [];
   const escaped = tool.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
