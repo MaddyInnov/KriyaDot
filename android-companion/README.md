@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Sarviq Companion (Android)
+# KriyaDot Companion (Android)
 
-Remote control for your Sarviq instance: the **phone → PC** direction of the
-Sarviq MVP. Pair once over WiFi by scanning a QR code, then monitor runs,
+Remote control for your KriyaDot instance: the **phone → PC** direction of the
+KriyaDot MVP. Pair once over WiFi by scanning a QR code, then monitor runs,
 approve/deny pending approvals, pause/resume/cancel runs, chat with the agent,
 and read the activity feed and briefing — all from your phone.
 
@@ -39,13 +39,13 @@ Zero paid APIs. No Play Services dependency anywhere.
 | Permission | Why |
 |---|---|
 | `CAMERA` | **QR pairing scan only.** Requested at runtime with an in-app rationale. Deny it and the manual host/port/token entry still works; the camera is never used for anything else. Declared `android.hardware.camera.any` as `required="false"` so camera-less devices can install. |
-| `INTERNET` | REST + WebSocket to the Sarviq instance on your LAN (`http://<lan-ip>:<port>`, `ws://…`). |
+| `INTERNET` | REST + WebSocket to the KriyaDot instance on your LAN (`http://<lan-ip>:<port>`, `ws://…`). |
 | `usesCleartextTraffic="true"` | Required because the MVP talks plain HTTP on the LAN (no TLS yet). Switch both ends to HTTPS/WSS before any use outside a trusted LAN. |
 
 ## How to pair
 
-1. On your PC: Sarviq Workspace → **Devices** → *Pair new phone*. A QR code appears encoding
-   `sarviq://pair?host=<lan-ip>&port=<port>&token=<ott>` (one-time token).
+1. On your PC: KriyaDot Workspace → **Devices** → *Pair new phone*. A QR code appears encoding
+   `kriyadot://pair?host=<lan-ip>&port=<port>&token=<ott>` (one-time token).
 2. In the app: tap **Scan QR code**, point at the code (or use *Enter details manually*).
 3. Confirm the server address, give the phone a name, tap **Pair**.
 4. The app `POST`s `/api/companion/pairing/exchange` with `{ott, deviceName}` and
@@ -82,7 +82,7 @@ Because the server workstream is being built in parallel, all JSON parsing is
 gracefully instead of crashing. Tighten the models once the server contract is frozen.
 
 **Chat TODO:** the bot id sent to `POST /chat` is currently the placeholder
-`SarviqApi.DEFAULT_BOT_ID = "default"` (marked `TODO(chat)` in code). No
+`KriyaDotApi.DEFAULT_BOT_ID = "default"` (marked `TODO(chat)` in code). No
 default bot id was discoverable in the web app sources; wire it to a bot
 picker (`GET /api/bots`) or a settings field once the server exposes one.
 
@@ -97,10 +97,10 @@ picker (`GET /api/bots`) or a settings field once the server exposes one.
 
 ## Files
 
-- `app/src/main/java/com/sarviq/companion/MainActivity.kt` — activity, QR-scan launcher, bottom-nav shell.
+- `app/src/main/java/com/kriyadot/companion/MainActivity.kt` — activity, QR-scan launcher, bottom-nav shell.
 - `…/data/PairingStore.kt` — EncryptedSharedPreferences (host/port/token/deviceId).
-- `…/data/QrParser.kt` — `sarviq://pair` payload parsing/validation.
-- `…/data/SarviqApi.kt` — OkHttp REST client + `POST /chat` SSE streaming.
+- `…/data/QrParser.kt` — `kriyadot://pair` payload parsing/validation.
+- `…/data/KriyaDotApi.kt` — OkHttp REST client + `POST /chat` SSE streaming.
 - `…/data/CompanionSocket.kt` — WebSocket client with exponential-backoff reconnect.
 - `…/data/Models.kt` — lenient contract models.
 - `…/ui/CompanionViewModel.kt` — pairing state, live data, chat, socket lifecycle.
@@ -110,14 +110,14 @@ picker (`GET /api/bots`) or a settings field once the server exposes one.
 
 ## Hosted mode — pair over the internet
 
-When Sarviq runs on a hosted machine (VPS, home server), the app pairs over
+When KriyaDot runs on a hosted machine (VPS, home server), the app pairs over
 the internet instead of WiFi:
 
 1. The server owner puts the API behind a reverse proxy with TLS and starts
-   it with `SARVIQ_PUBLIC_URL=https://sarviq.example.com` (see
+   it with `KRIYADOT_PUBLIC_URL=https://kriyadot.example.com` (see
    `apps/api/src/companion-PROTOCOL.md` §9 for the nginx config).
 2. In Workspace → Devices the QR then encodes
-   `sarviq://pair?url=https://sarviq.example.com&token=<ott>` — scan it as
+   `kriyadot://pair?url=https://kriyadot.example.com&token=<ott>` — scan it as
    usual, and the app connects to the public URL (REST over https, push
    socket over wss).
 3. No QR handy? Tap **Enter details manually** → **Hosted**, type the server
@@ -128,4 +128,4 @@ The Home screen's connection line shows which server the app is attached to
 (URL in hosted mode, `host:port` on LAN). Pairing, device tokens and the push
 channel work identically in both modes — only the transport address changes.
 Never pair with a server you don't trust: a paired phone can approve tool
-calls and drive chat sessions on that Sarviq instance.
+calls and drive chat sessions on that KriyaDot instance.

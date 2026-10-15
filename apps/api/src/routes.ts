@@ -1077,7 +1077,7 @@ export function createRouter(deps: RouteDeps): express.Router {
       });
     }
 
-    // Spaces: resolve the active space from the `X-Sarviq-Space` header or
+    // Spaces: resolve the active space from the `X-KriyaDot-Space` header or
     // the `spaceId` body field. Unknown → 404, paused → 423 (new runs are
     // rejected while a space is paused).
     let spaceCtx: SpaceRunContext | undefined;
@@ -1847,7 +1847,7 @@ export function createRouter(deps: RouteDeps): express.Router {
 
   // Stage-prompt overrides (feature #9): boot log of which overrides are
   // live (the summarizer stage resolves through the same store, so edits
-  // under ~/.sarviq/prompts/*.md hot-reload without a restart).
+  // under ~/.kriyadot/prompts/*.md hot-reload without a restart).
   logActivePromptOverrides();
   registerPromptRoutes(router);
 

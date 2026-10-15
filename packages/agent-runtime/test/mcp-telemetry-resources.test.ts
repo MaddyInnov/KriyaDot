@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Tests for the read-only telemetry MCP resources (sarviq://telemetry/*).
+// Tests for the read-only telemetry MCP resources (kriyadot://telemetry/*).
 
 import { describe, expect, it } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -59,20 +59,20 @@ function jsonOf(contents: Array<{ text?: string }>): unknown {
 }
 
 describe('telemetry MCP resources (read-only)', () => {
-  it('lists the sarviq://telemetry resources and templates', async () => {
+  it('lists the kriyadot://telemetry resources and templates', async () => {
     const { collector } = seededCollector();
     await withClient(collector, async (client) => {
       const { resources, resourceTemplates } = await client.listResources();
       const uris = resources.map((r) => r.uri).sort();
       expect(uris).toEqual([
-        'sarviq://telemetry/bots',
-        'sarviq://telemetry/runs',
-        'sarviq://telemetry/summary',
+        'kriyadot://telemetry/bots',
+        'kriyadot://telemetry/runs',
+        'kriyadot://telemetry/summary',
       ]);
       for (const r of resources) expect(r.mimeType).toBe('application/json');
       expect(resourceTemplates.map((t) => t.uriTemplate).sort()).toEqual([
-        'sarviq://telemetry/bots/{id}',
-        'sarviq://telemetry/runs/{id}',
+        'kriyadot://telemetry/bots/{id}',
+        'kriyadot://telemetry/runs/{id}',
       ]);
     });
   });
@@ -80,7 +80,7 @@ describe('telemetry MCP resources (read-only)', () => {
   it('reads summary, runs, and bots resources', async () => {
     const { collector } = seededCollector();
     await withClient(collector, async (client) => {
-      const summary = jsonOf((await client.readResource({ uri: 'sarviq://telemetry/summary' })).contents) as {
+      const summary = jsonOf((await client.readResource({ uri: 'kriyadot://telemetry/summary' })).contents) as {
         windowRuns: number;
         errors: number;
         totalTokens: number;
@@ -89,12 +89,12 @@ describe('telemetry MCP resources (read-only)', () => {
       expect(summary.errors).toBe(1);
       expect(summary.totalTokens).toBe(150);
 
-      const runs = jsonOf((await client.readResource({ uri: 'sarviq://telemetry/runs' })).contents) as Array<{
+      const runs = jsonOf((await client.readResource({ uri: 'kriyadot://telemetry/runs' })).contents) as Array<{
         kind: string;
       }>;
       expect(runs).toHaveLength(2);
 
-      const bots = jsonOf((await client.readResource({ uri: 'sarviq://telemetry/bots' })).contents) as Array<{
+      const bots = jsonOf((await client.readResource({ uri: 'kriyadot://telemetry/bots' })).contents) as Array<{
         id: string;
       }>;
       expect(bots.map((b) => b.id).sort()).toEqual(['bot-a', 'workflow:wf']);
@@ -105,13 +105,13 @@ describe('telemetry MCP resources (read-only)', () => {
     const { collector, runId } = seededCollector();
     await withClient(collector, async (client) => {
       const run = jsonOf(
-        (await client.readResource({ uri: `sarviq://telemetry/runs/${runId}` })).contents,
+        (await client.readResource({ uri: `kriyadot://telemetry/runs/${runId}` })).contents,
       ) as { id: string; botId: string; steps: unknown[] };
       expect(run.id).toBe(runId);
       expect(run.botId).toBe('bot-a');
       expect(run.steps).toHaveLength(1);
 
-      const bot = jsonOf((await client.readResource({ uri: 'sarviq://telemetry/bots/bot-a' })).contents) as {
+      const bot = jsonOf((await client.readResource({ uri: 'kriyadot://telemetry/bots/bot-a' })).contents) as {
         id: string;
         runs: number;
       };
@@ -123,9 +123,9 @@ describe('telemetry MCP resources (read-only)', () => {
   it('rejects unknown run ids, bot ids, and URIs', async () => {
     const { collector } = seededCollector();
     await withClient(collector, async (client) => {
-      await expect(client.readResource({ uri: 'sarviq://telemetry/runs/nope' })).rejects.toThrow();
-      await expect(client.readResource({ uri: 'sarviq://telemetry/bots/nope' })).rejects.toThrow();
-      await expect(client.readResource({ uri: 'sarviq://telemetry/nope' })).rejects.toThrow();
+      await expect(client.readResource({ uri: 'kriyadot://telemetry/runs/nope' })).rejects.toThrow();
+      await expect(client.readResource({ uri: 'kriyadot://telemetry/bots/nope' })).rejects.toThrow();
+      await expect(client.readResource({ uri: 'kriyadot://telemetry/nope' })).rejects.toThrow();
       await expect(client.readResource({ uri: 'other://telemetry/summary' })).rejects.toThrow();
     });
   });

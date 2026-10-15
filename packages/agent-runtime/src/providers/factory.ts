@@ -58,7 +58,7 @@ export function createProvider(providerId: string, opts?: { apiKey?: string }): 
   // Agent-CLI inference backend: `agent/<cli-id>/<model>` (e.g.
   // `agent/claude-code/sonnet`). Runs a locally installed agent CLI under
   // the user's own subscription login — zero marginal cost, zero API keys
-  // handled by Sarviq. Auth is the CLI's own; the child is spawned without
+  // handled by KriyaDot. Auth is the CLI's own; the child is spawned without
   // a shell and its output is marked untrusted (see agent-cli.ts).
   if (parseAgentProviderId(providerId)) {
     return createAgentCliProvider(providerId);

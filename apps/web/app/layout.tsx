@@ -11,12 +11,12 @@ import { BrandPet } from '../components/pet/BrandPet';
 import { I18nProvider } from '../lib/i18n';
 
 export const metadata: Metadata = {
-  title: 'Sarviq',
-  description: 'All-in-one AI agent platform — Sarviq console',
+  title: 'KriyaDot',
+  description: 'All-in-one AI agent platform — KriyaDot console',
   manifest: '/manifest.json',
   appleWebApp: {
     capable: true,
-    title: 'Sarviq',
+    title: 'KriyaDot',
     statusBarStyle: 'default',
   },
   icons: {
@@ -38,8 +38,8 @@ export const viewport: Viewport = {
 /** Sets html[data-ux] and html[data-theme] before first paint so Simple/Pro choice and theme never flash. */
 const UX_INIT_SCRIPT = `try{var m=localStorage.getItem('mvp:ux-mode');document.documentElement.dataset.ux=(m==='pro'?'pro':'simple');}catch(e){document.documentElement.dataset.ux='simple';}`;
 const THEME_INIT_SCRIPT = `try{var t=localStorage.getItem('mvp:theme');var ok=['light','dark','midnight','porcelain','ocean'].indexOf(t)>=0;t=ok?t:'system';var r=t==='system'?(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'):t;document.documentElement.dataset.theme=r;document.documentElement.dataset.themeChoice=t;}catch(e){document.documentElement.dataset.theme='light';document.documentElement.dataset.themeChoice='system';}`;
-/** Brand accent (Sarviq Jewels palette): persisted, no flash. Defaults to Amethyst Crown. */
-const ACCENT_INIT_SCRIPT = `try{var a=localStorage.getItem('sarviq:accent');var ok=['amethyst','emerald','sapphire','garnet','topaz','copper','opal','peacock'].indexOf(a)>=0;document.documentElement.dataset.accent=ok?a:'amethyst';}catch(e){document.documentElement.dataset.accent='amethyst';}`;
+/** Brand accent (KriyaDot Jewels palette): persisted, no flash. Defaults to Amethyst Crown. */
+const ACCENT_INIT_SCRIPT = `try{var a=localStorage.getItem('kriyadot:accent');var ok=['amethyst','emerald','sapphire','garnet','topaz','copper','opal','peacock'].indexOf(a)>=0;document.documentElement.dataset.accent=ok?a:'amethyst';}catch(e){document.documentElement.dataset.accent='amethyst';}`;
 /** Classic vs Minimal layout (Octop parity): persisted, no flash. Minimal is the default on small screens. */
 const LAYOUT_INIT_SCRIPT = `try{var l=localStorage.getItem('mvp:layout');var ok=['classic','minimal'].indexOf(l)>=0;if(!ok){l=(window.innerWidth||1024)<768?'minimal':'classic';}document.documentElement.dataset.layout=l;}catch(e){document.documentElement.dataset.layout='classic';}`;
 /** Registers the PWA service worker (no-op where unsupported). */
@@ -62,7 +62,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <header className="topbar">
             <Link href="/" className="brand">
               <BrandPet />
-              Sarviq
+              KriyaDot
             </Link>
             <Nav />
           </header>

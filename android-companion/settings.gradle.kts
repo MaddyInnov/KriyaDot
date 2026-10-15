@@ -17,5 +17,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "Sarviq Companion"
+rootProject.name = "KriyaDot Companion"
 include(":app")

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// `sarviq scan` — one-command offline project scanner.
+// `kriyadot scan` — one-command offline project scanner.
 //
 // Walks a project folder, detects its shape from dependency/config files
 // (package.json, pyproject.toml, go.mod, Dockerfile, docker-compose.yml,

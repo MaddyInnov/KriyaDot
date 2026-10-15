@@ -111,7 +111,7 @@ const SAMPLE_N8N: N8nWorkflowJson = {
 };
 
 describe('importN8nWorkflow', () => {
-  it('maps common n8n nodes to Sarviq node types', () => {
+  it('maps common n8n nodes to KriyaDot node types', () => {
     const { workflow, unmapped } = importN8nWorkflow(SAMPLE_N8N);
     const byName = Object.fromEntries(workflow.nodes.map((n) => [n.name, n]));
 
@@ -270,7 +270,7 @@ describe('importN8nWorkflow', () => {
 });
 
 describe('exportN8nWorkflow', () => {
-  it('reverse-maps Sarviq nodes to n8n format with branch outputs', () => {
+  it('reverse-maps KriyaDot nodes to n8n format with branch outputs', () => {
     const def: WorkflowDefinition = {
       id: 'wf-1',
       name: 'Triage',

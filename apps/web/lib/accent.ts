@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// Sarviq brand accent system.
+// KriyaDot brand accent system.
 //
-// THE SARVIQ JEWELS — our signature palette (designed 2026-10-09):
+// THE KRIYADOT JEWELS — our signature palette (designed 2026-10-09):
 //
 //   Deep jewel tones, refined metallics, elegant duotones. Every accent is a
-//   135° gradient duotone — the signature Sarviq gradient identity — with
+//   135° gradient duotone — the signature KriyaDot gradient identity — with
 //   theme-appropriate luminance roles (light + dark sets) so each theme keeps
 //   readable contrast without restyling the claymorphism/glassmorphism system.
 //
@@ -22,7 +22,7 @@
 //     opal      "Opal Mist"       #52617a → #aebccf   slate → pearl metallic
 //     peacock   "Peacock Plume"   #0b5c63 → #35c9b4   deep teal → aquamarine
 //
-// Choice persists in localStorage under `sarviq:accent` (a plain accent id
+// Choice persists in localStorage under `kriyadot:accent` (a plain accent id
 // string). The root layout sets html[data-accent] before first paint so the
 // accent never flashes. Unknown or missing values fall back to the default;
 // the legacy `mvp:*` preference keys are untouched, so existing prefs keep
@@ -72,7 +72,7 @@ export const ACCENTS: AccentDef[] = [
   {
     id: 'amethyst',
     name: 'Amethyst Crown',
-    blurb: 'The signature Sarviq identity — royal violet melting into luminous lavender.',
+    blurb: 'The signature KriyaDot identity — royal violet melting into luminous lavender.',
     swatch: ['#6d3fc4', '#b678e0'],
     light: { from: '#6d3fc4', to: '#b678e0', accent: '#6d3fc4', hover: '#5a30ae', soft: '#f0e9fb', ink: '#ffffff' },
     dark: { from: '#a179f2', to: '#d4aef8', accent: '#a179f2', hover: '#bb93f7', soft: '#221d3d', ink: '#161130' },
@@ -128,7 +128,7 @@ export const ACCENTS: AccentDef[] = [
   {
     id: 'peacock',
     name: 'Peacock Plume',
-    blurb: 'Deep teal into aquamarine — vivid jewel water, unmistakably Sarviq.',
+    blurb: 'Deep teal into aquamarine — vivid jewel water, unmistakably KriyaDot.',
     swatch: ['#0b5c63', '#35c9b4'],
     light: { from: '#0b5c63', to: '#35c9b4', accent: '#0b5c63', hover: '#0a4d53', soft: '#e2f7f1', ink: '#ffffff' },
     dark: { from: '#3ad6bd', to: '#8ef0d8', accent: '#3ad6bd', hover: '#5de0c8', soft: '#0f3229', ink: '#06231c' },
@@ -137,8 +137,8 @@ export const ACCENTS: AccentDef[] = [
 
 export const DEFAULT_ACCENT_ID: AccentId = 'amethyst';
 
-const KEY = 'sarviq:accent';
-const CHANGE_EVENT = 'sarviq:accent-change';
+const KEY = 'kriyadot:accent';
+const CHANGE_EVENT = 'kriyadot:accent-change';
 const VALID: AccentId[] = ACCENTS.map((a) => a.id);
 
 export function accentDef(id: AccentId): AccentDef {

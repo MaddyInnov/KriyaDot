@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 'use client';
 
-// Modules hub: lists the Sarviq modules with live stats. Each card links
+// Modules hub: lists the KriyaDot modules with live stats. Each card links
 // to the module's dedicated web page under /modules/<key>.
 
 import { useCallback, useEffect, useState } from 'react';
@@ -150,7 +150,7 @@ export default function ModulesPage() {
         <div>
           <h1 className="page-title">Modules</h1>
           <p className="page-sub">
-            The 13 Sarviq modules. Live counts come from the modules API; each card opens the
+            The 13 KriyaDot modules. Live counts come from the modules API; each card opens the
             module&apos;s dedicated page.
           </p>
         </div>

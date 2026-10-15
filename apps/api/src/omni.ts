@@ -55,7 +55,7 @@ export type VersionGranularity = 'daily' | 'weekly' | 'manual';
 
 export const OMNI_LAYERS: ReadonlyArray<OmniLayer> = ['attention', 'recent', 'period', 'milestones'];
 
-/** Matches the frontend BriefingItem contract in apps/web/lib/sarviq-api.ts. */
+/** Matches the frontend BriefingItem contract in apps/web/lib/kriyadot-api.ts. */
 export interface OmniItem {
   id: string;
   title: string;

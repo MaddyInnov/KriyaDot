@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Tests for the teach-by-recording compiler: recorded computer-view events
-// (fixture) -> Sarviq workflow definition. Zero paid APIs; pure function,
+// (fixture) -> KriyaDot workflow definition. Zero paid APIs; pure function,
 // no network, no filesystem.
 
 import { describe, expect, it } from 'vitest';

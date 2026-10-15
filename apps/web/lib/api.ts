@@ -426,7 +426,7 @@ export const exportBotRoster = async (): Promise<void> => {
   const blob = await res.blob();
   const cd = res.headers.get('content-disposition') ?? '';
   const match = /filename="([^"]+)"/.exec(cd);
-  const filename = match?.[1] ?? 'sarviq-bot-roster.json';
+  const filename = match?.[1] ?? 'kriyadot-bot-roster.json';
   const url = URL.createObjectURL(blob);
   try {
     const a = document.createElement('a');
@@ -702,7 +702,7 @@ export const getRuns = (): Promise<WorkflowRun[]> => apiJson('/api/workflows/run
 export const getRun = (runId: string): Promise<WorkflowRun> =>
   apiJson(`/api/workflows/runs/${encodeURIComponent(runId)}`);
 
-/** n8n node that had no Sarviq mapping during import (imported as a placeholder). */
+/** n8n node that had no KriyaDot mapping during import (imported as a placeholder). */
 export interface UnmappedN8nNode {
   n8nType: string;
   name: string;

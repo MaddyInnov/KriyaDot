@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Locale dictionaries for the Sarviq web console.
+// Locale dictionaries for the KriyaDot web console.
 //
 // English is the source of truth: every other locale must provide the exact
 // same key shape (enforced by `Strings = typeof en` and checked in

@@ -6,7 +6,7 @@
 // Mounted at the bottom of the Knowledge page.
 
 import { useState } from 'react';
-import { traceEntityApi, type EntityTraceResult } from '../../lib/sarviq-api';
+import { traceEntityApi, type EntityTraceResult } from '../../lib/kriyadot-api';
 
 export function EntityTrace() {
   const [q, setQ] = useState('');

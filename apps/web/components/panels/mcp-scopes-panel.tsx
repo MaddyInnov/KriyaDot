@@ -8,8 +8,8 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { EmptyState, ErrorBox } from '../../app/modules/lib';
-import { getMcpTools, patchMcpToolScopes } from '../../lib/sarviq-api';
-import type { McpTool, McpToolScopes } from '../../lib/sarviq-api';
+import { getMcpTools, patchMcpToolScopes } from '../../lib/kriyadot-api';
+import type { McpTool, McpToolScopes } from '../../lib/kriyadot-api';
 
 const SCOPE_KEYS: Array<{ key: keyof McpToolScopes; label: string; hint: string }> = [
   { key: 'read', label: 'Read', hint: 'Allow the tool to read data' },

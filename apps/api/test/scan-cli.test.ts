@@ -103,7 +103,7 @@ describe('runScanCli', () => {
     expect(code).toBe(0);
     expect(seen.dir).toBe(dir);
     const out = logs.join('\n');
-    expect(out).toMatch(/sarviq scan/);
+    expect(out).toMatch(/kriyadot scan/);
     expect(out).toMatch(/code-reviewer \(bot\)/);
     expect(out).toMatch(/offline/);
   });

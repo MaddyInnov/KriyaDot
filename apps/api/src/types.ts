@@ -38,7 +38,7 @@ export interface ChatRequestBody {
    */
   queueMode?: 'interrupt' | 'queue';
   /**
-   * Space to run in (Spaces feature). Alternative to the `X-Sarviq-Space`
+   * Space to run in (Spaces feature). Alternative to the `X-KriyaDot-Space`
    * request header. The space's model/workspace overrides apply to the
    * run; paused spaces reject the request with 423.
    */

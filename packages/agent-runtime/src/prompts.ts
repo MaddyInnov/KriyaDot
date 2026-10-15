@@ -2,7 +2,7 @@
 /**
  * Custom stage-prompt overrides (Laya-inspired, adapted — not copied).
  *
- * `~/.sarviq/prompts/*.md` hot-reloads pipeline stage prompts without a
+ * `~/.kriyadot/prompts/*.md` hot-reloads pipeline stage prompts without a
  * restart. On stage-prompt resolution, the store checks for an override file
  * named after the stage (`router.md`, `summarizer.md`, `delegate.md`,
  * `governance.md`); when present it wins, otherwise the built-in prompt is
@@ -77,9 +77,9 @@ export interface PromptOverrideInfo {
   mtimeMs: number;
 }
 
-/** `~/.sarviq/prompts` (or the test-provided home dir). */
+/** `~/.kriyadot/prompts` (or the test-provided home dir). */
 export function resolvePromptOverridesDir(homeDir?: string): string {
-  return join(homeDir ?? homedir(), '.sarviq', 'prompts');
+  return join(homeDir ?? homedir(), '.kriyadot', 'prompts');
 }
 
 function sanitizeStage(stage: string): string {
@@ -215,7 +215,7 @@ export class PromptOverrideStore {
   }
 }
 
-/** Default store against `~/.sarviq/prompts` (honors $HOME via os.homedir). */
+/** Default store against `~/.kriyadot/prompts` (honors $HOME via os.homedir). */
 export const defaultPromptStore = new PromptOverrideStore();
 
 /** Convenience: resolve via the default store. */

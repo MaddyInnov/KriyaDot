@@ -162,9 +162,9 @@ describe('CompanionStore pairing', () => {
 });
 
 describe('QR payload', () => {
-  it('builds the sarviq://pair payload the app parses', () => {
+  it('builds the kriyadot://pair payload the app parses', () => {
     expect(buildQrPayload('192.168.1.10', 4567, 'a'.repeat(32))).toBe(
-      `sarviq://pair?host=192.168.1.10&port=4567&token=${'a'.repeat(32)}`,
+      `kriyadot://pair?host=192.168.1.10&port=4567&token=${'a'.repeat(32)}`,
     );
   });
 
@@ -175,8 +175,8 @@ describe('QR payload', () => {
 
 describe('QR payload flavors (LAN vs hosted)', () => {
   it('buildHostedQrPayload encodes the public URL', () => {
-    expect(buildHostedQrPayload('https://sarviq.example.com', 'a'.repeat(32))).toBe(
-      `sarviq://pair?url=https%3A%2F%2Fsarviq.example.com&token=${'a'.repeat(32)}`,
+    expect(buildHostedQrPayload('https://kriyadot.example.com', 'a'.repeat(32))).toBe(
+      `kriyadot://pair?url=https%3A%2F%2Fkriyadot.example.com&token=${'a'.repeat(32)}`,
     );
   });
 
@@ -188,18 +188,18 @@ describe('QR payload flavors (LAN vs hosted)', () => {
 
   it('buildPairingPayload selects the hosted flavor and label', () => {
     const p = buildPairingPayload(
-      { publicBaseUrl: 'https://sarviq.example.com', lanIp: '192.168.1.10', port: 4567 },
+      { publicBaseUrl: 'https://kriyadot.example.com', lanIp: '192.168.1.10', port: 4567 },
       'b'.repeat(32),
     );
     expect(p.mode).toBe('hosted');
-    expect(p.qrPayload).toBe(`sarviq://pair?url=https%3A%2F%2Fsarviq.example.com&token=${'b'.repeat(32)}`);
-    expect(p.serverLabel).toBe('https://sarviq.example.com');
+    expect(p.qrPayload).toBe(`kriyadot://pair?url=https%3A%2F%2Fkriyadot.example.com&token=${'b'.repeat(32)}`);
+    expect(p.serverLabel).toBe('https://kriyadot.example.com');
   });
 
   it('buildPairingPayload falls back to the LAN flavor', () => {
     const p = buildPairingPayload({ lanIp: '192.168.1.10', port: 4567 }, 'b'.repeat(32));
     expect(p.mode).toBe('lan');
-    expect(p.qrPayload).toBe(`sarviq://pair?host=192.168.1.10&port=4567&token=${'b'.repeat(32)}`);
+    expect(p.qrPayload).toBe(`kriyadot://pair?host=192.168.1.10&port=4567&token=${'b'.repeat(32)}`);
     expect(p.serverLabel).toBe('192.168.1.10:4567');
   });
 });
@@ -502,12 +502,12 @@ describe('companion REST routes', () => {
       qrPayload: string;
       expiresAt: number;
     };
-    expect(qrPayload).toBe(`sarviq://pair?host=192.168.1.10&port=4567&token=${ott}`);
+    expect(qrPayload).toBe(`kriyadot://pair?host=192.168.1.10&port=4567&token=${ott}`);
     expect(expiresAt).toBeGreaterThan(Date.now());
 
     const qrRes = await get('/api/companion/pairing/qr');
     expect(qrRes.status).toBe(200);
-    expect(((await qrRes.json()) as { qrPayload: string }).qrPayload.startsWith('sarviq://pair?')).toBe(true);
+    expect(((await qrRes.json()) as { qrPayload: string }).qrPayload.startsWith('kriyadot://pair?')).toBe(true);
 
     const ex = await post('/api/companion/pairing/exchange', { ott, deviceName: 'Pixel 8' });
     expect(ex.status).toBe(200);
@@ -604,7 +604,7 @@ describe('companion REST routes', () => {
       runs: Array<{ id: string; kind: string; state: string }>;
     };
     expect(body.ok).toBe(true);
-    expect(body.server).toEqual({ name: 'Sarviq', version: '0.1.0' });
+    expect(body.server).toEqual({ name: 'KriyaDot', version: '0.1.0' });
     expect(body.activeRuns).toBe(1);
     expect(body.pendingApprovals).toBe(2);
     expect(body.runs[0]).toEqual(expect.objectContaining({ id: 'sess-1', kind: 'chat-turn', state: 'running' }));
@@ -809,12 +809,12 @@ describe('companion REST routes', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Hosted mode: SARVIQ_PUBLIC_URL pairing over the internet
+// Hosted mode: KRIYADOT_PUBLIC_URL pairing over the internet
 // ---------------------------------------------------------------------------
 
 describe('companion hosted mode (publicBaseUrl)', () => {
   let ctx: RouteTestCtx;
-  const PUBLIC = 'https://sarviq.example.com';
+  const PUBLIC = 'https://kriyadot.example.com';
 
   beforeEach(async () => {
     ctx = await makeRouteCtx({ publicBaseUrl: PUBLIC });
@@ -844,14 +844,14 @@ describe('companion hosted mode (publicBaseUrl)', () => {
     };
     expect(code.mode).toBe('hosted');
     expect(code.serverLabel).toBe(PUBLIC);
-    expect(code.qrPayload).toBe(`sarviq://pair?url=${encodeURIComponent(PUBLIC)}&token=${code.ott}`);
+    expect(code.qrPayload).toBe(`kriyadot://pair?url=${encodeURIComponent(PUBLIC)}&token=${code.ott}`);
     expect(code.qrPayload).not.toContain('host=');
 
     const qrRes = await get('/api/companion/pairing/qr');
     expect(qrRes.status).toBe(200);
     const qr = (await qrRes.json()) as { qrPayload: string; mode: string; serverLabel: string };
     expect(qr.mode).toBe('hosted');
-    expect(qr.qrPayload.startsWith('sarviq://pair?url=')).toBe(true);
+    expect(qr.qrPayload.startsWith('kriyadot://pair?url=')).toBe(true);
   });
 
   it('full pair → exchange → authed API flow works with no LAN assumptions', async () => {

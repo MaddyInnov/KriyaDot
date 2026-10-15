@@ -12,7 +12,7 @@
 // in any response.
 //
 // The chat route uses resolveSpaceForRun() to turn an incoming space
-// selector (X-Sarviq-Space header or `spaceId` body field) into a
+// selector (X-KriyaDot-Space header or `spaceId` body field) into a
 // per-run context: paused spaces reject with 423, and a space's apiKeyRef
 // is resolved server-side to a memory-only key value for the turn.
 
@@ -136,7 +136,7 @@ function callerOf(req: Request): string {
 }
 
 /**
- * Resolve the active space for a chat run from the `X-Sarviq-Space` header
+ * Resolve the active space for a chat run from the `X-KriyaDot-Space` header
  * or a `spaceId` body field. Returns undefined when no space is selected.
  *
  * - Unknown space → 404.
@@ -152,7 +152,7 @@ export function resolveSpaceForRun(opts: {
   spaceId?: string;
 }): SpaceRunContext | undefined {
   const { req, spaceStore, dataDir, spaceId } = opts;
-  const header = req.header('x-sarviq-space');
+  const header = req.header('x-kriyadot-space');
   const selector =
     (typeof spaceId === 'string' && spaceId.trim()) ||
     (typeof header === 'string' && header.trim()) ||

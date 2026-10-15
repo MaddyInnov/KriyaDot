@@ -30,7 +30,7 @@ export interface Pet3DProps {
 
 /** Pure config — safe to import in tests without WebGL. */
 export const PET3D_CONFIG: Record<PetId, { body: string; accent: string; description: string }> = {
-  sarviq: { body: '#4256c8', accent: '#8b9bf5', description: 'ink-blue blob, eight tool arms' },
+  kriyadot: { body: '#4256c8', accent: '#8b9bf5', description: 'ink-blue blob, eight tool arms' },
   ocky: { body: '#8b5cf6', accent: '#fbbf24', description: 'purple explorer, headlamp' },
   nubi: { body: '#f1efff', accent: '#f9a8d4', description: 'cloud drifter, rainbow frill' },
   plip: { body: '#2dd4bf', accent: '#a7f3d0', description: 'teardrop, six wiggly arms' },
@@ -38,7 +38,7 @@ export const PET3D_CONFIG: Record<PetId, { body: string; accent: string; descrip
   wisp: { body: '#c4b5fd', accent: '#ede9fe', description: 'ethereal floater, soft glow' },
 };
 
-export const PET3D_IDS: PetId[] = ['sarviq', 'ocky', 'nubi', 'plip', 'bolt', 'wisp'];
+export const PET3D_IDS: PetId[] = ['kriyadot', 'ocky', 'nubi', 'plip', 'bolt', 'wisp'];
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -168,7 +168,7 @@ function trackDisposables(group: THREE.Group): () => void {
 /* pet builders                                                        */
 /* ------------------------------------------------------------------ */
 
-function buildSarviq(dim: number): BuiltPet {
+function buildKriyaDot(dim: number): BuiltPet {
   const group = new THREE.Group();
   const bodyGeo = new THREE.IcosahedronGeometry(1, 4);
   displace(bodyGeo, 0.09);
@@ -478,7 +478,7 @@ function applyInter(rig: THREE.Group, inter: InterState): void {
 }
 
 const BUILDERS: Record<PetId, (dim: number) => BuiltPet> = {
-  sarviq: buildSarviq,
+  kriyadot: buildKriyaDot,
   ocky: buildOcky,
   nubi: buildNubi,
   plip: buildPlip,

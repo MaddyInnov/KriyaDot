@@ -10,7 +10,7 @@
 }
 
 /* ---- brand glow ------------------------------------------------------
-   The companion picks up the active Sarviq brand accent as a soft glow while
+   The companion picks up the active KriyaDot brand accent as a soft glow while
    it thinks or works. Static glow only (no motion) — it survives
    prefers-reduced-motion intact, and the mood animations remain the ones
    already disabled by the reduced-motion block below. */

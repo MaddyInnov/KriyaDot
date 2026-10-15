@@ -89,7 +89,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.event.inputs.tag || github.ref_name }}
-          releaseName: 'Sarviq ${{ github.event.inputs.tag || github.ref_name }}'
+          releaseName: 'KriyaDot ${{ github.event.inputs.tag || github.ref_name }}'
           releaseBody: |
             Desktop app installers (Windows .exe, Linux AppImage + .deb) and the
             standalone mvp-server binary. Alpha release — expect rough edges.

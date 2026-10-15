@@ -131,7 +131,7 @@ export interface PlatformMcpServerOptions {
   scopes?: McpScopeStore;
   /**
    * Runtime telemetry ("eyes for your AI"). When set, the server exposes
-   * telemetry as READ-ONLY MCP resources under `sarviq://telemetry/*`
+   * telemetry as READ-ONLY MCP resources under `kriyadot://telemetry/*`
    * (summary, runs, per-bot aggregates) so connected assistants — and the
    * platform's own bots — can diagnose from real measurements instead of
    * guessing. Read-only: only resources/list and resources/read are
@@ -457,7 +457,7 @@ export class PlatformMcpServer {
   }
 
   /**
-   * The `sarviq://telemetry/*` resource surface: an aggregate summary, the
+   * The `kriyadot://telemetry/*` resource surface: an aggregate summary, the
    * recent-runs list, and per-bot aggregates, plus URI templates for
    * addressing a single run or bot. All application/json, all read-only.
    */
@@ -465,7 +465,7 @@ export class PlatformMcpServer {
     resources: Array<{ uri: string; name: string; description: string; mimeType: string }>;
     resourceTemplates: Array<{ uriTemplate: string; name: string; description: string; mimeType: string }>;
   } {
-    const base = 'sarviq://telemetry';
+    const base = 'kriyadot://telemetry';
     return {
       resources: [
         {
@@ -507,7 +507,7 @@ export class PlatformMcpServer {
     };
   }
 
-  /** Read one `sarviq://telemetry/*` resource. Unknown URIs are errors. */
+  /** Read one `kriyadot://telemetry/*` resource. Unknown URIs are errors. */
   private readTelemetryResource(uri: string): {
     contents: Array<{ uri: string; mimeType: string; text: string }>;
   } {
@@ -515,7 +515,7 @@ export class PlatformMcpServer {
     if (!tel) {
       throw new McpError(ErrorCode.InvalidRequest, 'telemetry is not configured on this server');
     }
-    const base = 'sarviq://telemetry/';
+    const base = 'kriyadot://telemetry/';
     if (!uri.startsWith(base)) {
       throw new McpError(ErrorCode.InvalidParams, `unknown telemetry resource: ${uri}`);
     }

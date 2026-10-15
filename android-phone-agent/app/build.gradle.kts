@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.sarviq.phoneagent"
+    namespace = "com.kriyadot.phoneagent"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.sarviq.phoneagent"
+        applicationId = "com.kriyadot.phoneagent"
         minSdk = 29
         targetSdk = 34
         versionCode = 1

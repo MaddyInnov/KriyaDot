@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Remote-phone control v1 (Sarviq MVP): pairing store, session store, wire
+// Remote-phone control v1 (KriyaDot MVP): pairing store, session store, wire
 // protocol validation, and a dependency-free WebSocket hub.
 //
 // Scope: the user's OWN paired Android phone, viewed and controlled from the
-// Sarviq web UI. Security is mandatory: pairing requires explicit on-phone
+// KriyaDot web UI. Security is mandatory: pairing requires explicit on-phone
 // acceptance, live sessions are token-authenticated, every control session is
 // audit-logged, and input is only ever routed to the paired device that the
 // viewer is watching. See phone-PROTOCOL.md for the wire protocol + threat model.

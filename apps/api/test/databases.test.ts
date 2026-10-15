@@ -220,11 +220,11 @@ describe('databases HTTP routes', () => {
     const bad = await req('POST', '/', { name: 'x', columns: [] });
     expect(bad.status).toBe(400);
 
-    const row = await req('POST', `/${db.id}/rows`, { values: { name: 'Sarviq', status: 'todo' } });
+    const row = await req('POST', `/${db.id}/rows`, { values: { name: 'KriyaDot', status: 'todo' } });
     expect(row.status).toBe(201);
     const rowId = (row.json as { id: string }).id;
 
-    const sorted = await req('GET', `/${db.id}/rows?sort=name:asc&q=sarviq`);
+    const sorted = await req('GET', `/${db.id}/rows?sort=name:asc&q=kriyadot`);
     expect(sorted.status).toBe(200);
     expect((sorted.json as unknown[])).toHaveLength(1);
 

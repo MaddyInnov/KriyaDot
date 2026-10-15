@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// REST routes for the Sarviq companion app (phone → PC remote control).
+// REST routes for the KriyaDot companion app (phone → PC remote control).
 // Mounted by routes.ts as router.use('/companion', companionRouter) →
 // effective paths /api/companion/*. The WebSocket push channel
 // (/api/companion/ws) is handled by CompanionHub.handleUpgrade, wired to the
@@ -120,9 +120,9 @@ export interface CompanionRouteDeps {
   /** API port embedded in the QR pairing payload (LAN mode). */
   port: number;
   /**
-   * Public base URL for hosted deployments (e.g. "https://sarviq.example.com").
+   * Public base URL for hosted deployments (e.g. "https://kriyadot.example.com").
    * When set, pairing QR payloads encode this URL so phones pair over the
-   * internet; when unset, pairing stays LAN-only. From SARVIQ_PUBLIC_URL.
+   * internet; when unset, pairing stays LAN-only. From KRIYADOT_PUBLIC_URL.
    */
   publicBaseUrl?: string;
   version: string;
@@ -158,16 +158,16 @@ export function getLanIp(): string {
 }
 
 export function buildQrPayload(host: string, port: number, ott: string): string {
-  return `sarviq://pair?host=${encodeURIComponent(host)}&port=${port}&token=${encodeURIComponent(ott)}`;
+  return `kriyadot://pair?host=${encodeURIComponent(host)}&port=${port}&token=${encodeURIComponent(ott)}`;
 }
 
 /**
  * Hosted-mode QR payload: the phone connects to a public base URL over the
  * internet instead of a LAN host:port.
- *   sarviq://pair?url=https%3A%2F%2Fsarviq.example.com&token=<ott>
+ *   kriyadot://pair?url=https%3A%2F%2Fkriyadot.example.com&token=<ott>
  */
 export function buildHostedQrPayload(publicBaseUrl: string, ott: string): string {
-  return `sarviq://pair?url=${encodeURIComponent(publicBaseUrl)}&token=${encodeURIComponent(ott)}`;
+  return `kriyadot://pair?url=${encodeURIComponent(publicBaseUrl)}&token=${encodeURIComponent(ott)}`;
 }
 
 export type PairingMode = 'lan' | 'hosted';
@@ -474,7 +474,7 @@ export function registerCompanionRoutes(router: Router, deps: CompanionRouteDeps
     const { runs, pendingApprovals } = runSummary();
     res.json({
       ok: true,
-      server: { name: 'Sarviq', version: deps.version },
+      server: { name: 'KriyaDot', version: deps.version },
       runs,
       activeRuns: runs.length,
       pendingApprovals,

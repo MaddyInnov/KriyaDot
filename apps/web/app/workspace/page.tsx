@@ -13,7 +13,7 @@ const TABS = [
   { id: 'tasks', label: 'Tasks' },
   { id: 'files', label: 'Files' },
   { id: 'phone', label: 'Phone', title: 'Control your phone' },
-  { id: 'devices', label: 'Devices', title: 'Control Sarviq from your phone' },
+  { id: 'devices', label: 'Devices', title: 'Control KriyaDot from your phone' },
 ] as const;
 
 type TabId = (typeof TABS)[number]['id'];
@@ -23,7 +23,7 @@ export default function WorkspacePage() {
   return (
     <div>
       <h1 className="page-title">Workspace</h1>
-      <p className="page-sub">Notes, tasks, files — control your phone from here, or control Sarviq from your phone — in one personal working surface.</p>
+      <p className="page-sub">Notes, tasks, files — control your phone from here, or control KriyaDot from your phone — in one personal working surface.</p>
       <div className="tabs" role="tablist" aria-label="Workspace sections">
         {TABS.map((t) => (
           <button

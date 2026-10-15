@@ -20,7 +20,7 @@ describe('Pet render', () => {
 
   it('supports every mood without crashing', () => {
     for (const mood of MOODS) {
-      const html = renderToStaticMarkup(<Pet pet="sarviq" size={26} mood={mood} />);
+      const html = renderToStaticMarkup(<Pet pet="kriyadot" size={26} mood={mood} />);
       expect(html).toContain(`pet-mood-${mood}`);
     }
   });

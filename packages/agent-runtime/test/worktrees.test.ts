@@ -18,7 +18,7 @@ let base: string;
 let repo: string;
 
 beforeEach(() => {
-  base = mkdtempSync(join(tmpdir(), 'sarviq-wt-'));
+  base = mkdtempSync(join(tmpdir(), 'kriyadot-wt-'));
   repo = join(base, 'repo');
   mkdirSync(repo, { recursive: true });
   git(repo, 'init', '-q');

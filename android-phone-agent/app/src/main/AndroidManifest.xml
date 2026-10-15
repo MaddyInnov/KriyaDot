@@ -3,7 +3,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- WebSocket to the Sarviq API -->
+    <!-- WebSocket to the KriyaDot API -->
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- Screen capture runs as a foreground service with a visible notification -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -12,7 +12,7 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
-        android:label="Sarviq Phone Agent"
+        android:label="KriyaDot Phone Agent"
         android:theme="@style/Theme.Material3.DayNight.NoActionBar"
         android:allowBackup="false"
         tools:targetApi="34">

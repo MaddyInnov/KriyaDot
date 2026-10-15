@@ -39,8 +39,8 @@ describe('devices-panel helpers', () => {
   });
 
   it('labels which network the pairing QR encodes', () => {
-    expect(pairingModeLabel('hosted', 'https://sarviq.example.com')).toBe(
-      'QR encodes: internet (https://sarviq.example.com)',
+    expect(pairingModeLabel('hosted', 'https://kriyadot.example.com')).toBe(
+      'QR encodes: internet (https://kriyadot.example.com)',
     );
     expect(pairingModeLabel('lan', '192.168.1.10:4567')).toBe('QR encodes: WiFi LAN (192.168.1.10:4567)');
     expect(pairingModeLabel(undefined, undefined)).toBe('QR encodes: WiFi LAN');

@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Sarviq Phone Agent (Android)
+# KriyaDot Phone Agent (Android)
 
-Companion app for Sarviq's remote-phone control (Workspace → Phone tab).
-Streams the phone screen to the Sarviq API over a token-authenticated
+Companion app for KriyaDot's remote-phone control (Workspace → Phone tab).
+Streams the phone screen to the KriyaDot API over a token-authenticated
 WebSocket (MJPEG v1) and executes input commands (tap / swipe / text / keys)
 from the web UI.
 
@@ -27,18 +27,18 @@ from the web UI.
 | `FOREGROUND_SERVICE` + `FOREGROUND_SERVICE_MEDIA_PROJECTION` | Screen capture runs as a foreground service with a persistent notification — Android requires this for MediaProjection. |
 | MediaProjection (runtime consent) | The system capture dialog (`createScreenCaptureIntent()`) asks the user to allow screen sharing **every time the service starts**. No silent capture is possible. |
 | `BIND_ACCESSIBILITY_SERVICE` | Input injection (tap/swipe/text/keys) goes through `InputService`, an `AccessibilityService` the user must **manually enable** in Settings → Accessibility. The app cannot enable it itself. |
-| `INTERNET` | WebSocket to the Sarviq API (`ws://<your-server>/api/phone/ws`). |
+| `INTERNET` | WebSocket to the KriyaDot API (`ws://<your-server>/api/phone/ws`). |
 
 ## Pairing steps
 
-1. In the Sarviq web UI: Workspace → Phone tab → **Pair new phone**. A
+1. In the KriyaDot web UI: Workspace → Phone tab → **Pair new phone**. A
    6-digit code + expiry countdown appears.
 2. In the app: enter the server URL, type the 6-digit code, tap **Pair**.
 3. **Accept on the phone**: the app shows the code and asks you to confirm.
    Only after you tap *Accept* does the app send `POST /api/phone/pair/confirm`.
 4. The app stores the returned `{ deviceId, token }` in EncryptedSharedPreferences.
 5. Tap **Start sharing** → grant the MediaProjection dialog → the live screen
-   appears in the Sarviq web UI. Stop anytime from the notification or the app.
+   appears in the KriyaDot web UI. Stop anytime from the notification or the app.
 
 ## Protocol
 
@@ -57,7 +57,7 @@ token}`, then `{t:'frame', jpg, w, h, ts}`. Server → phone: `{t:'tap', x, y}`,
 
 ## Files
 
-- `app/src/main/java/com/sarviq/phoneagent/MainActivity.kt` — pairing UI (enter/show code, accept), service controls, server URL config.
+- `app/src/main/java/com/kriyadot/phoneagent/MainActivity.kt` — pairing UI (enter/show code, accept), service controls, server URL config.
 - `.../ScreenCaptureService.kt` — MediaProjection → ImageReader → JPEG frames → WebSocket.
 - `.../InputService.kt` — AccessibilityService: tap/swipe/text/key from server commands.
 - `.../WsClient.kt` — OkHttp WebSocket wrapper (hello auth, frame send, command dispatch).

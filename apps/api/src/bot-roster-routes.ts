@@ -6,7 +6,7 @@
 //
 // The manifest is a portable snapshot of the bot roster (bot configs +
 // agent-team definitions) for backup, review, and moving rosters between
-// Sarviq installs. Import NEVER overwrites: ids that already exist are
+// KriyaDot installs. Import NEVER overwrites: ids that already exist are
 // skipped and reported, and every malformed manifest or entry is rejected
 // with 400 + details.
 //
@@ -290,7 +290,7 @@ export function createBotRosterRouter(deps: BotRosterDeps): Router {
     };
     const stamp = manifest.exportedAt.slice(0, 10).replace(/-/g, '');
     res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', `attachment; filename="sarviq-bot-roster-${stamp}.json"`);
+    res.setHeader('Content-Disposition', `attachment; filename="kriyadot-bot-roster-${stamp}.json"`);
     deps.audit('bots.roster_export', {
       actor: 'api',
       detail: { bots: manifest.bots.length, teams: manifest.teams.length },

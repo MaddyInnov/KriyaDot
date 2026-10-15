@@ -145,7 +145,7 @@ export interface ChatCliRuntime {
 export const SCAN_USAGE = [
   'Usage: mvp-server scan [dir] [options]',
   '',
-  'sarviq scan: walk a project folder and recommend marketplace kits',
+  'kriyadot scan: walk a project folder and recommend marketplace kits',
   '(bots, skills, workflows, MCP servers) that fit the project.',
   'Fully offline — no account, no key, no network call.',
   '',
@@ -217,7 +217,7 @@ export interface ChatCliDeps {
 
 function printScanPretty(result: ScanResult): void {
   const s = result.signals;
-  console.log(`sarviq scan: ${result.dir}`);
+  console.log(`kriyadot scan: ${result.dir}`);
   console.log(`catalog: ${result.catalogSource} (${result.catalogSize} kits)`);
   console.log('');
   console.log('Detected');

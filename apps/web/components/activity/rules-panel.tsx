@@ -4,7 +4,7 @@
 // Processing rules + firing log (feature #5: the auditable log gets a UI).
 // Rules list on the left, the queryable firing log on the right. Reads
 // GET /api/processing-rules and GET /api/processing-rules/firing-log via
-// the sarviq-api clients; renders an empty state (never an error) when the
+// the kriyadot-api clients; renders an empty state (never an error) when the
 // backend is missing.
 
 import { useCallback, useEffect, useState } from 'react';
@@ -13,7 +13,7 @@ import {
   getRuleFirings,
   type ProcessingRule,
   type RuleFiring,
-} from '../../lib/sarviq-api';
+} from '../../lib/kriyadot-api';
 import { EmptyState, ErrorBox } from '../../app/modules/lib';
 
 function fmtTs(ts?: number): string {

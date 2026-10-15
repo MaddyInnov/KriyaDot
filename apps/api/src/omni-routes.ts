@@ -2,7 +2,7 @@
 // Omni rolling summary routes: GET /api/summary/omni (+ ?version=<id>,
 // /versions), pins, manual snapshots, and the manual rollup trigger.
 //
-// The web Omni panel (apps/web/lib/sarviq-api.ts) reads through
+// The web Omni panel (apps/web/lib/kriyadot-api.ts) reads through
 // optionalJson, which maps 404 → null → empty state. So an empty store
 // answers 404 here, and any other failure is a 500 with { error }.
 

@@ -14,13 +14,13 @@ import {
 } from '../src/prompts.js';
 
 function makeStore(): { store: PromptOverrideStore; dir: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'sarviq-prompts-'));
+  const dir = mkdtempSync(join(tmpdir(), 'kriyadot-prompts-'));
   return { store: new PromptOverrideStore({ dir }), dir };
 }
 
 describe('resolvePromptOverridesDir', () => {
-  it('points at ~/.sarviq/prompts', () => {
-    expect(resolvePromptOverridesDir('/home/testuser')).toBe('/home/testuser/.sarviq/prompts');
+  it('points at ~/.kriyadot/prompts', () => {
+    expect(resolvePromptOverridesDir('/home/testuser')).toBe('/home/testuser/.kriyadot/prompts');
   });
 });
 
@@ -122,7 +122,7 @@ describe('activeOverrides / logActivePromptOverrides', () => {
 
 describe('watch', () => {
   it('is a safe no-op when the dir does not exist', () => {
-    const store = new PromptOverrideStore({ dir: join(tmpdir(), 'sarviq-prompts-missing-xyz') });
+    const store = new PromptOverrideStore({ dir: join(tmpdir(), 'kriyadot-prompts-missing-xyz') });
     const unwatch = store.watch(() => {
       throw new Error('should not fire');
     });

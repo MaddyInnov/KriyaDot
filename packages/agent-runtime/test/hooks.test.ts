@@ -84,7 +84,7 @@ describe('HookBus', () => {
 
 describe('loadPlugins', () => {
   function makeDir(): string {
-    const dir = mkdtempSync(join(tmpdir(), 'sarviq-plugins-'));
+    const dir = mkdtempSync(join(tmpdir(), 'kriyadot-plugins-'));
     return dir;
   }
 
@@ -116,7 +116,7 @@ describe('loadPlugins', () => {
   });
 
   it('missing directory loads nothing without throwing', async () => {
-    const report = await loadPlugins(join(tmpdir(), 'sarviq-no-such-dir-xyz'), new HookBus());
+    const report = await loadPlugins(join(tmpdir(), 'kriyadot-no-such-dir-xyz'), new HookBus());
     expect(report.loaded).toEqual([]);
     expect(report.failed).toEqual([]);
   });

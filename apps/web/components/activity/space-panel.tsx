@@ -4,8 +4,8 @@
 // Spaces UI: a compact switcher plus full management (create / rename /
 // pause / resume / delete, per-space model + workspace overrides).
 // Backed by /api/spaces; when the backend is missing the panel shows an
-// empty state. The active space persists in localStorage key `sarviq:space`
-// and is sent as the `X-Sarviq-Space` header by the fetch wrapper.
+// empty state. The active space persists in localStorage key `kriyadot:space`
+// and is sent as the `X-KriyaDot-Space` header by the fetch wrapper.
 
 import { useCallback, useEffect, useState } from 'react';
 import { EmptyState, ErrorBox } from '../../app/modules/lib';
@@ -16,8 +16,8 @@ import {
   listSpaces,
   patchSpace,
   setActiveSpaceId,
-} from '../../lib/sarviq-api';
-import type { Space } from '../../lib/sarviq-api';
+} from '../../lib/kriyadot-api';
+import type { Space } from '../../lib/kriyadot-api';
 
 export function SpacePanel() {
   const [spaces, setSpaces] = useState<Space[]>([]);
@@ -142,8 +142,8 @@ export function SpacePanel() {
           )}
         </div>
         <p className="small muted mt">
-          The active space is stored on this device (<span className="mono">sarviq:space</span>)
-          and sent to the API as the <span className="mono">X-Sarviq-Space</span> header.
+          The active space is stored on this device (<span className="mono">kriyadot:space</span>)
+          and sent to the API as the <span className="mono">X-KriyaDot-Space</span> header.
         </p>
       </div>
 

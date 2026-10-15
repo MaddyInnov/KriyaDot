@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Computer use: Playwright browser layer (P3-B, open-dots parity)
 
-Sarviq's computer-use tools (`computer_screenshot` / `computer_click` /
+KriyaDot's computer-use tools (`computer_screenshot` / `computer_click` /
 `computer_type` / `computer_key`) drive an `OSScreenLayer`. Three layers exist:
 
 | Layer | Class | Select with | Install |

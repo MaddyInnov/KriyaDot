@@ -106,7 +106,7 @@ function PetFx({ x, y }: { x: number; y: number }) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 1. Sarviq — round ink-blue blob, 8 stubby arms each holding a tool   */
+/* 1. KriyaDot — round ink-blue blob, 8 stubby arms each holding a tool   */
 /* ------------------------------------------------------------------ */
 
 const TOOLS = ['circle', 'square', 'tri', 'star', 'plus', 'ring', 'diamond', 'bar'] as const;
@@ -135,8 +135,8 @@ function ToolGlyph({ kind, x, y }: { kind: (typeof TOOLS)[number]; x: number; y:
   }
 }
 
-function SarviqArt({ mood }: ArtProps) {
-  const gid = useGid('sarviq');
+function KriyaDotArt({ mood }: ArtProps) {
+  const gid = useGid('kriyadot');
   const cx = 60;
   const cy = 66;
   const arms = Array.from({ length: 8 }, (_, i) => {
@@ -402,7 +402,7 @@ function WispArt({ mood }: ArtProps) {
 /* ------------------------------------------------------------------ */
 
 export const PET_ART: Record<PetId, (props: ArtProps) => React.ReactElement> = {
-  sarviq: SarviqArt,
+  kriyadot: KriyaDotArt,
   ocky: OckyArt,
   nubi: NubiArt,
   plip: PlipArt,

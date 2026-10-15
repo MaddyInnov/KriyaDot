@@ -9,7 +9,7 @@
         "height": 860,
         "minHeight": 640,
         "minWidth": 960,
-        "title": "Sarviq",
+        "title": "KriyaDot",
         "width": 1280
       }
     ],
@@ -44,7 +44,7 @@
       }
     }
   },
-  "identifier": "com.sarviq.desktop",
-  "productName": "Sarviq",
+  "identifier": "com.kriyadot.desktop",
+  "productName": "KriyaDot",
   "version": "0.1.0"
 }

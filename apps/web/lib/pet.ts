@@ -7,7 +7,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 
-export type PetId = 'sarviq' | 'ocky' | 'nubi' | 'plip' | 'bolt' | 'wisp';
+export type PetId = 'kriyadot' | 'ocky' | 'nubi' | 'plip' | 'bolt' | 'wisp';
 export type PetMood = 'idle' | 'thinking' | 'working' | 'happy' | 'error' | 'sleeping';
 
 export interface PetDef {
@@ -20,8 +20,8 @@ export interface PetDef {
 
 export const PETS: PetDef[] = [
   {
-    id: 'sarviq',
-    name: 'Sarviq',
+    id: 'kriyadot',
+    name: 'KriyaDot',
     tagline: 'Eight hands. Zero waiting.',
     blurb: 'The flagship ink-blue blob. Every stubby arm holds a tiny tool, so nothing you ask ever queues.',
   },
@@ -57,7 +57,7 @@ export const PETS: PetDef[] = [
   },
 ];
 
-export const DEFAULT_PET_ID: PetId = 'sarviq';
+export const DEFAULT_PET_ID: PetId = 'kriyadot';
 
 const KEY = 'mvp:pet';
 const CHANGE_EVENT = 'mvp:pet-change';
@@ -78,11 +78,11 @@ export function getStoredPet(): PetChoice {
     const raw = localStorage.getItem(KEY);
     if (!raw) return { id: DEFAULT_PET_ID, name: '' };
     const parsed = JSON.parse(raw) as Partial<PetChoice>;
-    // One-time migration: the flagship pet was renamed tentio -> sarviq.
+    // One-time migration: the flagship pet was renamed tentio -> kriyadot.
     // Preserve the stored custom name (if any) and rewrite the id.
     if ((parsed.id as string) === 'tentio') {
       const migrated: PetChoice = {
-        id: 'sarviq',
+        id: 'kriyadot',
         name: typeof parsed.name === 'string' ? parsed.name.slice(0, 24) : '',
       };
       try {

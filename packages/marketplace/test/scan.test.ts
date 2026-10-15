@@ -10,7 +10,7 @@ import { describe, expect, it } from 'vitest';
 import { BUILTIN_KITS, detectSignals, loadCatalog, scanProject } from '../src/scan.js';
 
 function fixture(files: Record<string, string>): string {
-  const dir = mkdtempSync(join(tmpdir(), 'sarviq-scan-'));
+  const dir = mkdtempSync(join(tmpdir(), 'kriyadot-scan-'));
   for (const [rel, content] of Object.entries(files)) {
     const target = join(dir, rel);
     mkdirSync(join(target, '..'), { recursive: true });

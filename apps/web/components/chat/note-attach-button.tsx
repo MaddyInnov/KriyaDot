@@ -14,7 +14,7 @@ import {
   listNoteAttachments,
   type AttachmentKind,
   type NoteAttachment,
-} from '../../lib/sarviq-api';
+} from '../../lib/kriyadot-api';
 
 interface DocItem {
   id: string;

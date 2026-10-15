@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Per-bot COMPUTER VIEW (Sarviq MVP, workstream A).
+// Per-bot COMPUTER VIEW (KriyaDot MVP, workstream A).
 //
 // What it is: a live view + control surface for each bot's sandboxed screen.
 // The web UI (apps/web/components/panels/computer-panel.tsx, mounted as a

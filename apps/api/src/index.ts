@@ -32,7 +32,7 @@ import { buildToolRegistry } from './tool-registry.js';
 import { registerDelegateTools } from './delegate-wiring.js';
 import { createSummarizer } from './summarizer.js';
 import { createRouter } from './routes.js';
-import { renderSarviqMeter } from './sarviq-meter.js';
+import { renderKriyaDotMeter } from './kriyadot-meter.js';
 import { createWebhookRouter } from './webhooks.js';
 import { mountWebAssets } from './web-assets.js';
 // Parity workstreams (OpenMausBot/n8n/Notion/Dots/Groq/OpenCode/Laya/Boosthis/Muse):
@@ -86,7 +86,7 @@ if (process.argv[2] === 'chat') {
   process.exit(code);
 }
 
-// sarviq scan: one-command offline project scanner — `mvp-server scan [dir]`.
+// kriyadot scan: one-command offline project scanner — `mvp-server scan [dir]`.
 // Parsed at the very top, before boot(), so `scan` never starts the HTTP
 // server, loads no config, and makes no network calls.
 if (process.argv[2] === 'scan') {
@@ -137,7 +137,7 @@ function buildPlatformMcpServer(opts: {
   connectionClass?: McpConnectionClass;
   /** Annotation store backing `annotations.append` (required for read-only-assistant). */
   annotationStore?: AnnotationStore;
-  /** Runtime telemetry collector → read-only sarviq://telemetry/* resources. */
+  /** Runtime telemetry collector → read-only kriyadot://telemetry/* resources. */
   telemetry: import('@mvp/agent-runtime').TelemetryCollector;
 }): PlatformMcpServer {
   const fallbackBot = opts.bots[0];
@@ -322,8 +322,8 @@ async function boot(): Promise<void> {
   // carrying bodies/headers/cookies/query values are dropped with a
   // warning and never stored; route/screen/bot names are normalized to
   // id-templates. Shared by the agent runtime, the workflow runner, the
-  // platform MCP server (read-only sarviq://telemetry/* resources), and
-  // the /_sarviq/ meter page.
+  // platform MCP server (read-only kriyadot://telemetry/* resources), and
+  // the /_kriyadot/ meter page.
   const telemetry = new TelemetryCollector({
     guard: (payload) =>
       sanitizeTelemetry(payload, (message, detail) =>
@@ -511,7 +511,7 @@ async function boot(): Promise<void> {
     bots: seed.bots,
     scopes: mcpScopeStore,
     // Runtime telemetry ("eyes for your AI") as READ-ONLY MCP resources
-    // (sarviq://telemetry/*): connected assistants diagnose from real
+    // (kriyadot://telemetry/*): connected assistants diagnose from real
     // measurements instead of guessing. No mutation surface.
     telemetry,
     // Operators serving external assistants over MCP can flip the whole
@@ -750,10 +750,10 @@ async function boot(): Promise<void> {
   // per-bot activity. Mounted outside /api (it is not one of the app's nav
   // destinations) and before the SPA fallback so the path isn't claimed.
   // Counts and normalized names only — never secrets or message bodies.
-  app.get('/_sarviq/', (_req, res) => {
+  app.get('/_kriyadot/', (_req, res) => {
     try {
       res.type('html').send(
-        renderSarviqMeter({
+        renderKriyaDotMeter({
           version: '0.1.0',
           queueDepth: chatQueueStore.list().length,
           telemetry,

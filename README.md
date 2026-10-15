@@ -1,4 +1,4 @@
-# Sarviq — MVP
+# KriyaDot — MVP
 
 An all-in-one AI agent platform, minimum viable slice: chat with Groq-powered bots
 that use tools/skills/MCP servers, with sensitive actions paused for human approval
@@ -20,7 +20,7 @@ Double-click and the app window opens. **No browser, no Node, no Docker needed.*
 
 Produces:
 - **Windows:** `apps/desktop/src-tauri/target/release/bundle/nsis/*.exe` (installer)
-  + a portable single-file `sarviq.exe`
+  + a portable single-file `kriyadot.exe`
 - **Linux:** `apps/desktop/src-tauri/target/release/bundle/appimage/*.AppImage`
 
 The Tauri shell bundles the web UI natively and spawns the runtime API as an

@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Sarviq Companion App — Server Protocol v1 + Threat Model
+# KriyaDot Companion App — Server Protocol v1 + Threat Model
 
-Scope: remote control of the user's **own Sarviq PC instance** from the
-**Sarviq companion app** on their phone (phone → PC). This is the REVERSE
+Scope: remote control of the user's **own KriyaDot PC instance** from the
+**KriyaDot companion app** on their phone (phone → PC). This is the REVERSE
 of remote-phone v1 (`/api/phone/*`, PC → phone); the two namespaces are
 independent and share no auth material.
 
@@ -21,17 +21,17 @@ Web UI / API                    Phone app
   |  (or GET /api/companion/pairing/qr)|
   |  { ott, qrPayload, expiresAt }     |
   |                                    |  user scans QR in the app
-  |                                    |  sarviq://pair?host=<lan-ip>&port=<port>&token=<ott>
+  |                                    |  kriyadot://pair?host=<lan-ip>&port=<port>&token=<ott>
   |                                    |  POST /api/companion/pairing/exchange
   |                                    |  { ott, deviceName, platform? }
   |  { deviceToken, deviceId }          |
 ```
 
 - The QR payload has two flavors:
-  - LAN (default): `sarviq://pair?host=<lan-ip>&port=<port>&token=<ott>`
+  - LAN (default): `kriyadot://pair?host=<lan-ip>&port=<port>&token=<ott>`
     (`host` = first non-internal IPv4, `port` = the API port).
-  - Hosted: `sarviq://pair?url=<public-base-url>&token=<ott>` — used when
-    the server is started with `SARVIQ_PUBLIC_URL` set (see §9). The phone
+  - Hosted: `kriyadot://pair?url=<public-base-url>&token=<ott>` — used when
+    the server is started with `KRIYADOT_PUBLIC_URL` set (see §9). The phone
     then pairs over the internet instead of the LAN. The pairing responses
     also carry `mode: 'lan' | 'hosted'` and a human `serverLabel` so the
     web UI can show which network the QR encodes.
@@ -184,7 +184,7 @@ payloads are never logged.
 
 ## 9. Hosted mode — pair over the internet
 
-When Sarviq runs on a hosted machine (VPS, home server) instead of the PC
+When KriyaDot runs on a hosted machine (VPS, home server) instead of the PC
 beside you, the companion app can still pair — over the internet, not the
 LAN.
 
@@ -192,15 +192,15 @@ LAN.
 
 1. Put the API behind a reverse proxy that terminates TLS (the device
    token is a bearer credential — it must never travel as plain HTTP).
-   Example nginx config (cert via `certbot --nginx -d sarviq.example.com`):
+   Example nginx config (cert via `certbot --nginx -d kriyadot.example.com`):
 
 ```nginx
 server {
     listen 443 ssl;
-    server_name sarviq.example.com;
+    server_name kriyadot.example.com;
 
-    ssl_certificate     /etc/letsencrypt/live/sarviq.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/sarviq.example.com/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/kriyadot.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/kriyadot.example.com/privkey.pem;
 
     # The API listens on 127.0.0.1:4000 by default.
     location / {
@@ -227,7 +227,7 @@ server {
 2. Start the API with the public URL so pairing QRs encode it:
 
 ```
-SARVIQ_PUBLIC_URL=https://sarviq.example.com bun src/index.ts
+KRIYADOT_PUBLIC_URL=https://kriyadot.example.com bun src/index.ts
 ```
 
    (Trailing slashes are stripped; anything that is not an `http(s)://`
@@ -237,26 +237,26 @@ SARVIQ_PUBLIC_URL=https://sarviq.example.com bun src/index.ts
 
 - `POST /api/companion/pairing/code` and `GET /api/companion/pairing/qr`
   return the hosted QR flavor
-  (`sarviq://pair?url=<public-url>&token=<ott>`) with
+  (`kriyadot://pair?url=<public-url>&token=<ott>`) with
   `mode: 'hosted'` and `serverLabel: '<public-url>'`. Without
-  `SARVIQ_PUBLIC_URL`, responses are exactly as before (`mode: 'lan'`).
+  `KRIYADOT_PUBLIC_URL`, responses are exactly as before (`mode: 'lan'`).
 - The pairing handshake is otherwise identical — OTT single-use, exchange
   for a device token, Bearer auth on every route — because it is plain
   HTTPS; there are no LAN-only assumptions in the pairing or device code
   paths.
 - The app connects its push socket as
-  `wss://sarviq.example.com/api/companion/ws?token=<deviceToken>` (https
+  `wss://kriyadot.example.com/api/companion/ws?token=<deviceToken>` (https
   upgrades to wss automatically). The server honors `X-Forwarded-Proto` /
   `X-Forwarded-Host` (`trust proxy` is enabled) so scheme/host-dependent
   behavior stays correct behind the proxy.
 - The web UI (Workspace → Devices) shows which network the QR encodes and
-  hints at `SARVIQ_PUBLIC_URL` when in LAN mode.
+  hints at `KRIYADOT_PUBLIC_URL` when in LAN mode.
 
 **Security notes for hosted mode**
 
 - TLS is mandatory, not optional: without it, device tokens, approvals
   and chat content travel in cleartext across the internet. The server
-  logs a warning if `SARVIQ_PUBLIC_URL` is plain `http`.
+  logs a warning if `KRIYADOT_PUBLIC_URL` is plain `http`.
 - The QR / 6-digit code is still a short-lived secret (5-minute OTT):
   treat it like a password — only scan/type it into your own phone. In
   hosted mode the "physical proximity" assumption of LAN pairing is

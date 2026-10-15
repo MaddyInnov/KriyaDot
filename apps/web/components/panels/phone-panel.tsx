@@ -387,7 +387,7 @@ export default function PhonePanel() {
           <div className="pair-code">{pairing.code}</div>
           <div className="pair-meta">
             Expires in {fmtCountdown(pairing.expiresAt - now)} — enter this code in the
-            Sarviq Phone Agent app on your phone and tap <strong>Accept</strong> there.
+            KriyaDot Phone Agent app on your phone and tap <strong>Accept</strong> there.
             Pairing only completes with on-phone acceptance; the code is single-use.
           </div>
         </div>
@@ -398,7 +398,7 @@ export default function PhonePanel() {
           <p>No phones paired yet.</p>
           <p>
             Tap <strong>Pair new phone</strong>, then enter the 6-digit code in the
-            Sarviq Phone Agent app and accept on the phone.
+            KriyaDot Phone Agent app and accept on the phone.
           </p>
           {!adbAvailable ? (
             <p className="muted">
@@ -434,7 +434,7 @@ export default function PhonePanel() {
                   ? 'Tap Connect to start a live session.'
                   : watchOnline
                     ? 'Waiting for first frame…'
-                    : 'Phone offline — the Sarviq Phone Agent app must be running on the phone.'}
+                    : 'Phone offline — the KriyaDot Phone Agent app must be running on the phone.'}
               </div>
             )}
             {watching && (

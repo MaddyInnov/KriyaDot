@@ -2,7 +2,7 @@
 // n8n workflow interchange endpoints.
 //
 // POST /workflows/import       { n8nJson } → { workflow, unmapped }
-//   Parses a standard n8n workflow export, registers the resulting Sarviq
+//   Parses a standard n8n workflow export, registers the resulting KriyaDot
 //   definition, and reports nodes that had no mapping (the import itself
 //   never fails on unknown nodes).
 // GET  /workflows/:id/export-n8n → n8n-format JSON (best-effort reverse mapping)

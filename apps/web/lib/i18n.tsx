@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Lightweight i18n for the Sarviq web console.
+// Lightweight i18n for the KriyaDot web console.
 //
 // Static-export compatible: pure React context + localStorage, no
 // next-intl server features, no async locale loading, no middleware. Works

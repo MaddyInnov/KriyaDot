@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Notion export importer — takes a Notion "Export → HTML" ZIP (or a list of
-// pre-extracted files) and turns it into Sarviq content:
+// pre-extracted files) and turns it into KriyaDot content:
 //
 //   - `*.html` files → Pages (via a small HTML→Markdown converter)
 //   - `*.csv`  files → Notion-style Databases (schema inferred from cells)
 //   - `*.md`   files → Pages (verbatim markdown)
 //
 // Sub-pages in a Notion export are separate files; they are imported as
-// flat sibling pages (Sarviq pages have no nesting yet) with a title suffix
+// flat sibling pages (KriyaDot pages have no nesting yet) with a title suffix
 // when names collide. Local asset files (images etc.) are skipped and
 // reported in `warnings`.
 //

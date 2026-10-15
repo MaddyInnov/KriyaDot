@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Teach-by-recording: compile a recorded computer-view interaction into a
-// reusable Sarviq workflow definition.
+// reusable KriyaDot workflow definition.
 //
 // Input contract (produced by the per-bot computer view — workstream A — via
 // POST /api/computer/record/:id/events): coordinate-based input events
@@ -111,7 +111,7 @@ function eventToNode(event: ComputerRecordedEvent, id: string): WorkflowNode | u
 }
 
 /**
- * Compile recorded computer-view events into a Sarviq workflow definition.
+ * Compile recorded computer-view events into a KriyaDot workflow definition.
  *
  * Shape: exactly one manual trigger node, then a linear chain of tool nodes
  * (computer_click / computer_type / computer_key / computer_screenshot) with

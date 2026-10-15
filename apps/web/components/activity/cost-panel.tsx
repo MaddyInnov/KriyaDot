@@ -9,8 +9,8 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { EmptyState, ErrorBox } from '../../app/modules/lib';
-import { getUsageBreakdown } from '../../lib/sarviq-api';
-import type { UsageBreakdown } from '../../lib/sarviq-api';
+import { getUsageBreakdown } from '../../lib/kriyadot-api';
+import type { UsageBreakdown } from '../../lib/kriyadot-api';
 import { formatTokens } from '../../lib/usage';
 import { capPct, donutSegments, fmtUsd, sharePct } from '../../lib/cost';
 

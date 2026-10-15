@@ -34,7 +34,7 @@ export interface CreateWorktreeOptions {
   /**
    * Branch name for the new worktree. Sanitized to
    * /^[A-Za-z0-9._\/-]+$/ (must not start with '-', no '..').
-   * Defaults to `sarviq-<rand>`.
+   * Defaults to `kriyadot-<rand>`.
    */
   branch?: string;
   /** Base ref to branch from (default: HEAD). */
@@ -138,7 +138,7 @@ export class WorktreeManager {
   create(repoPath: string, opts: CreateWorktreeOptions = {}): WorktreeInfo {
     const repo = resolve(repoPath);
     if (!this.isGitRepo(repo)) throw new Error(`worktree: not a git repo: "${repoPath}"`);
-    const branch = opts.branch === undefined ? `sarviq-${randomSuffix()}` : this.sanitizeBranch(opts.branch);
+    const branch = opts.branch === undefined ? `kriyadot-${randomSuffix()}` : this.sanitizeBranch(opts.branch);
     const dirName = branch.replace(/\//g, '__');
     const target = join(this.root, dirName);
     if (existsSync(target) && !opts.force) {
@@ -235,7 +235,7 @@ export function createWorktreeTools(opts: CreateWorktreeToolsOptions): ToolDefin
       type: 'object',
       properties: {
         repo: { type: 'string', description: 'Workspace-relative path of the git repo (default: workspace root)' },
-        branch: { type: 'string', description: 'Branch name for the new worktree (default: sarviq-<random>)' },
+        branch: { type: 'string', description: 'Branch name for the new worktree (default: kriyadot-<random>)' },
         base: { type: 'string', description: 'Base ref to branch from (default: HEAD)' },
       },
       required: [],

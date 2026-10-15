@@ -24,9 +24,9 @@ jobs:
       matrix:
         include:
           - project: android-companion
-            artifact: sarviq-companion-debug
+            artifact: kriyadot-companion-debug
           - project: android-phone-agent
-            artifact: sarviq-phone-agent-debug
+            artifact: kriyadot-phone-agent-debug
     steps:
       - uses: actions/checkout@v4
 

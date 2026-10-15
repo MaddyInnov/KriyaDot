@@ -160,7 +160,7 @@ th{background:#f9fafb}
 </head>
 <body>
 <h1>${title}</h1>
-<div class="meta">Exported from Sarviq &middot; v${artifact.version} &middot; ${new Date(artifact.updatedAt).toISOString()}</div>
+<div class="meta">Exported from KriyaDot &middot; v${artifact.version} &middot; ${new Date(artifact.updatedAt).toISOString()}</div>
 ${html.join('\n')}
 </body>
 </html>`;

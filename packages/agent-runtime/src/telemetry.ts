@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Runtime telemetry ("eyes for your AI"): per-step latency, error/retry
 // rates, and token cost per bot turn / workflow run, captured in a bounded
-// in-memory ring buffer and exposed read-only (MCP resources, /_sarviq/).
+// in-memory ring buffer and exposed read-only (MCP resources, /_kriyadot/).
 //
 // Privacy posture: only metadata-tier fields are ever recorded (ids,
 // names, counts, timings, token totals). Every ingestion passes through an
@@ -134,7 +134,7 @@ export interface ListRunsFilter {
 
 /**
  * Read-only telemetry surface consumed by the platform MCP server
- * (sarviq://telemetry/* resources). Structural — TelemetryCollector
+ * (kriyadot://telemetry/* resources). Structural — TelemetryCollector
  * satisfies it without importing the MCP server.
  */
 export interface TelemetryResourceProvider {

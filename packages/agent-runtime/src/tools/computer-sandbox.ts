@@ -474,7 +474,7 @@ export class DockerComputerSandbox implements ComputerSandbox {
   async launch(): Promise<void> {
     if (this.launched) return;
     await this.runner.checkAvailable();
-    const name = `sarviq-computer-${Date.now().toString(36)}-${Math.floor(Math.random() * 0xffff).toString(16)}`;
+    const name = `kriyadot-computer-${Date.now().toString(36)}-${Math.floor(Math.random() * 0xffff).toString(16)}`;
     const args = [
       'run',
       '-d',

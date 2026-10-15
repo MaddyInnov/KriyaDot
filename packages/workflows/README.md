@@ -53,7 +53,7 @@ Labels are only valid on edges leaving an `if` node (validated at register).
   placeholders and are listed in the returned `unmapped: [{ n8nType, name,
   reason }]` — the import never fails on them. A missing trigger is
   synthesized; extra triggers are reported (one trigger per workflow).
-  n8n expressions (`={{$json.x}}`) have no Sarviq equivalent and need manual
+  n8n expressions (`={{$json.x}}`) have no KriyaDot equivalent and need manual
   conversion after import.
 - `exportN8nWorkflow(def)` — best-effort reverse mapping; `agent`/`tool`/
   `approval` (no n8n equivalent) become Code nodes carrying the original config

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 'use client';
 
-// Companion devices (Phone → PC): pair this PC's Sarviq instance with the
-// user's Android phone so the phone becomes a remote control for Sarviq.
+// Companion devices (Phone → PC): pair this PC's KriyaDot instance with the
+// user's Android phone so the phone becomes a remote control for KriyaDot.
 // This is the reverse of the Phone tab ("Control your phone") — here the
 // phone drives this machine, not the other way around.
 //
@@ -24,7 +24,7 @@ import {
   revokeCompanionDevice,
   type CompanionDevice,
   type CompanionPendingPairing,
-} from '../../lib/sarviq-api';
+} from '../../lib/kriyadot-api';
 import { useCalmMotion, useUxMode } from '../../lib/ux-mode';
 
 // ---- Pure helpers (unit-tested) --------------------------------------------------
@@ -209,11 +209,11 @@ export default function DevicesPanel() {
       <div className="phone-toolbar">
         <div>
           <span className="chip" title="Pair your phone so it can drive this PC">
-            Control Sarviq from your phone
+            Control KriyaDot from your phone
           </span>
           <p className="muted" style={{ margin: '8px 0 0' }}>
             Pair your Android phone with this PC — the phone becomes a remote
-            control for Sarviq. (The <strong>Phone</strong> tab is the reverse:
+            control for KriyaDot. (The <strong>Phone</strong> tab is the reverse:
             controlling your phone from here.)
           </p>
         </div>
@@ -241,7 +241,7 @@ export default function DevicesPanel() {
           </p>
           <p>
             The phone→PC remote-control service isn&apos;t running on this
-            Sarviq instance yet. Start the companion server (or check that it
+            KriyaDot instance yet. Start the companion server (or check that it
             exposes <code className="mono">/api/companion/…</code>), then tap
             Refresh.
           </p>
@@ -293,8 +293,8 @@ export default function DevicesPanel() {
                 ) : (
                   <>
                     Phones pair over your local WiFi. To pair over the internet
-                    instead, set <code className="mono">SARVIQ_PUBLIC_URL</code>{' '}
-                    (e.g. <code className="mono">https://sarviq.example.com</code>) on
+                    instead, set <code className="mono">KRIYADOT_PUBLIC_URL</code>{' '}
+                    (e.g. <code className="mono">https://kriyadot.example.com</code>) on
                     the server and tap Refresh.
                   </>
                 )}
@@ -310,7 +310,7 @@ export default function DevicesPanel() {
                     lineHeight: 0,
                     flexShrink: 0,
                   }}
-                  title="Scan with the Sarviq companion app"
+                  title="Scan with the KriyaDot companion app"
                 >
                   <QRCode
                     value={pairing.qrPayload}
@@ -318,12 +318,12 @@ export default function DevicesPanel() {
                     bgColor="#ffffff"
                     fgColor="#000000"
                     level="M"
-                    title="Sarviq pairing QR code"
+                    title="KriyaDot pairing QR code"
                   />
                 </div>
                 <div className="pair-meta">
                   <ol style={{ margin: '0 0 12px', paddingLeft: 20 }}>
-                    <li>Install the Sarviq companion app on your Android phone.</li>
+                    <li>Install the KriyaDot companion app on your Android phone.</li>
                     <li>
                       In the app, tap <strong>Scan QR</strong> and scan this code —
                       or tap <strong>Enter code</strong> and type the 6-digit code below.
@@ -408,7 +408,7 @@ export default function DevicesPanel() {
               <div className="panel-empty">
                 <p>No phones paired yet.</p>
                 <p>
-                  Scan the QR code above with the Sarviq companion app (or use
+                  Scan the QR code above with the KriyaDot companion app (or use
                   the pairing code), then approve on this screen.
                 </p>
               </div>

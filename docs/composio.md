@@ -2,7 +2,7 @@
 
 # Composio connector
 
-Let Sarviq bots act inside 1,000+ external apps (Gmail, Slack, GitHub,
+Let KriyaDot bots act inside 1,000+ external apps (Gmail, Slack, GitHub,
 Notion, Google Calendar, …) through one Composio API key. The API key is
 validated against the Composio backend, stored encrypted in the per-user
 vault, and never logged or returned. App access is toggled per bot on the
@@ -15,17 +15,17 @@ Accounts page.
 3. In the top-left mode toggle next to the logo, make sure you are in
    **PLATFORM** mode ("Build and manage AI agents with the Composio SDK")
    — not "FOR YOU" mode (that hands out a `ck_…` consumer key for desktop
-   AI apps, which Sarviq cannot use).
+   AI apps, which KriyaDot cannot use).
 4. Go to **Settings → API Keys** and copy your key (a PLATFORM key looks
    like `ak_…`).
 
 > Source docs: Composio README quickstart
 > (<https://github.com/sornwarinsonsiri31/composio>) uses a key from the
-> dashboard for all backend API calls, which is exactly what Sarviq uses.
+> dashboard for all backend API calls, which is exactly what KriyaDot uses.
 
-## 2. Connect it in Sarviq
+## 2. Connect it in KriyaDot
 
-1. Open the Sarviq web app → Settings (gear) → **Accounts & API keys**.
+1. Open the KriyaDot web app → Settings (gear) → **Accounts & API keys**.
 2. In the **Composio** section, paste the key and click **Connect**.
 3. The key is validated against `https://backend.composio.dev/api/v3` and
    stored in the encrypted vault (secret `composio-api-key`).

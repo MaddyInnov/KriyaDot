@@ -8,8 +8,8 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { EmptyState, ErrorBox } from '../../app/modules/lib';
-import { getOmniSummary } from '../../lib/sarviq-api';
-import type { BriefingItem, OmniSummary } from '../../lib/sarviq-api';
+import { getOmniSummary } from '../../lib/kriyadot-api';
+import type { BriefingItem, OmniSummary } from '../../lib/kriyadot-api';
 
 function fmtTs(ts?: number): string {
   if (!ts) return '';

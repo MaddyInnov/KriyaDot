@@ -150,7 +150,7 @@ describe('matchLearnedRule', () => {
 
 describe('persistence (bot/data dir JSON)', () => {
   it('round-trips rules through routing-rules.json', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'sarviq-rules-'));
+    const dir = mkdtempSync(join(tmpdir(), 'kriyadot-rules-'));
     const rules = recordRoutingCorrection(dir, correction({ message: 'deploy docker now' }));
     expect(rules).toHaveLength(2);
     const raw = JSON.parse(readFileSync(join(dir, ROUTING_RULES_FILENAME), 'utf8')) as {
@@ -168,13 +168,13 @@ describe('persistence (bot/data dir JSON)', () => {
   });
 
   it('returns [] for a missing or corrupt file', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'sarviq-rules-'));
+    const dir = mkdtempSync(join(tmpdir(), 'kriyadot-rules-'));
     expect(loadRoutingRules(dir)).toEqual([]);
     expect(loadRoutingRules(join(dir, 'does-not-exist'))).toEqual([]);
   });
 
   it('saveRoutingRules creates the data dir', () => {
-    const dir = join(mkdtempSync(join(tmpdir(), 'sarviq-rules-')), 'nested', 'data');
+    const dir = join(mkdtempSync(join(tmpdir(), 'kriyadot-rules-')), 'nested', 'data');
     saveRoutingRules(dir, []);
     expect(loadRoutingRules(dir)).toEqual([]);
   });

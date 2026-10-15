@@ -67,7 +67,7 @@ describe('spec registry', () => {
 
 describe('detectAgentClis', () => {
   it('finds an executable on a synthetic PATH, pure lookup', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'sarviq-cli-detect-'));
+    const dir = mkdtempSync(join(tmpdir(), 'kriyadot-cli-detect-'));
     const exe = join(dir, 'claude');
     writeFileSync(exe, '#!/bin/sh\necho hi\n');
     chmodSync(exe, 0o755);
@@ -75,7 +75,7 @@ describe('detectAgentClis', () => {
     expect(found).toHaveLength(1);
     expect(found[0]!.installed).toBe(true);
     expect(found[0]!.command).toBe('claude');
-    const missing = detectAgentClis([join(tmpdir(), 'sarviq-nope')]).filter(
+    const missing = detectAgentClis([join(tmpdir(), 'kriyadot-nope')]).filter(
       (d) => d.id === 'claude-code',
     );
     expect(missing[0]!.installed).toBe(false);
@@ -97,7 +97,7 @@ describe('flattenMessagesForCli', () => {
 
 /** A mock agent CLI: echoes its argv as JSON, exits 0. */
 function writeMockCli(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'sarviq-mock-cli-'));
+  const dir = mkdtempSync(join(tmpdir(), 'kriyadot-mock-cli-'));
   const path = join(dir, 'mock-agent-cli');
   writeFileSync(
     path,
@@ -108,7 +108,7 @@ function writeMockCli(): string {
 }
 
 function writeFailingCli(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'sarviq-mock-cli-'));
+  const dir = mkdtempSync(join(tmpdir(), 'kriyadot-mock-cli-'));
   const path = join(dir, 'mock-agent-cli-fail');
   writeFileSync(path, '#!/bin/sh\necho "boom: bad flags" >&2\nexit 3\n');
   chmodSync(path, 0o755);
@@ -173,7 +173,7 @@ describe('AgentCliProvider', () => {
     const provider = new AgentCliProvider({
       cliId: 'pi',
       model: 'x',
-      command: '/nonexistent/sarviq-cli-missing',
+      command: '/nonexistent/kriyadot-cli-missing',
       timeoutMs: 10_000,
     });
     await expect(provider.chat([{ role: 'user', content: 'hi' }], [], { model: 'x' })).rejects.toThrow(

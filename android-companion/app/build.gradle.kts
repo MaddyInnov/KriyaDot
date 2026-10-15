@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.sarviq.companion"
+    namespace = "com.kriyadot.companion"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.sarviq.companion"
+        applicationId = "com.kriyadot.companion"
         minSdk = 29
         targetSdk = 34
         versionCode = 1

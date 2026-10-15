@@ -5,7 +5,7 @@
  *
  * - `importN8nWorkflow` parses a standard n8n workflow export JSON
  *   (`nodes[]` with type/typeVersion/parameters/position, `connections{}`)
- *   into a Sarviq `WorkflowDefinition`. Common n8n nodes map best-effort;
+ *   into a KriyaDot `WorkflowDefinition`. Common n8n nodes map best-effort;
  *   anything without a mapping becomes a `code` placeholder node that fails
  *   loudly at runtime AND is listed in the returned `unmapped` report — the
  *   import itself never fails because of an unknown node.
@@ -14,7 +14,7 @@
  * Both directions are intentionally lossy (documented per node below); the
  * goal is a working starting point, not a perfect round-trip. n8n template
  * expressions (`={{$json.x}}`, `$node["X"].json`, …) reference n8n's item
- * model and are carried over as literals where no Sarviq equivalent exists —
+ * model and are carried over as literals where no KriyaDot equivalent exists —
  * they need manual conversion after import.
  */
 
@@ -95,7 +95,7 @@ function splitN8nExpression(value: unknown): { text: string; isExpression: boole
 }
 
 /**
- * Best-effort rewrite of n8n expression references to the Sarviq template
+ * Best-effort rewrite of n8n expression references to the KriyaDot template
  * model (`input` = run input ≈ n8n `$json` of the trigger item).
  * `$json.foo` → `input.foo`; anything else is left for manual conversion.
  */
@@ -132,7 +132,7 @@ const N8N_OPERATORS: Record<string, (l: string, r: string) => string> = {
 
 /**
  * Compile n8n IF `parameters.conditions` (v1 `{conditions[], combineOperation}`
- * or v2 `{conditions[], combinator}`) into a Sarviq `if` condition expression.
+ * or v2 `{conditions[], combinator}`) into a KriyaDot `if` condition expression.
  */
 function compileN8nConditions(parameters: Record<string, unknown>): string {
   const raw = asRecord(parameters['conditions']);
@@ -156,7 +156,7 @@ function compileN8nConditions(parameters: Record<string, unknown>): string {
     parts.push(
       fn
         ? `(${fn(left, right)})`
-        : `/* n8n operator "${operation}" has no Sarviq equivalent — review manually */ (false)`,
+        : `/* n8n operator "${operation}" has no KriyaDot equivalent — review manually */ (false)`,
     );
   }
   if (parts.length === 0) return 'true /* n8n IF had no parseable conditions */';
@@ -180,7 +180,7 @@ function unmappedPlaceholder(n8nNode: N8nNodeJson, reason: string): MappedNode {
       name: `${n8nNode.name} (unmapped)`,
       config: {
         code: `throw new Error(${JSON.stringify(
-          `n8n node "${n8nNode.name}" (${n8nNode.type}) has no Sarviq mapping — replace this node manually`,
+          `n8n node "${n8nNode.name}" (${n8nNode.type}) has no KriyaDot mapping — replace this node manually`,
         )});`,
       },
     },
@@ -324,7 +324,7 @@ function mapN8nNode(n: N8nNodeJson): MappedNode {
           ...base,
           type: 'agent',
           config: {
-            // No Sarviq bot id can be derived from n8n — wire one up manually.
+            // No KriyaDot bot id can be derived from n8n — wire one up manually.
             botId: '',
             prompt: asString(asRecord(params['options'])['systemMessage']) || asString(params['prompt']),
           },
@@ -354,7 +354,7 @@ function mapN8nNode(n: N8nNodeJson): MappedNode {
           },
         };
       }
-      return unmappedPlaceholder(n, 'no Sarviq node mapping (imported as a failing code placeholder)');
+      return unmappedPlaceholder(n, 'no KriyaDot node mapping (imported as a failing code placeholder)');
   }
 }
 
@@ -388,7 +388,7 @@ function parseN8nWorkflow(input: unknown): N8nWorkflowJson {
 }
 
 /**
- * Import a standard n8n workflow export into a Sarviq WorkflowDefinition.
+ * Import a standard n8n workflow export into a KriyaDot WorkflowDefinition.
  * Never fails on unknown nodes — they become loud `code` placeholders and
  * are listed in `unmapped`.
  */
@@ -412,7 +412,7 @@ export function importN8nWorkflow(n8nJson: unknown): N8nImportResult {
     if (mapped.node.type === 'trigger') triggerIds.push(mapped.node.id);
   }
 
-  // Sarviq requires exactly one trigger. Extra triggers become placeholders
+  // KriyaDot requires exactly one trigger. Extra triggers become placeholders
   // (edges preserved); a missing trigger is synthesized.
   const triggerNodes = nodes.filter((n) => n.type === 'trigger');
   if (triggerNodes.length > 1) {
@@ -427,7 +427,7 @@ export function importN8nWorkflow(n8nJson: unknown): N8nImportResult {
           position: [0, 0],
           parameters: extra.config,
         },
-        'workflow has multiple triggers — only the first is kept as the trigger (Sarviq supports exactly one)',
+        'workflow has multiple triggers — only the first is kept as the trigger (KriyaDot supports exactly one)',
       );
       nodes[idx] = placeholder.node;
       if (placeholder.unmapped) unmapped.push(placeholder.unmapped);
@@ -504,7 +504,7 @@ export function importN8nWorkflow(n8nJson: unknown): N8nImportResult {
 
 // -- export -------------------------------------------------------------------
 
-function sarviqNodeToN8n(node: WorkflowNode, position: [number, number]): N8nNodeJson {
+function kriyadotNodeToN8n(node: WorkflowNode, position: [number, number]): N8nNodeJson {
   const config = asRecord(node.config);
   const base = {
     id: node.id,
@@ -585,14 +585,14 @@ function sarviqNodeToN8n(node: WorkflowNode, position: [number, number]): N8nNod
         ...base,
         type: 'n8n-nodes-base.if',
         typeVersion: 2,
-        notes: `Sarviq condition (convert manually): ${condition}`,
+        notes: `KriyaDot condition (convert manually): ${condition}`,
         parameters: {
           conditions: {
             options: { caseSensitive: true, leftValue: '', typeValidation: 'loose' },
             conditions: [
               {
                 id: randomUUID(),
-                leftValue: `={{ /* sarviq: ${condition.slice(0, 200)} */ true }}`,
+                leftValue: `={{ /* kriyadot: ${condition.slice(0, 200)} */ true }}`,
                 rightValue: '',
                 operator: { type: 'boolean', operation: 'true', name: 'filter.operator.boolean.true' },
               },
@@ -622,7 +622,7 @@ function sarviqNodeToN8n(node: WorkflowNode, position: [number, number]): N8nNod
     default: {
       // agent / tool / approval have no direct n8n equivalent — emit a Code
       // node carrying the original config as a comment for manual conversion.
-      const note = `Sarviq '${node.type}' node "${node.name}" — no direct n8n equivalent; convert manually.`;
+      const note = `KriyaDot '${node.type}' node "${node.name}" — no direct n8n equivalent; convert manually.`;
       return {
         ...base,
         type: 'n8n-nodes-base.code',
@@ -630,7 +630,7 @@ function sarviqNodeToN8n(node: WorkflowNode, position: [number, number]): N8nNod
         notes: note,
         parameters: {
           mode: 'runOnceForAllItems',
-          jsCode: `// ${note}\n// Original Sarviq config:\n// ${JSON.stringify(config, null, 2).split('\n').join('\n// ')}\nthrow new Error(${JSON.stringify(note)});`,
+          jsCode: `// ${note}\n// Original KriyaDot config:\n// ${JSON.stringify(config, null, 2).split('\n').join('\n// ')}\nthrow new Error(${JSON.stringify(note)});`,
         },
       };
     }
@@ -638,13 +638,13 @@ function sarviqNodeToN8n(node: WorkflowNode, position: [number, number]): N8nNod
 }
 
 /**
- * Best-effort reverse mapping: Sarviq definition → n8n-format JSON.
+ * Best-effort reverse mapping: KriyaDot definition → n8n-format JSON.
  * Nodes without an n8n equivalent (agent/tool/approval) become Code nodes
  * carrying the original config as comments — loud, not silent.
  */
 export function exportN8nWorkflow(def: WorkflowDefinition): N8nWorkflowJson {
   const nodes: N8nNodeJson[] = def.nodes.map((node, i) =>
-    sarviqNodeToN8n(node, [(i % 4) * 280 + 240, Math.floor(i / 4) * 180 + 120]),
+    kriyadotNodeToN8n(node, [(i % 4) * 280 + 240, Math.floor(i / 4) * 180 + 120]),
   );
   const nameById = new Map(def.nodes.map((n) => [n.id, n.name]));
   const typeById = new Map(def.nodes.map((n) => [n.id, n.type]));

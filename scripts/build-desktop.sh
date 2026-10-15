@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Build the Sarviq DESKTOP app (Tauri shell + bun-compiled API sidecar + bundled web UI).
+# Build the KriyaDot DESKTOP app (Tauri shell + bun-compiled API sidecar + bundled web UI).
 #
 # PREREQUISITES (one machine with the toolchain — NOT required for dev):
 #   - Rust toolchain: https://rustup.rs
@@ -14,7 +14,7 @@
 #
 # WHAT IT PRODUCES:
 #   - Windows: apps/desktop/src-tauri/target/release/bundle/nsis/*.exe (installer)
-#     plus a portable single-file exe at .../target/release/sarviq.exe
+#     plus a portable single-file exe at .../target/release/kriyadot.exe
 #   - Linux:   .../target/release/bundle/appimage/*.AppImage
 #
 # Double-click the installer/binary: the app window opens with the full UI.

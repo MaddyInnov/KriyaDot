@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Sarviq landing hero: a cute procedural 3D blob pet (ported from the
-// Sarviq companion-pet geometry: displaced icosahedron body, 8 capsule
+// KriyaDot landing hero: a cute procedural 3D blob pet (ported from the
+// KriyaDot companion-pet geometry: displaced icosahedron body, 8 capsule
 // arms, big eyes, blush) floating over the hero gradient with mouse
 // parallax and soft particles. Reduced-motion renders one static frame.
 import * as THREE from './assets/vendor/three.module.min.js';

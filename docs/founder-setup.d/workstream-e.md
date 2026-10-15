@@ -1,4 +1,4 @@
-# Workstream E — Founder inputs for the 13 Sarviq modules
+# Workstream E — Founder inputs for the 13 KriyaDot modules
 
 Phase 4 build. All 13 modules ship **fully working with mocked providers** —
 zero paid usage, zero network calls in the default configuration. The table

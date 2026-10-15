@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// ADB fallback for remote-phone control (Sarviq MVP).
+// ADB fallback for remote-phone control (KriyaDot MVP).
 //
 // When `adb` is on PATH and a device is attached over USB/Wi-Fi, the API
 // exposes it as a virtual device (kind: 'adb') in the phone device list.

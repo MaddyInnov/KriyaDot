@@ -90,7 +90,7 @@ export default function PwaInstallBanner() {
     >
       <img src="/icons/icon-192.png" alt="" width={40} height={40} style={{ borderRadius: 10 }} />
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontWeight: 600, fontSize: 14 }}>Install Sarviq</div>
+        <div style={{ fontWeight: 600, fontSize: 14 }}>Install KriyaDot</div>
         <div className="small muted" style={{ fontSize: 12 }}>
           Add to your home screen for the full mobile companion.
         </div>

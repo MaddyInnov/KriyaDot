@@ -52,7 +52,7 @@ fn main() {
             use std::io::Write;
             let _ = writeln!(
                 log_file,
-                "[sarviq] sidecar spawned; port={} log={}",
+                "[kriyadot] sidecar spawned; port={} log={}",
                 DESKTOP_API_PORT,
                 log_path.to_string_lossy()
             );

@@ -7,15 +7,15 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 
-    <!-- Network access to the Sarviq instance on your LAN. -->
+    <!-- Network access to the KriyaDot instance on your LAN. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
     <!-- MVP talks to the PC over plain HTTP on the LAN (no TLS yet).
          usesCleartextTraffic is REQUIRED for this to work; switch the app
          and server to HTTPS/WSS before any use outside a trusted LAN. -->
     <application
-        android:label="Sarviq Companion"
-        android:theme="@style/Theme.Sarviq"
+        android:label="KriyaDot Companion"
+        android:theme="@style/Theme.KriyaDot"
         android:supportsRtl="true"
         android:allowBackup="false"
         android:usesCleartextTraffic="true">

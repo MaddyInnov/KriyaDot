@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 <resources>
-    <string name="accessibility_service_description">Lets the Sarviq Phone Agent perform taps, swipes, text entry, and Back/Home keys sent from your own Sarviq web UI. Enable only if you paired this phone yourself.</string>
+    <string name="accessibility_service_description">Lets the KriyaDot Phone Agent perform taps, swipes, text entry, and Back/Home keys sent from your own KriyaDot web UI. Enable only if you paired this phone yourself.</string>
 </resources>

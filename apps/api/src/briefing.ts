@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Daily Briefing backend. Assembles the overnight digest the web UI's
-// briefing panel renders (contract in apps/web/lib/sarviq-api.ts:
+// briefing panel renders (contract in apps/web/lib/kriyadot-api.ts:
 // GET /api/briefing -> { generatedAt, overnight[], calendar[], approvals[],
 // summary?, regressions? }).
 //
@@ -38,7 +38,7 @@ import { NoteStore } from './notes.js';
 
 const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
 
-// ---- Contract types (mirror apps/web/lib/sarviq-api.ts) -----------------------
+// ---- Contract types (mirror apps/web/lib/kriyadot-api.ts) -----------------------
 
 export interface BriefingItem {
   id?: string;

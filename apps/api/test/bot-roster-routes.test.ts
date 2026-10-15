@@ -118,7 +118,7 @@ describe('bot-roster router', () => {
   it('GET /export returns a downloadable manifest of bots and teams', async () => {
     const res = await fetch(`${baseUrl}/export`);
     expect(res.status).toBe(200);
-    expect(res.headers.get('content-disposition')).toMatch(/attachment; filename="sarviq-bot-roster-.*\.json"/);
+    expect(res.headers.get('content-disposition')).toMatch(/attachment; filename="kriyadot-bot-roster-.*\.json"/);
     const json = (await res.json()) as { version: string; exportedAt: string; bots: BotConfig[]; teams: unknown[] };
     expect(json.version).toBe('1');
     expect(json.bots.map((b) => b.id)).toEqual(['helper']);

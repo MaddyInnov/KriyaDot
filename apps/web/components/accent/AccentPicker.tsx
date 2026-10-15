@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Brand accent picker: grid of the 8 Sarviq Jewels duotones with live
+// Brand accent picker: grid of the 8 KriyaDot Jewels duotones with live
 // 135° gradient swatches. Selecting applies instantly across all themes.
 
 'use client';

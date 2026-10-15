@@ -7,8 +7,8 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { EmptyState, ErrorBox } from '../../app/modules/lib';
-import { getBriefing, getRegressions } from '../../lib/sarviq-api';
-import type { Briefing, BriefingItem, RegressionAlert, RegressionsPayload } from '../../lib/sarviq-api';
+import { getBriefing, getRegressions } from '../../lib/kriyadot-api';
+import type { Briefing, BriefingItem, RegressionAlert, RegressionsPayload } from '../../lib/kriyadot-api';
 import { useUxMode } from '../../lib/ux-mode';
 
 function fmtTs(ts?: number): string {

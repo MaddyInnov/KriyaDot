@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* Sarviq brand accents.
+/* KriyaDot brand accents.
  *
  * The signature "Amethyst Crown" identity lives in the five theme blocks in
  * globals.css, so html[data-accent='amethyst'] needs no rules here. Each
@@ -18,7 +18,7 @@
  * same variable names, just with jewel-toned values.
  *
  * No Octop colors are used anywhere in this file; the duotones below are
- * original Sarviq "Jewels" (see the palette comment in lib/accent.ts).
+ * original KriyaDot "Jewels" (see the palette comment in lib/accent.ts).
  */
 
 /* Convenience handle for the signature 135° brand gradient. Resolves against

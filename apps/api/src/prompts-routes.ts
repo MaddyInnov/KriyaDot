@@ -4,7 +4,7 @@
 //
 //   GET  /api/prompts          → { ok, stages: [{ stage, source, path? }], overrides: [{ stage, path, mtimeMs }] }
 //                                stages = the known pipeline stages; source is
-//                                'override' when ~/.sarviq/prompts/<stage>.md
+//                                'override' when ~/.kriyadot/prompts/<stage>.md
 //                                wins, 'builtin' otherwise.
 //   POST /api/prompts/refresh  → { ok, invalidated } — drops the override
 //                                cache so the next resolve() re-reads the

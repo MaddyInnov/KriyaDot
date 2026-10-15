@@ -16,7 +16,7 @@
  * - Detection is pure PATH lookup at runtime. No credential bytes are read.
  * - NEVER pass secrets to the child: this provider reads no API keys and
  *   forwards none. Authentication is the CLI's own login (its own auth
- *   flow / stored credentials) — Sarviq never sees them.
+ *   flow / stored credentials) — KriyaDot never sees them.
  * - The child is spawned WITHOUT a shell (argv array, no interpolation),
  *   so prompt text cannot escape into shell metacharacters.
  * - Child stdout is marked external/untrusted (ACP precedent): the returned
@@ -209,7 +209,7 @@ export interface AgentCliProviderOptions {
 
 /**
  * LLMProvider that shells out to a local agent CLI. Zero marginal cost for
- * users with existing CLI subscriptions; zero API keys handled by Sarviq.
+ * users with existing CLI subscriptions; zero API keys handled by KriyaDot.
  */
 export class AgentCliProvider implements LLMProvider {
   readonly providerId: string;
@@ -244,7 +244,7 @@ export class AgentCliProvider implements LLMProvider {
       }
     }
     // Token counts are unknown (the CLI meters against the user's own
-    // subscription, not Sarviq) — zeros mean "not metered by us".
+    // subscription, not KriyaDot) — zeros mean "not metered by us".
     return {
       content: marked,
       toolCalls: [],
@@ -357,7 +357,7 @@ export function createAgentCliProvider(
     if (!detection?.installed) {
       throw new Error(
         `Agent CLI "${spec.command}" (${parsed.cliId}) is not installed or not on PATH. ` +
-          `Install it and sign in once — Sarviq uses the CLI's own login and never sees your credentials.`,
+          `Install it and sign in once — KriyaDot uses the CLI's own login and never sees your credentials.`,
       );
     }
   }

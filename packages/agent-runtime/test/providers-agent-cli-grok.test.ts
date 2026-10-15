@@ -43,7 +43,7 @@ describe('grok agent CLI spec', () => {
   });
 
   it('runs a turn through a fake grok executable', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'sarviq-grok-'));
+    const dir = mkdtempSync(join(tmpdir(), 'kriyadot-grok-'));
     const script = join(dir, 'grok');
     // Fake CLI: echoes its argv as JSON on stdout, exits 0.
     writeFileSync(script, '#!/bin/sh\nnode -e "console.log(JSON.stringify(process.argv.slice(1)))" -- "$@"\n');
@@ -65,7 +65,7 @@ describe('grok agent CLI spec', () => {
   });
 
   it('createAgentCliProvider resolves agent/grok/<model> via the registry', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'sarviq-grok-'));
+    const dir = mkdtempSync(join(tmpdir(), 'kriyadot-grok-'));
     const script = join(dir, 'grok');
     writeFileSync(script, '#!/bin/sh\nexit 0\n');
     chmodSync(script, 0o755);

@@ -17,5 +17,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "Sarviq Phone Agent"
+rootProject.name = "KriyaDot Phone Agent"
 include(":app")

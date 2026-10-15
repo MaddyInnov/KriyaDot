@@ -3,7 +3,7 @@
 # Fast Message Router (`packages/agent-runtime/src/message-router.ts`)
 
 Pure, deterministic, zero-LLM message→bot routing — the "Jev" equivalent for
-Sarviq. Given a message and the bot roster, it returns
+KriyaDot. Given a message and the bot roster, it returns
 `{ botId, confidence, reason }` in microseconds with no model call.
 
 ## How it scores

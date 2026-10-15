@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Sarviq companion (phone → PC remote control) v1: pairing store, device
+// KriyaDot companion (phone → PC remote control) v1: pairing store, device
 // store, and a dependency-free WebSocket hub for server → phone pushes.
 //
 // This is the REVERSE of remote-phone v1 (/api/phone/*): here the phone is
@@ -126,7 +126,7 @@ export class CompanionStore {
 
   /**
    * Step 1: mint a one-time token (OTT) embedded in the QR payload
-   * (sarviq://pair?host=…&port=…&token=<ott>) shown in the web UI.
+   * (kriyadot://pair?host=…&port=…&token=<ott>) shown in the web UI.
    * ttlMs override is for tests.
    */
   requestPairingOTT(ttlMs: number = OTT_TTL_MS): PairingOTT {

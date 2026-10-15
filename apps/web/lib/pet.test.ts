@@ -25,9 +25,9 @@ describe('pet registry', () => {
     }
   });
 
-  it('defaults to sarviq', () => {
-    expect(DEFAULT_PET_ID).toBe('sarviq');
-    expect(petDef('sarviq').name).toBe('Sarviq');
+  it('defaults to kriyadot', () => {
+    expect(DEFAULT_PET_ID).toBe('kriyadot');
+    expect(petDef('kriyadot').name).toBe('KriyaDot');
   });
 
   it('falls back to the first pet for unknown ids', () => {
@@ -57,7 +57,7 @@ describe('pet storage (no-DOM fallback)', () => {
   });
 });
 
-describe('pet migration: tentio -> sarviq', () => {
+describe('pet migration: tentio -> kriyadot', () => {
   function stubStorage(initial: Record<string, string>) {
     const store = new Map(Object.entries(initial));
     const fake = {
@@ -77,16 +77,16 @@ describe('pet migration: tentio -> sarviq', () => {
     vi.unstubAllGlobals();
   });
 
-  it('rewrites a stored tentio id to sarviq', () => {
+  it('rewrites a stored tentio id to kriyadot', () => {
     const store = stubStorage({ 'mvp:pet': JSON.stringify({ id: 'tentio', name: '' }) });
-    expect(getStoredPet()).toEqual({ id: 'sarviq', name: '' });
+    expect(getStoredPet()).toEqual({ id: 'kriyadot', name: '' });
     // The stored value is rewritten so the migration runs once.
-    expect(JSON.parse(store.get('mvp:pet')!)).toEqual({ id: 'sarviq', name: '' });
+    expect(JSON.parse(store.get('mvp:pet')!)).toEqual({ id: 'kriyadot', name: '' });
   });
 
   it('preserves a custom name across the migration', () => {
     stubStorage({ 'mvp:pet': JSON.stringify({ id: 'tentio', name: 'Tentacruel' }) });
-    expect(getStoredPet()).toEqual({ id: 'sarviq', name: 'Tentacruel' });
+    expect(getStoredPet()).toEqual({ id: 'kriyadot', name: 'Tentacruel' });
     expect(petDisplayName(getStoredPet())).toBe('Tentacruel');
   });
 

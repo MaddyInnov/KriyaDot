@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Sarviq Remote-Phone Control — Wire Protocol v1 + Threat Model
+# KriyaDot Remote-Phone Control — Wire Protocol v1 + Threat Model
 
 Scope: remote view/control of the user's **own paired Android phone** from the
-Sarviq web UI (Workspace → Phone tab). There are two transport paths:
+KriyaDot web UI (Workspace → Phone tab). There are two transport paths:
 
 1. **Phone-app path** (primary): the `android-phone-agent` app on the phone
    streams MJPEG frames and receives input over a token-authenticated

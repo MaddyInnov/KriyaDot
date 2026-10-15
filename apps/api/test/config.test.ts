@@ -4,19 +4,19 @@ import { loadConfig, parsePublicBaseUrl } from '../src/config.js';
 
 describe('parsePublicBaseUrl', () => {
   it('accepts a clean https URL', () => {
-    expect(parsePublicBaseUrl('https://sarviq.example.com')).toBe('https://sarviq.example.com');
+    expect(parsePublicBaseUrl('https://kriyadot.example.com')).toBe('https://kriyadot.example.com');
   });
 
   it('strips trailing slashes', () => {
-    expect(parsePublicBaseUrl('https://sarviq.example.com///')).toBe('https://sarviq.example.com');
+    expect(parsePublicBaseUrl('https://kriyadot.example.com///')).toBe('https://kriyadot.example.com');
   });
 
   it('lowercases scheme and host but keeps the path', () => {
-    expect(parsePublicBaseUrl('HTTPS://Sarviq.Example.COM/app')).toBe('https://sarviq.example.com/app');
+    expect(parsePublicBaseUrl('HTTPS://KriyaDot.Example.COM/app')).toBe('https://kriyadot.example.com/app');
   });
 
   it('keeps an explicit port', () => {
-    expect(parsePublicBaseUrl('https://sarviq.example.com:8443')).toBe('https://sarviq.example.com:8443');
+    expect(parsePublicBaseUrl('https://kriyadot.example.com:8443')).toBe('https://kriyadot.example.com:8443');
   });
 
   it('accepts http (with a cleartext warning) so LAN tunnels still work', () => {
@@ -34,20 +34,20 @@ describe('parsePublicBaseUrl', () => {
   });
 });
 
-describe('loadConfig SARVIQ_PUBLIC_URL', () => {
-  const OLD = process.env.SARVIQ_PUBLIC_URL;
+describe('loadConfig KRIYADOT_PUBLIC_URL', () => {
+  const OLD = process.env.KRIYADOT_PUBLIC_URL;
   afterEach(() => {
-    if (OLD === undefined) delete process.env.SARVIQ_PUBLIC_URL;
-    else process.env.SARVIQ_PUBLIC_URL = OLD;
+    if (OLD === undefined) delete process.env.KRIYADOT_PUBLIC_URL;
+    else process.env.KRIYADOT_PUBLIC_URL = OLD;
   });
 
   it('exposes publicBaseUrl from the environment', () => {
-    process.env.SARVIQ_PUBLIC_URL = 'https://sarviq.example.com/';
-    expect(loadConfig().publicBaseUrl).toBe('https://sarviq.example.com');
+    process.env.KRIYADOT_PUBLIC_URL = 'https://kriyadot.example.com/';
+    expect(loadConfig().publicBaseUrl).toBe('https://kriyadot.example.com');
   });
 
   it('is undefined when the env var is absent', () => {
-    delete process.env.SARVIQ_PUBLIC_URL;
+    delete process.env.KRIYADOT_PUBLIC_URL;
     expect(loadConfig().publicBaseUrl).toBeUndefined();
   });
 });
