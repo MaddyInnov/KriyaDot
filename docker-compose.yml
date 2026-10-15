@@ -11,11 +11,16 @@ services:
     ports:
       - "${PORT:-4000}:4000"
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       PORT: "4000"
       DATA_DIR: /data
       SEED_DIR: /app/seed
+      WORKSPACE_DIR: ${WORKSPACE_DIR:-}
+      KRIYADOT_PUBLIC_URL: ${KRIYADOT_PUBLIC_URL:-}
+      SESSION_HISTORY_LIMIT: ${SESSION_HISTORY_LIMIT:-}
+      PROVIDERS_FILE: ${PROVIDERS_FILE:-}
     volumes:
       - mvp-data:/data
     restart: unless-stopped

@@ -78,12 +78,16 @@ export const HARD_FLOOR_PATTERNS: HardFloorPattern[] = [
     argCheck: (args) => {
       const text = argsText(args);
       const patterns: Array<[RegExp, string]> = [
+        [/\brm\s+.*--no-preserve-root\b/i, 'rm with --no-preserve-root'],
+        [/\brm\s+[-\w\s]*-[a-zA-Z]*R[a-zA-Z]*\s+\/(?![\w])/i, 'rm -R /'],
         [/\brm\s+(-r\s+-f|-f\s+-r|-rf?)\s+\/(?![\w])/i, 'rm -rf /'],
         [/\brm\s+(-r\s+-f|-f\s+-r|-rf?)\s+\/\*/, 'rm -rf /*'],
+        [/\brm\s+(-r\s+-f|-f\s+-r|-rf?)\s+\/(tmp|etc|home|root|var|usr)(\/|\s|$)/i, 'rm -rf on system dir'],
         [/\bmkfs\b/, 'mkfs'],
-        [/\bdd\b[^;&|]*\bof=\s*\/dev\//i, 'dd writing to a raw block device'],
+        [/\bdd\b[^;&|]*\bof\s*=\s*\/dev\//i, 'dd writing to a raw block device'],
         [/\b(shred|wipefs|fdisk|sfdisk|gdisk|sgdisk|cgdisk|parted)\b/i, 'disk wipe/partition tool'],
-        [/:(\(\))\s*\{\s*:\|:\&\s*\}\s*;?\s*:/, 'fork bomb'],
+        [/:\(\)\s*\{\s*:[|\s]+:[&\s]*\s*\}\s*;?\s*:?/, 'fork bomb'],
+        [/\$\{IFS\}/, 'shell IFS obfuscation with destructive command'],
       ];
       for (const [re, label] of patterns) {
         if (re.test(text)) return `catastrophic shell pattern: ${label}`;
@@ -102,6 +106,11 @@ export const HARD_FLOOR_PATTERNS: HardFloorPattern[] = [
         [/\bdd\s+if=/, 'dd with input file'],
         [/chmod\s+-R\s+777\s+\//, 'chmod -R 777 /'],
         [/\bshutdown\b|\breboot\b|\bhalt\b|\bpoweroff\b/, 'shutdown/reboot'],
+        // Shell redirection into an absolute/escaping target — the classic
+        // run_command escape around file-write approvals (e.g. `echo x >
+        // /etc/cron.d/pwn`). Tier 2 (needs human), not catastrophic: legit
+        // `> workspace/out.txt` uses relative paths and never matches.
+        [/(?:^|[;&|])[^;&|]*?>{1,2}\s*(?:\/|~|[a-zA-Z]:[\\/]|\\\\|\.\.)/, 'redirection into absolute/escaping path'],
       ];
       for (const [re, label] of patterns) {
         if (re.test(text)) return `destructive shell pattern: ${label}`;
@@ -112,10 +121,10 @@ export const HARD_FLOOR_PATTERNS: HardFloorPattern[] = [
   {
     id: 'file-escape-workspace',
     tier: 'destructive',
-    toolPattern: '^(write_file|delete_file|edit|patch)$',
+    toolPattern: '^(write_file|delete_file|edit|patch|create_file|edit_file|remove_file)$',
     argCheck: (args) => {
       const p = args['path'];
-      if (typeof p === 'string' && (p.startsWith('/') || p.startsWith('~') || p.includes('..'))) {
+      if (typeof p === 'string' && (p.startsWith('/') || p.startsWith('~') || p.includes('..') || /^[a-zA-Z]:[\\/]/.test(p) || p.startsWith('\\\\'))) {
         return `absolute or escaping path: ${p.slice(0, 80)}`;
       }
       return null;

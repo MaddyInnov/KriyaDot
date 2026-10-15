@@ -96,7 +96,7 @@ describe('SecureVault CRUD + audit', () => {
     expect(vault.list()).toHaveLength(0);
   });
 
-  it('audits every mutation with names only — never secret values', () => {
+  it('audits every mutation and read with names only — never secret values', () => {
     const vault = new SecureVault(dir);
     vault.create('tok', 'TOPSECRET1');
     vault.update('tok', 'TOPSECRET2');
@@ -104,7 +104,7 @@ describe('SecureVault CRUD + audit', () => {
     vault.get('nope');
     vault.delete('tok');
     const entries = vault.auditLog();
-    expect(entries.map((e) => e.action)).toEqual(['create', 'update', 'read-denied', 'delete']);
+    expect(entries.map((e) => e.action)).toEqual(['create', 'update', 'read', 'read-denied', 'delete']);
     for (const e of entries) {
       expect(e.ts).toBeTypeOf('number');
       expect(e.actor).toBe('api');

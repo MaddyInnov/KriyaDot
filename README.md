@@ -230,7 +230,6 @@ stop a determined social-engineering payload in tool output.
 ## Repo layout
 
 ```
-mvp/
   packages/agent-runtime/  Groq-first provider abstraction (OpenAI-compatible +
                            Anthropic drivers, data-driven catalog), agentic
                            tool-calling loop w/ streaming, parallel tools,
@@ -241,16 +240,23 @@ mvp/
                            PreToolUse/PostToolUse hooks
   packages/workflows/      Minimal durable DAG runner (agent/tool/http/delay/
                            approval nodes), run history, idempotency keys
+  packages/billing/        Local cost ledger + usage breakdown + monthly caps
+  packages/vault/          Encrypted credential store (AES-256-GCM, 0600)
+  packages/marketplace/    Curated skills/bots catalog
   apps/api/                Express API (Bun): chat SSE, approvals, providers,
                            workflows, audit; serves the web UI
-  apps/web/                Next.js (static export): chat, approvals inbox,
-                           workflows, audit, providers — Linear-style minimal UI
+  apps/web/                Next.js (static export): chat, bots, workflows,
+                           marketplace, workspace, activity + providers/usage
   apps/desktop/            Tauri shell: real .exe/AppImage with built-in UI,
                            API embedded as sidecar (no browser needed)
   seed/                    bots, skills, mcp.json, sample workflow
-  scripts/                 embed-web.mjs, build-desktop.sh
+  scripts/                 embed-web.mjs, embed-seed.mjs, build-desktop.sh, build-server-binary.sh
   docker-compose.yml       secondary server/self-host deployment
 ```
+
+> Local-first now, multi-tenancy later. No Postgres/Redis/microVM in this
+> phase — single-user SQLite in `DATA_DIR`. `packages/tenancy` is a
+> disabled stub until Phase 3.
 
 ## Tests
 

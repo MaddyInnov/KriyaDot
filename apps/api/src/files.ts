@@ -46,6 +46,14 @@ export function listWorkspaceFiles(root: string, rel = ''): FileNode[] {
     for (const e of ents) {
       if (count >= MAX_FILES) break;
       if (e.isDirectory() && SKIP_DIRS.has(e.name)) continue;
+      // Never follow symlinks: a linked dir could escape the workspace root
+      // (or loop forever). Surfaced as plain files so the UI still sees them.
+      if (e.isSymbolicLink()) {
+        count++;
+        const childRel = dirRel ? `${dirRel}/${e.name}` : e.name;
+        out.push({ name: e.name, path: childRel, type: 'file', size: 0 });
+        continue;
+      }
       const childRel = dirRel ? `${dirRel}/${e.name}` : e.name;
       const childAbs = path.join(dirAbs, e.name);
       count++;
@@ -74,7 +82,10 @@ export function readWorkspaceFile(root: string, rel: string): { content: string;
     const fd = fs.openSync(abs, 'r');
     fs.readSync(fd, buf, 0, MAX_FILE_BYTES, 0);
     fs.closeSync(fd);
+    if (buf.includes(0)) throw new Error('Binary file — download it instead of previewing');
     return { content: buf.toString('utf-8'), truncated: true, size: stat.size };
   }
-  return { content: fs.readFileSync(abs, 'utf-8'), truncated: false, size: stat.size };
+  const raw = fs.readFileSync(abs);
+  if (raw.includes(0)) throw new Error('Binary file — download it instead of previewing');
+  return { content: raw.toString('utf-8'), truncated: false, size: stat.size };
 }

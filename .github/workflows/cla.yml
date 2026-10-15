@@ -23,6 +23,6 @@ jobs:
           PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_ASSISTANT_PAT }}
         with:
           path-to-signatures: 'signatures/version1/cla.json'
-          path-to-document: 'https://github.com/SSDMOH/all-in-one-ai-agent-saas-platform/blob/main/CLA.md'
+          path-to-document: 'https://github.com/MaddyInnov/KriyaDot/blob/main/CLA.md'
           branch: 'main'
-          allowlist: SSDMOH
+          allowlist: MaddyInnov
