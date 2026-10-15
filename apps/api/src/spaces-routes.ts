@@ -18,7 +18,6 @@
 
 import express, { type Request, type Response, type Router } from 'express';
 import { SecureVault } from '@mvp/vault';
-import type { PrivacyTier } from '@mvp/governance';
 import {
   DEFAULT_SPACE_ID,
   SpaceError,
@@ -129,14 +128,6 @@ export interface SpaceRunContext {
    * duration of the run — never persisted, logged, or serialized.
    */
   apiKeyOverride?: string;
-  /**
-   * Privacy tier + ref of the resolved vault secret (for the chat turn's
-   * egress gate: a local-only secret must never be sent to a cloud provider).
-   * Same-service use (the secret IS that provider's key) is allowed — the
-   * gate only blocks local-only secrets on third-party cloud routes.
-   */
-  apiKeyTier?: PrivacyTier;
-  apiKeyRef?: string;
 }
 
 function callerOf(req: Request): string {
@@ -179,8 +170,6 @@ export function resolveSpaceForRun(opts: {
     );
   }
   let apiKeyOverride: string | undefined;
-  let apiKeyTier: PrivacyTier | undefined;
-  let apiKeyRef: string | undefined;
   if (space.apiKeyRef) {
     // The vault is per-user, namespaced like the /vault API routes.
     const vault = new SecureVault(dataDir, callerOf(req), callerOf(req));
@@ -192,10 +181,8 @@ export function resolveSpaceForRun(opts: {
       );
     }
     apiKeyOverride = secret.value;
-    apiKeyTier = secret.tier;
-    apiKeyRef = space.apiKeyRef;
   }
-  return { space, apiKeyOverride, apiKeyTier, apiKeyRef };
+  return { space, apiKeyOverride };
 }
 
 export { DEFAULT_SPACE_ID };

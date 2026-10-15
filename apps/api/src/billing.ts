@@ -186,13 +186,6 @@ export function registerBillingRoutes(router: Router, deps: BillingDeps): void {
   });
 
   router.post('/usage/cost-events', (req: Request, res: Response) => {
-    // Local-first note: this endpoint exists for the in-app meter and
-    // companion/phone surfaces to report usage. Inputs are validated so a
-    // stray caller cannot corrupt the ledger with negative tokens or
-    // unbounded strings (single-user machine: no auth, fail-closed shapes).
-    const fail = (msg: string): void => {
-      res.status(400).json({ error: msg });
-    };
     try {
       const body = (req.body ?? {}) as {
         feature?: unknown;
@@ -204,46 +197,16 @@ export function registerBillingRoutes(router: Router, deps: BillingDeps): void {
         sessionId?: unknown;
         botId?: unknown;
       };
-      const str = (v: unknown, field: string, max = 64): string => {
-        if (typeof v !== 'string' || !v.trim() || v.length > max) {
-          throw new Error(`body "${field}" must be a non-empty string (max ${max} chars)`);
-        }
-        return v.trim();
-      };
-      const count = (v: unknown, field: string): number => {
-        if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 1e9) {
-          throw new Error(`body "${field}" must be a number 0..1e9`);
-        }
-        return Math.floor(v);
-      };
-      const optStr = (v: unknown, field: string, max = 128): string | undefined => {
-        if (v === undefined) return undefined;
-        return str(v, field, max);
-      };
-      let costCents: number | undefined;
-      if (body.costCents !== undefined) {
-        if (typeof body.costCents !== 'number' || !Number.isFinite(body.costCents) || body.costCents < 0) {
-          fail('body "costCents" must be a non-negative number');
-          return;
-        }
-        costCents = body.costCents;
-      }
-      let event;
-      try {
-        event = costTracker.record({
-          feature: str(body.feature, 'feature'),
-          step: str(body.step, 'step'),
-          model: optStr(body.model, 'model'),
-          inputTokens: count(body.inputTokens, 'inputTokens'),
-          outputTokens: count(body.outputTokens, 'outputTokens'),
-          costCents,
-          sessionId: optStr(body.sessionId, 'sessionId'),
-          botId: optStr(body.botId, 'botId'),
-        });
-      } catch (err) {
-        fail(errMessage(err, 'invalid cost event'));
-        return;
-      }
+      const event = costTracker.record({
+        feature: body.feature as string,
+        step: body.step as string,
+        model: typeof body.model === 'string' ? body.model : undefined,
+        inputTokens: body.inputTokens as number,
+        outputTokens: body.outputTokens as number,
+        costCents: body.costCents === undefined ? undefined : (body.costCents as number),
+        sessionId: typeof body.sessionId === 'string' ? body.sessionId : undefined,
+        botId: typeof body.botId === 'string' ? body.botId : undefined,
+      });
       res.status(201).json(event);
     } catch (err) {
       res.status(400).json({ error: errMessage(err, 'invalid cost event') });

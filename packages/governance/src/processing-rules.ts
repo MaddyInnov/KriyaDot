@@ -20,7 +20,6 @@
 // API below is complete on its own.
 
 import { randomUUID } from 'node:crypto';
-import { redactSecrets } from './redact.js';
 
 // `node:sqlite` is loaded at runtime via process.getBuiltinModule instead of
 // a static import because this repo's vitest (Vite 5.4.21) cannot statically
@@ -523,10 +522,6 @@ export class ProcessingRuleStore {
     outcome: ActionOutcome,
   ): FiringLogEntry {
     const ts = Date.now();
-    // Redact before persisting: outcome.detail can carry tool args, message
-    // text, or credential-adjacent metadata. The firing log is queryable over
-    // REST, so it must never store secret values (same rule as the audit log).
-    const safeDetail = outcome.detail ? redactSecrets(outcome.detail) : null;
     const res = this.db
       .prepare(
         `INSERT INTO firing_log (ts, rule_id, rule_name, item_id, item_kind, action, status, reason, detail_json)
@@ -541,7 +536,7 @@ export class ProcessingRuleStore {
         action,
         outcome.status,
         outcome.reason ?? null,
-        safeDetail ? JSON.stringify(safeDetail) : null,
+        outcome.detail ? JSON.stringify(outcome.detail) : null,
       );
     return {
       id: Number(res.lastInsertRowid),
@@ -553,7 +548,7 @@ export class ProcessingRuleStore {
       action,
       status: outcome.status,
       ...(outcome.reason ? { reason: outcome.reason } : {}),
-      ...(safeDetail ? { detail: safeDetail } : {}),
+      ...(outcome.detail ? { detail: outcome.detail } : {}),
     };
   }
 

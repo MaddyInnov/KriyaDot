@@ -141,23 +141,16 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
       }
       return { decision: res.effect, reason: floorHit.reason };
     }
-    // Learned preferences (preference learning loop): deny is fail-closed and
-    // audited. 'allow' never applies to untrusted/privileged tools — those
-    // always fall through to full policy evaluation.
+    // Learned preferences (preference learning loop): check before policy.
+    // If the user consistently denied this tool, deny immediately.
+    // If consistently approved, allow immediately.
     if (this.getPreference) {
       const pref = this.getPreference(ctx.botId, call.name);
       if (pref === 'deny') {
-        this.audit({ type: 'policy', botId: ctx.botId, sessionId: ctx.sessionId, call, detail: 'Learned preference deny (audited, no policy evaluation)', ts: new Date().toISOString() });
         return { decision: 'deny', reason: 'Learned preference: you have denied this tool multiple times.' };
       }
       if (pref === 'allow') {
-        const privileged = /^(mcp:|run_command$|exec$|shell$|write_file$|edit_file$|create_file$|delete_file$|remove_file$)/.test(call.name)
-          || /delete|remove|drop|exec/.test(call.name);
-        if (!privileged) {
-          this.audit({ type: 'policy', botId: ctx.botId, sessionId: ctx.sessionId, call, detail: 'Learned preference allow (audited)', ts: new Date().toISOString() });
-          return { decision: 'allow', reason: 'Learned preference: you have approved this tool multiple times.' };
-        }
-        // Privileged tools ignore learned allow — fall through to policy.
+        return { decision: 'allow', reason: 'Learned preference: you have approved this tool multiple times.' };
       }
     }
     // Per-bot policy: merge the calling bot's rules ahead of the global

@@ -80,9 +80,7 @@ export function loadConfig(): AppConfig {
     dataDir,
     seedDir,
     skillsDir: path.join(seedDir, 'skills'),
-    // Local-first: WORKSPACE_DIR env wins when set, else <DATA_DIR>/workspace.
-    // (Previously hardcoded to dataDir/workspace, ignoring the documented env.)
-    workspaceDir: resolveDir(process.env.WORKSPACE_DIR, path.join(dataDir, 'workspace')),
+    workspaceDir: path.join(dataDir, 'workspace'),
     // ../web/out relative to apps/api (src/ and dist/ are both one level deep).
     webOutDir: path.resolve(SRC_DIR, '../../web/out'),
     publicBaseUrl: parsePublicBaseUrl(process.env.SARVIQ_PUBLIC_URL),

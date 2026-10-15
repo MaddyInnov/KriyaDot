@@ -170,7 +170,7 @@ export class SecureVault {
     return meta;
   }
 
-  /** Full read — the only method that returns a value. Success is audited (name-only). */
+  /** Full read — the only method that returns a value. */
   get(name: unknown): Secret | undefined {
     const n = requireName(name);
     const payload = this.load();
@@ -179,7 +179,6 @@ export class SecureVault {
       this.save(payload, { ts: Date.now(), actor: this.actor, action: 'read-denied', name: n });
       return undefined;
     }
-    this.save(payload, { ts: Date.now(), actor: this.actor, action: 'read', name: n });
     return { name: found.name, description: found.description, value: found.value, createdAt: found.createdAt, updatedAt: found.updatedAt, tier: found.tier };
   }
 

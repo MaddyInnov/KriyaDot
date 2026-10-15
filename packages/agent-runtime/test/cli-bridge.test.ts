@@ -46,13 +46,6 @@ function plantCli(binDir: string, name: string): void {
   chmodSync(p, 0o755);
 }
 
-/** Fake CLI executable that prints canned stdout (tests the real spawn path). */
-function plantCliOutput(binDir: string, name: string, stdout: string): void {
-  const p = join(binDir, name);
-  writeFileSync(p, `#!/bin/sh\nprintf '%s' ${JSON.stringify(stdout)}\n`);
-  chmodSync(p, 0o755);
-}
-
 beforeEach(() => {
   savedEnv = {};
   for (const k of ENV_KEYS) savedEnv[k] = process.env[k];
@@ -76,7 +69,7 @@ afterEach(() => {
 describe('detection', () => {
   it('detects nothing on a bare machine', () => {
     const found = detectCliBridges();
-    expect(found).toHaveLength(3); // claude, codex, opencode bridges
+    expect(found).toHaveLength(2);
     expect(found.every((d) => d.detected === false)).toBe(true);
     expect(detectCliBridge('claude').credentialsPresent).toBe(false);
   });
@@ -217,23 +210,21 @@ describe('bridged chat turn', () => {
     expect(headers['x-api-key']).toBeUndefined();
   });
 
-  // POSIX-only: Windows cannot execute the extensionless sh stub (spawn uses
-  // shell:false), and CI runs ubuntu-only. Detection/consent/token paths
-  // above already cover the bridge contract on every platform.
-  it.runIf(process.platform !== 'win32')('codex-subscription shells out to the codex CLI (ChatGPT OAuth is CLI-only)', async () => {
-    // The ChatGPT OAuth token is not valid against api.openai.com, so the
-    // bridge spawns the user's own `codex` CLI. Fake the binary on the
-    // faked PATH and exercise the real spawn path end to end.
+  it('codex-subscription uses the OpenAI-compatible Bearer driver', async () => {
     plantCodexCredentials(fakeHome, 'sk-codex-chat');
     grantBridgeConsent('codex');
-    plantCliOutput(fakeBin, 'codex', 'yo');
+
+    const sse = ['data: {"choices":[{"index":0,"delta":{"content":"yo"}}]}', '', 'data: [DONE]', ''].join('\n');
+    const fetchMock = vi.fn().mockResolvedValue(new Response(sse, { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
 
     const provider = createProvider('codex-subscription');
     const result = await provider.chat([{ role: 'user', content: 'hi' }], [], { model: 'gpt-5' });
 
-    expect(result.content).toContain('yo');
-    expect(result.content).toContain('untrusted');
-    expect(result.usage.totalTokens).toBe(0); // CLI subscription: metered by the CLI, not us
+    expect(result.content).toBe('yo');
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain('api.openai.com');
+    expect((init.headers as Record<string, string>)['Authorization']).toBe('Bearer sk-codex-chat');
   });
 
   it('createProvider throws a clear not-connected error without consent', () => {
@@ -244,7 +235,6 @@ describe('bridged chat turn', () => {
   it('catalog exposes the bridge presets with the bridge flag', () => {
     expect(getProviderPreset('claude-subscription')?.bridge).toBe('claude');
     expect(getProviderPreset('codex-subscription')?.bridge).toBe('codex');
-    expect(getProviderPreset('opencode-subscription')?.bridge).toBe('opencode');
     expect(getProviderPreset('groq')?.bridge).toBeUndefined();
   });
 });

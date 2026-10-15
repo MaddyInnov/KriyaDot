@@ -185,7 +185,7 @@ function readLocalOverrides(): Record<string, unknown> {
 /**
  * Resolve the API key for a provider: env var first, then providers.local.json
  * (keyed by envKey, e.g. { "GROQ_API_KEY": "..." }). Bridge presets
- * (claude-subscription / codex-subscription / opencode-subscription) resolve consent-gated from the
+ * (claude-subscription / codex-subscription) resolve consent-gated from the
  * user's own CLI login instead — never env, never disk. Never logs the key.
  */
 export function resolveApiKey(providerId: string): string | undefined {

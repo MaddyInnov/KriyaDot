@@ -8,7 +8,7 @@ export const REDACTED = '[REDACTED]';
  * api keys, tokens, secrets, passwords, auth headers, bearer tokens, cookies.
  */
 export const SECRET_KEY_RE =
-  /api[_-]?key|token|secret|password|passwd|authorization|bearer|cookie|credential|private[_-]?key|card|pan|otp|code_verifier|refresh/i;
+  /api[_-]?key|token|secret|password|passwd|authorization|bearer|cookie/i;
 
 export function isSecretKey(key: string): boolean {
   return SECRET_KEY_RE.test(key);

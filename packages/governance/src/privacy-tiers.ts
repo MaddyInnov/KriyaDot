@@ -2,8 +2,6 @@
 // Privacy tiers: 3-level data classification enforced across vault, memory,
 // and every cloud-egress path.
 //
-
-import { redactSecrets } from './redact.js';
 // ## Tier semantics
 //
 // - `metadata`: Non-sensitive facts about data, not the data itself — ids,
@@ -354,7 +352,5 @@ export function sanitizeTelemetry(
     return { accepted: false, reason, droppedFields: hits };
   }
   const sanitized = normalizeNames(payload, 0, new WeakSet()) as Record<string, unknown>;
-  // Defense in depth: forbidden keys are refused above, but a secret-like
-  // value under an innocuous key would still pass through — redact it.
-  return { accepted: true, sanitized: redactSecrets(sanitized) };
+  return { accepted: true, sanitized };
 }

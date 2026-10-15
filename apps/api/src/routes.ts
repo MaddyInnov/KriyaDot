@@ -9,14 +9,12 @@
 //   id → real approval id translation.
 
 import express from 'express';
-import { BotMemoryStore, SpaceStore, getProviderPreset, isFreeModel, listProviderPresets, resolveApiKey, resolveBotWorkspaceDir, routeMessage } from '@mvp/agent-runtime';
+import { BotMemoryStore, SpaceStore, isFreeModel, listProviderPresets, resolveApiKey, resolveBotWorkspaceDir, routeMessage } from '@mvp/agent-runtime';
 import type { AgentRuntime, BotConfig, StreamEvent, TokenUsage } from '@mvp/agent-runtime';
 // pricing.ts is not re-exported from the agent-runtime index (index untouched);
 // import the built subpath directly.
 import { priceOfModel } from '@mvp/agent-runtime/dist/pricing.js';
 import type { ApprovalStatus, GovernanceGateway } from '@mvp/governance';
-import { EgressGate } from '@mvp/governance';
-import type { TieredItem } from '@mvp/governance';
 import type { WorkflowRun, WorkflowRunner } from '@mvp/workflows';
 import { createHealthScoring, registerHealthRoutes } from './health-routes.js';
 import { registerOmniRoutes } from './omni-routes.js';
@@ -639,7 +637,7 @@ export function createRouter(deps: RouteDeps): express.Router {
       res.json({ ok: true, path: rel, ...file });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      const status = message.includes('escapes') ? 403 : message.includes('Not a file') ? 404 : message.includes('Binary file') ? 422 : 500;
+      const status = message.includes('escapes') ? 403 : message.includes('Not a file') ? 404 : 500;
       res.status(status).json(errorBody('Failed to read file', message));
     }
   });
@@ -1016,9 +1014,7 @@ export function createRouter(deps: RouteDeps): express.Router {
           ? 403
           : message.includes('Not a file')
             ? 404
-            : message.includes('Binary file')
-              ? 422
-              : 500;
+            : 500;
       res.status(status).json(errorBody('Failed to read bot file', message));
     }
   });
@@ -1263,36 +1259,6 @@ export function createRouter(deps: RouteDeps): express.Router {
       const turnStart = Date.now();
       let turnUsage: TokenUsage | null = null;
       let turnError: string | null = null;
-      // Privacy-egress choke point: the provider call below is a cloud egress
-      // (except fully local providers like Ollama). Memory recall already
-      // filters to cloud-ok tiers and attached files are the user's explicit
-      // content (cloud-ok) — but a space vault secret tagged local-only must
-      // never ride a third-party cloud route. Same-service use (the secret IS
-      // this provider's own key, byte-identical to its configured key) and
-      // fully local providers are allowed. Denials throw fail-closed with an
-      // audit entry before any network I/O (see runtime provider.chat).
-      const turnProviderId = turnOpts.providerId ?? bot.provider ?? 'groq';
-      const turnPreset = getProviderPreset(turnProviderId);
-      const egressGate = new EgressGate((action, detail) => {
-        try {
-          governance.audit(action, { actor: bot.id, sessionId: body.sessionId, ...detail });
-        } catch {
-          // Audit must never break chat.
-        }
-      });
-      const egressItems: TieredItem[] = [{ id: 'memory', tier: 'cloud-ok' }];
-      for (const fid of turnOpts.fileIds ?? []) egressItems.push({ id: `file:${fid}`, tier: 'cloud-ok' });
-      if (spaceCtx?.apiKeyOverride && spaceCtx.apiKeyTier === 'local-only' && turnPreset?.local !== true) {
-        let sameService = false;
-        try {
-          sameService = resolveApiKey(turnProviderId) === spaceCtx.apiKeyOverride;
-        } catch {
-          sameService = false;
-        }
-        if (!sameService) {
-          egressItems.push({ id: `vault:${spaceCtx.apiKeyRef ?? 'secret'}`, tier: 'local-only' });
-        }
-      }
       try {
         turnUsage = await agentRuntime.runTurn({
           bot,
@@ -1310,8 +1276,6 @@ export function createRouter(deps: RouteDeps): express.Router {
           sandboxMode: turnOpts.sandboxMode,
           reasoningEffort: turnOpts.reasoningEffort,
           memoryContext,
-          privacyGate: egressGate,
-          egressItems,
           // Learning-from-corrections routing (feature #4): stored rules
           // reloaded per turn so a recorded correction changes routing.
           routingRules: loadChatRoutingRules(),
@@ -1652,12 +1616,6 @@ export function createRouter(deps: RouteDeps): express.Router {
     const filePath = join(uploadsDir, storedName);
     try {
       const buffer = Buffer.from(body.data, 'base64');
-      // Re-check decoded size: base64 whitespace is ignored on decode, so the
-      // string-length check above is approximate. 10 MB hard cap on bytes.
-      if (buffer.length > 10 * 1024 * 1024) {
-        res.status(400).json(errorBody('File too large (max 10MB)'));
-        return;
-      }
       writeFileSync(filePath, buffer);
       const meta = {
         id,

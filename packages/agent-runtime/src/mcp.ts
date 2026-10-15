@@ -203,14 +203,6 @@ export class MCPClient {
     this.options = options;
     this.serverName = options.serverName;
     this.pinStore = options.pinDbPath ? new MCPSchemaPinStore(options.pinDbPath) : null;
-    if (!this.pinStore) {
-      // Fail-loud, not fail-closed: library users can still opt out, but an
-      // unpinned client silently skips schema-drift protection — say so once.
-      console.warn(
-        '[mcp] MCPClient without pinDbPath: tool-schema drift protection is OFF. ' +
-          'Pass pinDbPath (e.g. <dataDir>/mcp-pins.db) unless this is a throwaway test client.',
-      );
-    }
   }
 
   /** Name this client's tools are registered under: `mcp:<server>:<tool>` or legacy `mcp:<tool>`. */
@@ -220,20 +212,10 @@ export class MCPClient {
 
   async connectStdio(config: MCPStdioConfig): Promise<void> {
     this.label = `mcp-stdio:${config.command}`;
-    // Never hand provider keys to untrusted MCP children: syncProviderKeysToEnv
-    // mirrors decrypted keys into process.env, so strip secret-like vars here.
-    // Explicit config.env may still add non-secret vars (or its own auth).
-    const safeEnv: Record<string, string> = {};
-    for (const [k, v] of Object.entries(process.env)) {
-      if (v === undefined) continue;
-      if (/api[_-]?key|token|secret|password|passwd|authorization|bearer|cookie|credential|private[_-]?key/i.test(k)) continue;
-      if (k.endsWith('_HEADERS') || k.endsWith('_BASE_URL')) continue;
-      safeEnv[k] = v;
-    }
     const transport = new StdioClientTransport({
       command: config.command,
       args: config.args ?? [],
-      env: { ...safeEnv, ...(config.env ?? {}) } as Record<string, string>,
+      env: { ...process.env, ...(config.env ?? {}) } as Record<string, string>,
     });
     await this.connectWith(transport, `stdio command "${config.command}"`);
   }

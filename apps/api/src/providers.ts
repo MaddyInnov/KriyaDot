@@ -334,7 +334,7 @@ export function saveProviderKey(
   }
 }
 
-const BRIDGE_IDS: CliBridgeId[] = ['claude', 'codex', 'opencode'];
+const BRIDGE_IDS: CliBridgeId[] = ['claude', 'codex'];
 
 function asBridgeId(value: unknown): CliBridgeId | undefined {
   return typeof value === 'string' && (BRIDGE_IDS as string[]).includes(value)
@@ -349,7 +349,7 @@ function asBridgeId(value: unknown): CliBridgeId | undefined {
  */
 export function connectBridge(bridgeId: string): void {
   const id = asBridgeId(bridgeId);
-  if (!id) throw new Error(`Unknown bridge "${bridgeId}". Expected one of "claude", "codex", "opencode".`);
+  if (!id) throw new Error(`Unknown bridge "${bridgeId}". Expected "claude" or "codex".`);
   const probe = bridgeConnectable(id);
   if (!probe.ok) {
     throw new Error(probe.reason ?? 'Bridge is not connectable on this machine.');
