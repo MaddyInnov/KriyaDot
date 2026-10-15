@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Sarviq landing site behaviour: live star count, mobile nav,
+// KriyaDot landing site behaviour: live star count, mobile nav,
 // scroll reveal, and the self-playing "watch it write code" demo.
 (function () {
   'use strict';
