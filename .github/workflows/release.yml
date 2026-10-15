@@ -131,7 +131,7 @@ jobs:
       # .exe and Linux .deb the same way the AppImage is handled above.
       - name: Force-replace Windows .exe and Linux .deb assets
         env:
-GITHUB_TOKEN: <redacted>
+          GITHUB_TOKEN: <redacted>
         run: |
           set -euo pipefail
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
