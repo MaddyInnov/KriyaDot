@@ -27,10 +27,22 @@ fn main() {
 
             // Log file for the sidecar's stdout/stderr — if the API doesn't
             // come up, this file shows why (crash, port conflict, etc.).
-            // Rotate: keep the previous run's log too.
+            // Rotate: keep the previous run's log too (capped so a runaway
+            // sidecar can't fill the disk: giant logs are discarded, not kept).
+            const MAX_KEPT_LOG_BYTES: u64 = 8 * 1024 * 1024;
             let log_path = data_dir.join("mvp-api.log");
             let prev_log = data_dir.join("mvp-api.prev.log");
-            let _ = std::fs::rename(&log_path, &prev_log);
+            let keep_prev = true;
+            if let Ok(meta) = std::fs::metadata(&log_path) {
+                if meta.len() > MAX_KEPT_LOG_BYTES {
+                    let _ = std::fs::remove_file(&log_path);
+                    let _ = std::fs::remove_file(&prev_log);
+                    keep_prev = false;
+                }
+            }
+            if keep_prev {
+                let _ = std::fs::rename(&log_path, &prev_log);
+            }
             let log_file =
                 std::fs::File::create(&log_path).expect("failed to create sidecar log file");
 

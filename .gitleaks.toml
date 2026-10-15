@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Gitleaks config: fail CI on real leaked secrets, ignore test fixtures.
+# Test files use obviously-fake tokens (sk-*-test-*, hunter2, TOPSECRET*) —
+# those paths are allowlisted so the secret-scan gates releases without
+# false-positiveing on every fixture.
+
+[allowlist]
+paths = [
+  '''packages/.*/tests?/.*''',
+  '''apps/.*/tests?/.*''',
+  '''.*\.test\.ts''',
+  '''seed/.*''',
+  '''site/.*''',
+  '''docs/.*''',
+]
+
+# Belt and braces: the fixture token shapes used across tests.
+regexes = [
+  '''sk-(ant|test)-[a-z0-9-]*test[a-z0-9-]*''',
+  '''TOPSECRET[0-9]*''',
+  '''hunter[0-9]*''',
+]

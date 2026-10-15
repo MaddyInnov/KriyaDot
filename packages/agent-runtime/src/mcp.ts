@@ -203,6 +203,14 @@ export class MCPClient {
     this.options = options;
     this.serverName = options.serverName;
     this.pinStore = options.pinDbPath ? new MCPSchemaPinStore(options.pinDbPath) : null;
+    if (!this.pinStore) {
+      // Fail-loud, not fail-closed: library users can still opt out, but an
+      // unpinned client silently skips schema-drift protection — say so once.
+      console.warn(
+        '[mcp] MCPClient without pinDbPath: tool-schema drift protection is OFF. ' +
+          'Pass pinDbPath (e.g. <dataDir>/mcp-pins.db) unless this is a throwaway test client.',
+      );
+    }
   }
 
   /** Name this client's tools are registered under: `mcp:<server>:<tool>` or legacy `mcp:<tool>`. */

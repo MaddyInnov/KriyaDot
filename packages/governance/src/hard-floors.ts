@@ -106,6 +106,11 @@ export const HARD_FLOOR_PATTERNS: HardFloorPattern[] = [
         [/\bdd\s+if=/, 'dd with input file'],
         [/chmod\s+-R\s+777\s+\//, 'chmod -R 777 /'],
         [/\bshutdown\b|\breboot\b|\bhalt\b|\bpoweroff\b/, 'shutdown/reboot'],
+        // Shell redirection into an absolute/escaping target — the classic
+        // run_command escape around file-write approvals (e.g. `echo x >
+        // /etc/cron.d/pwn`). Tier 2 (needs human), not catastrophic: legit
+        // `> workspace/out.txt` uses relative paths and never matches.
+        [/(?:^|[;&|])[^;&|]*?>{1,2}\s*(?:\/|~|[a-zA-Z]:[\\/]|\\\\|\.\.)/, 'redirection into absolute/escaping path'],
       ];
       for (const [re, label] of patterns) {
         if (re.test(text)) return `destructive shell pattern: ${label}`;

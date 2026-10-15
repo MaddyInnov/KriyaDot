@@ -130,7 +130,8 @@
     "provider": "groq",
     "model": "gpt-oss-20b",
     "skills": [
-      "note-taking"
+      "note-taking",
+      "teach-by-recording"
     ],
     "tools": [
       "web_search",

@@ -111,12 +111,23 @@ export function registerVaultRoutes(router: express.Router, deps: VaultDeps): vo
   });
 
   vaultRouter.get('/:name', (req: Request, res: Response) => {
+    // Local-first single-user: the only caller is the owner's UI/turn on this
+    // machine (vaults are per x-user-id namespace). Reads are audited
+    // name-only below. There is intentionally NO vault.get tool registered for
+    // the model plane (see tool-registry.ts) — the agent can never pull
+    // secrets into prompt context. Revisit with real authZ before any
+    // multi-user/hosted phase.
     try {
       const secret = vaultOf(req).get(req.params.name);
       if (!secret) {
         res.status(404).json(errorBody(`unknown secret: ${req.params.name}`));
         return;
       }
+      governance.audit('vault.secret_read', {
+        actor: callerOf(req),
+        toolName: 'vault',
+        detail: { name: secret.name },
+      });
       res.json(secret);
     } catch (err) {
       res
