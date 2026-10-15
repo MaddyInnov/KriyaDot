@@ -119,10 +119,14 @@ jobs:
           export PATH="$work/squashfs-root/usr/bin:$PATH"
           APPNAME=$(basename "$APPIMAGE")
           "$work/squashfs-root/usr/bin/appimagetool" "$work/appdir" "$work/$APPNAME" >/dev/null
-          # Replace the release asset with the fixed AppImage
+          # Replace the release asset with the fixed AppImage (exact name match;
+          # a pattern match would also hit the old pre-rename Sarviq asset).
+          # Also clean up any stale pre-rename Sarviq_* assets.
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          ASSET_ID=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" --jq '.assets[] | select(.name | endswith(".AppImage")) | .id')
-          if [ -n "$ASSET_ID" ]; then gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$ASSET_ID"; fi
+          for name in "$APPNAME" "Sarviq_0.1.0_amd64.AppImage" "Sarviq_0.1.0_amd64.deb" "Sarviq_0.1.0_x64-setup.exe"; do
+            ASSET_ID=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" --jq '.assets[] | select(.name == "'"$name"'") | .id' || true)
+            if [ -n "$ASSET_ID" ]; then echo "Deleting stale asset $name"; gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$ASSET_ID"; fi
+          done
           gh release upload "$TAG" "$work/$APPNAME" --clobber
           rm -rf "$work" squashfs-root
 
@@ -144,3 +148,8 @@ jobs:
             gh release upload "$TAG" "$f" --clobber
           done
           shopt -u nullglob
+          # One-time cleanup of pre-rename Sarviq_* assets
+          for name in "Sarviq_0.1.0_amd64.AppImage" "Sarviq_0.1.0_amd64.deb" "Sarviq_0.1.0_x64-setup.exe"; do
+            ASSET_ID=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" --jq '.assets[] | select(.name == "'"$name"'") | .id' || true)
+            if [ -n "$ASSET_ID" ]; then echo "Deleting stale asset $name"; gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$ASSET_ID"; fi
+          done
