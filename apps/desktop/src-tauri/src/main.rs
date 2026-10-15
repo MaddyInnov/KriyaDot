@@ -32,7 +32,7 @@ fn main() {
             const MAX_KEPT_LOG_BYTES: u64 = 8 * 1024 * 1024;
             let log_path = data_dir.join("mvp-api.log");
             let prev_log = data_dir.join("mvp-api.prev.log");
-            let keep_prev = true;
+            let mut keep_prev = true;
             if let Ok(meta) = std::fs::metadata(&log_path) {
                 if meta.len() > MAX_KEPT_LOG_BYTES {
                     let _ = std::fs::remove_file(&log_path);
