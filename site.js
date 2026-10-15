@@ -14,7 +14,7 @@
       el.textContent = n == null ? '–' : String(n);
     });
   }
-  fetch('https://api.github.com/repos/MaddyInnov/Sarviq')
+  fetch('https://api.github.com/repos/MaddyInnov/KriyaDot')
     .then(function (r) { return r.ok ? r.json() : null; })
     .then(function (d) { paintStars(d && d.stargazers_count); })
     .catch(function () { paintStars(null); });
