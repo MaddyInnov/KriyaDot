@@ -39,7 +39,17 @@ export interface DetectOptions {
 }
 
 function defaultHomeDir(): string {
-  // os.homedir() honors $HOME on POSIX, so tests can point it at a temp dir.
+  // Honor $HOME explicitly so tests (and containers) can point detection at
+  // a temp dir on every platform. os.homedir() only honors $HOME on POSIX —
+  // on Windows it reads USERPROFILE, which lets the real ~/.codex login leak
+  // into hermetic tests. On win32 only accept drive-absolute paths so a
+  // POSIX-style $HOME from MSYS/git-bash (e.g. "/c/Users/x") never produces
+  // a garbage join — those fall back to homedir().
+  const override = process.env.HOME;
+  if (override && override.length > 0) {
+    if (process.platform !== 'win32') return override;
+    if (/^[a-zA-Z]:[\\/]/.test(override) || override.startsWith('\\\\')) return override;
+  }
   return homedir();
 }
 
