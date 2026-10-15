@@ -6,24 +6,36 @@
 //   computer_click      — click at (x, y)          [MUTATING → require-approval]
 //   computer_type       — type text                [MUTATING → require-approval]
 //   computer_key        — press a named key         [MUTATING → require-approval]
+//   computer_open_app   — launch a desktop app      [MUTATING → require-approval]
 //
 // Trust model (never weakened):
 //   - The OS layer sits behind the OSScreenLayer interface. Tests and the
 //     default wiring use MockOSScreenLayer; a real OS adapter (robotjs,
 //     nut.js, platform accessibility APIs) is injected by the host and
 //     requires explicit OS-level permission grants (see docs/founder-setup.d/workstream-d.md).
+//   - The open-app tool launches processes via node:child_process (no new
+//     native deps); the launcher is injectable so tests never spawn real
+//     processes, and the app name is sanitized + resolved through a fixed
+//     alias map (see computer-apps.ts).
 //   - Approval gating flows through the governance pattern: the runtime
 //     evaluates every tool call against policy BEFORE the handler runs.
 //     computerUsePolicyRules() declares explicit require-approval rules for
-//     the three mutating actions (screenshot stays allow), so gating is
+//     the four mutating actions (screenshot stays allow), so gating is
 //     deterministic even if the global default policy changes. Nothing here
 //     bypasses governance — deny-by-default still applies to everything
 //     unmatched.
 //   - Input validation is defense-in-depth on top of governance: click
 //     coordinates are bounds-checked against the display, typed text is
-//     length-capped, and keys are allowlisted.
+//     length-capped, keys are allowlisted, and app names are restricted to
+//     a safe character set.
 
 import type { BotPolicyRule, ToolContext, ToolDefinition } from '../types.js';
+import {
+  OPEN_APP_TOOL_NAME,
+  createOpenAppTool,
+  type AppLauncher,
+  type LaunchPlatform,
+} from './computer-apps.js';
 
 /** Display geometry in physical pixels. */
 export interface DisplaySize {
@@ -105,6 +117,7 @@ export const COMPUTER_TOOL_NAMES = {
   click: 'computer_click',
   type: 'computer_type',
   key: 'computer_key',
+  openApp: OPEN_APP_TOOL_NAME,
 } as const;
 
 const MAX_TYPE_CHARS = 2000;
@@ -138,9 +151,9 @@ export function computerUsePolicyRules(): BotPolicyRule[] {
   return [
     {
       id: 'computer-use-require-approval',
-      toolPattern: '^computer_(click|type|key)$',
+      toolPattern: '^computer_(click|type|key|open_app)$',
       effect: 'require-approval',
-      reason: 'Computer-use mutating actions (click/type/key) always need human approval',
+      reason: 'Computer-use mutating actions (click/type/key/open_app) always need human approval',
     },
     {
       id: 'computer-use-screenshot-allow',
@@ -262,12 +275,25 @@ export interface ComputerUseToolsOptions {
    * calls, performs no real input). A real adapter is injected by the host.
    */
   os?: OSScreenLayer;
+  /**
+   * App launcher for computer_open_app. Defaults to ChildProcessAppLauncher
+   * (spawns detached via node:child_process). Inject a mock in tests.
+   */
+  appLauncher?: AppLauncher;
+  /** Override process.platform for the open-app tool (tests). */
+  platform?: LaunchPlatform;
 }
 
-/** Build the four computer-use ToolDefinitions. */
+/** Build the five computer-use ToolDefinitions. */
 export function createComputerUseTools(opts: ComputerUseToolsOptions = {}): ToolDefinition[] {
   const os = opts.os ?? new MockOSScreenLayer();
-  return [screenshotTool(os), clickTool(os), typeTool(os), keyTool(os)];
+  return [
+    screenshotTool(os),
+    clickTool(os),
+    typeTool(os),
+    keyTool(os),
+    createOpenAppTool({ launcher: opts.appLauncher, platform: opts.platform }),
+  ];
 }
 
 /**
@@ -291,3 +317,16 @@ export function registerComputerUseTool(
 
 // Re-export the context type for handler authors.
 export type { ToolContext };
+
+// Re-export the open-app building blocks (alias map, launcher interface,
+// attempt resolver) for hosts and tests.
+export {
+  APP_ALIASES,
+  OPEN_APP_TOOL_NAME,
+  ChildProcessAppLauncher,
+  createOpenAppTool,
+  normalizeAppName,
+  resolveLaunchAttempts,
+  validateAppName,
+} from './computer-apps.js';
+export type { AppLauncher, LaunchAttempt, LaunchPlatform, OpenAppResult } from './computer-apps.js';

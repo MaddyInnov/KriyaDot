@@ -39,11 +39,12 @@ function freshRegistry(os?: MockOSScreenLayer): { registry: Map<string, ToolDefi
 }
 
 describe('registration', () => {
-  it('registers four tools with the canonical names', () => {
+  it('registers five tools with the canonical names', () => {
     const { registry } = freshRegistry();
     expect([...registry.keys()].sort()).toEqual([
       COMPUTER_TOOL_NAMES.click,
       COMPUTER_TOOL_NAMES.key,
+      COMPUTER_TOOL_NAMES.openApp,
       COMPUTER_TOOL_NAMES.screenshot,
       COMPUTER_TOOL_NAMES.type,
     ]);
@@ -128,7 +129,12 @@ describe('approval gating (governance pattern)', () => {
 
   it('mutating actions evaluate to require-approval with a minted approval id', async () => {
     const gw = gatewayWithComputerPolicy();
-    for (const name of [COMPUTER_TOOL_NAMES.click, COMPUTER_TOOL_NAMES.type, COMPUTER_TOOL_NAMES.key]) {
+    for (const name of [
+      COMPUTER_TOOL_NAMES.click,
+      COMPUTER_TOOL_NAMES.type,
+      COMPUTER_TOOL_NAMES.key,
+      COMPUTER_TOOL_NAMES.openApp,
+    ]) {
       const res = await gw.evaluate(name, {}, evalCtx);
       expect(res.effect).toBe('require-approval');
       expect(typeof res.approvalId).toBe('string');

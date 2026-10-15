@@ -193,6 +193,7 @@ describe('LocalComputerSandbox (default backend)', () => {
     expect(tools.map((t) => t.name).sort()).toEqual([
       'computer_click',
       'computer_key',
+      'computer_open_app',
       'computer_screenshot',
       'computer_type',
     ]);
@@ -204,7 +205,7 @@ describe('LocalComputerSandbox (default backend)', () => {
 
   it('mutating actions stay approval-gated regardless of backend', () => {
     const rules = computerUsePolicyRules();
-    const clickRule = rules.find((r) => r.toolPattern === '^computer_(click|type|key)$');
+    const clickRule = rules.find((r) => r.toolPattern === '^computer_(click|type|key|open_app)$');
     expect(clickRule?.effect).toBe('require-approval');
   });
 });
