@@ -697,7 +697,7 @@ async function boot(): Promise<void> {
   // cross-origin (http://127.0.0.1:4567). Revisit with an allowlist when
   // auth/multi-user ships.
   app.use(cors({ origin: '*' }));
-  app.use(express.json({ limit: '15mb' }));
+  app.use(express.json({ limit: '150mb' })); // 100MB file uploads (base64 +33%)
   // Phase 4: A2A agent-card discovery (spec-correct location).
   app.get('/.well-known/agent-card.json', (_req, res) => {
     res.json(defaultAgentCard(`http://127.0.0.1:${config.port}/api/protocols/a2a`));

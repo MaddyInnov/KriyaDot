@@ -1026,6 +1026,29 @@ export interface UploadedFile {
   size: number;
   mimeType: string;
   uploadedAt: string;
+  extracted?: {
+    units?: number;
+    unitLabel?: string;
+    truncated?: boolean;
+    charCount?: number;
+  };
+  extractFailed?: boolean;
+}
+
+/** File-type icon for attachment chips. */
+export function fileTypeIcon(name: string, mimeType: string): string {
+  const ext = name.toLowerCase().split('.').pop() ?? '';
+  const mt = mimeType.toLowerCase();
+  if (mt === 'application/pdf' || ext === 'pdf') return '📕';
+  if (ext === 'docx' || ext === 'doc') return '📘';
+  if (ext === 'xlsx' || ext === 'xls' || ext === 'csv') return '📊';
+  if (ext === 'pptx' || ext === 'ppt') return '📙';
+  if (mt.startsWith('image/')) return '🖼️';
+  if (mt.startsWith('audio/')) return '🎵';
+  if (mt.startsWith('video/')) return '🎬';
+  if (['txt', 'md'].includes(ext)) return '📝';
+  if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) return '📦';
+  return '📄';
 }
 
 export async function uploadFile(file: File): Promise<UploadedFile> {

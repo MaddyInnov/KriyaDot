@@ -23,6 +23,7 @@ import {
   streamChat,
   uploadFile,
   deleteUploadedFile,
+  fileTypeIcon,
   type MessageReaction,
 } from '../lib/api';
 import type {
@@ -2007,6 +2008,10 @@ function ChatPageInner() {
                 setUploading(true);
                 try {
                   for (const f of files) {
+                    if (f.size > 100 * 1024 * 1024) {
+                      setLoadError(`"${f.name}" is too large (max 100MB)`);
+                      continue;
+                    }
                     const uploaded = await uploadFile(f);
                     setAttachedFiles((prev) => [...prev, uploaded]);
                   }
@@ -2030,8 +2035,20 @@ function ChatPageInner() {
             {attachedFiles.length > 0 && (
               <div className="attached-files">
                 {attachedFiles.map((f) => (
-                  <span key={f.id} className="file-chip">
-                    📄 {f.name}
+                  <span key={f.id} className="file-chip" title={
+                    f.extracted
+                      ? `Text extracted${f.extracted.units ? ` (${f.extracted.units} ${f.extracted.unitLabel ?? 'units'})` : ''}${f.extracted.truncated ? ' — truncated to 100KB' : ''}`
+                      : f.extractFailed
+                        ? 'Preview not available'
+                        : f.name
+                  }>
+                    {fileTypeIcon(f.name, f.mimeType)} {f.name}
+                    {f.extracted && (
+                      <span className="extract-badge">
+                        ✓{f.extracted.units ? ` ${f.extracted.units}${f.extracted.unitLabel ? ` ${f.extracted.unitLabel}` : ''}` : ''}
+                      </span>
+                    )}
+                    {f.extractFailed && <span className="extract-badge extract-failed">no preview</span>}
                     <button
                       onClick={async () => {
                         try {

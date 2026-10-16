@@ -128,6 +128,7 @@ import type {
   ProviderKeyBody,
   RunWorkflowBody,
 } from './types.js';
+import { extractDocumentText, detectDocKind } from './document-extract.js';
 
 export interface RouteDeps {
   config: AppConfig;
@@ -1325,12 +1326,32 @@ export function createRouter(deps: RouteDeps): express.Router {
             } catch {
               // ignore
             }
-            // Text files: inject content (up to 100KB). Others: note presence.
-            if (mimeType.startsWith('text/') || /\.(txt|md|json|js|ts|py|csv|log)$/i.test(name)) {
+            // Text-extracted documents (PDF/DOCX/XLSX/PPTX/text): inject
+            // extracted content (up to 100KB). Others: note presence.
+            const extractedPath = `${filePath}.extracted.txt`;
+            let extractedText: string | null = null;
+            try {
+              extractedText = readFileSync(extractedPath, 'utf8');
+            } catch {
+              // no cached extraction
+            }
+            if (extractedText) {
+              let meta: { extracted?: { units?: number; unitLabel?: string; truncated?: boolean } } = {};
+              try {
+                meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+              } catch {
+                // ignore
+              }
+              const unitInfo = meta.extracted?.units
+                ? ` (${meta.extracted.units} ${meta.extracted.unitLabel ?? 'units'})`
+                : '';
+              const truncNote = meta.extracted?.truncated ? '\n[Content truncated to 100KB]' : '';
+              fileSections.push(`[Attached file: ${name}${unitInfo}]\n${extractedText}${truncNote}`);
+            } else if (mimeType.startsWith('text/') || /\.(txt|md|json|js|ts|py|csv|log)$/i.test(name)) {
               const content = readFileSync(filePath, 'utf8').slice(0, 100_000);
               fileSections.push(`[Attached file: ${name}]\n${content}`);
             } else {
-              fileSections.push(`[Attached file: ${name} (${mimeType}) — binary file, use read_file tool to access if needed]`);
+              fileSections.push(`[Attached file: ${name} (${mimeType}) — preview not available, use read_file tool to access if needed]`);
             }
           } catch {
             // ignore unreadable files
@@ -1724,7 +1745,7 @@ export function createRouter(deps: RouteDeps): express.Router {
     // ignore
   }
 
-  router.post('/files/upload', (req, res) => {
+  router.post('/files/upload', async (req, res) => {
     const body = (req.body ?? {}) as { name?: unknown; mimeType?: unknown; data?: unknown };
     if (typeof body.name !== 'string' || !body.name.trim()) {
       res.status(400).json(errorBody('name is required'));
@@ -1734,9 +1755,9 @@ export function createRouter(deps: RouteDeps): express.Router {
       res.status(400).json(errorBody('data (base64) is required'));
       return;
     }
-    // 10MB limit (base64 inflates ~33%)
-    if (body.data.length > 14_000_000) {
-      res.status(400).json(errorBody('File too large (max 10MB)'));
+    // 100MB limit (base64 inflates ~33%)
+    if (body.data.length > 140_000_000) {
+      res.status(400).json(errorBody('File too large (max 100MB)'));
       return;
     }
     const id = randomUUID();
@@ -1746,18 +1767,43 @@ export function createRouter(deps: RouteDeps): express.Router {
     try {
       const buffer = Buffer.from(body.data, 'base64');
       // Re-check decoded size: base64 whitespace is ignored on decode, so the
-      // string-length check above is approximate. 10 MB hard cap on bytes.
-      if (buffer.length > 10 * 1024 * 1024) {
-        res.status(400).json(errorBody('File too large (max 10MB)'));
+      // string-length check above is approximate. 100 MB hard cap on bytes.
+      if (buffer.length > 100 * 1024 * 1024) {
+        res.status(400).json(errorBody('File too large (max 100MB)'));
         return;
       }
       writeFileSync(filePath, buffer);
+      const mimeType = typeof body.mimeType === 'string' ? body.mimeType : 'application/octet-stream';
+      // Local document text extraction (best-effort, never blocks upload).
+      let extracted: { units?: number; unitLabel?: string; truncated?: boolean; charCount?: number } | undefined;
+      let extractFailed = false;
+      try {
+        const kind = detectDocKind(mimeType, safeName);
+        if (kind !== 'unsupported') {
+          const result = await extractDocumentText(filePath, mimeType, safeName);
+          if (result.text) {
+            writeFileSync(`${filePath}.extracted.txt`, result.text, 'utf8');
+            extracted = {
+              units: result.units,
+              unitLabel: result.unitLabel,
+              truncated: result.truncated || undefined,
+              charCount: result.text.length,
+            };
+          } else {
+            extractFailed = true;
+          }
+        }
+      } catch {
+        extractFailed = true;
+      }
       const meta = {
         id,
         name: safeName,
         size: buffer.length,
-        mimeType: typeof body.mimeType === 'string' ? body.mimeType : 'application/octet-stream',
+        mimeType,
         uploadedAt: new Date().toISOString(),
+        extracted,
+        extractFailed: extractFailed || undefined,
       };
       writeFileSync(`${filePath}.meta.json`, JSON.stringify(meta));
       res.json(meta);

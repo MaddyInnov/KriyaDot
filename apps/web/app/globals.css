@@ -4146,3 +4146,20 @@ html[data-ux='simple'] .mic-btn.recording {
 .conv-status.pending { opacity: 0.7; font-style: italic; }
 .conv-status.failed { color: #fca5a5; }
 .conv-time { margin-top: 0.25rem; font-size: 0.7rem; opacity: 0.5; }
+
+/* Attachment chips: extraction badges */
+.extract-badge {
+  display: inline-block;
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: #6ee7b7;
+  background: rgba(110, 231, 183, 0.12);
+  border-radius: 8px;
+  padding: 0.05rem 0.35rem;
+  margin-left: 0.3rem;
+  white-space: nowrap;
+}
+.extract-badge.extract-failed {
+  color: #fca5a5;
+  background: rgba(252, 165, 165, 0.12);
+}
