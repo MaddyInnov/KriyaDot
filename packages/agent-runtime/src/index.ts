@@ -55,6 +55,7 @@ export * from './peer-approval.js';
 export * from './chief.js';
 export * from './tools/chief.js';
 export * from './teams.js';
+export * from './group-goals.js';
 export * from './hooks.js';
 export * from './worktrees.js';
 export * from './fusion.js';

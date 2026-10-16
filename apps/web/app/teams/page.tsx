@@ -6,6 +6,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { authedFetch } from '../../lib/api';
 import { normalizeBots } from '../../lib/teams';
+import GoalsPanel from '../../components/goals/goals-panel';
 
 interface Bot {
   id: string;
@@ -61,6 +62,9 @@ export default function TeamsPage() {
   const [liveRun, setLiveRun] = useState<TeamRun | null>(null);
   const [error, setError] = useState<string | null>(null);
   const esRef = useRef<AbortController | null>(null);
+  // Group goals tab (OpenMausBot parity P1 #11): bounded multi-turn
+  // coordinator/worker goal runs. No new top-level nav — lives under Teams.
+  const [tab, setTab] = useState<'teams' | 'goals'>('teams');
 
   const active = teams.find((t) => t.id === activeId) ?? null;
   const botName = (id: string) => bots.find((b) => b.id === id)?.name ?? id;
@@ -224,6 +228,18 @@ export default function TeamsPage() {
       </div>
       {error && <div className="error">{error}</div>}
 
+      <div className="tabs">
+        <button className={tab === 'teams' ? 'tab active' : 'tab'} onClick={() => setTab('teams')}>
+          Teams
+        </button>
+        <button className={tab === 'goals' ? 'tab active' : 'tab'} onClick={() => setTab('goals')}>
+          🎯 Group goals
+        </button>
+      </div>
+
+      {tab === 'goals' && <GoalsPanel bots={bots} />}
+
+      {tab === 'teams' && (
       <div className="two-col">
         <div className="card">
           <h2>Teams</h2>
@@ -332,6 +348,7 @@ export default function TeamsPage() {
           )}
         </div>
       </div>
+      )}
     </div>
   );
 }

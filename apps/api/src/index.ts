@@ -590,11 +590,25 @@ async function boot(): Promise<void> {
     console.log(`[routines] marked ${recoveredRuns} interrupted run(s) as failed (server restart)`);
   }
   const { renderRoutinePrompt: renderRoutinePromptForRuns } = await import('./webhooks.js');
+  // Group goals (OpenMausBot parity P1 #11): mutable hook holder filled by
+  // registerGroupGoalRoutes inside createRouter (below); the routine
+  // executor forwards goal-mode routine fires to the goal engine.
+  const groupGoalHooks: {
+    startGroupGoal?: (args: {
+      routine: { id: string; name: string; botId: string };
+      prompt: string;
+    }) => Promise<string>;
+  } = {};
   const routineRunExecutor = new RoutineRunExecutor({
     runStore: routineRunStore,
     agentRuntime,
     getBots: () => seed.bots,
     renderPrompt: renderRoutinePromptForRuns,
+    startGroupGoal: (args) => {
+      const hook = groupGoalHooks.startGroupGoal;
+      if (!hook) throw new Error('group-goal engine not initialized');
+      return hook(args);
+    },
   });
   const { routineStore, triggerStore: routineTriggerStore } = registerRoutineRoutes(
     routinesRouter,
@@ -1121,6 +1135,8 @@ async function boot(): Promise<void> {
       // Native realtime speech-to-speech (OpenMausBot parity P0 #9).
       realtimeVoice: { service: realtimeVoiceService },
       push: pushService,
+      // Group goals (OpenMausBot parity P1 #11): routine-as-goal hook.
+      groupGoalHooks,
       recordingStore,
       chatQueueStore,
       mcpServers: seed.mcpServers,

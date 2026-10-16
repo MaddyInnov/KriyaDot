@@ -68,6 +68,7 @@ import { registerTasksRoutes } from './tasks.js';
 import { registerPagesRoutes } from './pages.js';
 import { registerTerminalRoutes } from './terminal-routes.js';
 import { registerTeamRoutes } from './teams-routes.js';
+import { registerGroupGoalRoutes } from './group-goal-routes.js';
 import { registerSpaceRoutes, resolveSpaceForRun, SpaceHttpError, type SpaceRunContext } from './spaces-routes.js';
 import { registerPhoneRoutes } from './phone-routes.js';
 import type { AdbPhoneProvider } from './phone-adb.js';
@@ -233,6 +234,18 @@ export interface RouteDeps {
    */
   realtimeVoice?: {
     service: import('./voice-realtime.js').RealtimeVoiceService;
+  };
+  /**
+   * Group goals (OpenMausBot parity P1 #11): routine-as-goal hook. index.ts
+   * passes a mutable holder; registerGroupGoalRoutes fills in
+   * `startGroupGoal` once the engine exists, and index.ts forwards it to
+   * the RoutineRunExecutor so goal-mode routines start group goals.
+   */
+  groupGoalHooks?: {
+    startGroupGoal?: (args: {
+      routine: { id: string; name: string; botId: string };
+      prompt: string;
+    }) => Promise<string>;
   };
 }
 
@@ -2504,6 +2517,23 @@ export function createRouter(deps: RouteDeps): express.Router {
     delegationBroker: deps.governanceAdapter,
   });
   router.use('/teams', teamsRouter);
+
+  // Group goals (OpenMausBot parity P1 #11): bounded multi-turn
+  // coordinator/worker runs with explicit completion decisions. Mounted
+  // next to teams (no new top-level API surface beyond /group-goals).
+  const groupGoalsRouter = express.Router();
+  registerGroupGoalRoutes(groupGoalsRouter, {
+    dataDir: config.dataDir,
+    agentRuntime,
+    getBots: () => bots,
+    // Same peer-approval broker as teams: coordinator delegations ask the
+    // user in the approvals inbox ('always-ask' semantics for ad-hoc goals).
+    delegationBroker: deps.governanceAdapter,
+    push: deps.push,
+    audit: (action, fields) => governance.audit(action, fields),
+    groupGoalHooks: deps.groupGoalHooks,
+  });
+  router.use('/group-goals', groupGoalsRouter);
 
   // Spaces: user-level contexts (Work/Personal, ...) with per-space model /
   // API-key / workspace overrides and pause/resume.

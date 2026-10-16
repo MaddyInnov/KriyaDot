@@ -367,6 +367,17 @@ export interface RoutineRunExecutorDeps {
   getBots: () => BotConfig[];
   /** Template rendering; default is {{payload}}/{{body}} substitution. */
   renderPrompt?: (template: string, body: unknown) => string;
+  /**
+   * Routine-as-goal (OpenMausBot parity P1 #11): when a routine has
+   * `goalMode` set, firing it calls this hook instead of running a single
+   * agent turn. The hook starts a bounded multi-turn group goal pursuing
+   * the routine's objective and resolves with the goal id. Unset →
+   * goal-mode routines fall back to a normal single turn (with a warning).
+   */
+  startGroupGoal?: (args: {
+    routine: BotRoutine;
+    prompt: string;
+  }) => Promise<string>;
 }
 
 const OUTPUT_EXCERPT_LIMIT = 2000;
@@ -469,6 +480,28 @@ export class RoutineRunExecutor {
         console.error('[routine-runs] onSettled threw:', err instanceof Error ? err.message : err);
       }
     };
+    // Routine-as-goal (OpenMausBot parity P1 #11): a goal-mode routine
+    // pursues its objective as a bounded multi-turn group goal instead of
+    // a single agent turn. The routine run record stays as the audit trail
+    // pointing at the goal.
+    if (opts.routine.goalMode === true) {
+      try {
+        const message = opts.message ?? render(opts.routine.promptTemplate, opts.payload ?? {});
+        if (!this.deps.startGroupGoal) {
+          console.warn(
+            `[routine-runs] routine "${opts.routine.id}" has goalMode but no group-goal hook; running a single turn instead`,
+          );
+        } else {
+          const goalId = await this.deps.startGroupGoal({ routine: opts.routine, prompt: message });
+          excerpt = `Group goal ${goalId} started.`;
+          settle({ status: 'succeeded' });
+          return;
+        }
+      } catch (err) {
+        settle({ status: 'failed', error: err instanceof Error ? err.message : String(err) });
+        return;
+      }
+    }
     try {
       const message = opts.message ?? render(opts.routine.promptTemplate, opts.payload ?? {});
       const usage = await this.deps.agentRuntime.runTurn({

@@ -13,7 +13,7 @@
 //   POST   /                        → { name, botId, promptTemplate, sessionId?, schedule? }
 //   GET    /                        → list routines (each with nextRunAt)
 //   GET    /:id                     → one routine (+ nextRunAt)
-//   PATCH  /:id                     → { name?, botId?, promptTemplate?, sessionId?, schedule?|null, enabled? }
+//   PATCH  /:id                     → { name?, botId?, promptTemplate?, sessionId?, schedule?|null, goalMode?, enabled? }
 //   DELETE /:id                     → delete routine (+ its webhook triggers)
 //   GET    /:id/next-runs?n=5       → upcoming scheduled run times
 //   POST   /:id/schedule/enable     → enable the schedule
@@ -55,6 +55,14 @@ export interface BotRoutine {
   schedule?: RoutineSchedule | null;
   /** Last scheduled-fire watermark (UTC ms), maintained by RoutineScheduler. */
   lastFiredAt?: number;
+  /**
+   * Routine-as-goal (OpenMausBot parity P1 #11): when true, firing the
+   * routine starts a bounded multi-turn group goal pursuing the routine's
+   * objective (coordinator auto-selected, chief preferred) instead of a
+   * single agent turn. The goal runs in the background and is visible
+   * under Teams → Group goals.
+   */
+  goalMode?: boolean;
   enabled: boolean;
   createdAt: number;
 }
@@ -79,6 +87,7 @@ interface RoutineRow {
   session_id: string | null;
   schedule: string | null;
   last_fired_at: number | null;
+  goal_mode: number | null;
   enabled: number;
   created_at: number;
 }
@@ -110,6 +119,7 @@ function rowToRoutine(r: RoutineRow): BotRoutine {
     sessionId: r.session_id ?? undefined,
     schedule,
     lastFiredAt: r.last_fired_at ?? undefined,
+    goalMode: r.goal_mode === 1 ? true : undefined,
     enabled: r.enabled === 1,
     createdAt: r.created_at,
   };
@@ -171,6 +181,11 @@ function openDb(dataDir: string): DatabaseSync {
   if (!cols.some((c) => c.name === 'last_fired_at')) {
     db.exec('ALTER TABLE bot_routines ADD COLUMN last_fired_at INTEGER');
   }
+  // Migration: routine-as-goal (OpenMausBot parity P1 #11). Firing a
+  // goal-mode routine starts a group goal instead of a single turn.
+  if (!cols.some((c) => c.name === 'goal_mode')) {
+    db.exec('ALTER TABLE bot_routines ADD COLUMN goal_mode INTEGER');
+  }
   return db;
 }
 
@@ -191,6 +206,7 @@ export class RoutineStore {
     promptTemplate: string;
     sessionId?: string;
     schedule?: RoutineSchedule | null;
+    goalMode?: boolean;
   }): BotRoutine {
     const name = input.name.trim().slice(0, 120);
     if (!name) throw new Error('name is required');
@@ -212,12 +228,13 @@ export class RoutineStore {
       promptTemplate,
       sessionId: input.sessionId,
       schedule,
+      goalMode: input.goalMode === true ? true : undefined,
       enabled: true,
       createdAt: Date.now(),
     };
     this.db
       .prepare(
-        'INSERT INTO bot_routines (id, name, bot_id, prompt_template, session_id, schedule, enabled, created_at, webhook_secret) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)',
+        'INSERT INTO bot_routines (id, name, bot_id, prompt_template, session_id, schedule, goal_mode, enabled, created_at, webhook_secret) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)',
       )
       .run(
         routine.id,
@@ -226,6 +243,7 @@ export class RoutineStore {
         routine.promptTemplate,
         routine.sessionId ?? null,
         schedule ? JSON.stringify(schedule) : null,
+        routine.goalMode === true ? 1 : null,
         routine.createdAt,
         randomBytes(32).toString('hex'),
       );
@@ -250,6 +268,7 @@ export class RoutineStore {
       promptTemplate?: string;
       sessionId?: string | null;
       schedule?: RoutineSchedule | null;
+      goalMode?: boolean;
       enabled?: boolean;
     },
   ): BotRoutine | undefined {
@@ -279,10 +298,11 @@ export class RoutineStore {
       // occurrences that "would have" fired before the schedule existed.
       next.lastFiredAt = Date.now();
     }
+    if (patch.goalMode !== undefined) next.goalMode = patch.goalMode === true ? true : undefined;
     if (patch.enabled !== undefined) next.enabled = patch.enabled;
     this.db
       .prepare(
-        'UPDATE bot_routines SET name = ?, bot_id = ?, prompt_template = ?, session_id = ?, schedule = ?, last_fired_at = ?, enabled = ? WHERE id = ?',
+        'UPDATE bot_routines SET name = ?, bot_id = ?, prompt_template = ?, session_id = ?, schedule = ?, last_fired_at = ?, goal_mode = ?, enabled = ? WHERE id = ?',
       )
       .run(
         next.name,
@@ -291,6 +311,7 @@ export class RoutineStore {
         next.sessionId ?? null,
         next.schedule ? JSON.stringify(next.schedule) : null,
         next.lastFiredAt ?? null,
+        next.goalMode === true ? 1 : null,
         next.enabled ? 1 : 0,
         id,
       );
@@ -484,6 +505,7 @@ export function registerRoutineRoutes(
       promptTemplate?: unknown;
       sessionId?: unknown;
       schedule?: unknown;
+      goalMode?: unknown;
     };
     const botId = typeof body.botId === 'string' ? body.botId : '';
     if (!deps.getBots().some((b) => b.id === botId)) {
@@ -500,6 +522,7 @@ export function registerRoutineRoutes(
           body.schedule === null || body.schedule === undefined
             ? null
             : (body.schedule as RoutineSchedule),
+        goalMode: body.goalMode === true,
       });
       res.status(201).json({ ok: true, routine: withNextRun(routine) });
     } catch (err) {
@@ -526,6 +549,7 @@ export function registerRoutineRoutes(
       promptTemplate?: unknown;
       sessionId?: unknown;
       schedule?: unknown;
+      goalMode?: unknown;
       enabled?: unknown;
     };
     if (body.botId !== undefined && !deps.getBots().some((b) => b.id === body.botId)) {
@@ -549,6 +573,7 @@ export function registerRoutineRoutes(
             : body.schedule === undefined
               ? undefined
               : (body.schedule as RoutineSchedule),
+        goalMode: typeof body.goalMode === 'boolean' ? body.goalMode : undefined,
         enabled: typeof body.enabled === 'boolean' ? body.enabled : undefined,
       });
       res.json({ ok: true, routine: updated ? withNextRun(updated) : updated });
