@@ -80,8 +80,9 @@ import {
 import { registerWorktreeRoutes } from './worktrees-routes.js';
 import { createWorktreeTools } from '@mvp/agent-runtime/dist/worktrees.js';
 import { HookBus, loadPlugins } from '@mvp/agent-runtime/dist/hooks.js';
-import { selectComputerSandbox } from '@mvp/agent-runtime/dist/tools/computer-sandbox.js';
 import { runChatCli, runScanCli } from './cli.js';
+// (selectComputerSandbox import removed: per-bot computers (P1 #14) replaced
+// the single shared sandbox with a PerBotComputerManager; see below.)
 // Phase 3: scheduled workflows create tasks; the platform also serves its
 // own tools as an MCP server (two-way MCP).
 import { makeTaskCreator } from './tasks.js';
@@ -95,6 +96,18 @@ import type { McpConnectionClass } from './mcp-annotations.js';
 // imported directly (not re-exported from the agent-runtime index — index
 // untouched), following the pricing.ts precedent in routes.ts.
 import { computerUsePolicyRules, registerComputerUseTool } from '@mvp/agent-runtime/dist/tools/computer.js';
+// Per-bot computers + "Works on" surface selection (OpenMausBot parity P1
+// #14): each bot gets its own computer instance instead of one shared
+// sandbox. Same direct-dist-subpath import pattern as computer.js above.
+import {
+  PerBotComputerManager,
+  type ComputerSurface,
+} from '@mvp/agent-runtime/dist/tools/computer-surfaces.js';
+import {
+  applyComputerSurfacePins,
+  applyComputerSurfaces,
+} from './computer-surfaces.js';
+import { registerComputerSurfaceRoutes } from './computer-surface-routes.js';
 // Password-safe login typing (type_login): resolves the vault password
 // server-side inside the handler; the model plane never sees values.
 // Same direct-dist-subpath import pattern as computer.js above.
@@ -102,7 +115,8 @@ import { registerTypeLoginTool } from '@mvp/agent-runtime/dist/tools/type-login.
 import { SecureVault } from '@mvp/vault';
 // Real foreground OS layer (opt-in via COMPUTER_USE_REAL=1; mock by default).
 // Same direct-dist-subpath import pattern as computer.js above.
-// (Kept for reference; the live path now goes through selectComputerSandbox.)
+// (Per-bot computers (P1 #14) resolve layers lazily per bot via the
+// PerBotComputerManager above; there is no shared sandbox anymore.)
 import {
   ModuleDb,
   ReminderStore,
@@ -242,6 +256,9 @@ async function boot(): Promise<void> {
   // Phase 2: per-bot policy overrides persisted in <dataDir>/bot-policies.json
   // are applied onto the in-memory bot configs before anything else reads them.
   applyBotPolicies(seed.bots, config.dataDir);
+  // Per-bot "Works on" computer surfaces (P1 #14): overlay from
+  // <dataDir>/computer-surfaces.json. Unset → 'auto'.
+  applyComputerSurfaces(seed.bots, config.dataDir);
   // MBTI personas: per-bot overlay from <dataDir>/bot-personas.json.
   const { applyBotPersonas } = await import('./bot-personas.js');
   applyBotPersonas(seed.bots, config.dataDir);
@@ -313,6 +330,36 @@ async function boot(): Promise<void> {
   const phoneHub = new PhoneSessionHub(phoneStore, (action, fields) => governance.audit(action, fields));
   const phoneAdb = new AdbPhoneProvider();
 
+  // Per-bot computers (OpenMausBot parity P1 #14): every bot gets its OWN
+  // computer instance (own display state, own serialized input queue) plus
+  // a "Works on" surface choice (auto/local/docker/browser/off), instead of
+  // one shared sandbox. Instances are created lazily on first computer-tool
+  // use, dropped when the surface changes or the bot is deleted, and reaped
+  // after 30 min idle. Created before the computer view so the viewer's
+  // createLayer resolves to the same instance the bot's tools drive.
+  const computerManager = new PerBotComputerManager({
+    onRealAction: (action, detail) => {
+      console.log(`[computer-real] ${action}`, JSON.stringify(detail));
+      try {
+        governance.audit('tool.computer_real_action', {
+          actor: 'agent',
+          toolName: `computer_${action}`,
+          detail,
+        });
+      } catch {
+        // Audit must never break input.
+      }
+    },
+  });
+  applyComputerSurfacePins(computerManager, config.dataDir);
+  // Idle sweep every 5 minutes (reaps computers idle > 30 min by default).
+  const computerIdleTimer = setInterval(() => {
+    computerManager.idleSweep().catch((err) => {
+      console.warn('[computer-surfaces] idle sweep failed:', (err as Error).message);
+    });
+  }, 5 * 60 * 1000);
+  if (typeof computerIdleTimer.unref === 'function') computerIdleTimer.unref();
+
   // Per-bot computer view (OpenMausBot parity): live screen stream + user
   // input per bot. The hub is created here so the WS upgrade handler below
   // shares the instance with the REST routes.
@@ -320,6 +367,11 @@ async function boot(): Promise<void> {
     audit: (action, fields) => governance.audit(action, fields),
     listAudit: (limit) => governance.listAudit(limit),
     loopbackToken,
+    // The viewer shows the same per-bot instance the bot's tools drive.
+    createLayer: (botId: string) =>
+      computerManager.getLayer(botId, {
+        surface: botsById.get(botId)?.computerSurface,
+      }),
   });
 
   const governanceAdapter = new GovernanceAdapter(governance, {
@@ -346,34 +398,18 @@ async function boot(): Promise<void> {
   // are approval-gated via computerUsePolicyRules above; the default OS
   // layer is the mock — no real input) and Muse-module tools (research_deep,
   // browser_action — browser_action approval-gated via museModuleToolPolicies).
-  // selectOSLayer() returns the Playwright browser layer when
-  // COMPUTER_USE_PLAYWRIGHT=1 (see docs/computer-use-playwright.md), the
-  // REAL foreground layer when COMPUTER_USE_REAL=1; otherwise the safe mock.
-  // The approval gate applies identically either way — governance evaluates
-  // before the handler runs.
-  // Pluggable computer sandbox (Dots parity): selectComputerSandbox() returns
-  // the Docker container backend when COMPUTER_USE_DOCKER=1, the Playwright
-  // browser layer when COMPUTER_USE_PLAYWRIGHT=1, the REAL foreground layer
-  // when COMPUTER_USE_REAL=1; otherwise the safe mock. LocalComputerSandbox
-  // delegates to the previous selectOSLayer() path, so behavior is unchanged
-  // by default. The approval gate applies identically either way.
-  const computerSandbox = selectComputerSandbox({
-    onRealAction: (action, detail) => {
-      console.log(`[computer-real] ${action}`, JSON.stringify(detail));
-      try {
-        governance.audit('tool.computer_real_action', {
-          actor: 'agent',
-          toolName: `computer_${action}`,
-          detail,
-        });
-      } catch {
-        // Audit must never break input.
-      }
-    },
-  });
-  await computerSandbox.launch(); // no-op for local; starts the container for docker
+  // Per-bot computers (OpenMausBot parity P1 #14): the tools no longer share
+  // one sandbox. Each handler resolves its OS layer per tool call from the
+  // calling bot's "Works on" surface (BotConfig.computerSurface, default
+  // 'auto' → docker if COMPUTER_USE_DOCKER=1, playwright if
+  // COMPUTER_USE_PLAYWRIGHT=1, else local mock/real via COMPUTER_USE_REAL=1;
+  // see docs/computer-use-playwright.md). The approval gate applies
+  // identically either way — governance evaluates before the handler runs.
+  const resolveBotComputerOS = computerManager.resolveOSFor(
+    (botId: string): ComputerSurface | undefined => botsById.get(botId)?.computerSurface,
+  );
   registerComputerUseTool(toolRegistry, {
-    os: computerSandbox,
+    resolveOS: resolveBotComputerOS,
   });
   // type_login (Codync parity): the handler resolves the vault password
   // server-side — the model plane only ever sees the loginId. Vault is
@@ -383,7 +419,8 @@ async function boot(): Promise<void> {
   // must match the login's stored site; the human approval gate is the
   // real protection (the approval card names the login and site).
   registerTypeLoginTool(toolRegistry, {
-    os: computerSandbox,
+    // Per-bot computers (P1 #14): type onto the calling bot's own surface.
+    resolveOS: resolveBotComputerOS,
     getLogin: (loginId: string) => {
       const vault = new SecureVault(config.dataDir, 'default-user', 'type-login-tool');
       const rec = vault.getLogin(loginId);
@@ -1144,6 +1181,7 @@ async function boot(): Promise<void> {
       runHealth,
       omniStore,
       omniCollector,
+      computerManager,
     }),
   );
   // Parity workstreams: routers. All factories; none of these existed before.
@@ -1427,7 +1465,10 @@ async function boot(): Promise<void> {
     hookDeliveryWorker.stop();
     await closeMcp();
     try {
-      await computerSandbox.kill();
+      // Tear down every per-bot computer instance (P1 #14).
+      for (const bot of seed.bots) {
+        await computerManager.removeBot(bot.id);
+      }
     } catch {
       // ignore
     }

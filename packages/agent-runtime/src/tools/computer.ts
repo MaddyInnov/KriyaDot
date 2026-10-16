@@ -288,7 +288,7 @@ function assertInDisplay(x: number, y: number, width: number, height: number, wh
   }
 }
 
-function screenshotTool(os: OSScreenLayer): ToolDefinition {
+function screenshotTool(os: OSScreenLayer, resolveOS?: ResolveOSLayer): ToolDefinition {
   return {
     name: COMPUTER_TOOL_NAMES.screenshot,
     description:
@@ -298,8 +298,9 @@ function screenshotTool(os: OSScreenLayer): ToolDefinition {
       properties: {},
       additionalProperties: false,
     },
-    handler: async (_args, _ctx) => {
-      const shot = await os.screenshot();
+    handler: async (_args, ctx) => {
+      const layer = resolveOS ? await resolveOS(ctx) : os;
+      const shot = await layer.screenshot();
       return {
         width: shot.width,
         height: shot.height,
@@ -309,7 +310,7 @@ function screenshotTool(os: OSScreenLayer): ToolDefinition {
   };
 }
 
-function clickTool(os: OSScreenLayer): ToolDefinition {
+function clickTool(os: OSScreenLayer, resolveOS?: ResolveOSLayer): ToolDefinition {
   return {
     name: COMPUTER_TOOL_NAMES.click,
     mutating: true,
@@ -329,10 +330,11 @@ function clickTool(os: OSScreenLayer): ToolDefinition {
       required: ['x', 'y'],
       additionalProperties: false,
     },
-    handler: async (args, _ctx) => {
+    handler: async (args, ctx) => {
+      const layer = resolveOS ? await resolveOS(ctx) : os;
       const x = intArg(args, 'x');
       const y = intArg(args, 'y');
-      const { width, height } = await os.displaySize();
+      const { width, height } = await layer.displaySize();
       assertInDisplay(x, y, width, height, 'click');
       const buttonRaw = args['button'] ?? 'left';
       if (typeof buttonRaw !== 'string' || !COMPUTER_DRAG_BUTTONS.has(buttonRaw)) {
@@ -344,13 +346,13 @@ function clickTool(os: OSScreenLayer): ToolDefinition {
         throw new Error('"clicks" must be 1 (single click) or 2 (double-click)');
       }
       const opts: ClickOptions = { button, clicks: clicksRaw };
-      await os.click(Math.floor(x), Math.floor(y), opts);
+      await layer.click(Math.floor(x), Math.floor(y), opts);
       return { clicked: { x: Math.floor(x), y: Math.floor(y), button, clicks: clicksRaw } };
     },
   };
 }
 
-function typeTool(os: OSScreenLayer): ToolDefinition {
+function typeTool(os: OSScreenLayer, resolveOS?: ResolveOSLayer): ToolDefinition {
   return {
     name: COMPUTER_TOOL_NAMES.type,
     mutating: true,
@@ -364,19 +366,20 @@ function typeTool(os: OSScreenLayer): ToolDefinition {
       required: ['text'],
       additionalProperties: false,
     },
-    handler: async (args, _ctx) => {
+    handler: async (args, ctx) => {
+      const layer = resolveOS ? await resolveOS(ctx) : os;
       const text = String(args['text'] ?? '');
       if (!text) throw new Error('"text" must be non-empty');
       if (text.length > MAX_TYPE_CHARS) {
         throw new Error(`"text" too long (${text.length} > ${MAX_TYPE_CHARS} chars)`);
       }
-      await os.type(text);
+      await layer.type(text);
       return { typedChars: text.length };
     },
   };
 }
 
-function keyTool(os: OSScreenLayer, platform: LaunchPlatform): ToolDefinition {
+function keyTool(os: OSScreenLayer, platform: LaunchPlatform, resolveOS?: ResolveOSLayer): ToolDefinition {
   return {
     name: COMPUTER_TOOL_NAMES.key,
     mutating: true,
@@ -399,7 +402,8 @@ function keyTool(os: OSScreenLayer, platform: LaunchPlatform): ToolDefinition {
       required: ['name'],
       additionalProperties: false,
     },
-    handler: async (args, _ctx) => {
+    handler: async (args, ctx) => {
+      const layer = resolveOS ? await resolveOS(ctx) : os;
       const raw = String(args['name'] ?? '').trim();
       if (!raw) {
         throw new Error('"name" must be a non-empty string');
@@ -407,13 +411,13 @@ function keyTool(os: OSScreenLayer, platform: LaunchPlatform): ToolDefinition {
       // 1. Hotkey preset (case-insensitive), e.g. "copy" → ctrl+c / meta+c.
       const hotkey = resolveHotkey(raw, platform);
       if (hotkey) {
-        await os.keyChord(hotkey.modifiers, hotkey.key);
+        await layer.keyChord(hotkey.modifiers, hotkey.key);
         return { pressed: raw, hotkey: raw.toLowerCase(), chord: formatChord(hotkey) };
       }
       // 2. Chord, e.g. "ctrl+shift+s".
       if (raw.includes('+')) {
         const chord = parseKeyChord(raw);
-        await os.keyChord(chord.modifiers, chord.key);
+        await layer.keyChord(chord.modifiers, chord.key);
         return { pressed: raw, chord: formatChord(chord) };
       }
       // 3. Single key — the original allowlist path (backward compatible).
@@ -423,11 +427,14 @@ function keyTool(os: OSScreenLayer, platform: LaunchPlatform): ToolDefinition {
             `or a hotkey preset (${HOTKEY_NAMES.join(', ')})`,
         );
       }
-      await os.key(raw);
+      await layer.key(raw);
       return { pressed: raw };
     },
   };
 }
+
+/** Resolve the OS layer for one tool call (per-bot computers, P1 #14). */
+export type ResolveOSLayer = (ctx: ToolContext) => OSScreenLayer | Promise<OSScreenLayer>;
 
 export interface ComputerUseToolsOptions {
   /**
@@ -442,6 +449,12 @@ export interface ComputerUseToolsOptions {
   appLauncher?: AppLauncher;
   /** Override process.platform for the open-app tool (tests). */
   platform?: LaunchPlatform;
+  /**
+   * Per-bot computer routing (P1 #14). When set, every handler resolves its
+   * OS layer from the tool-call context (bot id + conversation) instead of
+   * the shared `os` instance, so each bot drives its own computer.
+   */
+  resolveOS?: ResolveOSLayer;
 }
 
 /**
@@ -492,7 +505,7 @@ function resolveScrollDeltas(args: Record<string, unknown>): { deltaX: number; d
   return { deltaX, deltaY };
 }
 
-function scrollTool(os: OSScreenLayer): ToolDefinition {
+function scrollTool(os: OSScreenLayer, resolveOS?: ResolveOSLayer): ToolDefinition {
   return {
     name: COMPUTER_TOOL_NAMES.scroll,
     mutating: true,
@@ -514,19 +527,20 @@ function scrollTool(os: OSScreenLayer): ToolDefinition {
       required: ['x', 'y'],
       additionalProperties: false,
     },
-    handler: async (args, _ctx) => {
+    handler: async (args, ctx) => {
+      const layer = resolveOS ? await resolveOS(ctx) : os;
       const x = intArg(args, 'x');
       const y = intArg(args, 'y');
-      const { width, height } = await os.displaySize();
+      const { width, height } = await layer.displaySize();
       assertInDisplay(x, y, width, height, 'scroll target');
       const { deltaX, deltaY } = resolveScrollDeltas(args);
-      await os.scroll(Math.floor(x), Math.floor(y), deltaX, deltaY);
+      await layer.scroll(Math.floor(x), Math.floor(y), deltaX, deltaY);
       return { scrolled: { x: Math.floor(x), y: Math.floor(y), deltaX, deltaY } };
     },
   };
 }
 
-function dragTool(os: OSScreenLayer): ToolDefinition {
+function dragTool(os: OSScreenLayer, resolveOS?: ResolveOSLayer): ToolDefinition {
   return {
     name: COMPUTER_TOOL_NAMES.drag,
     mutating: true,
@@ -547,12 +561,13 @@ function dragTool(os: OSScreenLayer): ToolDefinition {
       required: ['x1', 'y1', 'x2', 'y2'],
       additionalProperties: false,
     },
-    handler: async (args, _ctx) => {
+    handler: async (args, ctx) => {
+      const layer = resolveOS ? await resolveOS(ctx) : os;
       const x1 = intArg(args, 'x1');
       const y1 = intArg(args, 'y1');
       const x2 = intArg(args, 'x2');
       const y2 = intArg(args, 'y2');
-      const { width, height } = await os.displaySize();
+      const { width, height } = await layer.displaySize();
       assertInDisplay(x1, y1, width, height, 'drag start');
       assertInDisplay(x2, y2, width, height, 'drag end');
       const buttonRaw = args['button'] ?? 'left';
@@ -565,7 +580,7 @@ function dragTool(os: OSScreenLayer): ToolDefinition {
         throw new Error(`"steps" must be an integer between 1 and ${MAX_DRAG_STEPS}`);
       }
       const opts: DragOptions = { button, steps: stepsRaw };
-      await os.drag(Math.floor(x1), Math.floor(y1), Math.floor(x2), Math.floor(y2), opts);
+      await layer.drag(Math.floor(x1), Math.floor(y1), Math.floor(x2), Math.floor(y2), opts);
       return {
         dragged: {
           x1: Math.floor(x1),
@@ -580,7 +595,7 @@ function dragTool(os: OSScreenLayer): ToolDefinition {
   };
 }
 
-function moveTool(os: OSScreenLayer): ToolDefinition {
+function moveTool(os: OSScreenLayer, resolveOS?: ResolveOSLayer): ToolDefinition {
   return {
     name: COMPUTER_TOOL_NAMES.move,
     mutating: true,
@@ -597,12 +612,13 @@ function moveTool(os: OSScreenLayer): ToolDefinition {
       required: ['x', 'y'],
       additionalProperties: false,
     },
-    handler: async (args, _ctx) => {
+    handler: async (args, ctx) => {
+      const layer = resolveOS ? await resolveOS(ctx) : os;
       const x = intArg(args, 'x');
       const y = intArg(args, 'y');
-      const { width, height } = await os.displaySize();
+      const { width, height } = await layer.displaySize();
       assertInDisplay(x, y, width, height, 'move target');
-      await os.move(Math.floor(x), Math.floor(y));
+      await layer.move(Math.floor(x), Math.floor(y));
       return { moved: { x: Math.floor(x), y: Math.floor(y) } };
     },
   };
@@ -612,15 +628,16 @@ function moveTool(os: OSScreenLayer): ToolDefinition {
 export function createComputerUseTools(opts: ComputerUseToolsOptions = {}): ToolDefinition[] {
   const os = opts.os ?? new MockOSScreenLayer();
   const platform = opts.platform ?? (process.platform as LaunchPlatform);
+  const resolveOS = opts.resolveOS;
   return [
-    screenshotTool(os),
-    clickTool(os),
-    typeTool(os),
-    keyTool(os, platform),
+    screenshotTool(os, resolveOS),
+    clickTool(os, resolveOS),
+    typeTool(os, resolveOS),
+    keyTool(os, platform, resolveOS),
     createOpenAppTool({ launcher: opts.appLauncher, platform: opts.platform }),
-    scrollTool(os),
-    dragTool(os),
-    moveTool(os),
+    scrollTool(os, resolveOS),
+    dragTool(os, resolveOS),
+    moveTool(os, resolveOS),
   ];
 }
 

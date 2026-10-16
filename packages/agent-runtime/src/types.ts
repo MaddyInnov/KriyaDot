@@ -4,6 +4,8 @@ import type { ApprovalMode } from './approval-modes.js';
 export type { ApprovalMode };
 import type { ProvenanceNote } from './provenance.js';
 export type { ProvenanceNote };
+import type { ComputerSurface } from './tools/computer-surfaces.js';
+export type { ComputerSurface };
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -95,6 +97,13 @@ export interface ToolContext {
    * started this turn.
    */
   provenance?: ProvenanceNote;
+  /**
+   * Conversation (session) this turn belongs to (OpenMausBot parity P1
+   * #14). Lets tools resolve per-conversation overrides — e.g. a pinned
+   * computer surface for this chat. Set by the runtime from
+   * RunTurnOptions.conversationId.
+   */
+  conversationId?: string;
 }
 
 export interface ToolDefinition {
@@ -267,6 +276,15 @@ export interface BotConfig {
    * Rendered in the chief prompt header; empty/absent = 'general'.
    */
   managedSections?: string[];
+  /**
+   * "Works on" computer surface (OpenMausBot parity P1 #14): which computer
+   * the bot's computer_* tools drive. 'auto' (default) picks the best
+   * available backend (docker → playwright → local); 'local' = the machine
+   * KriyaDot runs on; 'docker' = isolated container sandbox; 'browser' =
+   * Playwright browser surface; 'off' disables computer tools for this bot.
+   * A per-conversation pin can override this for one chat.
+   */
+  computerSurface?: ComputerSurface;
 }
 
 export interface LLMProvider {

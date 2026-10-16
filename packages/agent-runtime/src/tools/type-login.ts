@@ -21,7 +21,7 @@
 //     `type_login` name is in the require-approval pattern in computer.ts).
 
 import type { ToolContext, ToolDefinition } from '../types.js';
-import type { OSScreenLayer } from './computer.js';
+import { MockOSScreenLayer, type OSScreenLayer } from './computer.js';
 // Type-only import: the runtime package must not depend on @mvp/vault at
 // build time (the host injects getLogin). LoginRecord shape is redeclared
 // structurally to avoid the dependency.
@@ -48,8 +48,16 @@ export interface SiteCheck {
 }
 
 export interface TypeLoginToolOptions {
-  /** OS layer used for typing (username, Tab, password). */
-  os: OSScreenLayer;
+  /**
+   * OS layer used for typing (username, Tab, password). Optional when
+   * `resolveOS` is set; defaults to the safe mock.
+   */
+  os?: OSScreenLayer;
+  /**
+   * Per-bot computer routing (P1 #14). When set, the handler resolves its
+   * OS layer from the tool-call context instead of the shared `os`.
+   */
+  resolveOS?: (ctx: ToolContext) => OSScreenLayer | Promise<OSScreenLayer>;
   /**
    * Server-side login lookup. Called inside the handler — the returned
    * password never leaves this module except into os.type().
@@ -112,7 +120,7 @@ function loginIdArg(args: Record<string, unknown>): string {
 }
 
 export function createTypeLoginTool(opts: TypeLoginToolOptions): ToolDefinition {
-  const { os, getLogin, verifySite } = opts;
+  const { getLogin, verifySite } = opts;
   return {
     name: TYPE_LOGIN_TOOL_NAME,
     mutating: true,
@@ -138,8 +146,10 @@ export function createTypeLoginTool(opts: TypeLoginToolOptions): ToolDefinition 
       required: ['loginId'],
       additionalProperties: false,
     },
-    handler: async (args, _ctx: ToolContext) => {
+    handler: async (args, ctx: ToolContext) => {
       const loginId = loginIdArg(args);
+      // Per-bot computers: resolve the layer for the calling bot.
+      const os = opts.resolveOS ? await opts.resolveOS(ctx) : (opts.os ?? new MockOSScreenLayer());
       const login = getLogin(loginId);
       if (!login) {
         // Name-only error: never hint at whether the id exists vs is not a login.

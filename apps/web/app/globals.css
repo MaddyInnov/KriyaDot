@@ -3716,6 +3716,42 @@ html[data-ux='simple'] .phone-status .dot.on {
   flex-direction: column;
   gap: 12px;
 }
+/* "Works on" surface section (P1 #14). */
+.computer-surface {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--border, #e5e0d8);
+  border-radius: 12px;
+  background: var(--surface-2, rgba(255, 255, 255, 0.5));
+}
+.computer-surface-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+.computer-surface-row label {
+  font-weight: 600;
+}
+.computer-surface-status,
+.computer-surface-note {
+  font-size: 0.85rem;
+}
+.computer-surface-pins summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+.computer-surface-pins .computer-surface-row {
+  margin-top: 8px;
+}
+.computer-pin-list {
+  margin: 8px 0;
+  padding-left: 20px;
+  font-size: 0.85rem;
+}
 .computer-toolbar {
   display: flex;
   flex-wrap: wrap;

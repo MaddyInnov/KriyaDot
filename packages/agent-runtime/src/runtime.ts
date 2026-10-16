@@ -146,6 +146,11 @@ export interface RunTurnOptions {
   bot: BotConfig;
   message: string;
   sessionId?: string;
+  /**
+   * Conversation id for per-conversation overrides (P1 #14: pinned computer
+   * surface). Defaults to sessionId when the call site doesn't set it.
+   */
+  conversationId?: string;
   providerId?: string;
   model?: string;  /**
    * Task type for smart model routing (Phase 3). Only consulted when no
@@ -602,6 +607,8 @@ export class AgentRuntime {
       // Spaces: per-turn workspace override for tool calls.
       spaceWorkspaceOverride: opts.workspaceOverride,
       provenance: turnProvenance,
+      // Per-bot computers (P1 #14): conversation pin override for the surface.
+      conversationId: opts.conversationId ?? sessionId,
     };
 
     const { prompt: systemPrompt } = await this.buildSystemPrompt(

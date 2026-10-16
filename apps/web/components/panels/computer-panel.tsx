@@ -56,6 +56,7 @@ function wsBase(): string {
 }
 
 import { ComputerRecordToggle } from './computer-record-toggle';
+import ComputerSurfaceSection from './computer-surface-section';
 
 export default function ComputerPanel({ botId }: { botId: string }) {
   const [mode] = useUxMode();
@@ -209,6 +210,7 @@ export default function ComputerPanel({ botId }: { botId: string }) {
 
   return (
     <div className="computer-panel">
+      <ComputerSurfaceSection botId={botId} />
       <div className="computer-toolbar">
         <div className="computer-badges">
           <span className={`computer-driving${driving ? ' on' : ''}`} title="Lit when the bot used a computer tool in the last ~10s">

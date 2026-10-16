@@ -46,6 +46,7 @@ import type {
   RealOSAction,
   Screenshot,
 } from './computer.js';
+import { MockOSScreenLayer } from './computer.js';
 import { formatChord, type ChordModifier } from './computer-keys.js';
 
 /** Env var that opts into the Docker-backed computer sandbox. */
@@ -85,6 +86,11 @@ export class LocalComputerSandbox implements ComputerSandbox {
 
   constructor(deps: RealOSLayerDeps = {}) {
     this.inner = selectOSLayer(deps);
+  }
+
+  /** True when the wrapped layer is the safe mock (no real OS access). */
+  get isMock(): boolean {
+    return this.inner instanceof MockOSScreenLayer;
   }
 
   async launch(): Promise<void> {

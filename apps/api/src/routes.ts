@@ -11,6 +11,7 @@
 import express from 'express';
 import { BotMemoryStore, SpaceStore, getProviderPreset, isFreeModel, listProviderPresets, resolveApiKey, resolveBotWorkspaceDir, routeMessage } from '@mvp/agent-runtime';
 import type { AgentRuntime, BotConfig, StreamEvent, TokenUsage } from '@mvp/agent-runtime';
+import type { PerBotComputerManager } from '@mvp/agent-runtime';
 // pricing.ts is not re-exported from the agent-runtime index (index untouched);
 // import the built subpath directly.
 import { priceOfModel } from '@mvp/agent-runtime/dist/pricing.js';
@@ -27,6 +28,7 @@ import type { AppConfig } from './config.js';
 import type { GovernanceAdapter } from './governance-adapter.js';
 import type { McpConnection } from './tool-registry.js';
 import { rememberAllowedTool, saveBotPolicy } from './bot-policies.js';
+import { registerComputerSurfaceRoutes } from './computer-surface-routes.js';
 import {
   deleteSlashCommand,
   expandSlashCommand,
@@ -186,6 +188,12 @@ export interface RouteDeps {
   omniStore: OmniStore;
   /** Omni collector (feeds the store from audit/approvals/workflow runs). */
   omniCollector: OmniCollector;
+  /**
+   * Per-bot computers (OpenMausBot parity P1 #14). Created by index.ts; the
+   * computer-surface routes (computer-surface-routes.ts) read instance
+   * status and change surfaces through it.
+   */
+  computerManager: PerBotComputerManager;
   /**
    * Remote-phone control module (Workspace → Phone tab). Created by index.ts
    * so the WebSocket upgrade handler shares the same hub instance as the
@@ -395,6 +403,14 @@ export function createRouter(deps: RouteDeps): express.Router {
       const status = message.startsWith('Unknown bot') ? 404 : 400;
       res.status(status).json(errorBody('Failed to remember tool', message));
     }
+  });
+
+  // ---- Per-bot "Works on" computer surfaces (OpenMausBot parity P1 #14) --
+  registerComputerSurfaceRoutes(router, {
+    bots,
+    dataDir: config.dataDir,
+    computerManager: deps.computerManager,
+    errorBody,
   });
 
   // ---- Custom slash commands --------------------------------------------
@@ -1584,6 +1600,9 @@ export function createRouter(deps: RouteDeps): express.Router {
           bot,
           message: messageWithFiles,
           sessionId: body.sessionId,
+          // Per-bot computers (P1 #14): this chat's conversation id, so a
+          // pinned "Works on" surface for this conversation applies.
+          conversationId: body.sessionId,
           providerId: turnOpts.providerId,
           // Spaces: an explicit call-site model wins; otherwise the space's
           // model override applies (bot pin / smart routing as before when unset).

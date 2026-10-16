@@ -81,12 +81,12 @@ import { createHash } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { validateWsQueryToken } from './loopback-auth.js';
-import { isRealOSLayerActive, selectOSLayer } from '@mvp/agent-runtime/dist/tools/computer-real.js';
-import {
-  COMPUTER_KEY_ALLOWLIST,
-  MockOSScreenLayer,
-} from '@mvp/agent-runtime/dist/tools/computer.js';
+import { selectOSLayer } from '@mvp/agent-runtime/dist/tools/computer-real.js';
+import { COMPUTER_KEY_ALLOWLIST } from '@mvp/agent-runtime/dist/tools/computer.js';
 import type { OSScreenLayer } from '@mvp/agent-runtime/dist/tools/computer.js';
+// Per-bot computers (P1 #14): unwrap the manager's lazy proxy so the
+// "mock layer" badge stays honest now that layers resolve per bot.
+import { layerIsMock } from '@mvp/agent-runtime/dist/tools/computer-surfaces.js';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -463,7 +463,9 @@ export class ComputerViewHub {
       state = {
         botId,
         layer,
-        isMock: layer instanceof MockOSScreenLayer || !isRealOSLayerActive(),
+        // P1 #14: layers now arrive as per-bot lazy proxies — unwrap before
+        // the mock check so the badge reflects the real backend.
+        isMock: layerIsMock(layer),
         viewers: new Set(),
         timer: null,
         frames: 0,
