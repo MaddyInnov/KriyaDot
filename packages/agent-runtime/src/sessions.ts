@@ -13,6 +13,14 @@ export interface SessionRecord {
   createdAt: string;
 }
 
+/** A chat session (thread) summary for thread pickers and the CLI. */
+export interface SessionSummary extends SessionRecord {
+  /** Total messages stored in the session. */
+  messageCount: number;
+  /** ISO timestamp of the newest message, or null when the session is empty. */
+  lastMessageTs: string | null;
+}
+
 interface MessageRow {
   id: number;
   role: string;
@@ -261,6 +269,44 @@ export class SessionStore {
       .prepare('SELECT id, bot_id AS botId, created_at AS createdAt FROM sessions WHERE id = ?')
       .get(id) as { id: string; botId: string; createdAt: string } | undefined;
     return row ? { id: row.id, botId: row.botId, createdAt: row.createdAt } : undefined;
+  }
+
+  /**
+   * List chat sessions (threads), most recently active first. Used by the
+   * `GET /api/chat/threads` endpoint and the headless CLI (`kriyadot threads
+   * list`). Each summary carries message counts and the last-message
+   * timestamp so clients can render a useful thread picker without
+   * fetching every thread's messages.
+   */
+  listSessions(opts: { botId?: string; limit?: number } = {}): SessionSummary[] {
+    const limit = Math.min(Math.max(Math.floor(opts.limit ?? 50), 1), 200);
+    const botId = typeof opts.botId === 'string' && opts.botId.trim() ? opts.botId.trim() : null;
+    const rows = this.db
+      .prepare(
+        `SELECT s.id AS id, s.bot_id AS botId, s.created_at AS createdAt,
+                COUNT(m.id) AS messageCount,
+                MAX(m.ts) AS lastMessageTs
+         FROM sessions s
+         LEFT JOIN messages m ON m.session_id = s.id
+         WHERE (? IS NULL OR s.bot_id = ?)
+         GROUP BY s.id
+         ORDER BY COALESCE(MAX(m.ts), s.created_at) DESC, MAX(m.id) DESC, s.created_at DESC
+         LIMIT ?`,
+      )
+      .all(botId, botId, limit) as Array<{
+      id: string;
+      botId: string;
+      createdAt: string;
+      messageCount: number;
+      lastMessageTs: string | null;
+    }>;
+    return rows.map((r) => ({
+      id: r.id,
+      botId: r.botId,
+      createdAt: r.createdAt,
+      messageCount: r.messageCount,
+      lastMessageTs: r.lastMessageTs,
+    }));
   }
 
   /**

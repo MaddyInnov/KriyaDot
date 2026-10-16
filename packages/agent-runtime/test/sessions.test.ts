@@ -297,3 +297,37 @@ describe('session worktree links', () => {
     store.close();
   });
 });
+
+describe('listSessions', () => {
+  it('lists sessions with message counts, most-recently-active first', () => {
+    const store = new SessionStore(':memory:');
+    const a = store.createSession('bot-a');
+    store.appendMessage(a, { role: 'user', content: 'one' });
+    store.appendMessage(a, { role: 'assistant', content: 'two' });
+    const b = store.createSession('bot-b');
+    const c = store.createSession('bot-a');
+    store.appendMessage(c, { role: 'user', content: 'three' });
+
+    const all = store.listSessions();
+    expect(all).toHaveLength(3);
+    // c got its message after a's messages → c first, then a, then empty b
+    expect(all.map((s) => s.id)).toEqual([c, a, b]);
+    expect(all[0]).toMatchObject({ botId: 'bot-a', messageCount: 1 });
+    expect(all[1]).toMatchObject({ botId: 'bot-a', messageCount: 2 });
+    expect(all[2]).toMatchObject({ botId: 'bot-b', messageCount: 0, lastMessageTs: null });
+    expect(all[0].lastMessageTs).toBeTruthy();
+    store.close();
+  });
+
+  it('filters by botId and clamps the limit', () => {
+    const store = new SessionStore(':memory:');
+    store.createSession('bot-a');
+    store.createSession('bot-b');
+    store.createSession('bot-a');
+    expect(store.listSessions({ botId: 'bot-a' })).toHaveLength(2);
+    expect(store.listSessions({ botId: 'nope' })).toHaveLength(0);
+    expect(store.listSessions({ limit: 2 })).toHaveLength(2);
+    expect(store.listSessions({ limit: 0 })).toHaveLength(1);
+    store.close();
+  });
+});

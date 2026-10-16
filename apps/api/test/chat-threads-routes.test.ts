@@ -40,6 +40,7 @@ describe('chat-threads router', () => {
       '/api/chat/threads',
       createChatThreadsRouter({
         dataDir: dir,
+        listThreads: (opts) => store.listSessions(opts ?? {}),
         branchSession: (id, msgId, opts) => store.branchSession(id, msgId, opts?.botId),
         listThreadMessages: (id) => store.listThreadMessages(id),
         audit: (action, fields) => {
@@ -134,6 +135,41 @@ describe('chat-threads router', () => {
   it('GET /:threadId/messages 404s for an unknown thread', async () => {
     const res = await fetch(`${baseUrl}/nope/messages`);
     expect(res.status).toBe(404);
+  });
+
+  it('GET / lists threads most-recently-active first with titles and counts', async () => {
+    // Title the first thread so the list merges titles in.
+    const titles = new ThreadTitleStore(dir);
+    titles.setTitle(threadId, 'First thread');
+    titles.close();
+    const other = store.createSession('bot-b');
+    store.appendMessage(other, { role: 'user', content: 'hello' });
+    const res = await fetch(`${baseUrl}?limit=10`);
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as {
+      ok: boolean;
+      threads: Array<{ id: string; botId: string; title: string | null; messageCount: number; lastMessageTs: string | null }>;
+    };
+    expect(json.ok).toBe(true);
+    expect(json.threads).toHaveLength(2);
+    // `other` got a message after `threadId`'s last message → first in list.
+    expect(json.threads[0].id).toBe(other);
+    expect(json.threads[0].title).toBeNull();
+    expect(json.threads[0].messageCount).toBe(1);
+    expect(json.threads[1].id).toBe(threadId);
+    expect(json.threads[1].title).toBe('First thread');
+    expect(json.threads[1].messageCount).toBe(4);
+  });
+
+  it('GET / filters by botId', async () => {
+    const res = await fetch(`${baseUrl}?botId=bot-b`);
+    const json = (await res.json()) as { ok: boolean; threads: Array<{ id: string }> };
+    expect(json.ok).toBe(true);
+    expect(json.threads).toHaveLength(0);
+    const res2 = await fetch(`${baseUrl}?botId=bot-a`);
+    const json2 = (await res2.json()) as { ok: boolean; threads: Array<{ id: string }> };
+    expect(json2.threads).toHaveLength(1);
+    expect(json2.threads[0].id).toBe(threadId);
   });
 
   it('ThreadTitleStore round-trips titles', () => {

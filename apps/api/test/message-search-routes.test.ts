@@ -133,6 +133,7 @@ describe('chat-threads branches endpoint', () => {
       '/api/chat/threads',
       createChatThreadsRouter({
         dataDir: dir,
+        listThreads: (opts) => store.listSessions(opts ?? {}),
         branchSession: (id, msgId, opts) => store.branchSession(id, msgId, opts?.botId),
         listThreadMessages: (id) => store.listThreadMessages(id),
         audit: () => undefined,

@@ -1281,6 +1281,7 @@ async function boot(): Promise<void> {
     '/api/chat/threads',
     createChatThreadsRouter({
       dataDir: config.dataDir,
+      listThreads: (opts) => agentRuntime.sessionStore.listSessions(opts ?? {}),
       branchSession: (id, msgId, opts) => agentRuntime.branchSession(id, msgId, opts),
       listThreadMessages: (id) => agentRuntime.listThreadMessages(id),
       audit: (action, fields) => governance.audit(action, fields),

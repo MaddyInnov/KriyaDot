@@ -18,6 +18,7 @@
 //   import { createChatThreadsRouter } from './chat-threads-routes.js';
 //   app.use('/api/chat/threads', createChatThreadsRouter({
 //     dataDir: config.dataDir,
+//     listThreads: (opts) => agentRuntime.sessionStore.listSessions(opts),
 //     branchSession: (id, msgId, opts) => agentRuntime.branchSession(id, msgId, opts),
 //     listThreadMessages: (id) => agentRuntime.listThreadMessages(id),
 //     audit: (action, fields) => governance.audit(action, fields),
@@ -33,6 +34,29 @@ const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite
 
 export interface ChatThreadsDeps {
   dataDir: string;
+  /**
+   * List chat sessions (threads), most recently active first. Required:
+   * powers GET / (the thread picker used by the web UI branch picker and
+   * the headless CLI's `kriyadot threads list`).
+   */
+  listThreads: (opts?: {
+    botId?: string;
+    limit?: number;
+  }) => Array<{
+    id: string;
+    botId: string;
+    createdAt: string;
+    messageCount: number;
+    lastMessageTs: string | null;
+  }> | Promise<
+    Array<{
+      id: string;
+      botId: string;
+      createdAt: string;
+      messageCount: number;
+      lastMessageTs: string | null;
+    }>
+  >;
   /** Branch implementation — AgentRuntime.branchSession in production. */
   branchSession: (
     sessionId: string,
@@ -132,6 +156,33 @@ function parseMessageId(raw: unknown): number | undefined {
 export function createChatThreadsRouter(deps: ChatThreadsDeps): Router {
   const router = express.Router();
   const titles = deps.titles ?? new ThreadTitleStore(deps.dataDir);
+
+  /**
+   * Thread list: every chat session, most recently active first, with the
+   * stored title (when the thread was ever titled or branched) merged in.
+   * Used by the web branch picker and the headless CLI (`kriyadot threads list`).
+   */
+  router.get('/', async (req, res) => {
+    const botId = typeof req.query.botId === 'string' && req.query.botId.trim() ? req.query.botId.trim() : undefined;
+    const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : NaN;
+    const limit = Number.isSafeInteger(rawLimit) ? rawLimit : undefined;
+    try {
+      const sessions = await deps.listThreads({ ...(botId ? { botId } : {}), ...(limit !== undefined ? { limit } : {}) });
+      res.json({
+        ok: true,
+        threads: sessions.map((s) => ({
+          id: s.id,
+          botId: s.botId,
+          title: titles.getTitle(s.id) ?? null,
+          createdAt: s.createdAt,
+          messageCount: s.messageCount,
+          lastMessageTs: s.lastMessageTs,
+        })),
+      });
+    } catch (err) {
+      res.status(500).json(errorBody('Failed to list threads', err instanceof Error ? err.message : String(err)));
+    }
+  });
 
   /**
    * Branch family: the root thread plus every descendant branch, with
