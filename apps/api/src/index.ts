@@ -109,6 +109,12 @@ import {
 } from '@mvp/muse-modules';
 import { defaultAgentCard } from '@mvp/protocols';
 import type { Policy } from '@mvp/governance';
+// Composio execution bridge (OpenMausBot parity): connected-account OAuth
+// (composio-accounts.ts) + composio_call / composio_list_actions agent tools
+// with governance policy rules. The API key is resolved server-side from the
+// encrypted vault inside the tool handlers — it never reaches the model.
+import { applyComposioToolGrants, COMPOSIO_KEY_NAME } from './composio.js';
+import { composioToolPolicies, registerComposioTools } from './composio-tools.js';
 
 // Pipe/JSON chat mode: `mvp-server chat --bot <id> [--json]`. Parsed at the
 // very top, before boot(), so `chat` never starts the HTTP server.
@@ -267,6 +273,10 @@ async function boot(): Promise<void> {
   const { allocateBotWorkspaces } = await import('./bot-workspace-alloc.js');
   allocateBotWorkspaces(seed.bots, config.dataDir);
   const botsById = new Map<string, BotConfig>(seed.bots.map((b) => [b.id, b]));
+  // Composio bridge: bots with ≥1 enabled Composio app gain the
+  // composio_call / composio_list_actions tools (derived from the
+  // composio-enables.json files, so grants survive restarts).
+  applyComposioToolGrants(seed.bots, config.dataDir);
 
   // 2. Governance + tools.
   // Phase 4: prepend approval-gating rules for the new agent tools
@@ -275,7 +285,7 @@ async function boot(): Promise<void> {
   // so deny-by-default is preserved and extended.
   const globalPolicy: Policy = {
     ...DEFAULT_POLICY,
-    rules: [...interconnectionPolicyRules(), ...computerUsePolicyRules(), ...museModuleToolPolicies(), ...DEFAULT_POLICY.rules],
+    rules: [...interconnectionPolicyRules(), ...computerUsePolicyRules(), ...museModuleToolPolicies(), ...composioToolPolicies(), ...DEFAULT_POLICY.rules],
   };
   const governance = new GovernanceGateway({
     dbPath: `${config.dataDir}/governance.db`,
@@ -376,6 +386,24 @@ async function boot(): Promise<void> {
       const rec = vault.getLogin(loginId);
       return rec ? { name: rec.name, site: rec.site, username: rec.username, password: rec.password } : undefined;
     },
+  });
+  // Composio execution bridge (OpenMausBot parity): composio_call executes
+  // one action on a connected account (approval-gated + per-bot app
+  // enablement enforced in the handler); composio_list_actions is read-only
+  // discovery. The API key is resolved server-side from the encrypted vault
+  // per tool call — never in args, results, or logs. Tool turns run as the
+  // local single user ('default-user' namespace, matching the Settings UI).
+  registerComposioTools(toolRegistry, {
+    dataDir: config.dataDir,
+    getApiKey: (userId: string) => {
+      try {
+        return new SecureVault(config.dataDir, userId, 'composio-tool').get(COMPOSIO_KEY_NAME)?.value;
+      } catch {
+        return undefined;
+      }
+    },
+    resolveUserId: () => 'default-user',
+    audit: (action, fields) => governance.audit(action, fields),
   });
   // OpenCode parity: git worktree tools (per-session isolated checkouts).
   // Workspace resolves per-session: a session with an attached worktree

@@ -90,6 +90,7 @@ import { registerBillingRoutes } from './billing.js';
 import { registerTenancyRoutes } from './tenancy.js';
 import { registerVaultRoutes } from './vault.js';
 import { registerComposioRoutes } from './composio.js';
+import { registerComposioAccountRoutes } from './composio-accounts.js';
 import { registerDatabasesRoutes } from './databases.js';
 import { registerNotionImportRoutes } from './notion-import.js';
 import { registerProtocolRoutes } from './protocols.js';
@@ -2426,6 +2427,9 @@ export function createRouter(deps: RouteDeps): express.Router {
   registerVaultRoutes(router, { config, governance });
   // Composio connector: platform API key in the vault, per-bot app toggles.
   registerComposioRoutes(router, { config, governance, bots });
+  // Composio connected accounts: OAuth connect links, account list/labels,
+  // disconnect, and per-account tool browsers.
+  registerComposioAccountRoutes(router, { config, governance, bots });
   // Notion parity: databases/table view + Notion HTML/ZIP import.
   {
     const databasesRouter = express.Router();

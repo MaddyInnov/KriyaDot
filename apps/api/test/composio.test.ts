@@ -13,7 +13,46 @@ import { SecureVault } from '@mvp/vault';
 // Zero paid API usage: every Composio HTTP call goes through this mock.
 const VALID_KEY = 'ak_valid-test-key';
 
-const mockClient: ComposioClient = {
+const mockAccounts = [
+  { id: 'ca_gmail1', toolkitSlug: 'gmail', toolkitName: 'Gmail', status: 'ACTIVE', createdAt: '2026-01-01T00:00:00Z' },
+  { id: 'ca_slack1', toolkitSlug: 'slack', toolkitName: 'Slack', status: 'ACTIVE', createdAt: '2026-01-02T00:00:00Z' },
+];
+
+const mockTools: Record<string, Array<{ slug: string; name: string; description: string; inputParameters: Record<string, unknown> }>> = {
+  gmail: [
+    {
+      slug: 'GMAIL_SEND_EMAIL',
+      name: 'Send email',
+      description: 'Send an email via Gmail',
+      inputParameters: {
+        type: 'object',
+        properties: {
+          to: { type: 'string', description: 'Recipient' },
+          subject: { type: 'string' },
+          body: { type: 'string' },
+        },
+        required: ['to', 'subject', 'body'],
+      },
+    },
+    {
+      slug: 'GMAIL_LIST_MESSAGES',
+      name: 'List messages',
+      description: 'List Gmail messages',
+      inputParameters: { type: 'object', properties: { max_results: { type: 'number' } } },
+    },
+  ],
+  slack: [
+    {
+      slug: 'SLACK_SEND_MESSAGE',
+      name: 'Send message',
+      description: 'Send a Slack message',
+      inputParameters: { type: 'object', properties: { channel: { type: 'string' }, text: { type: 'string' } }, required: ['channel', 'text'] },
+    },
+  ],
+};
+
+/** Shared mock Composio client (zero paid API usage). Exported for the account/tool tests. */
+export const mockComposioClient: ComposioClient = {
   validateApiKey: async (apiKey: string) => {
     if (apiKey === VALID_KEY) return { ok: true, orgName: 'Test Org' };
     return { ok: false };
@@ -22,7 +61,27 @@ const mockClient: ComposioClient = {
     { appId: 'gmail', name: 'Gmail', description: 'Read and send email' },
     { appId: 'slack', name: 'Slack', description: 'Post to channels' },
   ],
+  createAuthLink: async (_apiKey, opts) => ({
+    redirectUrl: `https://connect.composio.dev/link/${opts.toolkitSlug}?user=${opts.userId}`,
+  }),
+  listConnectedAccounts: async () => mockAccounts.map((a) => ({ ...a })),
+  getConnectedAccount: async (_apiKey, nanoid) => {
+    const found = mockAccounts.find((a) => a.id === nanoid);
+    return found ? { ...found } : null;
+  },
+  deleteConnectedAccount: async (_apiKey, _nanoid) => {},
+  revokeConnectedAccount: async (_apiKey, _nanoid) => {},
+  listTools: async (_apiKey, toolkitSlug) =>
+    (mockTools[toolkitSlug ?? ''] ?? []).map((t) => ({ ...t })),
+  executeTool: async (_apiKey, input) => {
+    if (input.toolSlug === 'GMAIL_SEND_EMAIL_FAIL') {
+      return { successful: false, error: 'quota exceeded' };
+    }
+    return { successful: true, data: { echoed: input.args, via: input.connectedAccountId } };
+  },
 };
+
+const mockClient: ComposioClient = mockComposioClient;
 
 const bots = [{ id: 'bot-1', name: 'Helper' }, { id: 'bot-2', name: 'Coder' }] as unknown as import('../src/routes.js').RouteDeps['bots'];
 

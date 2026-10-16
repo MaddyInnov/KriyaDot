@@ -453,6 +453,353 @@ function ComposioPanel() {
 }
 
 // ---------------------------------------------------------------------------
+// Composio connected accounts (OpenMausBot parity): OAuth connect links,
+// account list with labels, per-account tool browser, disconnect.
+// ---------------------------------------------------------------------------
+
+interface ComposioAccount {
+  id: string;
+  toolkitSlug: string;
+  toolkitName?: string;
+  status: string;
+  label?: string;
+  connectedAt?: string;
+}
+
+interface ComposioPendingLink {
+  toolkitSlug: string;
+  label?: string;
+  requestedAt: number;
+}
+
+interface ComposioAccountsResponse {
+  connected: boolean;
+  accounts: ComposioAccount[];
+  pending: ComposioPendingLink[];
+  error?: string;
+}
+
+interface ComposioAccountTool {
+  slug: string;
+  name: string;
+  description?: string;
+}
+
+function ComposioAccountsPanel() {
+  const [accounts, setAccounts] = useState<ComposioAccount[]>([]);
+  const [pending, setPending] = useState<ComposioPendingLink[]>([]);
+  const [catalog, setCatalog] = useState<ComposioAppEntry[]>([]);
+  const [connected, setConnected] = useState<boolean | null>(null);
+  const [toolkitSlug, setToolkitSlug] = useState('');
+  const [label, setLabel] = useState('');
+  const [authUrl, setAuthUrl] = useState<string | null>(null);
+  const [waitingSlug, setWaitingSlug] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<Record<string, ComposioAccountTool[]>>({});
+  const [editingLabel, setEditingLabel] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState('');
+  const [busy, setBusy] = useState('');
+
+  const refresh = useCallback(async () => {
+    const data = await api<ComposioAccountsResponse>('GET', '/api/composio/accounts');
+    if (data.error) throw new Error(data.error);
+    setConnected(data.connected);
+    setAccounts(data.accounts ?? []);
+    setPending(data.pending ?? []);
+    return data;
+  }, []);
+
+  const boot = useCallback(async () => {
+    setError(null);
+    try {
+      const [data, appsData] = await Promise.all([
+        refresh(),
+        api<ComposioAppsResponse>('GET', '/api/composio/apps'),
+      ]);
+      setCatalog(appsData.apps ?? []);
+      if (data.connected && appsData.apps?.length && !toolkitSlug) {
+        setToolkitSlug(appsData.apps[0].appId);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refresh]);
+
+  useEffect(() => {
+    void boot();
+  }, [boot]);
+
+  // While a connect flow is in flight, poll until the pending entry is
+  // consumed (the account appeared) or it expires.
+  useEffect(() => {
+    if (!waitingSlug) return;
+    let cancelled = false;
+    const before = new Set(accounts.map((a) => a.id));
+    const timer = setInterval(() => {
+      void (async () => {
+        try {
+          const data = await refresh();
+          if (cancelled) return;
+          const stillWaiting = data.pending.some((p) => p.toolkitSlug === waitingSlug);
+          const appeared = data.accounts.some((a) => !before.has(a.id));
+          if (!stillWaiting || appeared) {
+            setWaitingSlug(null);
+            setAuthUrl(null);
+            setNotice(
+              appeared
+                ? 'Account connected — enable its app per bot in the Composio section above.'
+                : 'The pending connection finished. Refresh the list if the account is missing.',
+            );
+          }
+        } catch {
+          // Poll failures are non-fatal; the next tick retries.
+        }
+      })();
+    }, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [waitingSlug, refresh]);
+
+  const startLink = async () => {
+    if (!toolkitSlug) return;
+    setBusy('link');
+    setError(null);
+    setNotice('');
+    try {
+      const data = await api<{ redirectUrl: string }>('POST', '/api/composio/accounts/link', {
+        toolkitSlug,
+        label: label.trim() || undefined,
+      });
+      setAuthUrl(data.redirectUrl);
+      setWaitingSlug(toolkitSlug);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const cancelWait = () => {
+    setWaitingSlug(null);
+    setAuthUrl(null);
+  };
+
+  const saveLabel = async (id: string) => {
+    const next = (editingLabel[id] ?? '').trim();
+    if (!next) return;
+    setBusy(id);
+    setError(null);
+    try {
+      await api('POST', `/api/composio/accounts/${encodeURIComponent(id)}/label`, { label: next });
+      setEditingLabel((prev) => {
+        const copy = { ...prev };
+        delete copy[id];
+        return copy;
+      });
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const toggleTools = async (id: string) => {
+    if (expanded[id]) {
+      setExpanded((prev) => {
+        const copy = { ...prev };
+        delete copy[id];
+        return copy;
+      });
+      return;
+    }
+    setBusy(id);
+    setError(null);
+    try {
+      const data = await api<{ tools: ComposioAccountTool[] }>(
+        'GET',
+        `/api/composio/accounts/${encodeURIComponent(id)}/tools`,
+      );
+      setExpanded((prev) => ({ ...prev, [id]: data.tools ?? [] }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const disconnect = async (id: string) => {
+    if (!window.confirm('Disconnect this account? The provider grant is revoked.')) return;
+    setBusy(id);
+    setError(null);
+    try {
+      await api('DELETE', `/api/composio/accounts/${encodeURIComponent(id)}`);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy('');
+    }
+  };
+
+  return (
+    <Section
+      title="Connected app accounts"
+      hint="OAuth connections bots act through (Gmail, Slack, GitHub, …). Tokens stay at Composio and are never shown."
+    >
+      <ErrorLine error={error} />
+      {notice && (
+        <div className="card" style={{ borderColor: '#bbf7d0', background: '#f0fdf4' }}>
+          {notice}
+        </div>
+      )}
+      {connected === false && (
+        <p className="small muted">Connect a Composio API key in the Composio section above first.</p>
+      )}
+      {connected === true && (
+        <div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'end', marginBottom: 12 }}>
+            <label className="small" style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <strong>App</strong>
+              <select
+                className="input"
+                value={toolkitSlug}
+                onChange={(e) => setToolkitSlug(e.target.value)}
+                disabled={catalog.length === 0 || waitingSlug !== null}
+              >
+                {catalog.map((a) => (
+                  <option key={a.appId} value={a.appId}>
+                    {a.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="small" style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <strong>Label (optional)</strong>
+              <input
+                className="input"
+                placeholder='e.g. "work Gmail"'
+                value={label}
+                onChange={(e) => setLabel(e.target.value)}
+                disabled={waitingSlug !== null}
+                style={{ minWidth: 160 }}
+              />
+            </label>
+            <button
+              className="btn btn-primary"
+              disabled={busy === 'link' || !toolkitSlug || waitingSlug !== null}
+              onClick={() => void startLink()}
+            >
+              {busy === 'link' ? 'Creating link…' : 'Connect account'}
+            </button>
+          </div>
+
+          {authUrl && waitingSlug && (
+            <div className="card" style={{ borderStyle: 'dashed', marginBottom: 12 }}>
+              <p>
+                <strong>Waiting for connection…</strong>
+              </p>
+              <p className="small muted">
+                Open the sign-in page, authorize at the provider, then come back — this list
+                refreshes automatically.
+              </p>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <a className="btn btn-primary btn-sm" href={authUrl} target="_blank" rel="noreferrer">
+                  Open sign-in page
+                </a>
+                <button className="btn btn-sm" onClick={cancelWait}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+
+          {accounts.length === 0 && !waitingSlug && (
+            <p className="small muted">No connected accounts yet.</p>
+          )}
+          {accounts.map((a) => (
+            <div key={a.id} className="card" style={{ marginBottom: 8, padding: 12 }}>
+              <div className="row-between">
+                <div>
+                  <strong>{a.label || a.toolkitName || a.toolkitSlug}</strong>{' '}
+                  <span className={`chip ${a.status === 'ACTIVE' ? 'green' : 'amber'}`}>{a.status}</span>
+                  {a.label && <span className="small muted"> · {a.toolkitName || a.toolkitSlug}</span>}
+                  <div className="small muted mono">{a.id}</div>
+                </div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button className="btn btn-sm" disabled={busy === a.id} onClick={() => void toggleTools(a.id)}>
+                    {expanded[a.id] ? 'Hide tools' : 'Browse tools'}
+                  </button>
+                  <button className="btn btn-sm btn-danger" disabled={busy === a.id} onClick={() => void disconnect(a.id)}>
+                    Disconnect
+                  </button>
+                </div>
+              </div>
+              <div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center' }}>
+                {editingLabel[a.id] !== undefined ? (
+                  <>
+                    <input
+                      className="input"
+                      value={editingLabel[a.id]}
+                      onChange={(e) =>
+                        setEditingLabel((prev) => ({ ...prev, [a.id]: e.target.value }))
+                      }
+                      placeholder="account label"
+                      style={{ maxWidth: 220 }}
+                    />
+                    <button className="btn btn-sm btn-primary" disabled={busy === a.id} onClick={() => void saveLabel(a.id)}>
+                      Save
+                    </button>
+                    <button
+                      className="btn btn-sm"
+                      onClick={() =>
+                        setEditingLabel((prev) => {
+                          const copy = { ...prev };
+                          delete copy[a.id];
+                          return copy;
+                        })
+                      }
+                    >
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    className="btn btn-sm"
+                    onClick={() => setEditingLabel((prev) => ({ ...prev, [a.id]: a.label ?? '' }))}
+                  >
+                    {a.label ? 'Rename' : 'Add label'}
+                  </button>
+                )}
+              </div>
+              {expanded[a.id] && (
+                <div style={{ marginTop: 8 }}>
+                  {expanded[a.id].length === 0 && <p className="small muted">No actions found.</p>}
+                  {expanded[a.id].map((t) => (
+                    <div key={t.slug} style={{ padding: '6px 0', borderTop: '1px solid var(--border, #eee)' }}>
+                      <code className="small">{t.slug}</code>
+                      <div className="small">
+                        <strong>{t.name}</strong>
+                      </div>
+                      {t.description && <div className="small muted">{t.description}</div>}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </Section>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Vault
 // ---------------------------------------------------------------------------
 
@@ -827,6 +1174,7 @@ export default function AccountsPage() {
       <h1>Accounts</h1>
       <ConnectedAccounts />
       <ComposioPanel />
+      <ComposioAccountsPanel />
       <VaultPanel />
       <LoginsPanel />
       <WalletPanel />
