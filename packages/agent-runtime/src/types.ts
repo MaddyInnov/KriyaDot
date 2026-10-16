@@ -35,6 +35,18 @@ export type StreamEvent =
   | { type: 'done'; usage: TokenUsage }
   | { type: 'error'; message: string }
   | { type: 'interrupted'; reason: string }
+  /**
+   * Spend cap reached (OpenMausBot parity P1 #21). Emitted instead of
+   * 'error' when the spend-cap gate (or the per-turn budget) blocks a
+   * provider call BEFORE it runs. The host push-notifies the user on
+   * this event; clients render it as an error-style message.
+   */
+  | {
+      type: 'spend_cap_reached';
+      message: string;
+      /** Which cap tripped: 'spend-cap' (global/per-bot) or 'turn-budget'. */
+      capKind: 'spend-cap' | 'turn-budget';
+    }
   | { type: 'approval_required'; approvalId: string; call: ToolCall }
   /**
    * Peer-approval card raised for a bot→bot call (ask_bot / message_bot /

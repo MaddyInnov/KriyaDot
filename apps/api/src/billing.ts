@@ -20,6 +20,11 @@
 //   POST   /usage/cost-events     → record a per-feature/per-step cost event (201)
 //   GET    /usage/caps            → FeatureCapStatus[] (monthly per-feature caps)
 //   PUT    /usage/caps/:feature   → { monthlyCapCents } → FeatureCapStatus
+//   GET    /usage/spend-caps      → { config, statuses } (global + per-bot
+//                                   daily/monthly spend caps, hard-stop)
+//   PUT    /usage/spend-caps      → { scope, botId?, period, capCents|null }
+//   GET    /usage/ledger          → CostEvent[] (?from=, ?to=, ?botId=, ?limit=)
+//   GET    /usage/ledger.csv      → CSV download of the usage ledger
 //   GET    /ledger                → LedgerInvoice[] (?customerId=, ?limit=)
 //   GET    /ledger/:id            → LedgerInvoice
 //   POST   /customers             → { email, name? } → BillingCustomer (mock)
@@ -38,8 +43,25 @@
 
 import { Router } from 'express';
 import type { Request, Response } from 'express';
-import { BillingLedger, costOfUsage, resolvePriceConfig, UsageMeter, CostTracker } from '@mvp/billing';
-import type { BillingProvider, TokenUsageInput, UsageKind, BreakdownPeriod } from '@mvp/billing';
+import { join } from 'node:path';
+import {
+  BillingLedger,
+  costOfUsage,
+  resolvePriceConfig,
+  UsageMeter,
+  CostTracker,
+  SpendCapStore,
+  spendCapStatuses,
+} from '@mvp/billing';
+import type {
+  BillingProvider,
+  TokenUsageInput,
+  UsageKind,
+  BreakdownPeriod,
+  CostEvent,
+  SpendCapPeriod,
+  SpendCapScope,
+} from '@mvp/billing';
 import { MockBillingProvider } from '@mvp/billing';
 
 export interface BillingDeps {
@@ -49,6 +71,11 @@ export interface BillingDeps {
   provider: BillingProvider;
   /** Per-feature/per-step cost tracking for the cost dashboard. */
   costTracker: CostTracker;
+  /**
+   * Global + per-bot daily/monthly spend caps (hard-stop enforcement).
+   * Optional: defaults to a store on `<dataDir>/billing.db`.
+   */
+  spendCaps?: SpendCapStore;
 }
 
 const VALID_USAGE_KINDS: ReadonlySet<string> = new Set(['tokens', 'workflow', 'sandbox']);
@@ -61,6 +88,7 @@ function numQuery(v: unknown): number | undefined {
 
 export function registerBillingRoutes(router: Router, deps: BillingDeps): void {
   const { meter, ledger, provider, costTracker } = deps;
+  const spendCaps = deps.spendCaps ?? new SpendCapStore(join(deps.dataDir, 'billing.db'));
 
   // ---- Usage metering ------------------------------------------------------
 
@@ -272,6 +300,110 @@ export function registerBillingRoutes(router: Router, deps: BillingDeps): void {
     }
   });
 
+  // ---- Spend caps (OpenMausBot parity P1 #21) ---------------------------
+  // GET  /usage/spend-caps        → { config, statuses } — global + per-bot
+  //                                 daily/monthly caps with current spend
+  // PUT  /usage/spend-caps        → { scope, botId?, period, capCents }
+  //                                 (capCents null/undefined clears the cap)
+  //
+  // Enforcement is a hard stop: the runtime's spend-cap gate (see
+  // spend-caps.ts) blocks provider calls BEFORE they run when
+  // spend + estimate would exceed any applicable cap.
+
+  router.get('/usage/spend-caps', (_req: Request, res: Response) => {
+    try {
+      const config = spendCaps.getConfig();
+      const statuses = spendCapStatuses({
+        caps: config,
+        spentLookup: (since, until, botId) => costTracker.spentCents({ since, until, botId }),
+      });
+      res.json({ config, statuses });
+    } catch (err) {
+      res.status(500).json({ error: errMessage(err, 'failed to read spend caps') });
+    }
+  });
+
+  router.put('/usage/spend-caps', (req: Request, res: Response) => {
+    try {
+      const body = (req.body ?? {}) as {
+        scope?: unknown;
+        botId?: unknown;
+        period?: unknown;
+        capCents?: unknown;
+      };
+      const scope = body.scope as SpendCapScope;
+      const period = body.period as SpendCapPeriod;
+      if (scope !== 'global' && scope !== 'bot') {
+        res.status(400).json({ error: 'body "scope" must be "global" or "bot"' });
+        return;
+      }
+      if (period !== 'day' && period !== 'month') {
+        res.status(400).json({ error: 'body "period" must be "day" or "month"' });
+        return;
+      }
+      if (scope === 'bot' && (typeof body.botId !== 'string' || !body.botId.trim())) {
+        res.status(400).json({ error: 'body "botId" is required for bot-scoped caps' });
+        return;
+      }
+      let capCents: number | null;
+      if (body.capCents === null || body.capCents === undefined) {
+        capCents = null; // clear → unlimited
+      } else if (typeof body.capCents === 'number' && Number.isInteger(body.capCents) && body.capCents >= 0) {
+        capCents = body.capCents;
+      } else {
+        res.status(400).json({ error: 'body "capCents" must be a non-negative integer (USD cents) or null' });
+        return;
+      }
+      spendCaps.setCap(scope, scope === 'bot' ? (body.botId as string) : undefined, period, capCents);
+      const config = spendCaps.getConfig();
+      res.json({
+        config,
+        statuses: spendCapStatuses({
+          caps: config,
+          spentLookup: (since, until, botId) => costTracker.spentCents({ since, until, botId }),
+        }),
+      });
+    } catch (err) {
+      res.status(400).json({ error: errMessage(err, 'invalid spend cap') });
+    }
+  });
+
+  // ---- Usage ledger (OpenMausBot parity P1 #21) --------------------------
+  // Append-only record of every metered event (the CostTracker store).
+  // GET  /usage/ledger?from=&to=&botId=&limit= → CostEvent[] (newest first)
+  // GET  /usage/ledger.csv?from=&to=&botId=   → CSV download
+
+  router.get('/usage/ledger', (req: Request, res: Response) => {
+    try {
+      res.json(
+        costTracker.listEvents({
+          since: numQuery(req.query.from),
+          until: numQuery(req.query.to),
+          botId: typeof req.query.botId === 'string' && req.query.botId ? req.query.botId : undefined,
+          limit: numQuery(req.query.limit),
+        }),
+      );
+    } catch (err) {
+      res.status(500).json({ error: errMessage(err, 'failed to read usage ledger') });
+    }
+  });
+
+  router.get('/usage/ledger.csv', (req: Request, res: Response) => {
+    try {
+      const events = costTracker.listEvents({
+        since: numQuery(req.query.from),
+        until: numQuery(req.query.to),
+        botId: typeof req.query.botId === 'string' && req.query.botId ? req.query.botId : undefined,
+        limit: 5000,
+      });
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', 'attachment; filename="kriyadot-usage-ledger.csv"');
+      res.send(ledgerToCsv(events));
+    } catch (err) {
+      res.status(500).json({ error: errMessage(err, 'failed to export usage ledger') });
+    }
+  });
+
   // ---- Billing ledger ------------------------------------------------------
 
   router.get('/ledger', (req: Request, res: Response) => {
@@ -419,6 +551,42 @@ function errMessage(err: unknown, fallback: string): string {
   return err instanceof Error ? err.message : fallback;
 }
 
+/** CSV export of usage-ledger events. Fields are RFC-4180 quoted. */
+function csvCell(v: string | number | null | undefined): string {
+  const s = v === null || v === undefined ? '' : String(v);
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
+export function ledgerToCsv(events: CostEvent[]): string {
+  const header = [
+    'id',
+    'timestamp_utc',
+    'bot_id',
+    'session_id',
+    'feature',
+    'step',
+    'model',
+    'input_tokens',
+    'output_tokens',
+    'cost_usd',
+  ].join(',');
+  const lines = events.map((e) =>
+    [
+      csvCell(e.id),
+      csvCell(new Date(e.ts).toISOString()),
+      csvCell(e.botId),
+      csvCell(e.sessionId),
+      csvCell(e.feature),
+      csvCell(e.step),
+      csvCell(e.model),
+      csvCell(e.inputTokens),
+      csvCell(e.outputTokens),
+      csvCell((e.costCents / 100).toFixed(4)),
+    ].join(','),
+  );
+  return `${header}\n${lines.join('\n')}\n`;
+}
+
 /** Heuristic: validation errors from the mock provider are client errors. */
 function isBadRequest(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
@@ -426,4 +594,4 @@ function isBadRequest(err: unknown): boolean {
 }
 
 // Re-export the package classes the integrator needs to construct deps.
-export { BillingLedger, MockBillingProvider, UsageMeter, costOfUsage, resolvePriceConfig };
+export { BillingLedger, MockBillingProvider, UsageMeter, costOfUsage, resolvePriceConfig, SpendCapStore };

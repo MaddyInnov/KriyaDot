@@ -25,7 +25,7 @@ import {
   getProviderPreset,
   resolveApiKey,
 } from './providers/catalog.js';
-import { costOfUsage } from './pricing.js';
+import { costOfUsage, priceOfModel } from './pricing.js';
 import type { TelemetryCollector, TelemetryRunStatus } from './telemetry.js';
 import { SessionStore } from './sessions.js';
 import type { HookBus, ToolAfterPayload, ToolBeforePayload } from './hooks.js';
@@ -136,6 +136,18 @@ export type DelegateGateVerdict = { decision: 'allow' } | { decision: 'deny'; re
  * 'always-allow'). A deny aborts the subtask with the gate's reason.
  */
 export type DelegateGate = (call: ToolCall, ctx: ToolContext) => Promise<DelegateGateVerdict>;
+
+/** Verdict from the host's spend-cap gate: allow, or deny with a message. */
+export type SpendCapGateVerdict = { allowed: true } | { allowed: false; message: string };
+
+/**
+ * Spend-cap gate (OpenMausBot parity P1 #21): consulted BEFORE every
+ * provider.chat call with the estimated cost of the upcoming call in USD
+ * cents. The host (API layer) builds it from the SpendCapStore +
+ * CostTracker ledger; the runtime only ever sees allow/deny. Must never
+ * throw — a throwing gate is treated as a deny (fail closed).
+ */
+export type SpendCapGate = (estimatedCallCostCents: number) => Promise<SpendCapGateVerdict>;
 
 /**
  * Host-registered turn context provider. Called with the bot, resolved
@@ -287,6 +299,16 @@ export interface RunTurnOptions {
    * "not available" (previous behavior).
    */
   widgetCoordinator?: WidgetCoordinator;
+  /**
+   * Spend-cap gate (OpenMausBot parity P1 #21). When set, the runtime
+   * consults it BEFORE every provider.chat call with the estimated cost
+   * of the upcoming call (USD cents). A denied verdict blocks the call
+   * fail-closed — the turn stops with a "spend cap reached" message and
+   * the user is push-notified by the host. Unset → no gating (previous
+   * behavior). The gate must never throw into the runtime; a throwing
+   * gate is treated as a deny (fail closed).
+   */
+  spendCapGate?: SpendCapGate;
 }
 
 export interface PreviewToolInfo {
@@ -383,6 +405,7 @@ export class AgentRuntime {
    * never throw into the turn — failures are swallowed per provider.
    */
   private readonly contextProviders: TurnContextProvider[] = [];
+  private defaultSpendCapGateFactory: ((botId: string) => SpendCapGate) | null = null;
 
   constructor(opts: AgentRuntimeOptions) {
     this.store = new SessionStore(opts.dbPath, opts.sessionStoreOptions);
@@ -414,6 +437,18 @@ export class AgentRuntime {
    */
   addContextProvider(fn: TurnContextProvider): void {
     this.contextProviders.push(fn);
+  }
+
+  /**
+   * Host wiring: default spend-cap gate factory (OpenMausBot parity P1
+   * #21). When a turn does not set RunTurnOptions.spendCapGate, the
+   * runtime builds one from this factory (fresh per turn, so in-flight
+   * cost reservations never leak across turns). Covers every runTurn
+   * caller: chat, group rooms, routines, fusion workers. Null restores
+   * previous behavior (no gating).
+   */
+  setDefaultSpendCapGateFactory(factory: ((botId: string) => SpendCapGate) | null): void {
+    this.defaultSpendCapGateFactory = factory;
   }
 
   /**
@@ -667,6 +702,11 @@ export class AgentRuntime {
       userMessage,
     ];
 
+    // Spend-cap gate for this turn (OpenMausBot parity P1 #21): an
+    // explicit per-turn gate wins; otherwise the host's default factory
+    // builds one (fresh per turn, so in-flight cost reservations never
+    // leak across turns). Covers chat, group rooms, routines, fusion.
+    const spendCapGate = opts.spendCapGate ?? this.defaultSpendCapGateFactory?.(opts.bot.id);
     let totalUsage = emptyUsage();
     // Approval ids minted by THIS turn, so an abort can withdraw them
     // (fail-closed) instead of leaving stale cards in the inbox.
@@ -737,6 +777,57 @@ export class AgentRuntime {
           where: 'provider.chat',
           iteration,
         });
+        // Spend-cap enforcement (OpenMausBot parity P1 #21): hard stop
+        // BEFORE the provider call. The host gate checks global + per-bot
+        // daily/monthly caps against the usage ledger; a deny (or a
+        // throwing gate, treated as deny) ends the turn with a clear
+        // message — no cost is incurred by the blocked call.
+        const estCallCents = this.estimateCallCostCents(messages, model);
+        if (spendCapGate) {
+          let verdict: SpendCapGateVerdict;
+          try {
+            verdict = await spendCapGate(estCallCents);
+          } catch (err) {
+            verdict = {
+              allowed: false,
+              message: `Spend-cap gate failed (${err instanceof Error ? err.message : String(err)}); blocking the call fail-closed.`,
+            };
+          }
+          if (!verdict.allowed) {
+            const msg = verdict.message;
+            this.audit({
+              type: 'turn.spend_cap',
+              sessionId,
+              botId: ctx.botId,
+              detail: { estimatedCallCostCents: estCallCents, iteration },
+            });
+            recordTurnFailure('spend_cap_exceeded', msg, { estimatedCallCostCents: estCallCents });
+            await emit({ type: 'spend_cap_reached', message: msg, capKind: 'spend-cap' });
+            await emit({ type: 'error', message: msg });
+            this.finishTelemetryRun(telRunId, 'interrupted', totalUsage, providerId, model, telIterations);
+            return totalUsage;
+          }
+        }
+        // Per-turn budget in the same enforcement path: pre-call, so the
+        // turn never starts a call it cannot afford. (The existing
+        // post-call check below stays as the backstop.)
+        if (opts.maxBudgetUsd !== undefined && opts.maxBudgetUsd >= 0) {
+          const projected = this.estimateTurnCost(totalUsage, model) + estCallCents / 100;
+          if (projected > opts.maxBudgetUsd) {
+            const msg = `Budget cap reached: $${this.estimateTurnCost(totalUsage, model).toFixed(4)} spent this turn (cap $${opts.maxBudgetUsd.toFixed(4)}); the next call would exceed it. Turn stopped.`;
+            this.audit({
+              type: 'turn.budget_cap',
+              sessionId,
+              botId: ctx.botId,
+              detail: { projected, cap: opts.maxBudgetUsd, iteration },
+            });
+            recordTurnFailure('budget_exceeded', msg, { projected, cap: opts.maxBudgetUsd });
+            await emit({ type: 'spend_cap_reached', message: msg, capKind: 'turn-budget' });
+            await emit({ type: 'error', message: msg });
+            this.finishTelemetryRun(telRunId, 'interrupted', totalUsage, providerId, model, telIterations);
+            return totalUsage;
+          }
+        }
         const llmStep = telRunId ? this.telemetry?.startStep(telRunId, `llm:${model}`, 'llm') : null;
         let turn: Awaited<ReturnType<LLMProvider['chat']>>;
         try {
@@ -1376,6 +1467,32 @@ export class AgentRuntime {
   private estimateTurnCost(usage: TokenUsage, model: string): number {
     try {
       return costOfUsage(this.defaultProviderId, model, usage).total;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Estimate the cost of ONE upcoming provider.chat call, in USD cents.
+   * Input tokens are estimated from the outgoing message text (~4 chars
+   * per token); output is a conservative fixed reserve. Unknown prices
+   * count as $0 — the spend cap is a guardrail, and unknown-price models
+   * are typically free-tier/subscription bridges anyway.
+   */
+  private estimateCallCostCents(messages: RichMessage[], model: string): number {
+    try {
+      let chars = 0;
+      for (const m of messages) {
+        if (typeof m.content === 'string') chars += m.content.length;
+      }
+      const price = priceOfModel(this.defaultProviderId, model);
+      if (!price) return 0;
+      const inputTokens = Math.ceil(chars / 4);
+      const outputReserveTokens = 4096;
+      const cents =
+        (inputTokens / 1_000_000) * price.inputPer1M * 100 +
+        (outputReserveTokens / 1_000_000) * price.outputPer1M * 100;
+      return Math.max(0, Math.round(cents));
     } catch {
       return 0;
     }

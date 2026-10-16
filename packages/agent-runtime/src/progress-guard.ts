@@ -16,6 +16,7 @@ export type TurnFailureKind =
   | 'approval_denied'
   | 'no_progress'
   | 'budget_exceeded'
+  | 'spend_cap_exceeded'
   | 'model_error'
   | 'timeout'
   | 'interrupted'
@@ -26,6 +27,7 @@ export const TURN_FAILURE_KINDS: readonly TurnFailureKind[] = [
   'approval_denied',
   'no_progress',
   'budget_exceeded',
+  'spend_cap_exceeded',
   'model_error',
   'timeout',
   'interrupted',
@@ -37,6 +39,7 @@ export const TURN_FAILURE_DESCRIPTIONS: Record<TurnFailureKind, string> = {
   approval_denied: 'The user denied (or did not answer) an approval request.',
   no_progress: 'The agent made repeated tool calls without producing new information.',
   budget_exceeded: 'The turn exceeded its spending cap.',
+  spend_cap_exceeded: 'A global or per-bot spend cap blocked the next model call.',
   model_error: 'The model provider returned an error.',
   timeout: 'The turn timed out waiting for a response.',
   interrupted: 'The turn was superseded by a newer message.',

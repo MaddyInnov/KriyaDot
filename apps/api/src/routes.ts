@@ -66,6 +66,7 @@ import { registerKnowledgeRoutes } from './knowledge.js';
 // delegation is handled by the runtime delegate gate + teams-routes policy
 // (single implementation — the duplicate modules were removed).
 import { attachNoteContextProvider, registerNoteAttachmentRoutes } from './note-attachments.js';
+import { attachSpendCapGate } from './spend-caps.js';
 import { registerTasksRoutes } from './tasks.js';
 import { registerPagesRoutes } from './pages.js';
 import { registerTerminalRoutes } from './terminal-routes.js';
@@ -320,6 +321,13 @@ export function createRouter(deps: RouteDeps): express.Router {
   // and the billing routes serve GET /api/usage/breakdown from the same
   // store. Declared up front so the chat route closure can reach it.
   const costTracker = new CostTracker(join(config.dataDir, 'billing.db'));
+
+  // Spend-cap enforcement (OpenMausBot parity P1 #21): attach the default
+  // gate factory to the runtime so every runTurn (chat, group rooms,
+  // routines, fusion) is hard-stopped BEFORE a provider call that would
+  // exceed a global/per-bot daily/monthly cap. Returns the shared store
+  // for the billing config routes below.
+  const spendCapStore = attachSpendCapGate(agentRuntime, { dataDir: config.dataDir, costTracker });
 
   // Learning-from-corrections routing (feature #4): learned rules are
   // loaded fresh per chat request (cheap JSON read) and fed into
@@ -1452,6 +1460,11 @@ export function createRouter(deps: RouteDeps): express.Router {
       return argHint ? `wants to run ${call.name} (${argHint})` : `wants to run ${call.name}`;
     };
 
+    // Set when a 'spend_cap_reached' push goes out, so the 'error' event
+    // the runtime emits right after doesn't double-notify. Declared per
+    // chat request (outside onEvent) so it survives across events.
+    let spendCapPushSent = false;
+
     const onEvent = async (event: StreamEvent): Promise<void> => {
       if (closed) return;
       if (event.type === 'done' || event.type === 'error' || event.type === 'interrupted') terminalEmitted = true;
@@ -1469,13 +1482,32 @@ export function createRouter(deps: RouteDeps): express.Router {
           const toolName = typeof event.call?.name === 'string' ? event.call.name : 'tool';
           const summary = summarizeApprovalCall(event.call);
           void push.notifyApprovalNeeded(bId, bName, event.approvalId, toolName, summary).catch(() => {});
+        } else if (event.type === 'spend_cap_reached') {
+          // Spend-cap hard stop (OpenMausBot parity P1 #21): dedicated
+          // push with the cap details; the following 'error' event must
+          // not send a second, generic push for the same stop.
+          spendCapPushSent = true;
+          void push
+            .notify({
+              kind: 'failed',
+              botId: bId,
+              botName: bName,
+              title: `${bName} — Spend cap reached`,
+              body: event.message.slice(0, 400),
+              chatId,
+            })
+            .catch(() => {});
         } else if (event.type === 'done') {
           void push.notifyTurnDone(bId, bName, turnAssistantText, chatId).catch(() => {});
         } else if (event.type === 'error') {
-          const msg = typeof (event as { message?: unknown }).message === 'string'
-            ? (event as { message: string }).message
-            : 'The run failed.';
-          void push.notifyTurnFailed(bId, bName, msg, chatId).catch(() => {});
+          if (spendCapPushSent) {
+            // The dedicated spend-cap push above already covered this stop.
+          } else {
+            const msg = typeof (event as { message?: unknown }).message === 'string'
+              ? (event as { message: string }).message
+              : 'The run failed.';
+            void push.notifyTurnFailed(bId, bName, msg, chatId).catch(() => {});
+          }
         }
       }
       res.write(`data: ${serializeEvent(event)}\n\n`);
@@ -2469,7 +2501,10 @@ export function createRouter(deps: RouteDeps): express.Router {
     // Cost dashboard: per-feature/per-step token + spend breakdown and
     // monthly feature caps (shares billing.db with the meter/ledger; the
     // same instance the chat route records turn cost events into).
+    // Plus spend caps (global/per-bot daily/monthly, hard-stop enforced
+    // by the runtime gate) and the usage ledger + CSV export.
     costTracker,
+    spendCaps: spendCapStore,
   });
   router.use('/billing', billingRouter);
 

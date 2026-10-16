@@ -338,7 +338,80 @@ export class CostTracker {
     return { period, since, until, byFeature: featureSlices, byStep: stepSlices, totals };
   }
 
-  /** Set (or replace) the monthly spend cap for a feature, in USD cents. */
+  /**
+   * Append-only usage ledger: raw metered events, newest first. Every
+   * costTracker.record() call lands here (timestamp, bot, session, model,
+   * tokens in/out, estimated USD cost, feature, step). This is the backing
+   * store for the spend-cap enforcer and the CSV export.
+   */
+  listEvents(
+    opts: { since?: number; until?: number; botId?: string; limit?: number } = {},
+  ): CostEvent[] {
+    const conds: string[] = [];
+    const args: Array<string | number> = [];
+    if (opts.since !== undefined) {
+      conds.push('ts >= ?');
+      args.push(opts.since);
+    }
+    if (opts.until !== undefined) {
+      conds.push('ts < ?');
+      args.push(opts.until);
+    }
+    if (opts.botId) {
+      conds.push('bot_id = ?');
+      args.push(opts.botId);
+    }
+    const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+    const limit = opts.limit === undefined ? 500 : Math.max(1, Math.min(5000, Math.floor(opts.limit)));
+    const rows = this.db
+      .prepare(
+        `SELECT id, ts, session_id, bot_id, feature, step, model,
+                input_tokens, output_tokens, cost_cents
+         FROM cost_events ${where}
+         ORDER BY ts DESC, rowid DESC LIMIT ?`,
+      )
+      .all(...args, limit) as Array<{
+      id: string;
+      ts: number;
+      session_id: string;
+      bot_id: string;
+      feature: string;
+      step: string;
+      model: string | null;
+      input_tokens: number;
+      output_tokens: number;
+      cost_cents: number;
+    }>;
+    return rows.map((r) => ({
+      id: r.id,
+      ts: r.ts,
+      sessionId: r.session_id,
+      botId: r.bot_id,
+      feature: r.feature,
+      step: r.step,
+      model: r.model,
+      inputTokens: r.input_tokens,
+      outputTokens: r.output_tokens,
+      costCents: r.cost_cents,
+    }));
+  }
+
+  /**
+   * Total spend (USD cents) in a window — the read path the spend-cap
+   * enforcer uses. `botId` narrows to one bot; omit for account-wide.
+   */
+  spentCents(opts: { since: number; until: number; botId?: string }): number {
+    const conds = ['ts >= ?', 'ts < ?'];
+    const args: Array<string | number> = [opts.since, opts.until];
+    if (opts.botId) {
+      conds.push('bot_id = ?');
+      args.push(opts.botId);
+    }
+    const row = this.db
+      .prepare(`SELECT COALESCE(SUM(cost_cents), 0) AS spent FROM cost_events WHERE ${conds.join(' AND ')}`)
+      .get(...args) as unknown as { spent: number };
+    return row.spent;
+  }
   setFeatureCap(feature: string, monthlyCapCents: number): void {
     const f = requireLabel(feature, 'feature');
     const cap = requireNonNegativeInt(monthlyCapCents, 'monthlyCapCents');

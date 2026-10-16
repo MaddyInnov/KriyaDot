@@ -4799,3 +4799,143 @@ tr.run-row:hover td { background: rgba(255, 255, 255, 0.03); }
 .branch-select {
   max-width: 220px;
 }
+
+/* ---- Usage & costs page (spend caps + ledger) ---- */
+.usage-page .page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.period-picker {
+  display: flex;
+  gap: 6px;
+}
+.usage-cards {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 20px;
+}
+.usage-card {
+  border: 1px solid var(--border, #e5e0f5);
+  border-radius: 12px;
+  padding: 14px 18px;
+  min-width: 180px;
+  background: var(--card, #fff);
+}
+.usage-card-label {
+  font-size: 12px;
+  opacity: 0.65;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.usage-card-value {
+  font-size: 26px;
+  font-weight: 700;
+  margin: 4px 0;
+}
+.usage-card-sub {
+  font-size: 12px;
+  opacity: 0.65;
+}
+.usage-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0 24px;
+  font-size: 13px;
+}
+.usage-table th,
+.usage-table td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border, #eee);
+}
+.usage-table th {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.6;
+}
+.usage-section {
+  margin-top: 28px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border, #eee);
+}
+.usage-section h3 {
+  margin: 16px 0 8px;
+  font-size: 14px;
+}
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.section-head h2 {
+  margin: 0;
+}
+.cap-editor {
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border, #e5e0f5);
+  border-radius: 10px;
+  background: var(--card, #fff);
+}
+.cap-editor-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.cap-editor-row label {
+  font-size: 13px;
+  font-weight: 600;
+  min-width: 240px;
+}
+.input-sm {
+  padding: 6px 10px;
+  border: 1px solid var(--border, #ccc);
+  border-radius: 8px;
+  font-size: 13px;
+  width: 130px;
+  background: var(--input-bg, #fff);
+  color: inherit;
+}
+select.input-sm {
+  width: auto;
+  min-width: 200px;
+}
+.cap-row {
+  margin-top: 10px;
+}
+.cap-row-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+.cap-label {
+  opacity: 0.7;
+}
+.cap-amount.exceeded {
+  color: var(--danger, #c0392b);
+  font-weight: 700;
+}
+.cap-bar {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--border, #eee);
+  overflow: hidden;
+}
+.cap-bar-fill {
+  height: 100%;
+  border-radius: 4px;
+  background: var(--accent, #7c6cf0);
+  transition: width 0.3s ease;
+}
+.cap-bar-fill.exceeded {
+  background: var(--danger, #c0392b);
+}
