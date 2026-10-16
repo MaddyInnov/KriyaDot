@@ -8,6 +8,7 @@ import { useUxMode } from '../../lib/ux-mode';
 import { I18nProvider, LanguageSwitcher, useI18n } from '../../lib/i18n';
 import ComputerPanel from '../../components/panels/computer-panel';
 import { MemoryPanel } from '../../components/panels/memory-panel';
+import { RoutinesPanel } from '../../components/panels/routines-panel';
 
 const EFFECTS: BotPolicyEffect[] = ['allow', 'deny', 'require-approval'];
 
@@ -707,7 +708,7 @@ function BotsPageInner() {
   const [bots, setBots] = useState<BotConfig[]>([]);
   const [selectedBotId, setSelectedBotId] = useState('');
   const [error, setError] = useState('');
-  const [tab, setTab] = useState<'policy' | 'model' | 'robustness' | 'computer' | 'memory'>('policy');
+  const [tab, setTab] = useState<'policy' | 'model' | 'robustness' | 'computer' | 'memory' | 'routines'>('policy');
   const [mode] = useUxMode();
   const [rosterBusy, setRosterBusy] = useState(false);
   const [rosterError, setRosterError] = useState('');
@@ -718,6 +719,7 @@ function BotsPageInner() {
     { id: 'model' as const, label: t('bots.tabModel') },
     { id: 'computer' as const, label: t('bots.tabComputer') },
     { id: 'memory' as const, label: t('bots.tabMemory') },
+    { id: 'routines' as const, label: t('bots.tabRoutines') },
     // Pro surface: hidden in Simple mode.
     ...(mode === 'pro' ? [{ id: 'robustness' as const, label: t('bots.tabRobustness') }] : []),
   ];
@@ -921,6 +923,8 @@ function BotsPageInner() {
                 <ComputerPanel key={`computer-${selectedBot.id}`} botId={selectedBot.id} />
               ) : activeTab === 'memory' ? (
                 <MemoryPanel key={`memory-${selectedBot.id}`} botId={selectedBot.id} />
+              ) : activeTab === 'routines' ? (
+                <RoutinesPanel key={`routines-${selectedBot.id}`} botId={selectedBot.id} />
               ) : (
                 <RobustnessPanel key={`robustness-${selectedBot.id}`} bot={selectedBot} />
               )}

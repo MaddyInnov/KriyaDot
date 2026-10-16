@@ -49,6 +49,7 @@ import { createGroupChatsRouter } from './group-chats-routes.js';
 import { applyImportedBots, createBotRosterRouter } from './bot-roster-routes.js';
 import { registerRoutineRoutes } from './bot-routines.js';
 import { createRoutineWebhookRouter } from './webhooks.js';
+import { RoutineHookStore, WebhookDeliveryWorker, createPublicHookRouter } from './routine-hooks.js';
 import { createWorkflowN8nRouter } from './workflow-n8n.js';
 import {
   interconnectionPolicyRules,
@@ -438,13 +439,30 @@ async function boot(): Promise<void> {
   // the management API and the webhook ingress (shared SQLite). The routers
   // are mounted on `app` in the HTTP section below.
   const routinesRouter = express.Router();
+  const routineHookStore = new RoutineHookStore(config.dataDir);
   const { routineStore, triggerStore: routineTriggerStore } = registerRoutineRoutes(
     routinesRouter,
-    { dataDir: config.dataDir, getBots: () => seed.bots },
+    {
+      dataDir: config.dataDir,
+      getBots: () => seed.bots,
+      hookStore: routineHookStore,
+      getBaseUrls: () => ({ publicBaseUrl: config.publicBaseUrl, localPort: config.port }),
+    },
   );
   const routineWebhookRouter = createRoutineWebhookRouter({
     routineStore,
     triggerStore: routineTriggerStore,
+    agentRuntime,
+    getBots: () => seed.bots,
+  });
+  // Public webhook ingress (Codync parity): per-routine URL + secret with
+  // HMAC verification and a queued delivery worker. The router is created
+  // here; it mounts on `app` before the global express.json() parser below
+  // because it needs the raw request body for signature verification.
+  const routinePublicHookRouter = createPublicHookRouter({ routineStore, hookStore: routineHookStore });
+  const hookDeliveryWorker = new WebhookDeliveryWorker({
+    routineStore,
+    hookStore: routineHookStore,
     agentRuntime,
     getBots: () => seed.bots,
   });
@@ -693,6 +711,13 @@ async function boot(): Promise<void> {
   // and phone pairing rate limiters read X-Forwarded-For themselves and are
   // unaffected by this setting either way.
   app.set('trust proxy', 1);
+  // Public routine webhook ingress (Codync parity): mounted BEFORE the
+  // global express.json() parser because HMAC signature verification needs
+  // the raw request body. express.raw() sets req._body so the JSON parser
+  // skips these requests. Reachability note: the API binds to 127.0.0.1 —
+  // external senders (GitHub etc.) need a tunnel (Tailscale/cloudflared/ngrok)
+  // plus KRIYADOT_PUBLIC_URL; LAN senders use the local URL.
+  app.use('/api/hooks', express.raw({ type: '*/*', limit: '64kb' }), routinePublicHookRouter);
   // MVP: allow any origin — the Tauri webview calls the sidecar API
   // cross-origin (http://127.0.0.1:4567). Revisit with an allowlist when
   // auth/multi-user ships.
@@ -859,6 +884,10 @@ async function boot(): Promise<void> {
           `[tools] MCP warmup done: ${mcpConnections.filter((c) => c.ok).length}/${mcpConnections.length} connected`,
         );
       });
+    // Public webhook delivery worker (Codync parity): drains the queued
+    // routine-hook deliveries. Started after listen like the MCP warmup.
+    hookDeliveryWorker.start();
+    console.log('[routine-hooks] delivery worker started');
   });
 
   // Remote-phone control: WebSocket endpoint for live sessions at
@@ -883,6 +912,7 @@ async function boot(): Promise<void> {
     console.log('[api] shutting down…');
     server.close();
     scheduler.stop();
+    hookDeliveryWorker.stop();
     await closeMcp();
     try {
       await computerSandbox.kill();

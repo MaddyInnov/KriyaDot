@@ -125,6 +125,12 @@ function openDb(dataDir: string): DatabaseSync {
     );
     CREATE INDEX IF NOT EXISTS idx_routine_triggers_routine ON routine_webhook_triggers(routine_id);
   `);
+  // Migration: per-routine public webhook secret (Codync parity: every
+  // routine has a public URL + key). Backfilled lazily on first use.
+  const cols = db.prepare('PRAGMA table_info(bot_routines)').all() as unknown as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === 'webhook_secret')) {
+    db.exec('ALTER TABLE bot_routines ADD COLUMN webhook_secret TEXT');
+  }
   return db;
 }
 
@@ -160,9 +166,17 @@ export class RoutineStore {
     };
     this.db
       .prepare(
-        'INSERT INTO bot_routines (id, name, bot_id, prompt_template, session_id, enabled, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)',
+        'INSERT INTO bot_routines (id, name, bot_id, prompt_template, session_id, enabled, created_at, webhook_secret) VALUES (?, ?, ?, ?, ?, 1, ?, ?)',
       )
-      .run(routine.id, routine.name, routine.botId, routine.promptTemplate, routine.sessionId ?? null, routine.createdAt);
+      .run(
+        routine.id,
+        routine.name,
+        routine.botId,
+        routine.promptTemplate,
+        routine.sessionId ?? null,
+        routine.createdAt,
+        randomBytes(32).toString('hex'),
+      );
     return routine;
   }
 
@@ -211,6 +225,37 @@ export class RoutineStore {
     this.db.prepare('DELETE FROM routine_webhook_triggers WHERE routine_id = ?').run(id);
     const r = this.db.prepare('DELETE FROM bot_routines WHERE id = ?').run(id);
     return r.changes > 0;
+  }
+
+  /**
+   * Per-routine public webhook secret (32 random bytes, hex). Generated at
+   * creation for new routines; backfilled lazily for older ones via
+   * ensureWebhookSecret(). Never exposed in list/get — use the dedicated
+   * reveal/regenerate endpoints.
+   */
+  getWebhookSecret(id: string): string | undefined {
+    const row = this.db.prepare('SELECT webhook_secret FROM bot_routines WHERE id = ?').get(id) as unknown as
+      | { webhook_secret: string | null }
+      | undefined;
+    return row?.webhook_secret ?? undefined;
+  }
+
+  setWebhookSecret(id: string, secret: string): void {
+    this.db.prepare('UPDATE bot_routines SET webhook_secret = ? WHERE id = ?').run(secret, id);
+  }
+
+  ensureWebhookSecret(id: string): string {
+    const existing = this.getWebhookSecret(id);
+    if (existing) return existing;
+    const secret = randomBytes(32).toString('hex');
+    this.setWebhookSecret(id, secret);
+    return secret;
+  }
+
+  regenerateWebhookSecret(id: string): string {
+    const secret = randomBytes(32).toString('hex');
+    this.setWebhookSecret(id, secret);
+    return secret;
   }
 }
 
@@ -262,6 +307,10 @@ export class RoutineWebhookTriggerStore {
 export interface RoutineRouteDeps {
   dataDir: string;
   getBots: () => BotConfig[];
+  /** Delivery-queue store for the public hook ingress (routine-hooks.ts). */
+  hookStore: import('./routine-hooks.js').RoutineHookStore;
+  /** Base URLs for building the public/local hook URLs shown in the UI. */
+  getBaseUrls: () => { publicBaseUrl?: string; localPort: number };
 }
 
 function errorBody(message: string, detail?: string): Record<string, unknown> {
@@ -413,6 +462,72 @@ export function registerRoutineRoutes(
     }
     triggerStore.revoke(triggerId);
     res.json({ ok: true, revoked: triggerId });
+  });
+
+  // --- Public webhook hook (Codync parity) ---------------------------------
+  // Every routine has a public URL + secret: POST /api/hooks/:id/:secret.
+  // The secret itself is never returned by GET — use reveal/regenerate.
+
+  const hookInfo = (routine: BotRoutine, opts?: { includeSecret: boolean }) => {
+    const base = deps.getBaseUrls();
+    const secret = routineStore.ensureWebhookSecret(routine.id);
+    const path = `/api/hooks/${routine.id}/${secret}`;
+    const publicUrl = base.publicBaseUrl ? `${base.publicBaseUrl}${path}` : null;
+    const local = `http://127.0.0.1:${base.localPort}${path}`;
+    const deliveries = deps.hookStore.listByRoutine(routine.id, 1);
+    const info: Record<string, unknown> = {
+      routineId: routine.id,
+      url: publicUrl,
+      localUrl: local,
+      hasSecret: true,
+      // "connected" only after a real delivery arrived (Codync contract).
+      connected: deliveries.some((d) => d.status === 'done'),
+      queueDepth: deps.hookStore.countPending(),
+    };
+    if (opts?.includeSecret) {
+      info.secret = secret;
+    } else {
+      // Never leak the secret in the info endpoint — redact it from the
+      // URLs; use /hook/reveal for an explicit one-time display.
+      if (typeof info.url === 'string') info.url = (info.url as string).replace(secret, '<secret>');
+      info.localUrl = (info.localUrl as string).replace(secret, '<secret>');
+    }
+    return info;
+  };
+
+  router.get('/:id/hook', (req: Request, res: Response) => {
+    const routine = requireRoutine(res, req.params.id);
+    if (!routine) return;
+    res.json({ ok: true, hook: hookInfo(routine) });
+  });
+
+  router.post('/:id/hook/reveal', (req: Request, res: Response) => {
+    const routine = requireRoutine(res, req.params.id);
+    if (!routine) return;
+    res.json({ ok: true, hook: hookInfo(routine, { includeSecret: true }) });
+  });
+
+  router.post('/:id/hook/regenerate', (req: Request, res: Response) => {
+    const routine = requireRoutine(res, req.params.id);
+    if (!routine) return;
+    routineStore.regenerateWebhookSecret(routine.id);
+    res.json({ ok: true, hook: hookInfo(routine, { includeSecret: true }) });
+  });
+
+  router.get('/:id/deliveries', (req: Request, res: Response) => {
+    const routine = requireRoutine(res, req.params.id);
+    if (!routine) return;
+    const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 50));
+    const deliveries = deps.hookStore.listByRoutine(routine.id, limit).map((d) => ({
+      id: d.id,
+      eventType: d.eventType,
+      status: d.status,
+      attempts: d.attempts,
+      error: d.error,
+      createdAt: d.createdAt,
+      updatedAt: d.updatedAt,
+    }));
+    res.json({ ok: true, deliveries });
   });
 
   return { routineStore, triggerStore };

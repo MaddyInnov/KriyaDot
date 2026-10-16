@@ -10,6 +10,7 @@ import type { AddressInfo } from 'node:net';
 import express from 'express';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { registerRoutineRoutes } from '../src/bot-routines.js';
+import { RoutineHookStore } from '../src/routine-hooks.js';
 import { createRoutineWebhookRouter, renderRoutinePrompt } from '../src/webhooks.js';
 import type { AgentRuntime, BotConfig } from '@mvp/agent-runtime';
 
@@ -45,6 +46,8 @@ describe('bot routines', () => {
     const { routineStore, triggerStore } = registerRoutineRoutes(routinesRouter, {
       dataDir: dir,
       getBots: () => bots,
+      hookStore: new RoutineHookStore(dir),
+      getBaseUrls: () => ({ publicBaseUrl: undefined, localPort: 4567 }),
     });
     app.use('/api/routines', routinesRouter);
     // Mount the ingress the way index.ts will: /webhooks/routines.

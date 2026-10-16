@@ -4163,3 +4163,31 @@ html[data-ux='simple'] .mic-btn.recording {
   color: #fca5a5;
   background: rgba(252, 165, 165, 0.12);
 }
+
+/* Routines & webhooks panel */
+.routines-panel .panel-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.75rem; }
+.routines-panel .panel-head h3 { margin: 0; font-size: 1rem; }
+.routine-row { border: 1px solid var(--border, #3a3a48); border-radius: 10px; margin-bottom: 0.5rem; overflow: hidden; }
+.routine-row-head { display: flex; align-items: center; gap: 0.5rem; width: 100%; padding: 0.6rem 0.75rem; background: none; border: none; cursor: pointer; font-size: 0.9rem; }
+.routine-name { font-weight: 600; flex: 1; text-align: left; }
+.routine-badge { font-size: 0.7rem; padding: 0.1rem 0.45rem; border-radius: 20px; background: rgba(110, 231, 183, 0.15); color: #6ee7b7; }
+.routine-badge.paused { background: rgba(252, 211, 77, 0.15); color: #fcd34d; }
+.routine-badge.connected { background: rgba(139, 92, 246, 0.18); color: #c4b5fd; }
+.routine-chev { opacity: 0.6; }
+.routine-detail { padding: 0.25rem 0.75rem 0.75rem; border-top: 1px solid var(--border, #3a3a48); }
+.routine-detail .field-label { display: block; font-size: 0.78rem; font-weight: 600; margin: 0.6rem 0 0.3rem; }
+.routine-detail .muted { opacity: 0.65; font-size: 0.8rem; }
+.routine-detail .muted.small { font-size: 0.75rem; }
+.routine-detail .error { color: #fca5a5; font-size: 0.82rem; }
+.copy-row { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; }
+.url-box { flex: 1; min-width: 0; font-size: 0.75rem; padding: 0.45rem 0.6rem; border-radius: 8px; background: var(--surface-2, #23232e); word-break: break-all; }
+.url-box.secret { font-family: monospace; }
+.url-box.masked { opacity: 0.6; }
+.btn-ghost.small { font-size: 0.75rem; padding: 0.25rem 0.6rem; }
+.btn-danger { font-size: 0.8rem; padding: 0.35rem 0.7rem; border-radius: 8px; border: 1px solid #fca5a5; background: rgba(252, 165, 165, 0.1); color: #fca5a5; cursor: pointer; }
+.deliveries-head { display: flex; align-items: center; justify-content: space-between; margin-top: 0.6rem; }
+.deliveries-head .field-label { margin: 0; }
+.deliveries-table { width: 100%; font-size: 0.78rem; border-collapse: collapse; margin-top: 0.4rem; }
+.deliveries-table th, .deliveries-table td { text-align: left; padding: 0.3rem 0.4rem; border-bottom: 1px solid var(--border, #33333f); }
+.deliveries-table th { opacity: 0.6; font-weight: 600; }
+.deliveries-table code { font-size: 0.72rem; }
