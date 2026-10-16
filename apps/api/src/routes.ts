@@ -12,6 +12,7 @@ import express from 'express';
 import { BotMemoryStore, SpaceStore, getProviderPreset, isFreeModel, listProviderPresets, readModelsDevCache, resolveApiKey, resolveBotWorkspaceDir, routeMessage } from '@mvp/agent-runtime';
 import type { AgentRuntime, BotConfig, StreamEvent, TokenUsage, WidgetCoordinator } from '@mvp/agent-runtime';
 import type { PerBotComputerManager } from '@mvp/agent-runtime';
+import type { VpsConnectionPool } from '@mvp/agent-runtime';
 import type { LazyMcpManager } from '@mvp/agent-runtime';
 // pricing.ts is not re-exported from the agent-runtime index (index untouched);
 // import the built subpath directly.
@@ -30,6 +31,7 @@ import type { GovernanceAdapter } from './governance-adapter.js';
 import type { McpConnection } from './tool-registry.js';
 import { rememberAllowedTool, saveBotPolicy } from './bot-policies.js';
 import { registerComputerSurfaceRoutes } from './computer-surface-routes.js';
+import { registerVpsRoutes } from './vps-routes.js';
 import {
   deleteSlashCommand,
   expandSlashCommand,
@@ -205,6 +207,11 @@ export interface RouteDeps {
    * status and change surfaces through it.
    */
   computerManager: PerBotComputerManager;
+  /**
+   * BYO VPS connection pool (OpenMausBot parity P1 #24). Created by index.ts;
+   * the VPS routes (vps-routes.ts) manage profiles and connections through it.
+   */
+  vpsPool: VpsConnectionPool;
   /**
    * Remote-phone control module (Workspace → Phone tab). Created by index.ts
    * so the WebSocket upgrade handler shares the same hub instance as the
@@ -435,6 +442,15 @@ export function createRouter(deps: RouteDeps): express.Router {
     bots,
     dataDir: config.dataDir,
     computerManager: deps.computerManager,
+    errorBody,
+  });
+
+  // ---- BYO VPS (OpenMausBot parity P1 #24) -------------------------------
+  registerVpsRoutes(router, {
+    bots,
+    dataDir: config.dataDir,
+    pool: deps.vpsPool,
+    audit: (action, fields) => governance.audit(action, fields),
     errorBody,
   });
 

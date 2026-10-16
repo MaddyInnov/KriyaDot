@@ -113,6 +113,15 @@ import {
   applyComputerSurfaces,
 } from './computer-surfaces.js';
 import { registerComputerSurfaceRoutes } from './computer-surface-routes.js';
+// BYO VPS (OpenMausBot parity P1 #24): per-bot SSH connection profiles.
+// Same direct-dist-subpath import pattern as computer.js above.
+import {
+  VpsComputerLayer,
+  VpsConnectionPool,
+  VpsNotConfiguredError,
+} from '@mvp/agent-runtime/dist/tools/vps.js';
+import { resolveVpsProfile } from './vps-profiles.js';
+import { registerVpsRoutes } from './vps-routes.js';
 // Password-safe login typing (type_login): resolves the vault password
 // server-side inside the handler; the model plane never sees values.
 // Same direct-dist-subpath import pattern as computer.js above.
@@ -341,23 +350,45 @@ async function boot(): Promise<void> {
 
   // Per-bot computers (OpenMausBot parity P1 #14): every bot gets its OWN
   // computer instance (own display state, own serialized input queue) plus
-  // a "Works on" surface choice (auto/local/docker/browser/off), instead of
+  // a "Works on" surface choice (auto/local/docker/browser/vps/off), instead of
   // one shared sandbox. Instances are created lazily on first computer-tool
   // use, dropped when the surface changes or the bot is deleted, and reaped
   // after 30 min idle. Created before the computer view so the viewer's
   // createLayer resolves to the same instance the bot's tools drive.
-  const computerManager = new PerBotComputerManager({
-    onRealAction: (action, detail) => {
-      console.log(`[computer-real] ${action}`, JSON.stringify(detail));
+  //
+  // BYO VPS (OpenMausBot parity P1 #24): the connection pool lives here so
+  // the 'vps' computer surface and the VPS REST routes share connections.
+  // Private keys resolve from the SecureVault ('default-user' namespace, like
+  // provider keys); passwords are never stored and only travel inside the
+  // connect request body.
+  const vpsPool = new VpsConnectionPool({
+    resolvePrivateKey: (ref: string) => {
       try {
-        governance.audit('tool.computer_real_action', {
-          actor: 'agent',
-          toolName: `computer_${action}`,
-          detail,
-        });
+        return new SecureVault(config.dataDir, 'default-user', 'vps').get(ref)?.value;
       } catch {
-        // Audit must never break input.
+        return undefined;
       }
+    },
+  });
+  const auditComputerAction = (action: string, detail: unknown): void => {
+    console.log(`[computer-real] ${action}`, JSON.stringify(detail));
+    try {
+      governance.audit('tool.computer_real_action', {
+        actor: 'agent',
+        toolName: `computer_${action}`,
+        detail,
+      });
+    } catch {
+      // Audit must never break input.
+    }
+  };
+  const computerManager = new PerBotComputerManager({
+    onRealAction: auditComputerAction,
+    vpsLayerFor: (botId: string) => {
+      const profile = resolveVpsProfile(config.dataDir, botId);
+      if (!profile) throw new VpsNotConfiguredError(botId);
+      const conn = vpsPool.getOrCreate(`bot:${botId}`, profile);
+      return new VpsComputerLayer(conn, { onRealAction: auditComputerAction });
     },
   });
   applyComputerSurfacePins(computerManager, config.dataDir);
@@ -1228,6 +1259,8 @@ async function boot(): Promise<void> {
       omniStore,
       omniCollector,
       computerManager,
+      // BYO VPS (OpenMausBot parity P1 #24).
+      vpsPool,
       // Lazy MCP directory (OpenMausBot parity P1 #22).
       lazyMcpManager,
       refreshMcpStubs,
@@ -1600,6 +1633,12 @@ async function boot(): Promise<void> {
       for (const bot of seed.bots) {
         await computerManager.removeBot(bot.id);
       }
+    } catch {
+      // ignore
+    }
+    try {
+      // Close all VPS SSH connections (P1 #24).
+      await vpsPool.closeAll();
     } catch {
       // ignore
     }

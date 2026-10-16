@@ -12,6 +12,8 @@
 //   local    — the machine KriyaDot runs on (mock unless COMPUTER_USE_REAL=1).
 //   docker   — the Docker computer sandbox (isolated container + CDP).
 //   browser  — the Playwright browser surface.
+//   vps      — the user's own server over SSH (VpsComputerLayer; needs a VPS
+//              profile for the bot, configured in Bots → Computer → VPS).
 //   off      — computer tools disabled for this bot (calls fail with a clear
 //              error instead of driving a shared screen).
 //
@@ -44,20 +46,22 @@ import {
   type Screenshot,
   type ToolContext,
 } from './computer.js';
+import { VpsNotConfiguredError } from './vps.js';
 
 /** "Works on" surface choices. Stored on BotConfig.computerSurface. */
-export type ComputerSurface = 'auto' | 'local' | 'docker' | 'browser' | 'off';
+export type ComputerSurface = 'auto' | 'local' | 'docker' | 'browser' | 'vps' | 'off';
 
 export const COMPUTER_SURFACES: readonly ComputerSurface[] = [
   'auto',
   'local',
   'docker',
   'browser',
+  'vps',
   'off',
 ];
 
 /** A surface that actually resolves to a backend ('off' never does). */
-export type ResolvedComputerSurface = 'local' | 'docker' | 'browser';
+export type ResolvedComputerSurface = 'local' | 'docker' | 'browser' | 'vps';
 
 export function isComputerSurface(v: unknown): v is ComputerSurface {
   return typeof v === 'string' && (COMPUTER_SURFACES as readonly string[]).includes(v);
@@ -106,12 +110,20 @@ export interface PerBotComputerManagerDeps {
   clock?: () => number;
   /**
    * Backend factory (tests inject mocks). Defaults to the real backends:
-   * LocalComputerSandbox / DockerComputerSandbox / PlaywrightOSScreenLayer.
+   * LocalComputerSandbox / DockerComputerSandbox / PlaywrightOSScreenLayer /
+   * the VPS layer (via vpsLayerFor).
    */
   createBackend?: (
     resolved: ResolvedComputerSurface,
     botId: string,
   ) => OSScreenLayer | Promise<OSScreenLayer>;
+  /**
+   * VPS layer factory: builds the OSScreenLayer for a bot whose surface
+   * resolves to 'vps'. The host wires this to a VpsConnectionPool backed by
+   * the bot's VPS profile. Throw VpsNotConfiguredError when the bot has no
+   * profile — the error message tells the user where to add one.
+   */
+  vpsLayerFor?: (botId: string) => OSScreenLayer | Promise<OSScreenLayer>;
 }
 
 export interface ComputerInstanceStatus {
@@ -266,12 +278,14 @@ export class PerBotComputerManager {
   private readonly clock: () => number;
   private readonly onRealAction?: (action: string, detail: unknown) => void;
   private readonly createBackendOverride?: PerBotComputerManagerDeps['createBackend'];
+  private readonly vpsLayerFor?: PerBotComputerManagerDeps['vpsLayerFor'];
 
   constructor(deps: PerBotComputerManagerDeps = {}) {
     this.idleTimeoutMs = deps.idleTimeoutMs ?? DEFAULT_COMPUTER_IDLE_TIMEOUT_MS;
     this.clock = deps.clock ?? Date.now;
     this.onRealAction = deps.onRealAction;
     this.createBackendOverride = deps.createBackend;
+    this.vpsLayerFor = deps.vpsLayerFor;
   }
 
   now(): number {
@@ -357,7 +371,7 @@ export class PerBotComputerManager {
       entry.launching = (async () => {
         const layer = this.createBackendOverride
           ? await this.createBackendOverride(entry.resolved, entry.botId)
-          : this.defaultBackend(entry.resolved);
+          : await this.defaultBackend(entry.resolved, entry.botId);
         if (hasLaunch(layer)) await layer.launch();
         entry.running = true;
         return layer;
@@ -373,8 +387,15 @@ export class PerBotComputerManager {
     }
   }
 
-  private defaultBackend(resolved: ResolvedComputerSurface): OSScreenLayer {
+  private async defaultBackend(resolved: ResolvedComputerSurface, botId: string): Promise<OSScreenLayer> {
     const onRealAction = this.onRealAction;
+    if (resolved === 'vps') {
+      if (!this.vpsLayerFor) {
+        throw new VpsNotConfiguredError(botId);
+      }
+      // The layer itself connects lazily (first tool use), so this stays fast.
+      return this.vpsLayerFor(botId);
+    }
     if (resolved === 'docker') {
       return new DockerComputerSandbox(
         onRealAction

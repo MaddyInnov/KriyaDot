@@ -3,7 +3,8 @@
     "@modelcontextprotocol/sdk": "^1.7.0",
     "@mvp/governance": "*",
     "e2b": "^2.53.1",
-    "gray-matter": "^4.0.3"
+    "gray-matter": "^4.0.3",
+    "ssh2": "^1.17.0"
   },
   "devDependencies": {
     "@types/node": "^22.7.5",

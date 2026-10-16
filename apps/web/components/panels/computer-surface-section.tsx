@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 'use client';
 
-// "Works on" surface selection (OpenMausBot parity P1 #14). Rendered at the
+// "Works on" surface selection (OpenMausBot parity P1 #14 + VPS P1 #24). Rendered at the
 // top of the per-bot Computer tab (computer-panel.tsx): lets the user pick
 // which computer a bot drives — auto (best available), local (this machine),
-// docker (isolated container), browser (Playwright), or off (disable
-// computer tools for this bot). Shows instance status + a restart button,
-// and manages per-conversation surface pins.
+// docker (isolated container), browser (Playwright), vps (the user's own
+// server over SSH), or off (disable computer tools for this bot). Shows
+// instance status + a restart button, and manages per-conversation surface pins.
 
 import { useCallback, useEffect, useState } from 'react';
 import { authedFetch } from '../../lib/api';
@@ -16,6 +16,7 @@ const SURFACES = [
   { id: 'local', label: 'Local (this machine)' },
   { id: 'docker', label: 'Docker sandbox' },
   { id: 'browser', label: 'Browser (Playwright)' },
+  { id: 'vps', label: 'VPS (your own server over SSH)' },
   { id: 'off', label: 'Off (disable computer tools)' },
 ] as const;
 

@@ -92,7 +92,7 @@ export function saveBotComputerSurface(
   if (!bot) throw new Error(`Unknown bot "${botId}"`);
   if (!isComputerSurface(surface)) {
     throw new Error(
-      `"surface" must be one of auto, local, docker, browser, off (got ${JSON.stringify(surface)})`,
+      `"surface" must be one of auto, local, docker, browser, vps, off (got ${JSON.stringify(surface)})`,
     );
   }
   const overlay = loadComputerSurfaceOverlay(dataDir);
@@ -113,7 +113,7 @@ export function saveComputerSurfacePin(
     throw new Error('"conversationId" must be a non-empty string (max 256 chars)');
   }
   if (surface !== null && !isComputerSurface(surface)) {
-    throw new Error('"surface" must be one of auto, local, docker, browser, off');
+    throw new Error('"surface" must be one of auto, local, docker, browser, vps, off');
   }
   const overlay = loadComputerSurfaceOverlay(dataDir);
   const key = `${botId}:${conversationId}`;

@@ -4939,3 +4939,74 @@ select.input-sm {
 .cap-bar-fill.exceeded {
   background: var(--danger, #c0392b);
 }
+
+/* BYO VPS section (OpenMausBot parity P1 #24). */
+.vps-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border, #e5e0d8);
+  border-radius: 12px;
+  background: var(--surface-2, rgba(255, 255, 255, 0.5));
+  margin-top: 12px;
+}
+.vps-section h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+.vps-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+}
+.vps-section label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+.vps-section input,
+.vps-section select,
+.vps-section textarea {
+  font-weight: 400;
+}
+.vps-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+.vps-status {
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+.vps-error-detail {
+  font-weight: 400;
+  color: var(--danger, #b3261e);
+}
+.vps-fingerprint {
+  font-size: 0.85rem;
+  word-break: break-all;
+}
+.vps-trust {
+  padding: 10px;
+  border: 1px solid var(--warning-border, #e8a13d);
+  border-radius: 8px;
+  background: var(--warning-bg, rgba(232, 161, 61, 0.12));
+  font-size: 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.vps-test-result {
+  font-size: 0.9rem;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface-3, rgba(0, 0, 0, 0.04));
+}
+.vps-notice {
+  font-size: 0.85rem;
+  color: var(--success, #1e7e34);
+}

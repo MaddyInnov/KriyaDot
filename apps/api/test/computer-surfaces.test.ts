@@ -51,10 +51,18 @@ describe('computer surface overlay', () => {
   it('rejects invalid surfaces and unknown bots', () => {
     const d = freshDir();
     const bs = bots();
-    expect(() => saveBotComputerSurface(d, bs, 'scout', 'windows')).toThrow(/auto, local, docker, browser, off/);
+    expect(() => saveBotComputerSurface(d, bs, 'scout', 'windows')).toThrow(/auto, local, docker, browser, vps, off/);
     expect(() => saveBotComputerSurface(d, bs, 'ghost', 'docker')).toThrow(/Unknown bot/);
     // Nothing persisted on failure.
     expect(loadComputerSurfaceOverlay(d).surfaces).toEqual({});
+  });
+
+  it('accepts the vps surface (BYO VPS, P1 #24)', () => {
+    const d = freshDir();
+    const bs = bots();
+    expect(saveBotComputerSurface(d, bs, 'scout', 'vps')).toBe('vps');
+    expect(bs[0].computerSurface).toBe('vps');
+    expect(loadComputerSurfaceOverlay(d).surfaces).toEqual({ scout: 'vps' });
   });
 
   it('applies the overlay onto bots at boot without clobbering seed values', () => {
