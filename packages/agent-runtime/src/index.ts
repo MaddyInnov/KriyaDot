@@ -3,6 +3,7 @@
 export * from './types.js';
 export * from './governance.js';
 export * from './providers/catalog.js';
+export * from './providers/models-dev.js';
 export * from './providers/cli-bridge.js';
 export * from './providers/cli-driver.js';
 export * from './providers/cli-auth.js';
@@ -21,6 +22,7 @@ export * from './skills.js';
 export * from './user-skills.js';
 export * from './agent-import.js';
 export * from './mcp.js';
+export * from './mcp-directory.js';
 export * from './mcp-oauth.js';
 export * from './tools/builtin.js';
 export * from './tools/coding.js';

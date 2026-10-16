@@ -7,13 +7,15 @@ import {
   connectBridge,
   disconnectBridge,
   getCliAuthStatus,
+  getModelsCatalogInfo,
   getProviders,
   pollCliLogin,
+  refreshModelsCatalog,
   removeProviderKey,
   saveProviderKey,
   startCliLogin,
 } from '../../lib/api';
-import type { CliLoginStatus, ProviderInfo, RateLimitSnapshot } from '../../lib/api';
+import type { CliLoginStatus, ModelsCatalogInfo, ProviderInfo, RateLimitSnapshot } from '../../lib/api';
 import { formatResetIn, formatTokens } from '../../lib/usage';
 
 /**
@@ -300,6 +302,9 @@ export default function ProvidersPage() {
   // In-app CLI sign-in status (OpenMausBot parity).
   const [cliAuth, setCliAuth] = useState<CliLoginStatus[]>([]);
   const [signInFor, setSignInFor] = useState<ProviderInfo | null>(null);
+  // models.dev catalog cache (OpenMausBot parity P1 #23): manual refresh only.
+  const [catalogInfo, setCatalogInfo] = useState<ModelsCatalogInfo | null>(null);
+  const [refreshingCatalog, setRefreshingCatalog] = useState(false);
 
   const toggleFreeOnly = (on: boolean) => {
     setFreeOnly(on);
@@ -327,7 +332,26 @@ export default function ProvidersPage() {
     } catch {
       // sign-in status is best-effort; the page works without it
     }
+    try {
+      setCatalogInfo(await getModelsCatalogInfo());
+    } catch {
+      // catalog info is best-effort
+    }
   }, []);
+
+  const refreshCatalog = async () => {
+    setRefreshingCatalog(true);
+    setError('');
+    try {
+      const info = await refreshModelsCatalog();
+      setCatalogInfo(info);
+      setNotice(`Model catalog refreshed — ${info.modelCount} models from ${info.providerCount} providers.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRefreshingCatalog(false);
+    }
+  };
 
   useEffect(() => {
     void refresh();
@@ -430,6 +454,23 @@ export default function ProvidersPage() {
         <strong>Key storage:</strong> keys are stored only in environment variables or the local
         file <span className="mono">providers.local.json</span> (mode 0600) next to the API&apos;s
         data directory. They are never logged and never returned by the API.
+      </div>
+      <div className="card" style={{ marginTop: 12 }}>
+        <div className="row-between">
+          <div>
+            <strong>Model catalog</strong>
+            <p className="small muted" style={{ margin: '4px 0 0' }}>
+              {catalogInfo
+                ? `Updated ${catalogInfo.ageLabel} · ${catalogInfo.modelCount} models from ${catalogInfo.providerCount} providers (models.dev).`
+                : 'Model catalog info unavailable.'}
+              <br />
+              Refresh is manual only — the app never re-fetches on its own.
+            </p>
+          </div>
+          <button className="btn btn-sm" disabled={refreshingCatalog} onClick={() => void refreshCatalog()}>
+            {refreshingCatalog ? 'Refreshing…' : 'Refresh catalog'}
+          </button>
+        </div>
       </div>
       <div className="row-between" style={{ marginTop: 12 }}>
         <label className="small" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>

@@ -47,6 +47,7 @@ import { createAgentImportRouter } from './agent-import-routes.js';
 import { createAnalyticsRouter } from './analytics-routes.js';
 import { createLocalLlmRouter } from './local-llm-routes.js';
 import { LocalLlmManager } from '@mvp/agent-runtime';
+import { LazyMcpManager } from '@mvp/agent-runtime';
 import { createSelfUpdateRouter } from './self-update-routes.js';
 import { SelfUpdateManager } from '@mvp/agent-runtime';
 import { createFusionRouter, shutdownFusionRuns } from './fusion-routes.js';
@@ -401,6 +402,23 @@ async function boot(): Promise<void> {
       // workspace per tool-call (Octop-style isolation).
       getBotConfig: (id) => botsById.get(id),
     });
+
+  // Lazy MCP directory (OpenMausBot parity P1 #22): installed servers are
+  // registered as lazy stubs in the tool registry. Nothing spawns at boot;
+  // the server process starts on the first tool call. Disabled servers never
+  // spawn.
+  const lazyMcpManager = new LazyMcpManager({
+    dataDir: config.dataDir,
+    pinDbPath: path.join(config.dataDir, 'mcp-pins.db'),
+  });
+  lazyMcpManager.syncRegistry(toolRegistry);
+  const refreshMcpStubs = (): void => {
+    try {
+      lazyMcpManager.syncRegistry(toolRegistry);
+    } catch (err) {
+      console.warn('[mcp] lazy stub re-sync failed:', (err as Error).message);
+    }
+  };
 
   // Phase 4: computer-use tools (sandboxed GUI automation; mutating actions
   // are approval-gated via computerUsePolicyRules above; the default OS
@@ -1210,6 +1228,9 @@ async function boot(): Promise<void> {
       omniStore,
       omniCollector,
       computerManager,
+      // Lazy MCP directory (OpenMausBot parity P1 #22).
+      lazyMcpManager,
+      refreshMcpStubs,
       // Interactive widgets (OpenMausBot parity P1 #15): the chat route
       // passes this into runTurn so ask_user_question can pause for answers.
       widgetCoordinator,
@@ -1569,6 +1590,11 @@ async function boot(): Promise<void> {
     scheduler.stop();
     hookDeliveryWorker.stop();
     await closeMcp();
+    try {
+      await lazyMcpManager.close();
+    } catch {
+      // ignore lazy MCP close errors on shutdown
+    }
     try {
       // Tear down every per-bot computer instance (P1 #14).
       for (const bot of seed.bots) {

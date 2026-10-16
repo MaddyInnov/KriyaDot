@@ -338,6 +338,8 @@ export interface ModelPriceInfo {
   inputPer1M?: number;
   outputPer1M?: number;
   estimated: boolean;
+  /** 'catalog' (shipped presets) or 'models.dev' (refreshed catalog). */
+  source?: 'catalog' | 'models.dev';
 }
 
 export interface ProviderInfo {
@@ -805,6 +807,19 @@ export const getBotApprovalMode = (
 export const getProviders = (): Promise<ProviderInfo[]> => apiJson('/api/providers');
 export const getModels = (freeOnly = false): Promise<ModelPriceInfo[]> =>
   apiJson(`/api/models${freeOnly ? '?freeOnly=1' : ''}`);
+
+/** models.dev catalog cache info (OpenMausBot parity P1 #23). */
+export interface ModelsCatalogInfo {
+  fetchedAt: string | null;
+  ageMs: number | null;
+  ageLabel: string;
+  providerCount: number;
+  modelCount: number;
+}
+export const getModelsCatalogInfo = (): Promise<ModelsCatalogInfo> =>
+  apiJson('/api/models/catalog-info');
+export const refreshModelsCatalog = (): Promise<ModelsCatalogInfo & { ok: boolean }> =>
+  apiJson('/api/models/refresh', { method: 'POST' });
 export function updateBotPolicy(botId: string, rules: BotPolicyRule[]): Promise<{ ok: boolean; botId: string; policy: BotPolicy }> {
   return apiJson(`/api/bots/${encodeURIComponent(botId)}/policy`, {
     method: 'PUT',

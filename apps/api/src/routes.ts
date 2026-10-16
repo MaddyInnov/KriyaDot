@@ -9,9 +9,10 @@
 //   id → real approval id translation.
 
 import express from 'express';
-import { BotMemoryStore, SpaceStore, getProviderPreset, isFreeModel, listProviderPresets, resolveApiKey, resolveBotWorkspaceDir, routeMessage } from '@mvp/agent-runtime';
+import { BotMemoryStore, SpaceStore, getProviderPreset, isFreeModel, listProviderPresets, readModelsDevCache, resolveApiKey, resolveBotWorkspaceDir, routeMessage } from '@mvp/agent-runtime';
 import type { AgentRuntime, BotConfig, StreamEvent, TokenUsage, WidgetCoordinator } from '@mvp/agent-runtime';
 import type { PerBotComputerManager } from '@mvp/agent-runtime';
+import type { LazyMcpManager } from '@mvp/agent-runtime';
 // pricing.ts is not re-exported from the agent-runtime index (index untouched);
 // import the built subpath directly.
 import { priceOfModel } from '@mvp/agent-runtime/dist/pricing.js';
@@ -55,6 +56,8 @@ import {
 // Phase 3: connected apps (OAuth), messaging gateway, notes, tasks/calendar.
 import { registerOAuthRoutes } from './oauth.js';
 import { registerMcpOAuthRoutes } from './mcp-oauth.js';
+import { registerMcpDirectoryRoutes } from './mcp-directory-routes.js';
+import { registerModelsDevRoutes } from './models-dev-routes.js';
 import type { McpServerConfig } from './seed.js';
 import { registerMessagingRoutes } from './messaging.js';
 import { registerNotesRoutes } from './notes.js';
@@ -189,6 +192,13 @@ export interface RouteDeps {
   omniStore: OmniStore;
   /** Omni collector (feeds the store from audit/approvals/workflow runs). */
   omniCollector: OmniCollector;
+  /**
+   * Lazy MCP directory manager (OpenMausBot parity P1 #22). Created by
+   * index.ts; installed servers connect on first tool call, never at boot.
+   */
+  lazyMcpManager?: LazyMcpManager;
+  /** Re-sync lazy MCP stubs into the tool registry (owned by index.ts). */
+  refreshMcpStubs?: () => void;
   /**
    * Per-bot computers (OpenMausBot parity P1 #14). Created by index.ts; the
    * computer-surface routes (computer-surface-routes.ts) read instance
@@ -1898,12 +1908,16 @@ export function createRouter(deps: RouteDeps): express.Router {
         inputPer1M?: number;
         outputPer1M?: number;
         estimated: boolean;
+        /** 'catalog' (shipped presets) or 'models.dev' (refreshed catalog). */
+        source: 'catalog' | 'models.dev';
       }> = [];
+      const seen = new Set<string>();
       for (const preset of listProviderPresets()) {
         for (const m of preset.models) {
           const free = isFreeModel(preset.id, m.id);
           if (freeOnly && !free) continue;
           const price = priceOfModel(preset.id, m.id);
+          seen.add(`${preset.id}:${m.id}`);
           models.push({
             providerId: preset.id,
             id: m.id,
@@ -1913,8 +1927,37 @@ export function createRouter(deps: RouteDeps): express.Router {
             inputPer1M: price?.inputPer1M,
             outputPer1M: price?.outputPer1M,
             estimated: price ? price.estimate : true,
+            source: 'catalog',
           });
         }
+      }
+      // models.dev catalog refresh (OpenMausBot parity P1 #23): merge cached
+      // models.dev models the shipped catalog does not already have. Marked
+      // with their source so the picker can show it; failures just skip.
+      try {
+        const cached = readModelsDevCache(config.dataDir);
+        if (cached && !freeOnly) {
+          for (const provider of cached.providers) {
+            for (const m of provider.models) {
+              const key = `${provider.id}:${m.id}`;
+              if (seen.has(key)) continue;
+              seen.add(key);
+              models.push({
+                providerId: provider.id,
+                id: m.id,
+                name: m.name,
+                contextLength: m.contextLength,
+                free: false,
+                inputPer1M: m.inputPer1M,
+                outputPer1M: m.outputPer1M,
+                estimated: false,
+                source: 'models.dev',
+              });
+            }
+          }
+        }
+      } catch {
+        // models.dev merge must never break /api/models
       }
       res.json(models);
     } catch (err) {
@@ -2366,6 +2409,17 @@ export function createRouter(deps: RouteDeps): express.Router {
   // under /api/oauth/... and /api/messaging/....
   registerOAuthRoutes(router, { config, governance });
   registerMcpOAuthRoutes(router, { config, governance, mcpServers });
+  // Lazy MCP directory (OpenMausBot parity P1 #22) + models.dev catalog
+  // refresh (P1 #23). Both are optional deps so older index.ts callers and
+  // tests keep working.
+  if (deps.lazyMcpManager) {
+    registerMcpDirectoryRoutes(router, {
+      manager: deps.lazyMcpManager,
+      governance,
+      refreshStubs: deps.refreshMcpStubs ?? (() => undefined),
+    });
+  }
+  registerModelsDevRoutes(router, { dataDir: config.dataDir });
   // Inbound bot mentions (Discord/Slack) run an agent turn through the chat
   // pipeline and reply in the channel. The turn uses the default bot; the
   // session is scoped per (provider, channel) so the bot keeps context.

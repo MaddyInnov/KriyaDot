@@ -10,6 +10,7 @@ import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { authedFetch } from '../../lib/api';
 import SkillsPanel from '../../components/skills/skills-panel';
+import McpDirectoryPanel from '../../components/mcp/mcp-directory-panel';
 
 interface MarketplaceEntry {
   id: string;
@@ -44,7 +45,7 @@ const api = (path: string, init?: RequestInit): Promise<unknown> =>
 const fmtMoney = (cents: number): string =>
   `$${(cents / 100).toFixed(2).replace(/\.00$/, '')}`;
 
-type Tab = 'browse' | 'skills' | 'revenue';
+type Tab = 'browse' | 'skills' | 'mcp' | 'revenue';
 
 export default function MarketplacePage() {
   const [tab, setTab] = useState<Tab>('browse');
@@ -154,6 +155,9 @@ export default function MarketplacePage() {
           <button className={`btn btn-sm${tab === 'skills' ? ' btn-primary' : ''}`} onClick={() => setTab('skills')}>
             Skills
           </button>{' '}
+          <button className={`btn btn-sm${tab === 'mcp' ? ' btn-primary' : ''}`} onClick={() => setTab('mcp')}>
+            MCP servers
+          </button>{' '}
           <button className={`btn btn-sm${tab === 'revenue' ? ' btn-primary' : ''}`} onClick={() => setTab('revenue')}>
             Creator revenue
           </button>
@@ -248,6 +252,8 @@ export default function MarketplacePage() {
       )}
 
       {tab === 'skills' && <SkillsPanel />}
+
+      {tab === 'mcp' && <McpDirectoryPanel />}
 
       {tab === 'revenue' && (
         <>
