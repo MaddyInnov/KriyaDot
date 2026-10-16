@@ -3,6 +3,8 @@
 import type { ToolContext, ToolDefinition } from '../types.js';
 import { MAX_SUBAGENT_DEPTH, spawnSubagent } from '../subagents.js';
 import type { SubagentAuditFn, SubagentSpawnFn } from '../subagents.js';
+import type { ProvenanceNote } from '../provenance.js';
+import { noteFromChain } from '../provenance.js';
 import { SubagentStore } from '../subagent-store.js';
 import { AcpClient, acpOptionsFromBot } from '../acp.js';
 import type { BotConfig } from '../types.js';
@@ -171,14 +173,38 @@ export function createDelegateTools(opts: CreateDelegateToolsOptions): ToolDefin
         ? (args.tools as unknown[]).map(String).filter((t) => t && t !== 'delegate')
         : undefined;
 
+      // P1 #13: the child's turn inherits the parent's provenance with the
+      // relay path extended by the child bot, so nested delegation keeps a
+      // full origin chain and the consent rule applies downstream.
+      const childBotId = botOverride ?? ctx.botId;
+      const childProvenance: ProvenanceNote = ctx.provenance
+        ? {
+            ...ctx.provenance,
+            relayPath: [...ctx.provenance.relayPath, childBotId],
+            relayNames: ctx.provenance.relayNames
+              ? [...ctx.provenance.relayNames, opts.getBotConfig?.(childBotId)?.name ?? childBotId]
+              : undefined,
+            timestamp: new Date().toISOString(),
+          }
+        : noteFromChain({
+            chain: [ctx.botId, childBotId],
+            origin: 'bot',
+            originBotId: ctx.botId,
+            names: {
+              [ctx.botId]: opts.getBotConfig?.(ctx.botId)?.name ?? ctx.botId,
+              [childBotId]: opts.getBotConfig?.(childBotId)?.name ?? childBotId,
+            },
+          });
+
       if (!store) {
         // Minimal wiring: spawn without depth enforcement or records.
         // Hosts SHOULD pass a SubagentStore (see options docs).
         const result = await spawn({
           task,
           tools: requested,
-          botId: botOverride ?? ctx.botId,
+          botId: childBotId,
           parentSessionId: ctx.sessionId,
+          provenance: childProvenance,
         });
         return { result: result.result, usage: result.usage ?? null };
       }
@@ -193,6 +219,7 @@ export function createDelegateTools(opts: CreateDelegateToolsOptions): ToolDefin
         task,
         tools: requested,
         botId: botOverride ?? ctx.botId,
+        provenance: childProvenance,
       });
       return {
         result: spawned.result,

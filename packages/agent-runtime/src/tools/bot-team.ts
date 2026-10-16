@@ -17,6 +17,8 @@
 // requester's transcript.
 
 import type { BotConfig, ToolContext, ToolDefinition } from '../types.js';
+import type { ProvenanceNote } from '../provenance.js';
+import { noteFromChain } from '../provenance.js';
 
 export const BOT_TEAM_TOOL_NAMES = {
   listBots: 'list_bots',
@@ -47,6 +49,11 @@ export interface BotExchange {
   detail?: string;
   createdAt: string;
   completedAt?: string;
+  /**
+   * Provenance note for this relay (P1 #13): origin + relay path, stored
+   * with the exchange and shown in the pair sheet as a "via A → B" chip.
+   */
+  provenance?: ProvenanceNote;
 }
 
 export interface BotSummary {
@@ -65,11 +72,12 @@ export interface CreateBotTeamToolsOptions {
    * Run one target-bot turn and return its final text. The host wires this
    * to agentRuntime.runTurn with a fresh session; `chain` is the handoff
    * chain INCLUDING the target (for nested ask_bot/message_bot calls).
+   * `provenance` carries the origin note into the target turn (P1 #13).
    */
   runBotTurn: (
     bot: BotConfig,
     message: string,
-    opts: { chain: string[]; timeoutMs?: number },
+    opts: { chain: string[]; timeoutMs?: number; provenance?: ProvenanceNote },
   ) => Promise<{ text: string }>;
   /**
    * Current handoff chain for a session (bot ids, requester first).
@@ -100,6 +108,29 @@ function cleanText(raw: unknown, maxLen: number): string {
   const text = typeof raw === 'string' ? raw.trim() : '';
   if (!text) throw new Error('message must be a non-empty string');
   return text.length > maxLen ? text.slice(0, maxLen) : text;
+}
+
+/**
+ * Build the provenance note for a relay (P1 #13): origin 'bot', the full
+ * handoff chain as the relay path, display names resolved from configs.
+ */
+function buildRelayProvenance(
+  opts: CreateBotTeamToolsOptions,
+  sourceBotId: string,
+  chain: string[],
+): ProvenanceNote {
+  const names: Record<string, string> = {};
+  for (const id of chain) {
+    const name = opts.getBotConfig(id)?.name;
+    if (name) names[id] = name;
+  }
+  return noteFromChain({
+    chain,
+    origin: 'bot',
+    originBotId: sourceBotId,
+    originBotName: opts.getBotConfig(sourceBotId)?.name,
+    names,
+  });
 }
 
 /**
@@ -198,15 +229,17 @@ export function createBotTeamTools(opts: CreateBotTeamToolsOptions): ToolDefinit
         targetId,
       );
 
+      const provenance = buildRelayProvenance(opts, ctx.botId, newChain);
       const exchange = opts.recordExchange({
         sourceBotId: ctx.botId,
         targetBotId: targetId,
         type: 'ask',
         text: message,
         status: 'pending',
+        provenance,
       });
 
-      const run = opts.runBotTurn(target, message, { chain: newChain, timeoutMs: askTimeoutMs });
+      const run = opts.runBotTurn(target, message, { chain: newChain, timeoutMs: askTimeoutMs, provenance });
       const timeout = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error('ask_bot timed out waiting for a reply')), askTimeoutMs),
       );
@@ -290,17 +323,19 @@ export function createBotTeamTools(opts: CreateBotTeamToolsOptions): ToolDefinit
         targetId,
       );
 
+      const provenance = buildRelayProvenance(opts, ctx.botId, newChain);
       const exchange = opts.recordExchange({
         sourceBotId: ctx.botId,
         targetBotId: targetId,
         type: 'message',
         text: message,
         status: 'pending',
+        provenance,
       });
 
       // Fire-and-forget: don't await. Record the outcome when it settles.
       void opts
-        .runBotTurn(target, message, { chain: newChain })
+        .runBotTurn(target, message, { chain: newChain, provenance })
         .then(({ text }) => {
           opts.updateExchange(exchange.id, {
             status: 'completed',

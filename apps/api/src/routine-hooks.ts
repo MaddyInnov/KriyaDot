@@ -607,6 +607,14 @@ export class WebhookDeliveryWorker {
         message,
         sessionId: routine.sessionId ?? `routine_${routine.id}`,
         taskType: 'chat',
+        // P1 #13: routine hook deliveries carry external event payloads —
+        // untrusted origin, approvals go to the human.
+        provenance: {
+          origin: 'routine',
+          relayPath: [`routine:${routine.id}`],
+          relayNames: [`routine ${routine.id}`],
+          timestamp: new Date().toISOString(),
+        },
         onEvent: () => {},
       });
       hookStore.markDone(delivery.id);

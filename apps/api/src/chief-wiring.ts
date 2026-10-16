@@ -148,12 +148,26 @@ export function registerChiefToolsWiring(opts: ChiefWiringOpts): ChiefWiringResu
       if (e.type === 'token' && typeof e.content === 'string') text += e.content;
       else if (e.type === 'done') usage = e.usage;
     };
+    // P1 #13: chief → member briefs are bot-to-bot relays — the member's
+    // turn carries the chief's origin note.
+    const chiefId = store.getChiefConfig().chiefBotId;
+    const chiefName = chiefId ? opts.getBotConfig(chiefId)?.name : undefined;
     try {
       const returned = await opts.agentRuntime.runTurn({
         bot,
         message,
         sessionId,
         taskType: 'chat',
+        provenance: chiefId
+          ? {
+              origin: 'bot' as const,
+              originBotId: chiefId,
+              originBotName: chiefName,
+              relayPath: [chiefId, bot.id],
+              relayNames: [chiefName ?? chiefId, bot.name],
+              timestamp: new Date().toISOString(),
+            }
+          : undefined,
         onEvent,
       });
       usage = usage ?? returned;

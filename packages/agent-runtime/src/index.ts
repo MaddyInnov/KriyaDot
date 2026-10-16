@@ -28,6 +28,7 @@ export * from './tools/sandbox.js';
 export * from './tools/verify.js';
 export * from './approval-modes.js';
 export * from './progress-guard.js';
+export * from './provenance.js';
 export * from './workspaces.js';
 export * from './spaces.js';
 export * from './routing.js';

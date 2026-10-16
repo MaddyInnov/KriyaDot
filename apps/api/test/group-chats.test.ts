@@ -215,13 +215,17 @@ describe('buildMemberPrompt', () => {
       group: { id: 'g', name: 'Dev', description: 'ship it', memberBotIds: [], createdAt: '' },
       members: MEMBERS,
       userText: '@coder fix the bug',
-      priorReplies: [{ botName: 'Scout', text: 'I found it in auth.ts' }],
+      priorReplies: [{ botName: 'Scout', botId: 'scout', text: 'I found it in auth.ts' }],
       round: 2,
     });
     expect(p).toContain('[Group chat: "Dev"');
     expect(p).toContain('Room purpose: ship it');
     expect(p).toContain('The user said: coder fix the bug');
-    expect(p).toContain('Scout: I found it in auth.ts');
+    // P1 #13: peer replies are fenced as untrusted content.
+    expect(p).toContain('UNTRUSTED PEER CONTENT — BEGIN');
+    expect(p).toContain('Scout:');
+    expect(p).toContain('I found it in auth.ts');
+    expect(p).toContain('UNTRUSTED');
     expect(p).toContain('round 2');
     expect(p).toContain('(pass)');
   });
@@ -376,8 +380,11 @@ describe('runRoomTurn', () => {
     try {
       const group = store.createGroup('Team', ['coder', 'scout']);
       await runRoomTurn(group, 'hello', deps);
-      // Second speaker's prompt includes the first speaker's reply
-      expect(calls[1].prompt).toContain('Coder: reply from Coder');
+      // Second speaker's prompt includes the first speaker's reply,
+      // fenced as untrusted peer content (P1 #13).
+      expect(calls[1].prompt).toContain('Coder:');
+      expect(calls[1].prompt).toContain('reply from Coder');
+      expect(calls[1].prompt).toContain('UNTRUSTED PEER CONTENT — BEGIN');
     } finally {
       store.close();
       rmSync(dir, { recursive: true, force: true });

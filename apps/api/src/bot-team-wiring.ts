@@ -13,6 +13,7 @@
 import type {
   AgentRuntime,
   BotConfig,
+  ProvenanceNote,
   StreamEvent,
   TokenUsage,
   ToolDefinition,
@@ -52,7 +53,7 @@ export function registerBotTeamToolsWiring(opts: BotTeamWiringOpts): BotConversa
   const runBotTurn = async (
     bot: BotConfig,
     message: string,
-    turnOpts: { chain: string[]; timeoutMs?: number },
+    turnOpts: { chain: string[]; timeoutMs?: number; provenance?: ProvenanceNote },
   ): Promise<{ text: string; usage?: TokenUsage }> => {
     const sessionId = newTeamSessionId();
     chains.set(sessionId, turnOpts.chain);
@@ -68,6 +69,9 @@ export function registerBotTeamToolsWiring(opts: BotTeamWiringOpts): BotConversa
         message,
         sessionId,
         taskType: 'chat',
+        // P1 #13: the target turn sees the relay's origin note — its message
+        // is fenced as untrusted peer content and the consent rule applies.
+        provenance: turnOpts.provenance,
         onEvent,
       });
       usage = usage ?? returned;

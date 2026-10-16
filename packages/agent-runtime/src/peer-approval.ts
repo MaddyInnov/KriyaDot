@@ -23,6 +23,8 @@ const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite
 import type { DatabaseSync } from 'node:sqlite';
 
 import type { StreamEvent, ToolCall, ToolContext } from './types.js';
+import type { ProvenanceNote } from './provenance.js';
+import { serializeProvenanceNote, parseProvenanceNote } from './provenance.js';
 
 /** Bot→bot action kinds that go through peer approval. */
 export type PeerActionType = 'ask' | 'message' | 'delegate';
@@ -57,6 +59,13 @@ export interface PeerApprovalCard {
   expiresAt: number;
   decidedAt?: number;
   decidedBy?: string;
+  /**
+   * Provenance of the sender turn that raised this card (P1 #13): the
+   * origin chain of the content that led the sender bot to make this peer
+   * request. Shown in the UI as a security note. Absent for direct
+   * user-driven turns.
+   */
+  provenance?: ProvenanceNote;
 }
 
 export interface PeerApprovalGrant {
@@ -75,6 +84,8 @@ export interface RaisePeerCardInput {
   actionType: PeerActionType;
   preview: string;
   sessionId: string;
+  /** Origin chain of the sender's turn (P1 #13) — shown on the card. */
+  provenance?: ProvenanceNote;
 }
 
 /** Default card time-to-live: 15 minutes (OpenMausBot parity). */
@@ -97,6 +108,7 @@ interface PeerCardRow {
   expires_at: number;
   decided_at: number | null;
   decided_by: string | null;
+  provenance_json: string | null;
 }
 
 interface PeerGrantRow {
@@ -108,6 +120,14 @@ interface PeerGrantRow {
 }
 
 function rowToCard(r: PeerCardRow): PeerApprovalCard {
+  let provenance: ProvenanceNote | undefined;
+  if (r.provenance_json) {
+    try {
+      provenance = parseProvenanceNote(JSON.parse(r.provenance_json));
+    } catch {
+      provenance = undefined;
+    }
+  }
   return {
     id: r.id,
     senderBotId: r.sender_bot_id,
@@ -122,6 +142,7 @@ function rowToCard(r: PeerCardRow): PeerApprovalCard {
     expiresAt: r.expires_at,
     decidedAt: r.decided_at ?? undefined,
     decidedBy: r.decided_by ?? undefined,
+    provenance,
   };
 }
 
@@ -178,6 +199,12 @@ export class PeerApprovalStore {
         PRIMARY KEY (sender_bot_id, target_bot_id, action_type)
       );
     `);
+    // P1 #13: provenance column for existing databases.
+    try {
+      this.db.exec('ALTER TABLE peer_cards ADD COLUMN provenance_json TEXT');
+    } catch {
+      // Column already exists (or DB is read-only in a test) — safe to ignore.
+    }
   }
 
   /** Card TTL in ms (for the broker's await timeout). */
@@ -199,13 +226,14 @@ export class PeerApprovalStore {
       status: 'pending',
       createdAt: now,
       expiresAt: now + this.ttlMs,
+      provenance: input.provenance,
     };
     this.db
       .prepare(
         `INSERT INTO peer_cards
            (id, sender_bot_id, sender_bot_name, target_bot_id, target_bot_name,
-            action_type, preview, session_id, status, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            action_type, preview, session_id, status, created_at, expires_at, provenance_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         card.id,
@@ -219,6 +247,7 @@ export class PeerApprovalStore {
         card.status,
         card.createdAt,
         card.expiresAt,
+        input.provenance ? serializeProvenanceNote(input.provenance) : null,
       );
     return card;
   }
@@ -524,6 +553,9 @@ export function createPeerApprovalGate(opts: PeerApprovalGateOpts): PeerApproval
         actionType: parsed.action,
         preview: parsed.preview,
         sessionId: ctx.sessionId,
+        // P1 #13: the origin chain of the sender's turn rides on the card
+        // so the human sees WHY the sender is asking (user → A → B…).
+        provenance: ctx.provenance,
       });
     } catch (err) {
       return {
@@ -544,6 +576,7 @@ export function createPeerApprovalGate(opts: PeerApprovalGateOpts): PeerApproval
         targetBotName: card.targetBotName,
         actionType: card.actionType,
         preview: card.preview,
+        provenance: card.provenance,
       });
     } catch {
       // Event sinks must never break the gate.

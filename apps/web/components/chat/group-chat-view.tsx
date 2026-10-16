@@ -15,6 +15,7 @@ import {
   type RoomTurnReply,
 } from '../../lib/group-chats';
 import { GroupRoomControls } from './group-room-controls';
+import { ProvenanceChip } from '../provenance-chip';
 
 interface Props {
   group: GroupChat;
@@ -177,6 +178,7 @@ export function GroupChatView({ group, botNames, onOpenThread }: Props) {
             <div key={m.id} className={`msg-row${m.authorType === 'user' ? ' mine' : ''}`}>
               <div className="msg-head">
                 <span className="msg-author">{authorLabel}</span>
+                {m.authorType === 'bot' && <ProvenanceChip note={m.provenance} compact />}
                 <span className="msg-time">{fmtTime(m.createdAt)}</span>
                 {onOpenThread && (
                   <button

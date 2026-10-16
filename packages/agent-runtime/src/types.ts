@@ -2,6 +2,8 @@
 
 import type { ApprovalMode } from './approval-modes.js';
 export type { ApprovalMode };
+import type { ProvenanceNote } from './provenance.js';
+export type { ProvenanceNote };
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -44,6 +46,8 @@ export type StreamEvent =
       targetBotName: string;
       actionType: 'ask' | 'message' | 'delegate';
       preview: string;
+      /** Origin chain of the sender's turn (P1 #13) — shown on the card. */
+      provenance?: ProvenanceNote;
     }
   | { type: 'peer_approval_decided'; cardId: string; decision: 'allowed' | 'denied' | 'expired' }
   | { type: 'queued_turn_start'; queueId: string; message: string }
@@ -84,6 +88,13 @@ export interface ToolContext {
    * Set by the runtime from RunTurnOptions.workspaceOverride.
    */
   spaceWorkspaceOverride?: string;
+  /**
+   * Provenance of the turn's triggering message (OpenMausBot parity P1
+   * #13). Set by the runtime from RunTurnOptions.provenance. Lets tools —
+   * e.g. the peer-approval gate — see the origin chain of the content that
+   * started this turn.
+   */
+  provenance?: ProvenanceNote;
 }
 
 export interface ToolDefinition {

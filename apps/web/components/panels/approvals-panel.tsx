@@ -13,6 +13,7 @@ import {
 } from '../../lib/api';
 import type { ApprovalRecord, PeerApprovalCard, PeerGrant, PeerDecision } from '../../lib/api';
 import { BulkBar, ShortcutHelp, useActivityShortcuts, type TriageHandlers } from '../activity/triage';
+import { PeerOriginSecurityNote } from '../provenance-chip';
 
 function fmtTs(ts: number): string {
   return new Date(ts).toLocaleString();
@@ -360,6 +361,7 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
               {c.preview}
             </pre>
           )}
+          <PeerOriginSecurityNote note={c.provenance} />
           <div className="approval-actions">
             <button
               className="btn btn-primary btn-sm"

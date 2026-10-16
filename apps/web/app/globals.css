@@ -1069,6 +1069,46 @@ table.tbl tr:last-child td {
   box-shadow: none;
 }
 
+/* Provenance chips (P1 #13): "via Scout → Coder" + origin badges. */
+.prov-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  border: 1px dashed var(--border);
+  background: var(--surface-2);
+  color: var(--muted);
+  white-space: nowrap;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+.prov-relay {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.prov-origin {
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.prov-origin.untrusted {
+  color: var(--amber);
+}
+
+.prov-security-note {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--amber);
+  background: var(--amber-soft);
+}
+
 .chip.blue {
   background: var(--accent-soft);
   border-color: var(--accent);

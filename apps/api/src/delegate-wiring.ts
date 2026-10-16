@@ -113,6 +113,9 @@ export function registerDelegateTools(opts: DelegateWiringOpts): void {
         bot,
         message: input.task,
         sessionId: childSessionId,
+        // P1 #13: inherit the parent's origin chain so the consent rule and
+        // untrusted-content fencing apply to the child's turn too.
+        provenance: input.provenance,
         onEvent,
       });
       usage = usage ?? returned;

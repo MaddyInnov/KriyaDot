@@ -333,6 +333,14 @@ export class ThreadScheduler {
             message: s.prompt,
             sessionId: s.sessionId,
             persistentSandboxId: this.deps.getPersistentSandboxId?.(s.sessionId),
+            // P1 #13: scheduled wakes are routine-origin — untrusted until
+            // the human says otherwise; approvals go to the human.
+            provenance: {
+              origin: 'routine',
+              relayPath: [`schedule:${s.id}`],
+              relayNames: [`scheduled wake ${s.id}`],
+              timestamp: new Date().toISOString(),
+            },
             onEvent: () => {},
           });
           this.deps.onWake?.({ schedule: s, ok: true });

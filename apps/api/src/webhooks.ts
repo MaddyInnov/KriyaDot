@@ -136,6 +136,14 @@ export function createRoutineWebhookRouter(opts: RoutineWebhookRouterOptions): R
           message,
           sessionId,
           taskType: 'chat',
+          // P1 #13: inbound webhooks are untrusted external content — the
+          // turn is fenced and its approvals always go to the human.
+          provenance: {
+            origin: 'webhook',
+            relayPath: [`webhook:${routine.id}`],
+            relayNames: [`webhook ${routine.id}`],
+            timestamp: new Date().toISOString(),
+          },
           onEvent: () => {},
         });
       } catch (err) {

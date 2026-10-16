@@ -20,6 +20,8 @@
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
+import type { ProvenanceNote } from '@mvp/agent-runtime';
+import { parseProvenanceNote, serializeProvenanceNote } from '@mvp/agent-runtime';
 
 const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
 
@@ -43,6 +45,11 @@ export interface GroupMessage {
   /** Thread id when this message has a reply thread (message-threads infra). */
   threadId: string | null;
   createdAt: string;
+  /**
+   * Provenance note (P1 #13) — set on bot messages: origin + relay path,
+   * shown in the room as a "via …" chip with an untrusted-origin badge.
+   */
+  provenance?: ProvenanceNote;
 }
 
 export function newGroupId(): string {
@@ -135,6 +142,14 @@ export class GroupChatStore {
         FOREIGN KEY (group_id) REFERENCES groups(group_id) ON DELETE CASCADE
       );
       CREATE INDEX IF NOT EXISTS idx_group_messages_group ON group_messages(group_id, created_at);
+    `);
+    // P1 #13: provenance column for existing databases.
+    try {
+      this.db.exec('ALTER TABLE group_messages ADD COLUMN provenance_json TEXT');
+    } catch {
+      // Column already exists — safe to ignore.
+    }
+    this.db.exec(`
       -- Room robustness (OpenMausBot parity): per-room settings + hold state.
       CREATE TABLE IF NOT EXISTS room_settings (
         group_id TEXT PRIMARY KEY,
@@ -249,16 +264,34 @@ export class GroupChatStore {
     authorType: GroupMessageAuthor,
     text: string,
     authorBotId?: string | null,
+    provenance?: ProvenanceNote,
   ): GroupMessage {
     const id = newGroupMessageId();
     const createdAt = new Date().toISOString();
     this.db
       .prepare(
-        `INSERT INTO group_messages (message_id, group_id, author_type, author_bot_id, text, thread_id, created_at)
-         VALUES (?, ?, ?, ?, ?, NULL, ?)`,
+        `INSERT INTO group_messages (message_id, group_id, author_type, author_bot_id, text, thread_id, created_at, provenance_json)
+         VALUES (?, ?, ?, ?, ?, NULL, ?, ?)`,
       )
-      .run(id, groupId, authorType, authorBotId ?? null, text, createdAt);
-    return { id, groupId, authorType, authorBotId: authorBotId ?? null, text, threadId: null, createdAt };
+      .run(
+        id,
+        groupId,
+        authorType,
+        authorBotId ?? null,
+        text,
+        createdAt,
+        provenance ? serializeProvenanceNote(provenance) : null,
+      );
+    return {
+      id,
+      groupId,
+      authorType,
+      authorBotId: authorBotId ?? null,
+      text,
+      threadId: null,
+      createdAt,
+      provenance,
+    };
   }
 
   listMessages(groupId: string, limit = 200): GroupMessage[] {
@@ -274,16 +307,28 @@ export class GroupChatStore {
       text: string;
       thread_id: string | null;
       created_at: string;
+      provenance_json: string | null;
     }>;
-    return rows.map((row) => ({
-      id: row.message_id,
-      groupId: row.group_id,
-      authorType: row.author_type,
-      authorBotId: row.author_bot_id,
-      text: row.text,
-      threadId: row.thread_id,
-      createdAt: row.created_at,
-    }));
+    return rows.map((row) => {
+      let provenance: ProvenanceNote | undefined;
+      if (row.provenance_json) {
+        try {
+          provenance = parseProvenanceNote(JSON.parse(row.provenance_json));
+        } catch {
+          provenance = undefined;
+        }
+      }
+      return {
+        id: row.message_id,
+        groupId: row.group_id,
+        authorType: row.author_type,
+        authorBotId: row.author_bot_id,
+        text: row.text,
+        threadId: row.thread_id,
+        createdAt: row.created_at,
+        provenance,
+      };
+    });
   }
 
   /** Link a reply thread to a group message (message-threads infra). */

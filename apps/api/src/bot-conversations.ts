@@ -13,6 +13,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { BotExchange } from '@mvp/agent-runtime';
+import { parseProvenanceNote, serializeProvenanceNote } from '@mvp/agent-runtime';
 
 const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
 
@@ -52,6 +53,12 @@ export class BotConversationStore {
       );
       CREATE INDEX IF NOT EXISTS idx_bot_exchanges_pair ON bot_exchanges(pair_key, created_at);
     `);
+    // P1 #13: provenance column for existing databases.
+    try {
+      this.db.exec('ALTER TABLE bot_exchanges ADD COLUMN provenance_json TEXT');
+    } catch {
+      // Column already exists — safe to ignore.
+    }
   }
 
   record(exchange: Omit<BotExchange, 'id' | 'createdAt'>): BotExchange {
@@ -60,8 +67,8 @@ export class BotConversationStore {
     this.db
       .prepare(
         `INSERT INTO bot_exchanges
-           (exchange_id, source_bot_id, target_bot_id, pair_key, type, text, reply, status, detail, created_at, completed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (exchange_id, source_bot_id, target_bot_id, pair_key, type, text, reply, status, detail, created_at, completed_at, provenance_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -75,6 +82,7 @@ export class BotConversationStore {
         exchange.detail ?? null,
         createdAt,
         exchange.completedAt ?? null,
+        exchange.provenance ? serializeProvenanceNote(exchange.provenance) : null,
       );
     return { ...exchange, id, createdAt };
   }
@@ -160,9 +168,18 @@ interface Row {
   detail: string | null;
   created_at: string;
   completed_at: string | null;
+  provenance_json: string | null;
 }
 
 function rowToExchange(row: Row): BotExchange {
+  let provenance: BotExchange['provenance'];
+  if (row.provenance_json) {
+    try {
+      provenance = parseProvenanceNote(JSON.parse(row.provenance_json));
+    } catch {
+      provenance = undefined;
+    }
+  }
   return {
     id: row.exchange_id,
     sourceBotId: row.source_bot_id,
@@ -174,5 +191,6 @@ function rowToExchange(row: Row): BotExchange {
     detail: row.detail ?? undefined,
     createdAt: row.created_at,
     completedAt: row.completed_at ?? undefined,
+    provenance,
   };
 }

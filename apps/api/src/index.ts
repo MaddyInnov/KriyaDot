@@ -1206,6 +1206,17 @@ async function boot(): Promise<void> {
           bot,
           message: prompt,
           taskType: 'chat',
+          // P1 #13: group member turns are bot-originated (their prompt
+          // carries fenced peer content) — the consent rule applies, so
+          // their tool approvals always go to the human.
+          provenance: {
+            origin: 'bot',
+            originBotId: bot.id,
+            originBotName: bot.name,
+            relayPath: [bot.id],
+            relayNames: [bot.name],
+            timestamp: new Date().toISOString(),
+          },
           onEvent: (e) => {
             if (e.type === 'token' && typeof e.content === 'string') content += e.content;
           },

@@ -795,6 +795,8 @@ export interface PeerApprovalCard {
   expiresAt: number;
   decidedAt?: number;
   decidedBy?: string;
+  /** Origin chain of the sender's turn (P1 #13) — shown as a security note. */
+  provenance?: import('../components/provenance-chip').ProvenanceNoteDto;
 }
 
 export interface PeerGrant {
@@ -1342,6 +1344,8 @@ export interface BotExchangeDto {
   detail?: string;
   createdAt: string;
   completedAt?: string;
+  /** Provenance note (P1 #13): origin + relay path, shown as a "via" chip. */
+  provenance?: import('../components/provenance-chip').ProvenanceNoteDto;
 }
 
 export interface BotPeerDto {

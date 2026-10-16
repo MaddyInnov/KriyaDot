@@ -31,6 +31,8 @@ export interface GroupMessage {
   text: string;
   threadId: string | null;
   createdAt: string;
+  /** Provenance note (P1 #13) on bot messages: origin + relay path. */
+  provenance?: import('../components/provenance-chip').ProvenanceNoteDto;
 }
 
 export interface RoomTurnReply {

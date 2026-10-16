@@ -38,6 +38,13 @@ import type { LearnedRoutingRule } from './routing-learn.js';
 import { resolvePersona } from './personas.js';
 import type { ApprovalMode } from './approval-modes.js';
 import type { PeerApprovalGate } from './peer-approval.js';
+import type { ProvenanceNote } from './provenance.js';
+import {
+  PEER_ORIGIN_INSTRUCTION,
+  defusePeerText,
+  isUserOrigin,
+  wrapPeerContent,
+} from './provenance.js';
 import { PLAN_APPROVAL_TOOL, buildPlanPrompt } from './approval-modes.js';
 import {
   ProgressGuard,
@@ -249,6 +256,15 @@ export interface RunTurnOptions {
    * subtask with the gate's reason. Unset → no gating (previous behavior).
    */
   delegateGate?: DelegateGate;
+  /**
+   * Provenance of the triggering message (OpenMausBot parity P1 #13).
+   * When set and origin !== 'user', the turn is bot-originated: the message
+   * is defused and fenced as untrusted peer content before reaching the
+   * model, and the consent rule applies — approvals on this turn can never
+   * be auto-approved by reviewer models, session auto-approve, or bypass
+   * mode; they always go to the human.
+   */
+  provenance?: ProvenanceNote;
 }
 
 export interface PreviewToolInfo {
@@ -457,10 +473,21 @@ export class AgentRuntime {
     return parts.length > 0 ? parts.join('\n\n') : undefined;
   }
 
-  private async buildSystemPrompt(bot: BotConfig, memoryContext?: string): Promise<{ prompt: string; loadedSkills: string[] }> {    // The untrusted-content floor rides along on every turn: the bot's own
+  private async buildSystemPrompt(
+    bot: BotConfig,
+    memoryContext?: string,
+    sysOpts: { peerOriginated?: boolean } = {},
+  ): Promise<{ prompt: string; loadedSkills: string[] }> {
+    // The untrusted-content floor rides along on every turn: the bot's own
     // prompt first, then the security instruction (it must hold regardless
     // of what skills or tool output say later).
     const parts: string[] = [bot.systemPrompt, '\n\n' + UNTRUSTED_CONTENT_INSTRUCTION];
+    // Peer-originated turns additionally get the provenance instruction:
+    // fenced peer content is untrusted data, and a bot's message is never
+    // the user's approval.
+    if (sysOpts.peerOriginated) {
+      parts.push('\n\n' + PEER_ORIGIN_INSTRUCTION);
+    }
     // MBTI persona: shape tone/working style without replacing the bot's
     // own instructions.
     const persona = resolvePersona(bot.persona);
@@ -560,21 +587,34 @@ export class AgentRuntime {
       // session.created hook — never blocks a turn.
       await this.hooks.emit('session.created', { sessionId, botId: opts.bot.id }).catch(() => undefined);
     }
+    // Peer provenance (OpenMausBot parity P1 #13): when the triggering
+    // message did not originate with the user, the turn is bot-originated.
+    // The message text is defused and fenced as untrusted peer content
+    // before it reaches the model, and the consent rule applies below: a
+    // bot's message is never the user's approval, so auto-approve paths
+    // (reviewer, session auto-approve, bypass) are disabled for this turn.
+    const turnProvenance: ProvenanceNote | undefined = opts.provenance;
+    const botOriginated = !isUserOrigin(turnProvenance);
     const ctx: ToolContext = {
       sessionId,
       botId: opts.bot.id,
       persistentSandboxId: opts.persistentSandboxId,
       // Spaces: per-turn workspace override for tool calls.
       spaceWorkspaceOverride: opts.workspaceOverride,
+      provenance: turnProvenance,
     };
 
     const { prompt: systemPrompt } = await this.buildSystemPrompt(
       opts.bot,
       await this.combineTurnContext(opts, sessionId),
+      { peerOriginated: botOriginated },
     );
     const { tools } = this.resolveTools(opts.bot);
 
-    const userMessage: ChatMessage = { role: 'user', content: opts.message };
+    const turnMessage = botOriginated && turnProvenance
+      ? wrapPeerContent(defusePeerText(opts.message), turnProvenance)
+      : opts.message;
+    const userMessage: ChatMessage = { role: 'user', content: turnMessage };
     this.store.appendMessage(sessionId, userMessage);
 
     const history: RichMessage[] = (await this.store.getMessages(sessionId)).slice(0, -1);
@@ -948,7 +988,31 @@ export class AgentRuntime {
             // exactly what bypass allowed. The catastrophic-command
             // denylist still applies at the tool floor — bypass can never
             // approve what the tools refuse.
-            if (approvalMode === 'bypass') {
+            //
+            // Consent rule (P1 #13): a bot's message is never the user's
+            // approval. On bot-originated turns bypass is overridden — the
+            // approval goes to the human, audited as an escalation.
+            if (approvalMode === 'bypass' && botOriginated) {
+              this.audit({
+                type: 'tool.approval_escalated',
+                sessionId,
+                botId: ctx.botId,
+                call,
+                detail: {
+                  from: 'bypass',
+                  reason:
+                    'bot-originated turn: bypass mode overridden — a bot\'s message is never the user\'s approval, so a human must decide.',
+                },
+                provenance: 'human',
+              });
+              await emit({
+                type: 'notice',
+                kind: 'approval-escalated',
+                message:
+                  'Bypass overridden: this turn was triggered by another bot, so approvals need a human decision.',
+              });
+            }
+            if (approvalMode === 'bypass' && !botOriginated) {
               this.audit({
                 type: 'tool.approval_bypassed',
                 sessionId,
@@ -971,8 +1035,25 @@ export class AgentRuntime {
             }
             // Circuit breaker: if this session tripped (too many denials),
             // force manual approvals even when autoApprove was requested.
+            // Consent rule (P1 #13): on bot-originated turns, session
+            // auto-approve (and its reviewer model) can never stand in for
+            // the human — the approval always goes to a human card.
             const circuitTripped = this.trippedSessions.has(sessionId);
-            const useAutoApprove = opts.autoApprove && !circuitTripped;
+            const useAutoApprove = opts.autoApprove && !circuitTripped && !botOriginated;
+            if (botOriginated && opts.autoApprove && !circuitTripped) {
+              this.audit({
+                type: 'tool.approval_escalated',
+                sessionId,
+                botId: ctx.botId,
+                call,
+                detail: {
+                  from: 'auto-approve',
+                  reason:
+                    'bot-originated turn: auto-approve/reviewer overridden — a bot\'s message is never the user\'s approval.',
+                },
+                provenance: 'human',
+              });
+            }
             // Session auto-approve (user explicitly enabled "auto-approve this
             // session" in the UI): the reviewer model vets the call instead
             // of blindly allowing. YES → allow (audited as reviewer-approved).

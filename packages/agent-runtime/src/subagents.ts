@@ -2,6 +2,7 @@
 
 import type { AuditEntry } from './governance.js';
 import type { TokenUsage } from './types.js';
+import type { ProvenanceNote } from './provenance.js';
 import { SubagentStore } from './subagent-store.js';
 
 /**
@@ -30,6 +31,12 @@ export interface SubagentSpawnInput {
    * limit holds for grandchildren. Optional for backward compatibility.
    */
   sessionId?: string;
+  /**
+   * Provenance for the child's turn (P1 #13): the parent's origin note with
+   * the relay path extended. Hosts SHOULD forward it to runTurn so the
+   * consent rule and untrusted-content fencing apply to the child.
+   */
+  provenance?: ProvenanceNote;
 }
 
 export interface SubagentSpawnResult {
@@ -68,6 +75,8 @@ export interface SpawnSubagentOptions {
   task: string;
   tools?: string[];
   botId?: string;
+  /** Provenance forwarded to the child's spawn input (P1 #13). */
+  provenance?: ProvenanceNote;
 }
 
 /**
@@ -127,6 +136,7 @@ export async function spawnSubagent(
       // session matches the store record — depth walks then follow the real
       // chain (grandchild delegation is correctly depth-limited).
       sessionId: record.sessionId,
+      provenance: opts.provenance,
     });
     // If the host minted its own child session, prefer it for the record so
     // depth walks follow the real session chain.

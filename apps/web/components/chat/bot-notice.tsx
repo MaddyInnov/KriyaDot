@@ -10,6 +10,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { fetchBotConversation, type BotExchangeDto } from '../../lib/api';
+import { ProvenanceChip } from '../provenance-chip';
 
 export interface BotNoticeData {
   type: 'ask' | 'message';
@@ -139,6 +140,7 @@ export function BotConversationSheet({
                   <div className="conv-author">
                     {outgoing ? '→' : '←'} {ex.sourceBotId}
                     <span className="conv-kind">{ex.type === 'ask' ? 'asked' : 'messaged'}</span>
+                    <ProvenanceChip note={ex.provenance} compact />
                   </div>
                   <div className="conv-text">{ex.text}</div>
                   {ex.reply && <div className="conv-reply">↳ {ex.reply}</div>}
