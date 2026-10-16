@@ -80,11 +80,28 @@ describe('computer_screenshot', () => {
 });
 
 describe('computer_click', () => {
-  it('clicks within bounds and records the call', async () => {
+  it('clicks within bounds and records the call (defaults: left, single)', async () => {
     const { registry, os } = freshRegistry();
     const res = await registry.get(COMPUTER_TOOL_NAMES.click)!.handler({ x: 100, y: 200 }, ctx);
-    expect(res).toEqual({ clicked: { x: 100, y: 200 } });
-    expect(os.callsOf('click')).toEqual([{ x: 100, y: 200 }]);
+    expect(res).toEqual({ clicked: { x: 100, y: 200, button: 'left', clicks: 1 } });
+    expect(os.callsOf('click')).toEqual([{ x: 100, y: 200, button: 'left', clicks: 1 }]);
+  });
+
+  it('supports right-click and double-click', async () => {
+    const { registry, os } = freshRegistry();
+    const tool = registry.get(COMPUTER_TOOL_NAMES.click)!;
+    const res = await tool.handler({ x: 50, y: 60, button: 'right', clicks: 2 }, ctx);
+    expect(res).toEqual({ clicked: { x: 50, y: 60, button: 'right', clicks: 2 } });
+    expect(os.callsOf('click')).toEqual([{ x: 50, y: 60, button: 'right', clicks: 2 }]);
+  });
+
+  it('rejects invalid button and clicks values', async () => {
+    const { registry, os } = freshRegistry();
+    const tool = registry.get(COMPUTER_TOOL_NAMES.click)!;
+    await expect(tool.handler({ x: 10, y: 10, button: 'side' }, ctx)).rejects.toThrow(/"button" must be one of/);
+    await expect(tool.handler({ x: 10, y: 10, clicks: 3 }, ctx)).rejects.toThrow(/"clicks" must be 1/);
+    await expect(tool.handler({ x: 10, y: 10, clicks: 0 }, ctx)).rejects.toThrow(/"clicks" must be 1/);
+    expect(os.callsOf('click')).toHaveLength(0);
   });
 
   it('rejects out-of-bounds coordinates', async () => {
@@ -115,15 +132,47 @@ describe('computer_type', () => {
 });
 
 describe('computer_key', () => {
-  it('presses allowlisted keys only', async () => {
+  it('presses allowlisted single keys (backward compatible)', async () => {
     const { registry, os } = freshRegistry();
     const tool = registry.get(COMPUTER_TOOL_NAMES.key)!;
     expect(COMPUTER_KEY_ALLOWLIST.has('Enter')).toBe(true);
     const res = await tool.handler({ name: 'Enter' }, ctx);
     expect(res).toEqual({ pressed: 'Enter' });
     await expect(tool.handler({ name: 'F13' }, ctx)).rejects.toThrow(/allowlist/);
-    await expect(tool.handler({ name: 'ctrl+alt+del' }, ctx)).rejects.toThrow(/allowlist/);
+    await expect(tool.handler({ name: '' }, ctx)).rejects.toThrow(/non-empty/);
     expect(os.callsOf('key')).toEqual([{ name: 'Enter' }]);
+    expect(os.callsOf('keychord')).toHaveLength(0);
+  });
+
+  it('accepts chords and routes them to keyChord', async () => {
+    const { registry, os } = freshRegistry();
+    const tool = registry.get(COMPUTER_TOOL_NAMES.key)!;
+    const res = await tool.handler({ name: 'ctrl+alt+del' }, ctx);
+    expect(res).toEqual({ pressed: 'ctrl+alt+del', chord: 'ctrl+alt+Delete' });
+    expect(os.callsOf('keychord')).toEqual([{ modifiers: ['ctrl', 'alt'], key: 'Delete' }]);
+    expect(os.callsOf('key')).toHaveLength(0);
+  });
+
+  it('resolves hotkey presets per platform', async () => {
+    const { registry, os } = freshRegistry();
+    const tool = registry.get(COMPUTER_TOOL_NAMES.key)!;
+    // freshRegistry() uses the mock platform default (process.platform);
+    // 'copy' must resolve to a single-modifier + 'c' chord on any platform.
+    const res = (await tool.handler({ name: 'copy' }, ctx)) as { hotkey: string; chord: string };
+    expect(res.hotkey).toBe('copy');
+    expect(res.chord).toMatch(/^[a-z]+\+c$/);
+    const [chord] = os.callsOf('keychord');
+    expect(chord.key).toBe('c');
+    expect((chord.modifiers as string[])).toHaveLength(1);
+  });
+
+  it('chords and hotkeys are still approval-gated like the base key tool', async () => {
+    const gw = gatewayWithComputerPolicy();
+    const evalCtx = { sessionId: 's1', botId: 'b1', actor: 'b1' };
+    for (const name of ['ctrl+c', 'copy', 'Enter', 'alt+tab']) {
+      const res = await gw.evaluate(COMPUTER_TOOL_NAMES.key, { name }, evalCtx);
+      expect(res.effect, name).toBe('require-approval');
+    }
   });
 });
 

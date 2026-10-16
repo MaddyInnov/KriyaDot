@@ -38,7 +38,15 @@
 import { execFile, spawnSync } from 'node:child_process';
 import { selectOSLayer } from './computer-real.js';
 import type { RealOSLayerDeps } from './computer-real.js';
-import type { DisplaySize, DragOptions, OSScreenLayer, RealOSAction, Screenshot } from './computer.js';
+import type {
+  ClickOptions,
+  DisplaySize,
+  DragOptions,
+  OSScreenLayer,
+  RealOSAction,
+  Screenshot,
+} from './computer.js';
+import { formatChord, type ChordModifier } from './computer-keys.js';
 
 /** Env var that opts into the Docker-backed computer sandbox. */
 export const COMPUTER_USE_DOCKER_ENV = 'COMPUTER_USE_DOCKER';
@@ -95,8 +103,8 @@ export class LocalComputerSandbox implements ComputerSandbox {
     return this.inner.screenshot();
   }
 
-  click(x: number, y: number): Promise<void> {
-    return this.inner.click(x, y);
+  click(x: number, y: number, opts?: ClickOptions): Promise<void> {
+    return this.inner.click(x, y, opts);
   }
 
   scroll(x: number, y: number, deltaX: number, deltaY: number): Promise<void> {
@@ -117,6 +125,10 @@ export class LocalComputerSandbox implements ComputerSandbox {
 
   key(name: string): Promise<void> {
     return this.inner.key(name);
+  }
+
+  keyChord(modifiers: ChordModifier[], key: string): Promise<void> {
+    return this.inner.keyChord(modifiers, key);
   }
 }
 
@@ -405,7 +417,41 @@ const CDP_KEY_MAP: Record<string, CdpKeyDef> = {
   End: { key: 'End', code: 'End', windowsVirtualKeyCode: 35 },
   PageUp: { key: 'PageUp', code: 'PageUp', windowsVirtualKeyCode: 33 },
   PageDown: { key: 'PageDown', code: 'PageDown', windowsVirtualKeyCode: 34 },
+  PrintScreen: { key: 'PrintScreen', code: 'PrintScreen', windowsVirtualKeyCode: 44 },
 };
+
+/** CDP key descriptions for our canonical chord modifiers. */
+const CDP_MODIFIER_DEFS: Record<ChordModifier, CdpKeyDef> = {
+  ctrl: { key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17 },
+  shift: { key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16 },
+  alt: { key: 'Alt', code: 'AltLeft', windowsVirtualKeyCode: 18 },
+  meta: { key: 'Meta', code: 'MetaLeft', windowsVirtualKeyCode: 91 },
+};
+
+/** CDP Input.dispatchKeyEvent modifiers bitmask (Alt=1, Ctrl=2, Meta=4, Shift=8). */
+const CDP_MODIFIER_BITS: Record<ChordModifier, number> = {
+  alt: 1,
+  ctrl: 2,
+  meta: 4,
+  shift: 8,
+};
+
+/** Resolve a canonical chord final key to its CDP key description. */
+function cdpChordKeyDef(key: string): CdpKeyDef {
+  const named = CDP_KEY_MAP[key];
+  if (named) return named;
+  if (/^[a-z]$/.test(key)) {
+    return { key, code: `Key${key.toUpperCase()}`, windowsVirtualKeyCode: key.toUpperCase().charCodeAt(0) };
+  }
+  if (/^[0-9]$/.test(key)) {
+    return { key, code: `Digit${key}`, windowsVirtualKeyCode: key.charCodeAt(0) };
+  }
+  const fm = /^F([1-9]|1[0-2])$/.exec(key);
+  if (fm) {
+    return { key, code: key, windowsVirtualKeyCode: 111 + Number(fm[1]) }; // F1 = 112
+  }
+  throw new Error(`no CDP key mapping for chord key "${key}"`);
+}
 
 export interface DockerComputerSandboxOptions {
   /** Docker image with headless Chrome. Default: zenika/alpine-chrome:latest. */
@@ -568,25 +614,31 @@ export class DockerComputerSandbox implements ComputerSandbox {
     return { png, width: dims?.width ?? this.width, height: dims?.height ?? this.height };
   }
 
-  async click(x: number, y: number): Promise<void> {
+  async click(x: number, y: number, opts: ClickOptions = {}): Promise<void> {
     const cdp = this.requireCdp();
     const px = Math.floor(x);
     const py = Math.floor(y);
-    await cdp.send('Input.dispatchMouseEvent', {
-      type: 'mousePressed',
-      x: px,
-      y: py,
-      button: 'left',
-      clickCount: 1,
-    });
-    await cdp.send('Input.dispatchMouseEvent', {
-      type: 'mouseReleased',
-      x: px,
-      y: py,
-      button: 'left',
-      clickCount: 1,
-    });
-    this.onEvent?.('click', { x: px, y: py });
+    const button = opts.button ?? 'left';
+    const clicks = opts.clicks ?? 1;
+    // Double-click: two press/release pairs, the second carrying
+    // clickCount 2 so the page sees a genuine double-click.
+    for (let n = 1; n <= clicks; n++) {
+      await cdp.send('Input.dispatchMouseEvent', {
+        type: 'mousePressed',
+        x: px,
+        y: py,
+        button,
+        clickCount: n,
+      });
+      await cdp.send('Input.dispatchMouseEvent', {
+        type: 'mouseReleased',
+        x: px,
+        y: py,
+        button,
+        clickCount: n,
+      });
+    }
+    this.onEvent?.('click', { x: px, y: py, button, clicks });
   }
 
   async scroll(x: number, y: number, deltaX: number, deltaY: number): Promise<void> {
@@ -678,6 +730,50 @@ export class DockerComputerSandbox implements ComputerSandbox {
       windowsVirtualKeyCode: def.windowsVirtualKeyCode,
     });
     this.onEvent?.('key', { name });
+  }
+
+  async keyChord(modifiers: ChordModifier[], key: string): Promise<void> {
+    const cdp = this.requireCdp();
+    const def = cdpChordKeyDef(key);
+    // Modifiers down in order, accumulating the CDP modifiers bitmask.
+    let mods = 0;
+    for (const m of modifiers) {
+      mods |= CDP_MODIFIER_BITS[m];
+      const md = CDP_MODIFIER_DEFS[m];
+      await cdp.send('Input.dispatchKeyEvent', {
+        type: 'rawKeyDown',
+        key: md.key,
+        code: md.code,
+        windowsVirtualKeyCode: md.windowsVirtualKeyCode,
+        modifiers: mods,
+      });
+    }
+    // Final key tap with all modifiers held.
+    const tap: Record<string, unknown> = {
+      key: def.key,
+      code: def.code,
+      windowsVirtualKeyCode: def.windowsVirtualKeyCode,
+      modifiers: mods,
+    };
+    await cdp.send('Input.dispatchKeyEvent', { ...tap, type: 'keyDown' });
+    await cdp.send('Input.dispatchKeyEvent', { ...tap, type: 'keyUp' });
+    // Modifiers up in reverse order, unwinding the bitmask.
+    for (const m of [...modifiers].reverse()) {
+      mods &= ~CDP_MODIFIER_BITS[m];
+      const md = CDP_MODIFIER_DEFS[m];
+      await cdp.send('Input.dispatchKeyEvent', {
+        type: 'keyUp',
+        key: md.key,
+        code: md.code,
+        windowsVirtualKeyCode: md.windowsVirtualKeyCode,
+        modifiers: mods,
+      });
+    }
+    this.onEvent?.('key', {
+      chord: formatChord({ modifiers, key }),
+      modifiers: [...modifiers],
+      key,
+    });
   }
 
   private requireCdp(): CdpConnection {

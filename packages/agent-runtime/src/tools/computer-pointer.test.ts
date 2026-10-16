@@ -219,8 +219,8 @@ function fakeRealInput(): RealInputBackend & { log: string[] } {
     async moveMouse(x, y) {
       log.push(`move:${x},${y}`);
     },
-    async mouseClick() {
-      log.push('click');
+    async mouseClick(button, double) {
+      log.push(`click:${button}${double ? ':double' : ''}`);
     },
     async mouseDown(b) {
       log.push(`down:${b}`);
@@ -236,6 +236,9 @@ function fakeRealInput(): RealInputBackend & { log: string[] } {
     },
     async pressKey() {
       log.push('key');
+    },
+    async pressKeyChord(modifiers, key) {
+      log.push(`chord:${[...modifiers, key].join('+')}`);
     },
     async screenWidth() {
       return 1920;
@@ -329,6 +332,9 @@ function fakePageBackend(): PlaywrightPageBackend & { log: string[] } {
     },
     async keyboardType() {},
     async keyboardPress() {},
+    async keyboardChord(modifiers, key) {
+      log.push(`chord:${[...modifiers, key].join('+')}`);
+    },
     async close() {},
   };
 }

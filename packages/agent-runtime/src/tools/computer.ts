@@ -3,9 +3,11 @@
 //
 // Tools:
 //   computer_screenshot — capture the screen (read-only; auto-allowed by policy)
-//   computer_click      — click at (x, y)                    [MUTATING → require-approval]
+//   computer_click      — click at (x, y), button left|right|middle, single|double
+//                                                        [MUTATING → require-approval]
 //   computer_type       — type text                          [MUTATING → require-approval]
-//   computer_key        — press a named key                   [MUTATING → require-approval]
+//   computer_key        — press a key, chord ("ctrl+c"), or hotkey ("copy")
+//                                                        [MUTATING → require-approval]
 //   computer_open_app   — launch a desktop app                [MUTATING → require-approval]
 //   computer_scroll     — scroll at (x, y) by direction/amount
 //                         or (deltaX, deltaY)                 [MUTATING → require-approval]
@@ -30,8 +32,10 @@
 //     unmatched.
 //   - Input validation is defense-in-depth on top of governance: click
 //     coordinates are bounds-checked against the display, typed text is
-//     length-capped, keys are allowlisted, and app names are restricted to
-//     a safe character set.
+//     length-capped, keys/chords/hotkeys are allowlisted and parsed by
+//     computer-keys.ts (modifiers + final key both validated; dangerous
+//     chords still need the same human approval as every computer action),
+//     and app names are restricted to a safe character set.
 
 import type { BotPolicyRule, ToolContext, ToolDefinition } from '../types.js';
 import {
@@ -40,6 +44,14 @@ import {
   type AppLauncher,
   type LaunchPlatform,
 } from './computer-apps.js';
+import {
+  CHORD_KEY_ALLOWLIST,
+  HOTKEY_NAMES,
+  formatChord,
+  parseKeyChord,
+  resolveHotkey,
+  type ChordModifier,
+} from './computer-keys.js';
 
 /** Display geometry in physical pixels. */
 export interface DisplaySize {
@@ -59,12 +71,28 @@ export interface Screenshot {
  * (dedicated VM/container or an explicit user-consent session) — this
  * interface deliberately carries no credential or session concept.
  */
+/**
+ * Options for OSScreenLayer.click. Defaults (button 'left', clicks 1)
+ * preserve the original single-left-click behavior.
+ */
+export interface ClickOptions {
+  button?: 'left' | 'right' | 'middle';
+  /** 1 = single click, 2 = double-click. */
+  clicks?: 1 | 2;
+}
+
 export interface OSScreenLayer {
   displaySize(): Promise<DisplaySize>;
   screenshot(): Promise<Screenshot>;
-  click(x: number, y: number): Promise<void>;
+  click(x: number, y: number, opts?: ClickOptions): Promise<void>;
   type(text: string): Promise<void>;
   key(name: string): Promise<void>;
+  /**
+   * Press a keyboard chord: hold each modifier down in order, tap the
+   * final key, then release the modifiers in reverse order. An empty
+   * modifiers array is a plain key tap.
+   */
+  keyChord(modifiers: ChordModifier[], key: string): Promise<void>;
   /**
    * Scroll at (x, y). deltaX/deltaY are wheel deltas in pixels:
    * positive deltaY scrolls down, positive deltaX scrolls right.
@@ -102,7 +130,15 @@ function fixturePng(): Uint8Array {
  * real input, and returns the fixture PNG for screenshots. Reported display
  * geometry is 1920×1080.
  */
-export type MockOSAction = 'click' | 'type' | 'key' | 'screenshot' | 'scroll' | 'drag' | 'move';
+export type MockOSAction =
+  | 'click'
+  | 'type'
+  | 'key'
+  | 'keychord'
+  | 'screenshot'
+  | 'scroll'
+  | 'drag'
+  | 'move';
 
 export class MockOSScreenLayer implements OSScreenLayer {
   readonly calls: Array<{ action: MockOSAction; args: Record<string, unknown> }> = [];
@@ -118,8 +154,11 @@ export class MockOSScreenLayer implements OSScreenLayer {
     return { png: fixturePng(), width: this.displayWidth, height: this.displayHeight };
   }
 
-  async click(x: number, y: number): Promise<void> {
-    this.calls.push({ action: 'click', args: { x, y } });
+  async click(x: number, y: number, opts: ClickOptions = {}): Promise<void> {
+    this.calls.push({
+      action: 'click',
+      args: { x, y, button: opts.button ?? 'left', clicks: opts.clicks ?? 1 },
+    });
   }
 
   async type(text: string): Promise<void> {
@@ -128,6 +167,10 @@ export class MockOSScreenLayer implements OSScreenLayer {
 
   async key(name: string): Promise<void> {
     this.calls.push({ action: 'key', args: { name } });
+  }
+
+  async keyChord(modifiers: ChordModifier[], key: string): Promise<void> {
+    this.calls.push({ action: 'keychord', args: { modifiers: [...modifiers], key } });
   }
 
   async scroll(x: number, y: number, deltaX: number, deltaY: number): Promise<void> {
@@ -178,7 +221,7 @@ const MAX_DRAG_STEPS = 100;
 
 const MAX_TYPE_CHARS = 2000;
 
-/** Keys the computer_key tool accepts (conservative allowlist; no chord parsing in the MVP). */
+/** Single keys the computer_key tool accepts. Chords ("ctrl+c") and hotkey presets ("copy") are parsed by computer-keys.ts. */
 export const COMPUTER_KEY_ALLOWLIST: ReadonlySet<string> = new Set([
   'Enter',
   'Tab',
@@ -271,12 +314,17 @@ function clickTool(os: OSScreenLayer): ToolDefinition {
     name: COMPUTER_TOOL_NAMES.click,
     mutating: true,
     description:
-      'Click at display coordinates (x, y) in physical pixels. MUTATING: requires human approval via governance.',
+      'Click at display coordinates (x, y) in physical pixels. ' +
+      'button is left|right|middle (default left — right-click opens context menus); ' +
+      'clicks is 1 (single) or 2 (double-click, default 1). ' +
+      'MUTATING: requires human approval via governance.',
     parameters: {
       type: 'object',
       properties: {
         x: { type: 'number', description: 'Horizontal pixel coordinate' },
         y: { type: 'number', description: 'Vertical pixel coordinate' },
+        button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Mouse button (default left)' },
+        clicks: { type: 'number', description: '1 = single click, 2 = double-click (default 1)' },
       },
       required: ['x', 'y'],
       additionalProperties: false,
@@ -286,8 +334,18 @@ function clickTool(os: OSScreenLayer): ToolDefinition {
       const y = intArg(args, 'y');
       const { width, height } = await os.displaySize();
       assertInDisplay(x, y, width, height, 'click');
-      await os.click(Math.floor(x), Math.floor(y));
-      return { clicked: { x: Math.floor(x), y: Math.floor(y) } };
+      const buttonRaw = args['button'] ?? 'left';
+      if (typeof buttonRaw !== 'string' || !COMPUTER_DRAG_BUTTONS.has(buttonRaw)) {
+        throw new Error(`"button" must be one of ${[...COMPUTER_DRAG_BUTTONS].join(', ')}`);
+      }
+      const button = buttonRaw as 'left' | 'right' | 'middle';
+      const clicksRaw = args['clicks'] ?? 1;
+      if (clicksRaw !== 1 && clicksRaw !== 2) {
+        throw new Error('"clicks" must be 1 (single click) or 2 (double-click)');
+      }
+      const opts: ClickOptions = { button, clicks: clicksRaw };
+      await os.click(Math.floor(x), Math.floor(y), opts);
+      return { clicked: { x: Math.floor(x), y: Math.floor(y), button, clicks: clicksRaw } };
     },
   };
 }
@@ -318,27 +376,55 @@ function typeTool(os: OSScreenLayer): ToolDefinition {
   };
 }
 
-function keyTool(os: OSScreenLayer): ToolDefinition {
+function keyTool(os: OSScreenLayer, platform: LaunchPlatform): ToolDefinition {
   return {
     name: COMPUTER_TOOL_NAMES.key,
     mutating: true,
     description:
-      `Press a named key (${[...COMPUTER_KEY_ALLOWLIST].join(', ')}). MUTATING: requires human approval via governance.`,
+      `Press a key, keyboard chord, or named hotkey. ` +
+      `Single keys: ${[...COMPUTER_KEY_ALLOWLIST].join(', ')}. ` +
+      `Chords: "ctrl+c", "ctrl+shift+s", "alt+tab", "cmd+q", "ctrl+alt+del" ` +
+      `(modifiers ctrl/shift/alt/meta + letter, digit, F1-F12, or a named key). ` +
+      `Hotkeys: ${HOTKEY_NAMES.join(', ')} (mapped per-OS: Cmd on macOS, Ctrl elsewhere). ` +
+      `MUTATING: requires human approval via governance.`,
     parameters: {
       type: 'object',
       properties: {
-        name: { type: 'string', description: 'Key name from the allowlist' },
+        name: {
+          type: 'string',
+          description:
+            'Single key name, chord ("ctrl+c"), or hotkey preset ("copy")',
+        },
       },
       required: ['name'],
       additionalProperties: false,
     },
     handler: async (args, _ctx) => {
-      const name = String(args['name'] ?? '');
-      if (!COMPUTER_KEY_ALLOWLIST.has(name)) {
-        throw new Error(`key "${name}" is not in the allowlist`);
+      const raw = String(args['name'] ?? '').trim();
+      if (!raw) {
+        throw new Error('"name" must be a non-empty string');
       }
-      await os.key(name);
-      return { pressed: name };
+      // 1. Hotkey preset (case-insensitive), e.g. "copy" → ctrl+c / meta+c.
+      const hotkey = resolveHotkey(raw, platform);
+      if (hotkey) {
+        await os.keyChord(hotkey.modifiers, hotkey.key);
+        return { pressed: raw, hotkey: raw.toLowerCase(), chord: formatChord(hotkey) };
+      }
+      // 2. Chord, e.g. "ctrl+shift+s".
+      if (raw.includes('+')) {
+        const chord = parseKeyChord(raw);
+        await os.keyChord(chord.modifiers, chord.key);
+        return { pressed: raw, chord: formatChord(chord) };
+      }
+      // 3. Single key — the original allowlist path (backward compatible).
+      if (!COMPUTER_KEY_ALLOWLIST.has(raw)) {
+        throw new Error(
+          `key "${raw}" is not in the key allowlist, a valid chord ("ctrl+c"), ` +
+            `or a hotkey preset (${HOTKEY_NAMES.join(', ')})`,
+        );
+      }
+      await os.key(raw);
+      return { pressed: raw };
     },
   };
 }
@@ -525,11 +611,12 @@ function moveTool(os: OSScreenLayer): ToolDefinition {
 /** Build the eight computer-use ToolDefinitions. */
 export function createComputerUseTools(opts: ComputerUseToolsOptions = {}): ToolDefinition[] {
   const os = opts.os ?? new MockOSScreenLayer();
+  const platform = opts.platform ?? (process.platform as LaunchPlatform);
   return [
     screenshotTool(os),
     clickTool(os),
     typeTool(os),
-    keyTool(os),
+    keyTool(os, platform),
     createOpenAppTool({ launcher: opts.appLauncher, platform: opts.platform }),
     scrollTool(os),
     dragTool(os),
@@ -558,6 +645,17 @@ export function registerComputerUseTool(
 
 // Re-export the context type for handler authors.
 export type { ToolContext };
+
+// Re-export chord/hotkey building blocks for hosts, backends, and tests.
+export {
+  CHORD_KEY_ALLOWLIST,
+  HOTKEY_NAMES,
+  MAX_CHORD_LENGTH,
+  formatChord,
+  parseKeyChord,
+  resolveHotkey,
+} from './computer-keys.js';
+export type { ChordModifier, HotkeyName, ParsedChord } from './computer-keys.js';
 
 // Re-export the open-app building blocks (alias map, launcher interface,
 // attempt resolver) for hosts and tests.

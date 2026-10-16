@@ -26,8 +26,8 @@ function fakePage(): PlaywrightPageBackend & { log: string[] } {
       log.push('screenshot');
       return new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
     },
-    async mouseClick(x, y) {
-      log.push(`click:${x},${y}`);
+    async mouseClick(x, y, opts) {
+      log.push(`click:${x},${y}:${opts?.button ?? 'left'}:x${opts?.clickCount ?? 1}`);
     },
     async mouseMove(x, y) {
       log.push(`move:${x},${y}`);
@@ -46,6 +46,9 @@ function fakePage(): PlaywrightPageBackend & { log: string[] } {
     },
     async keyboardPress(key) {
       log.push(`press:${key}`);
+    },
+    async keyboardChord(modifiers, key) {
+      log.push(`chord:${[...modifiers, key].join('+')}`);
     },
     async close() {
       log.push('close');
@@ -102,7 +105,7 @@ describe('PlaywrightOSScreenLayer', () => {
     await layer.click(100, 200);
     await layer.type('hello');
     await layer.key('Enter');
-    expect(fake.log).toEqual(['click:100,200', 'type:5', 'press:Enter']);
+    expect(fake.log).toEqual(['click:100,200:left:x1', 'type:5', 'press:Enter']);
     expect(actions.map((a) => a.action)).toEqual(['click', 'type', 'key']);
     expect(actions[0].detail.backend).toBe('playwright');
   });

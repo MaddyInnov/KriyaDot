@@ -33,7 +33,15 @@
 //   COMPUTER_PLAYWRIGHT_HEADLESS   — "1" (default) or "0" (visible window)
 
 import { createRequire } from 'node:module';
-import type { DisplaySize, DragOptions, OSScreenLayer, RealOSAction, Screenshot } from './computer.js';
+import type {
+  ClickOptions,
+  DisplaySize,
+  DragOptions,
+  OSScreenLayer,
+  RealOSAction,
+  Screenshot,
+} from './computer.js';
+import { formatChord, type ChordModifier } from './computer-keys.js';
 
 // ESM-safe require for the optional playwright dependency.
 const requireOptional = createRequire(import.meta.url);
@@ -62,7 +70,25 @@ const PLAYWRIGHT_KEY_MAP: Record<string, string> = {
   End: 'End',
   PageUp: 'PageUp',
   PageDown: 'PageDown',
+  PrintScreen: 'PrintScreen',
 };
+
+/** Map our canonical chord modifiers to Playwright keyboard key names. */
+const PLAYWRIGHT_MODIFIER_MAP: Record<ChordModifier, string> = {
+  ctrl: 'Control',
+  shift: 'Shift',
+  alt: 'Alt',
+  meta: 'Meta',
+};
+
+/** Map a canonical chord final key to its Playwright keyboard key name. */
+function mapPlaywrightChordKey(key: string): string {
+  const mapped = PLAYWRIGHT_KEY_MAP[key];
+  if (mapped) return mapped;
+  if (/^[a-z0-9]$/.test(key)) return key; // letters/digits press as themselves
+  if (/^F([1-9]|1[0-2])$/.test(key)) return key; // 'F1'..'F12'
+  throw new Error(`no Playwright mapping for chord key "${key}"`);
+}
 
 /**
  * Minimal page-shaped backend. Playwright-Page-shaped; injectable so tests
@@ -76,7 +102,11 @@ export interface PlaywrightPageBackend {
   /** Capture the page as PNG bytes. */
   screenshot(): Promise<Uint8Array>;
   /** Click at viewport (CSS-pixel) coordinates. */
-  mouseClick(x: number, y: number): Promise<void>;
+  mouseClick(
+    x: number,
+    y: number,
+    opts?: { button?: 'left' | 'right' | 'middle'; clickCount?: number },
+  ): Promise<void>;
   /** Move the mouse to viewport coordinates (no click). */
   mouseMove(x: number, y: number): Promise<void>;
   /** Hold a mouse button down at the current position. */
@@ -89,6 +119,11 @@ export interface PlaywrightPageBackend {
   keyboardType(text: string): Promise<void>;
   /** Press a key by Playwright key name. */
   keyboardPress(key: string): Promise<void>;
+  /**
+   * Press a chord: hold each modifier down in order, press the final key,
+   * release the modifiers in reverse order.
+   */
+  keyboardChord(modifiers: ChordModifier[], key: string): Promise<void>;
   /** Tear the browser down. */
   close(): Promise<void>;
 }
@@ -146,13 +181,22 @@ export function lazyPlaywrightPageFactory(): () => Promise<PlaywrightPageBackend
               goto(url: string): Promise<void>;
               screenshot(opts: { type: 'png' }): Promise<Buffer>;
               mouse: {
-                click(x: number, y: number): Promise<void>;
+                click(
+                  x: number,
+                  y: number,
+                  opts?: { button?: 'left' | 'right' | 'middle'; clickCount?: number },
+                ): Promise<void>;
                 move(x: number, y: number): Promise<void>;
                 wheel(deltaX: number, deltaY: number): Promise<void>;
                 down(opts?: { button?: 'left' | 'right' | 'middle' }): Promise<void>;
                 up(opts?: { button?: 'left' | 'right' | 'middle' }): Promise<void>;
               };
-              keyboard: { type(text: string): Promise<void>; press(key: string): Promise<void> };
+              keyboard: {
+                type(text: string): Promise<void>;
+                press(key: string): Promise<void>;
+                down(key: string): Promise<void>;
+                up(key: string): Promise<void>;
+              };
             }>;
           }>;
           close(): Promise<void>;
@@ -178,13 +222,29 @@ export function lazyPlaywrightPageFactory(): () => Promise<PlaywrightPageBackend
         viewportSize: () => page.viewportSize(),
         goto: (url) => page.goto(url),
         screenshot: async () => new Uint8Array(await page.screenshot({ type: 'png' })),
-        mouseClick: (x, y) => page.mouse.click(x, y),
+        mouseClick: (x, y, opts) =>
+          page.mouse.click(x, y, {
+            button: opts?.button ?? 'left',
+            clickCount: opts?.clickCount ?? 1,
+          }),
         mouseMove: (x, y) => page.mouse.move(x, y),
         mouseDown: (button) => page.mouse.down({ button: button ?? 'left' }),
         mouseUp: (button) => page.mouse.up({ button: button ?? 'left' }),
         mouseWheel: (x, y, deltaX, deltaY) => page.mouse.move(x, y).then(() => page.mouse.wheel(deltaX, deltaY)),
         keyboardType: (text) => page.keyboard.type(text),
         keyboardPress: (key) => page.keyboard.press(key),
+        keyboardChord: async (modifiers, key) => {
+          const mappedMods = modifiers.map((m) => PLAYWRIGHT_MODIFIER_MAP[m]);
+          const mappedKey = mapPlaywrightChordKey(key);
+          // Explicit down/up sequencing: modifiers down in order, press
+          // the key, modifiers up in reverse. Never leave one held.
+          for (const m of mappedMods) await page.keyboard.down(m);
+          try {
+            await page.keyboard.press(mappedKey);
+          } finally {
+            for (const m of [...mappedMods].reverse()) await page.keyboard.up(m);
+          }
+        },
         close: () => browser.close(),
       };
       return cached;
@@ -233,9 +293,11 @@ export class PlaywrightOSScreenLayer implements OSScreenLayer {
     return { png, width, height };
   }
 
-  async click(x: number, y: number): Promise<void> {
-    await (await this.page()).mouseClick(x, y);
-    this.onRealAction?.('click', { x, y, at: Date.now(), backend: 'playwright' });
+  async click(x: number, y: number, opts: ClickOptions = {}): Promise<void> {
+    const button = opts.button ?? 'left';
+    const clicks = opts.clicks ?? 1;
+    await (await this.page()).mouseClick(x, y, { button, clickCount: clicks });
+    this.onRealAction?.('click', { x, y, button, clicks, at: Date.now(), backend: 'playwright' });
   }
 
   async scroll(x: number, y: number, deltaX: number, deltaY: number): Promise<void> {
@@ -274,6 +336,17 @@ export class PlaywrightOSScreenLayer implements OSScreenLayer {
     if (!mapped) throw new Error(`no Playwright mapping for key "${name}"`);
     await (await this.page()).keyboardPress(mapped);
     this.onRealAction?.('key', { name, at: Date.now(), backend: 'playwright' });
+  }
+
+  async keyChord(modifiers: ChordModifier[], key: string): Promise<void> {
+    await (await this.page()).keyboardChord(modifiers, key);
+    this.onRealAction?.('key', {
+      chord: formatChord({ modifiers, key }),
+      modifiers: [...modifiers],
+      key,
+      at: Date.now(),
+      backend: 'playwright',
+    });
   }
 }
 

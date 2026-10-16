@@ -27,7 +27,15 @@
 
 import { createRequire } from 'node:module';
 import { MockOSScreenLayer } from './computer.js';
-import type { DisplaySize, DragOptions, OSScreenLayer, RealOSAction, Screenshot } from './computer.js';
+import type {
+  ClickOptions,
+  DisplaySize,
+  DragOptions,
+  OSScreenLayer,
+  RealOSAction,
+  Screenshot,
+} from './computer.js';
+import { formatChord, type ChordModifier } from './computer-keys.js';
 import { COMPUTER_USE_PLAYWRIGHT_ENV, PlaywrightOSScreenLayer } from './computer-playwright.js';
 
 /** Mouse button names shared by the real input backends. */
@@ -43,8 +51,11 @@ const requireOptional = createRequire(import.meta.url);
 export interface RealInputBackend {
   /** Move the mouse cursor to physical pixel coordinates. */
   moveMouse(x: number, y: number): Promise<void>;
-  /** Click the current mouse position (left button). */
-  mouseClick(): Promise<void>;
+  /**
+   * Click the current mouse position with the given button.
+   * double=true performs a double-click.
+   */
+  mouseClick(button: RealMouseButton, double: boolean): Promise<void>;
   /** Hold a mouse button down at the current position. */
   mouseDown(button: RealMouseButton): Promise<void>;
   /** Release a mouse button at the current position. */
@@ -58,6 +69,11 @@ export interface RealInputBackend {
   typeString(text: string): Promise<void>;
   /** Press a key by our allowlist name (Enter, Tab, Escape, ...). */
   pressKey(name: string): Promise<void>;
+  /**
+   * Press a chord: hold each modifier down in order, tap the final key,
+   * release the modifiers in reverse order.
+   */
+  pressKeyChord(modifiers: ChordModifier[], key: string): Promise<void>;
   screenWidth(): Promise<number>;
   screenHeight(): Promise<number>;
 }
@@ -98,7 +114,26 @@ const ROBOTJS_KEY_MAP: Record<string, string> = {
   End: 'end',
   PageUp: 'pageup',
   PageDown: 'pagedown',
+  PrintScreen: 'printscreen',
 };
+
+/** Map our canonical chord modifiers to robotjs modifier names. */
+const ROBOTJS_MODIFIER_MAP: Record<ChordModifier, string> = {
+  ctrl: 'control',
+  shift: 'shift',
+  alt: 'alt',
+  // robotjs 'command' is Cmd on macOS and the Windows key on Windows.
+  meta: 'command',
+};
+
+/** Map a canonical chord final key to its robotjs key name. */
+function mapRobotJsChordKey(key: string): string {
+  const mapped = ROBOTJS_KEY_MAP[key];
+  if (mapped) return mapped;
+  if (/^[a-z0-9]$/.test(key)) return key; // letters/digits tap as themselves
+  if (/^F([1-9]|1[0-2])$/.test(key)) return key.toLowerCase(); // 'f1'..'f12'
+  throw new Error(`no robotjs mapping for chord key "${key}"`);
+}
 
 /**
  * Lazy robotjs backend. require() happens on first use, not at import, so
@@ -107,8 +142,9 @@ const ROBOTJS_KEY_MAP: Record<string, string> = {
 function lazyRobotJs(): RealInputBackend {
   let robot: {
     moveMouse(x: number, y: number): void;
-    mouseClick(button?: string): void;
+    mouseClick(button?: string, double?: boolean): void;
     mouseToggle(down: 'down' | 'up', button?: string): void;
+    keyToggle(key: string, down: 'down' | 'up'): void;
     scrollMouse(magnitude: number, direction: 'up' | 'down' | 'left' | 'right'): void;
     typeString(text: string): void;
     keyTap(key: string): void;
@@ -133,8 +169,8 @@ function lazyRobotJs(): RealInputBackend {
     async moveMouse(x, y) {
       load().moveMouse(x, y);
     },
-    async mouseClick() {
-      load().mouseClick('left');
+    async mouseClick(button: RealMouseButton, double: boolean) {
+      load().mouseClick(button, double);
     },
     async mouseDown(button) {
       load().mouseToggle('down', button);
@@ -160,6 +196,19 @@ function lazyRobotJs(): RealInputBackend {
       const mapped = ROBOTJS_KEY_MAP[name];
       if (!mapped) throw new Error(`no robotjs mapping for key "${name}"`);
       load().keyTap(mapped);
+    },
+    async pressKeyChord(modifiers: ChordModifier[], key: string) {
+      const r = load();
+      const mappedMods = modifiers.map((m) => ROBOTJS_MODIFIER_MAP[m]);
+      const mappedKey = mapRobotJsChordKey(key);
+      // Modifiers down in order, tap the key, modifiers up in reverse —
+      // never leave a modifier held if the tap throws.
+      for (const m of mappedMods) r.keyToggle(m, 'down');
+      try {
+        r.keyTap(mappedKey);
+      } finally {
+        for (const m of [...mappedMods].reverse()) r.keyToggle(m, 'up');
+      }
     },
     async screenWidth() {
       return load().getScreenSize().width;
@@ -218,10 +267,12 @@ export class RealOSScreenLayer implements OSScreenLayer {
     return { png, width, height };
   }
 
-  async click(x: number, y: number): Promise<void> {
+  async click(x: number, y: number, opts: ClickOptions = {}): Promise<void> {
+    const button = opts.button ?? 'left';
+    const clicks = opts.clicks ?? 1;
     await this.input.moveMouse(x, y);
-    await this.input.mouseClick();
-    this.onRealAction?.('click', { x, y, at: Date.now() });
+    await this.input.mouseClick(button, clicks === 2);
+    this.onRealAction?.('click', { x, y, button, clicks, at: Date.now() });
   }
 
   async scroll(x: number, y: number, deltaX: number, deltaY: number): Promise<void> {
@@ -260,6 +311,16 @@ export class RealOSScreenLayer implements OSScreenLayer {
   async key(name: string): Promise<void> {
     await this.input.pressKey(name);
     this.onRealAction?.('key', { name, at: Date.now() });
+  }
+
+  async keyChord(modifiers: ChordModifier[], key: string): Promise<void> {
+    await this.input.pressKeyChord(modifiers, key);
+    this.onRealAction?.('key', {
+      chord: formatChord({ modifiers, key }),
+      modifiers: [...modifiers],
+      key,
+      at: Date.now(),
+    });
   }
 }
 

@@ -10,7 +10,7 @@ import {
   COMPUTER_USE_REAL_ENV,
 } from './computer-real.js';
 import { MockOSScreenLayer } from './computer.js';
-import type { RealInputBackend, RealScreenshotBackend } from './computer-real.js';
+import type { RealInputBackend, RealMouseButton, RealScreenshotBackend } from './computer-real.js';
 
 function fakeInput(): RealInputBackend & { log: string[] } {
   const log: string[] = [];
@@ -19,8 +19,8 @@ function fakeInput(): RealInputBackend & { log: string[] } {
     async moveMouse(x, y) {
       log.push(`move:${x},${y}`);
     },
-    async mouseClick() {
-      log.push('click');
+    async mouseClick(button: RealMouseButton, double: boolean) {
+      log.push(`click:${button}${double ? ':double' : ''}`);
     },
     async mouseDown(button) {
       log.push(`down:${button}`);
@@ -36,6 +36,9 @@ function fakeInput(): RealInputBackend & { log: string[] } {
     },
     async pressKey(name) {
       log.push(`key:${name}`);
+    },
+    async pressKeyChord(modifiers, key) {
+      log.push(`chord:${[...modifiers, key].join('+')}`);
     },
     async screenWidth() {
       return 1920;
@@ -105,7 +108,10 @@ describe('RealOSScreenLayer', () => {
     expect(shot.width).toBe(1920);
 
     await layer.click(100, 200);
-    expect(input.log).toEqual(['move:100,200', 'click']);
+    expect(input.log).toEqual(['move:100,200', 'click:left']);
+
+    await layer.click(300, 400, { button: 'right', clicks: 2 });
+    expect(input.log).toContain('click:right:double');
 
     await layer.type('hello');
     expect(input.log).toContain('type:5');
@@ -113,9 +119,14 @@ describe('RealOSScreenLayer', () => {
     await layer.key('Enter');
     expect(input.log).toContain('key:Enter');
 
+    await layer.keyChord(['ctrl', 'shift'], 's');
+    expect(input.log).toContain('chord:ctrl+shift+s');
+
     // Every mutating action is reported exactly once via the audit hook.
-    expect(seen.map((s) => s.action)).toEqual(['click', 'type', 'key']);
-    expect(seen[0].detail).toMatchObject({ x: 100, y: 200 });
+    expect(seen.map((s) => s.action)).toEqual(['click', 'click', 'type', 'key', 'key']);
+    expect(seen[0].detail).toMatchObject({ x: 100, y: 200, button: 'left', clicks: 1 });
+    expect(seen[1].detail).toMatchObject({ button: 'right', clicks: 2 });
+    expect(seen[4].detail).toMatchObject({ chord: 'ctrl+shift+s' });
   });
 
   it('throws a clear install error when native deps are missing', async () => {
