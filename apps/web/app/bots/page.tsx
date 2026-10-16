@@ -814,6 +814,9 @@ function BotsPageInner() {
       <p>
         <a className="btn btn-ghost" href="/groups">
           👥 Group chats — several bots in one room
+        </a>{' '}
+        <a className="btn btn-ghost" href="/evals">
+          🧪 Eval harnesses — score bot quality
         </a>
       </p>
       {error && <div className="error-box">{error}</div>}

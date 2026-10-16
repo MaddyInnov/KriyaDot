@@ -41,6 +41,8 @@ import { createSelfUpdateRouter } from './self-update-routes.js';
 import { SelfUpdateManager } from '@mvp/agent-runtime';
 import { createFusionRouter, shutdownFusionRuns } from './fusion-routes.js';
 import { FusionRunStore } from './fusion.js';
+import { createEvalRouter, shutdownEvalRuns } from './eval-routes.js';
+import { EvalRunStore, EvalSuiteStore } from './evals.js';
 import { createSummarizer } from './summarizer.js';
 import { createRouter } from './routes.js';
 import { renderKriyaDotMeter } from './kriyadot-meter.js';
@@ -958,6 +960,22 @@ async function boot(): Promise<void> {
     }),
   );
 
+  // Eval harnesses (Atomic Agent parity): rubric-scored test suites run the
+  // bot in isolated sessions. Stores created once; background runs tracked
+  // in-memory.
+  const evalRunStore = new EvalRunStore(config.dataDir);
+  const evalSuiteStore = new EvalSuiteStore(config.dataDir);
+  app.use(
+    '/api/evals',
+    createEvalRouter({
+      runStore: evalRunStore,
+      suiteStore: evalSuiteStore,
+      getBot: (id) => seed.bots.find((b) => b.id === id),
+      agentRuntime,
+      memoryStore: tieredMemoryStore,
+    }),
+  );
+
   // Self-update (Atomic Agent parity): check official GitHub releases, download
   // the platform installer with explicit consent, launch it. The manager's
   // auto-check timer uses unref() so it never keeps the process alive.
@@ -1088,6 +1106,11 @@ async function boot(): Promise<void> {
     }
     try {
       shutdownFusionRuns();
+    } catch {
+      // ignore
+    }
+    try {
+      shutdownEvalRuns();
     } catch {
       // ignore
     }

@@ -1327,3 +1327,188 @@ export function streamFusionRun(
   })();
   return () => controller.abort();
 }
+
+// ---------------------------------------------------------------------------
+// Eval harnesses (Atomic Agent parity)
+// ---------------------------------------------------------------------------
+
+export type EvalRubricDto =
+  | { type: 'contains'; keywords: string[]; caseSensitive?: boolean }
+  | { type: 'regex'; pattern: string; flags?: string }
+  | { type: 'tool_used'; tool: string | string[] }
+  | { type: 'llm_judge'; criteria: string; threshold?: number; model?: string };
+
+export interface EvalCaseDto {
+  id: string;
+  name: string;
+  input: string;
+  rubrics: EvalRubricDto[];
+  passThreshold?: number;
+  setupMemories?: string[];
+  timeoutMs?: number;
+}
+
+export interface EvalSuiteDto {
+  id: string;
+  name: string;
+  description?: string;
+  cases: EvalCaseDto[];
+}
+
+export interface EvalRubricResultDto {
+  rubric: EvalRubricDto;
+  score: number;
+  detail: string;
+}
+
+export interface EvalCaseResultDto {
+  caseId: string;
+  name: string;
+  passed: boolean;
+  score: number;
+  rubricResults: EvalRubricResultDto[];
+  response: string;
+  toolsUsed: string[];
+  usage: { promptTokens: number; completionTokens: number; totalTokens: number } | null;
+  error?: string;
+  durationMs: number;
+}
+
+export interface EvalRunDto {
+  runId: string;
+  suiteId: string;
+  suiteName: string;
+  botId: string;
+  botName: string;
+  status: 'running' | 'completed' | 'aborted_budget' | 'failed';
+  score: number | null;
+  passed: number | null;
+  failed: number | null;
+  caseResults: EvalCaseResultDto[] | null;
+  usage: { promptTokens: number; completionTokens: number; totalTokens: number } | null;
+  costUsd: number | null;
+  error: string | null;
+  createdAt: string;
+  completedAt: string | null;
+}
+
+export type EvalStreamEvent =
+  | { type: 'snapshot'; run: EvalRunDto }
+  | { type: 'run_started'; suiteId: string; suiteName: string; caseCount: number }
+  | { type: 'case_started'; caseId: string; name: string; index: number; total: number }
+  | { type: 'case_done'; result: EvalCaseResultDto }
+  | { type: 'done'; report: unknown }
+  | { type: 'error'; message: string };
+
+export async function listEvalSuites(): Promise<{ ok: boolean; suites: EvalSuiteDto[] }> {
+  return apiJson('/api/evals');
+}
+
+export async function saveEvalSuite(suite: EvalSuiteDto): Promise<{ ok: boolean; suite: EvalSuiteDto }> {
+  const res = await apiFetch('/api/evals', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(suite),
+  });
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const body = (await res.json()) as { errors?: string[]; error?: string };
+      detail = body.errors?.join('; ') ?? body.error ?? '';
+    } catch {
+      // ignore
+    }
+    throw new Error(`Saving eval suite failed (${res.status}): ${detail || res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function deleteEvalSuite(id: string): Promise<{ ok: boolean; deleted: boolean }> {
+  return apiJson(`/api/evals/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+export async function startEvalRun(input: {
+  suiteId: string;
+  botId: string;
+  maxConcurrency?: number;
+  maxBudgetUsd?: number;
+  providerId?: string;
+  model?: string;
+  judgeProviderId?: string;
+  judgeModel?: string;
+}): Promise<{ ok: boolean; runId: string }> {
+  const res = await apiFetch(`/api/evals/${encodeURIComponent(input.suiteId)}/run`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    let detail = '';
+    try {
+      detail = ((await res.json()) as { error?: string }).error ?? '';
+    } catch {
+      // ignore
+    }
+    throw new Error(`Eval run failed to start (${res.status}): ${detail || res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function listEvalRuns(limit = 50, suiteId?: string): Promise<{ ok: boolean; runs: EvalRunDto[] }> {
+  const q = new URLSearchParams({ limit: String(limit) });
+  if (suiteId) q.set('suiteId', suiteId);
+  return apiJson(`/api/evals/runs?${q.toString()}`);
+}
+
+export async function getEvalRun(runId: string): Promise<{ ok: boolean; run: EvalRunDto }> {
+  return apiJson(`/api/evals/runs/${encodeURIComponent(runId)}`);
+}
+
+/**
+ * Subscribe to an eval run's SSE progress stream. Returns an unsubscribe
+ * function. Same fetch + reader pattern as the fusion stream.
+ */
+export function streamEvalRun(
+  runId: string,
+  onEvent: (e: EvalStreamEvent) => void,
+  onError?: (err: Error) => void,
+): () => void {
+  const controller = new AbortController();
+  let buffer = '';
+  const dispatch = (chunk: string): void => {
+    buffer += chunk;
+    let idx: number;
+    while ((idx = buffer.indexOf('\n\n')) >= 0) {
+      const frame = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      for (const line of frame.split('\n')) {
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload) continue;
+        try {
+          onEvent(JSON.parse(payload) as EvalStreamEvent);
+        } catch {
+          // ignore malformed frame
+        }
+      }
+    }
+  };
+  (async () => {
+    try {
+      const res = await fetch(`${getApiBase()}/api/evals/runs/${encodeURIComponent(runId)}/stream`, {
+        signal: controller.signal,
+      });
+      if (!res.ok || !res.body) throw new Error(`Eval stream failed (${res.status})`);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        dispatch(decoder.decode(value, { stream: true }));
+      }
+    } catch (err) {
+      if (!controller.signal.aborted) onError?.(err instanceof Error ? err : new Error(String(err)));
+    }
+  })();
+  return () => controller.abort();
+}
