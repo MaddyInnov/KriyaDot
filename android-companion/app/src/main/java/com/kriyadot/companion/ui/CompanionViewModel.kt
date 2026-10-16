@@ -2,6 +2,9 @@
 package com.kriyadot.companion.ui
 
 import android.app.Application
+import android.graphics.Bitmap
+import android.os.Handler
+import android.os.Looper
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -13,15 +16,19 @@ import com.kriyadot.companion.core.ChatMessage
 import com.kriyadot.companion.core.CompanionSocket
 import com.kriyadot.companion.core.PairingPayload
 import com.kriyadot.companion.core.PairingStore
+import com.kriyadot.companion.core.RemoteScreenSession
+import com.kriyadot.companion.core.RemoteScreenSocket
 import com.kriyadot.companion.core.RunSummary
 import com.kriyadot.companion.core.ActivityItem
 import com.kriyadot.companion.core.KriyaDotApi
 import com.kriyadot.companion.core.ServerStatus
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 
@@ -279,7 +286,139 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         socket.stop()
+        stopScreenShare()
         super.onCleared()
+    }
+
+    // ---- Remote screen (phone -> PC live view) ------------------------------
+
+    private val screenSocket = RemoteScreenSocket(store)
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private val _screenSession = MutableStateFlow<RemoteScreenSession?>(null)
+    val screenSession: StateFlow<RemoteScreenSession?> = _screenSession.asStateFlow()
+
+    private val _screenBitmap = MutableStateFlow<Bitmap?>(null)
+    val screenBitmap: StateFlow<Bitmap?> = _screenBitmap.asStateFlow()
+
+    /** Human-readable status line for the screen UI (approval wait, errors…). */
+    private val _screenNote = MutableStateFlow<String?>(null)
+    val screenNote: StateFlow<String?> = _screenNote.asStateFlow()
+
+    private var screenPollJob: Job? = null
+
+    /** Ask the PC to share its screen. The owner must approve in the web UI. */
+    fun startScreenShare() {
+        if (_screenSession.value != null) return
+        _screenNote.value = null
+        _screenBitmap.value = null
+        viewModelScope.launch {
+            try {
+                val s = api.startRemoteScreen()
+                _screenSession.value = s
+                _screenNote.value = "Waiting for approval on your PC…"
+                pollScreenSession(s)
+            } catch (e: Exception) {
+                _error.value = "Couldn't start screen sharing: ${e.message}"
+            }
+        }
+    }
+
+    private fun pollScreenSession(first: RemoteScreenSession) {
+        screenPollJob?.cancel()
+        screenPollJob = viewModelScope.launch {
+            var session = first
+            while (isActive) {
+                delay(session.pollMs.coerceIn(1000L, 10_000L))
+                try {
+                    session = api.getRemoteScreenSession(session.sessionId)
+                } catch (e: Exception) {
+                    _screenNote.value = "Lost contact with the PC: ${e.message}"
+                    break
+                }
+                _screenSession.value = session
+                when {
+                    session.isLive -> {
+                        _screenNote.value = if (session.mock) "Preview mode (test feed)" else "Live"
+                        connectScreenSocket(session.sessionId)
+                        break
+                    }
+                    session.isTerminal -> {
+                        _screenNote.value = when (session.status) {
+                            "denied" -> "Screen sharing was declined on the PC."
+                            "expired" -> "The approval request expired."
+                            else -> "Screen sharing ended."
+                        }
+                        _screenSession.value = null
+                        break
+                    }
+                    else -> _screenNote.value = "Waiting for approval on your PC…"
+                }
+            }
+        }
+    }
+
+    private fun connectScreenSocket(sessionId: String) {
+        screenSocket.start(sessionId, object : RemoteScreenSocket.Listener {
+            override fun onConnected(mock: Boolean) {
+                mainHandler.post {
+                    _screenNote.value = if (mock) "Preview mode (test feed)" else "Live"
+                }
+            }
+
+            override fun onFrame(bitmap: Bitmap, w: Int, h: Int, frameNo: Long) {
+                mainHandler.post { _screenBitmap.value = bitmap }
+            }
+
+            override fun onServerError(detail: String) {
+                mainHandler.post {
+                    _screenNote.value = when (detail) {
+                        "capture_failed" -> "The PC couldn't capture its screen."
+                        "not_approved" -> "Not approved on the PC."
+                        else -> "Screen error: $detail"
+                    }
+                }
+            }
+
+            override fun onEnded(reason: String) {
+                mainHandler.post {
+                    _screenNote.value = when (reason) {
+                        "max_duration" -> "Screen sharing stopped (30-minute limit)."
+                        "capture_unavailable" -> "Screen capture unavailable on the PC."
+                        else -> "Screen sharing ended."
+                    }
+                    _screenSession.value = null
+                    _screenBitmap.value = null
+                }
+            }
+
+            override fun onConnectionLost(willRetry: Boolean) {
+                mainHandler.post {
+                    _screenNote.value = "Connection to the PC lost."
+                    _screenSession.value = null
+                    _screenBitmap.value = null
+                }
+            }
+        })
+    }
+
+    /** Stop sharing (also tells the PC to end the session). */
+    fun stopScreenShare() {
+        screenPollJob?.cancel()
+        screenPollJob = null
+        screenSocket.stop()
+        val id = _screenSession.value?.sessionId
+        _screenSession.value = null
+        _screenBitmap.value = null
+        _screenNote.value = null
+        if (id != null) {
+            viewModelScope.launch {
+                try {
+                    api.stopRemoteScreen(id)
+                } catch (_: Exception) {
+                }
+            }
+        }
     }
 
     class Factory(private val app: Application) : ViewModelProvider.Factory {

@@ -123,6 +123,20 @@ Without `fcm_config.json` the app builds and runs normally — pushes are
 silently disabled and the WebSocket covers the foreground case. Without
 `FCM_SERVICE_ACCOUNT_JSON` the server skips sending (logged once).
 
+## Remote screen
+
+More → Remote screen watches the paired PC's live screen (Codync parity).
+Tapping Start asks the PC to share; the PC owner must approve the "Allow
+screen sharing?" card in the KriyaDot web UI before any frame flows, and a
+red banner on the PC shows while sharing is active. Frames stream over a
+WebSocket frame channel (MJPEG-style PNG frames, ~4 fps) — view-only, with
+pinch-to-zoom; sessions stop automatically after 30 minutes.
+
+Server setup: `npm install screenshot-desktop` where the KriyaDot API runs
+(optional dependency, loaded lazily). Without it the app shows a clear
+"screen capture unavailable" error. For development without a display, set
+`REMOTE_SCREEN_MOCK=1` on the server for a labeled test-pattern feed.
+
 ## Files
 
 - `app/src/main/java/com/kriyadot/companion/MainActivity.kt` — activity, QR-scan launcher, bottom-nav shell.

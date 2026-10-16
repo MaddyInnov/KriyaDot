@@ -321,6 +321,31 @@ function computeAccept(key: string): string {
   return createHash('sha1').update(key + WS_GUID, 'utf8').digest('base64');
 }
 
+/**
+ * Perform the server side of the RFC 6455 handshake on an upgraded socket
+ * and wrap it in a ViewerSocket. Returns null (after writing a 400 and
+ * destroying the socket) when the handshake headers are invalid.
+ *
+ * Shared with remote-screen.ts so the minimal WS implementation lives in
+ * exactly one place.
+ */
+export function acceptRawWsSocket(req: IncomingMessage, socket: Duplex): ViewerSocket | null {
+  const key = req.headers['sec-websocket-key'];
+  const upgrade = String(req.headers['upgrade'] ?? '').toLowerCase();
+  if (upgrade !== 'websocket' || req.headers['sec-websocket-version'] !== '13' || typeof key !== 'string') {
+    socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return null;
+  }
+  socket.write(
+    'HTTP/1.1 101 Switching Protocols\r\n' +
+      'Upgrade: websocket\r\n' +
+      'Connection: Upgrade\r\n' +
+      `Sec-WebSocket-Accept: ${computeAccept(key)}\r\n\r\n`,
+  );
+  return new MiniWsSocket(socket);
+}
+
 // ---------------------------------------------------------------------------
 // Per-bot viewer state
 // ---------------------------------------------------------------------------
@@ -546,22 +571,11 @@ export class ComputerViewHub {
 
   /** HTTP upgrade entry point — wired into the server's 'upgrade' event by the integrator. */
   handleUpgrade(req: IncomingMessage, socket: Duplex, _head: Buffer): void {
-    const key = req.headers['sec-websocket-key'];
-    const upgrade = String(req.headers['upgrade'] ?? '').toLowerCase();
-    if (upgrade !== 'websocket' || req.headers['sec-websocket-version'] !== '13' || typeof key !== 'string') {
-      socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
-      socket.destroy();
-      return;
-    }
-    socket.write(
-      'HTTP/1.1 101 Switching Protocols\r\n' +
-        'Upgrade: websocket\r\n' +
-        'Connection: Upgrade\r\n' +
-        `Sec-WebSocket-Accept: ${computeAccept(key)}\r\n\r\n`,
-    );
+    const sock = acceptRawWsSocket(req, socket);
+    if (!sock) return;
     const url = new URL(req.url ?? COMPUTER_VIEW_WS_PATH, 'http://localhost');
     const queryBotId = url.searchParams.get('botId');
-    this.acceptSocket(new MiniWsSocket(socket), queryBotId);
+    this.acceptSocket(sock, queryBotId);
   }
 
   /**

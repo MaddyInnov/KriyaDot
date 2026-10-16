@@ -59,6 +59,12 @@ fun MoreScreen(vm: CompanionViewModel, nav: NavController) {
         )
         HorizontalDivider()
         ListItem(
+            headlineContent = { Text("Remote screen") },
+            supportingContent = { Text("Watch this PC's screen (approval required)") },
+            modifier = Modifier.clickable { nav.navigate("screen") },
+        )
+        HorizontalDivider()
+        ListItem(
             headlineContent = { Text("Unpair this device", color = MaterialTheme.colorScheme.error) },
             leadingContent = {
                 Icon(Icons.Filled.Logout, contentDescription = null, tint = MaterialTheme.colorScheme.error)

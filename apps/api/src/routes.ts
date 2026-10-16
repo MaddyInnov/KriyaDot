@@ -74,6 +74,7 @@ import type { AdbPhoneProvider } from './phone-adb.js';
 import type { PhoneSessionHub, PhoneStore } from './phone.js';
 import { getLanIp, registerCompanionRoutes } from './companion-routes.js';
 import type { CompanionHub, CompanionStore } from './companion.js';
+import { createRemoteScreenRouter } from './remote-screen-routes.js';
 import { TieredMemoryStore } from '@mvp/agent-runtime';
 import { PERSONAS, MBTI_TYPES, QUIZ_QUESTIONS, scoreQuiz, resolvePersona } from '@mvp/agent-runtime';
 import { saveBotPersona } from './bot-personas.js';
@@ -201,6 +202,15 @@ export interface RouteDeps {
    * that don't exercise push; created by index.ts otherwise.
    */
   push?: import('./push.js').PushService;
+  /**
+   * Remote screen viewing (phone -> PC, Codync parity). Optional: omitted in
+   * tests that don't exercise it; created by index.ts otherwise. The WS
+   * endpoint (/api/remote-screen/ws) is wired in index.ts's upgrade handler.
+   */
+  remoteScreen?: {
+    store: CompanionStore;
+    service: import('./remote-screen.js').RemoteScreenService;
+  };
 }
 
 const TERMINAL_RUN_STATUSES: ReadonlySet<WorkflowRun['status']> = new Set(['succeeded', 'failed']);
@@ -2428,6 +2438,20 @@ export function createRouter(deps: RouteDeps): express.Router {
       },
     });
     router.use('/companion', companionRouter);
+
+    // Remote screen viewing (phone -> PC, Codync parity). REST only — the
+    // live frame WebSocket (/api/remote-screen/ws) is wired to the HTTP
+    // server's 'upgrade' event in index.ts, sharing deps.remoteScreen.
+    if (deps.remoteScreen) {
+      router.use(
+        '/remote-screen',
+        createRemoteScreenRouter({
+          store: deps.remoteScreen.store,
+          service: deps.remoteScreen.service,
+          audit: (action, fields) => governance.audit(action, fields),
+        }),
+      );
+    }
 
     // Live run-status pushes to connected companion phones.
     workflowRunner.onRunUpdate((run) => {

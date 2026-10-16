@@ -158,6 +158,35 @@ class KriyaDotApi(
     suspend fun getBriefing(): Briefing =
         Briefing.fromJson(awaitJson(authed("/api/companion/briefing").get().build()))
 
+    // ---- Remote screen (phone -> PC live screen view) -----------------------
+    // Approval-gated: start() returns a pending session; the PC owner approves
+    // in the web UI, then the app opens the frame WebSocket.
+
+    suspend fun startRemoteScreen(): RemoteScreenSession {
+        val json = post("/api/remote-screen/start")
+        if (!json.optBoolean("ok", false)) {
+            throw IOException(json.optString("detail", json.optString("error", "Failed to start screen sharing")))
+        }
+        return RemoteScreenSession.fromJson(json)
+    }
+
+    suspend fun getRemoteScreenSession(sessionId: String): RemoteScreenSession {
+        val json = awaitJson(authed("/api/remote-screen/session/$sessionId").get().build())
+        if (!json.optBoolean("ok", false)) {
+            throw IOException(json.optString("detail", json.optString("error", "Unknown screen session")))
+        }
+        return RemoteScreenSession.fromJson(json.getJSONObject("session"))
+    }
+
+    suspend fun stopRemoteScreen(sessionId: String): Boolean {
+        return try {
+            val json = post("/api/remote-screen/stop", JSONObject().put("sessionId", sessionId))
+            json.optBoolean("ok", false)
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     // ---- Chat (mirrors the web app's POST /chat) ----------------------------
 
     /**

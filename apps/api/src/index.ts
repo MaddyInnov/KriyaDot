@@ -748,6 +748,22 @@ async function boot(): Promise<void> {
   app.get('/.well-known/agent-card.json', (_req, res) => {
     res.json(defaultAgentCard(`http://127.0.0.1:${config.port}/api/protocols/a2a`));
   });
+  // Remote screen viewing (phone -> PC, Codync parity): approval-gated live
+  // screen frames over a WebSocket frame channel (MJPEG-style, not raw
+  // WebRTC — see remote-screen.ts). REST at /api/remote-screen via routes.ts;
+  // the WS upgrade is handled in the switch below, sharing this instance.
+  const { RemoteScreenService } = await import('./remote-screen.js');
+  const { createRemoteScreenUpgrade } = await import('./remote-screen-routes.js');
+  const remoteScreenService = new RemoteScreenService({
+    requestApproval: (toolName, args, ctx) => governance.requestApproval(toolName, args, ctx),
+    awaitDecision: (approvalId, timeoutMs) => governance.awaitDecision(approvalId, timeoutMs),
+    audit: (action, fields) => governance.audit(action, fields),
+  });
+  const remoteScreenUpgrade = createRemoteScreenUpgrade({
+    store: companionStore,
+    service: remoteScreenService,
+    audit: (action, fields) => governance.audit(action, fields),
+  });
   // Phase 2: workflow webhook triggers (shared-secret authenticated).
   app.use('/webhooks', createWebhookRouter({ runner: workflowRunner, triggerStore }));
   app.use(
@@ -768,6 +784,8 @@ async function boot(): Promise<void> {
       preferenceStore,
       phone: { store: phoneStore, hub: phoneHub, adb: phoneAdb },
       companion: { store: companionStore, hub: companionHub },
+      // Remote screen viewing (phone -> PC, Codync parity): approval-gated.
+      remoteScreen: { store: companionStore, service: remoteScreenService },
       // Encrypted push notifications (Codync parity): FCM fan-out to paired
       // devices, sealed per device. No-op when FCM isn't configured.
       push: new (await import('./push.js')).PushService({
@@ -937,6 +955,8 @@ async function boot(): Promise<void> {
       companionHub.handleUpgrade(req, socket, head);
     } else if (path === '/api/computer/ws') {
       computerView.handleUpgrade(req, socket, head);
+    } else if (path === '/api/remote-screen/ws') {
+      remoteScreenUpgrade.handleUpgrade(req, socket, head);
     } else {
       socket.destroy();
     }
@@ -955,6 +975,11 @@ async function boot(): Promise<void> {
     }
     try {
       agentRuntime.close();
+    } catch {
+      // ignore
+    }
+    try {
+      remoteScreenService.close();
     } catch {
       // ignore
     }

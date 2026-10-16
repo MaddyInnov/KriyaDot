@@ -161,3 +161,30 @@ sealed interface ChatEvent {
     data class Queued(val position: Int) : ChatEvent
     data class Error(val message: String) : ChatEvent
 }
+
+/** A remote-screen session (phone viewing the PC's live screen). */
+data class RemoteScreenSession(
+    val sessionId: String,
+    val status: String, // pending | approved | active | denied | expired | ended
+    val deviceName: String = "",
+    val wsPath: String = "/api/remote-screen/ws",
+    val pollMs: Long = 2000L,
+    val mock: Boolean = false,
+) {
+    companion object {
+        fun fromJson(o: JSONObject): RemoteScreenSession {
+            val s = if (o.has("session")) o.getJSONObject("session") else o
+            return RemoteScreenSession(
+                sessionId = s.optString("sessionId", o.optString("sessionId", "")),
+                status = s.optString("status", "pending"),
+                deviceName = s.optString("deviceName", ""),
+                wsPath = o.optString("wsPath", "/api/remote-screen/ws"),
+                pollMs = o.optLong("pollMs", 2000L),
+                mock = s.optBoolean("mock", false),
+            )
+        }
+    }
+
+    val isTerminal: Boolean get() = status == "denied" || status == "expired" || status == "ended"
+    val isLive: Boolean get() = status == "approved" || status == "active"
+}

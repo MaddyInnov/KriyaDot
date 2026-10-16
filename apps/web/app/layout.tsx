@@ -7,6 +7,7 @@ import './minimal-layout.css';
 import './pet.css';
 import Nav from './nav';
 import PwaInstallBanner from '../components/pwa-install';
+import RemoteScreenBanner from '../components/remote-screen-banner';
 import { BrandPet } from '../components/pet/BrandPet';
 import { I18nProvider } from '../lib/i18n';
 
@@ -69,6 +70,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <main className="main">{children}</main>
         </div>
         <PwaInstallBanner />
+        <RemoteScreenBanner />
         </I18nProvider>
       </body>
     </html>

@@ -265,6 +265,41 @@ KRIYADOT_PUBLIC_URL=https://kriyadot.example.com bun src/index.ts
 - Pairing and WS auth failures are IP rate-limited and audit-logged
   (`companion.*`); the limiter keys off `X-Forwarded-For` behind a proxy.
 
+## 10. Remote screen viewing (phone -> PC, Codync parity)
+
+The paired phone can watch the PC's live screen. Transport is a **WebSocket
+frame channel** (base64 PNG frames, MJPEG-style, ~4 fps default) — the same
+proven pattern as `/api/computer/ws`. It is deliberately NOT raw WebRTC: the
+`wrtc` native module routinely fails to build on current Node releases and
+buys nothing for a view-only low-fps stream.
+
+**Approval gate (fail closed):** `POST /start` creates a `pending` session and
+mints a governance approval (`remote_screen.share`). Frames flow ONLY after
+the PC owner approves the "Allow screen sharing to \"<device>\"?" card in
+the web UI approvals inbox. Deny or 120 s of silence -> `denied`/`expired`.
+Sessions auto-stop after 30 minutes. The web UI shows a red
+"Screen sharing active" banner (with a Stop button) while any session is live.
+
+The channel is **view-only** — anything the phone sends gets
+`{t:'error', detail:'view_only'}`. Screen capture needs the optional
+`screenshot-desktop` package on the PC (`npm install screenshot-desktop`
+where the API runs); without it the phone gets a clear error, never a
+silent mock. `REMOTE_SCREEN_MOCK=1` enables a labeled test-pattern feed
+(`mock:true` on the wire) for development.
+
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/api/remote-screen/start` | Device Bearer -> `{ok, sessionId, approvalId, status:'pending', wsPath, pollMs}` (202) |
+| GET | `/api/remote-screen/session/:id` | Device Bearer, owner-only -> `{ok, session:{sessionId, status, ...}}` (phone polls) |
+| POST | `/api/remote-screen/stop` | Device Bearer, owner-only `{sessionId}` -> `{ok}` |
+| GET | `/api/remote-screen/status` | No device token (PC owner's console) -> `{ok, active:[...]}` (banner feed) |
+| POST | `/api/remote-screen/stop-local` | No device token (banner Stop button) `{sessionId}` -> `{ok}` |
+| WS | `/api/remote-screen/ws?sessionId=&token=` | `{t:'ok'}` then `{t:'frame', png, w, h, ts, n}`; `{t:'error', detail}`; `{t:'ended', reason}` |
+
+Threat notes: a stolen device token can *request* a session but cannot see a
+single pixel without the PC owner's explicit approval; the red banner makes
+an active session impossible to miss; frames are never stored server-side.
+
 ## MCP connector OAuth sign-in from the phone
 
 The API supports completing an MCP OAuth sign-in from the Android companion:

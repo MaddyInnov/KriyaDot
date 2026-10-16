@@ -44,6 +44,7 @@ import com.kriyadot.companion.ui.HomeScreen
 import com.kriyadot.companion.ui.MoreScreen
 import com.kriyadot.companion.ui.PairingScreen
 import com.kriyadot.companion.ui.RunsScreen
+import com.kriyadot.companion.ui.ScreenShareScreen
 import com.kriyadot.companion.ui.KriyaDotTheme
 
 class MainActivity : ComponentActivity() {
@@ -174,6 +175,7 @@ private fun MainShell(
             composable(Tab.More.route) { MoreScreen(vm, nav) }
             composable("activity") { ActivityScreen(vm, nav) }
             composable("briefing") { BriefingScreen(vm, nav) }
+            composable("screen") { ScreenShareScreen(vm, nav) }
         }
     }
 }
