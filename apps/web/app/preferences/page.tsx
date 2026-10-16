@@ -8,6 +8,7 @@ import { McpOAuthPanel } from '../../components/panels/mcp-oauth-panel';
 import { DetectedAgentsPanel } from '../../components/panels/detected-agents-panel';
 import { AnalyticsPanel } from '../../components/panels/analytics-panel';
 import { LocalLlmPanel } from '../../components/panels/local-llm-panel';
+import { UpdatesPanel } from '../../components/panels/updates-panel';
 import { useUxMode } from '../../lib/ux-mode';
 
 interface LearnedPreference {
@@ -181,6 +182,16 @@ export default function PreferencesPage() {
           GPU auto-detect, served on 127.0.0.1 only. No API key, no cloud, no cost.
         </p>
         <LocalLlmPanel />
+      </section>
+
+      <section className="card">
+        <h2>Updates</h2>
+        <p className="muted small">
+          Check the official KriyaDot releases for newer versions. Nothing downloads or
+          installs without your explicit action — updates come only from
+          MaddyInnov/KriyaDot on GitHub.
+        </p>
+        <UpdatesPanel />
       </section>
 
       <section className="card">

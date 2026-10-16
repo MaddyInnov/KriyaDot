@@ -36,6 +36,8 @@ import { createAgentDetectRouter } from './agent-detect-routes.js';
 import { createAnalyticsRouter } from './analytics-routes.js';
 import { createLocalLlmRouter } from './local-llm-routes.js';
 import { LocalLlmManager } from '@mvp/agent-runtime';
+import { createSelfUpdateRouter } from './self-update-routes.js';
+import { SelfUpdateManager } from '@mvp/agent-runtime';
 import { createFusionRouter, shutdownFusionRuns } from './fusion-routes.js';
 import { FusionRunStore } from './fusion.js';
 import { createSummarizer } from './summarizer.js';
@@ -954,6 +956,15 @@ async function boot(): Promise<void> {
     }),
   );
 
+  // Self-update (Atomic Agent parity): check official GitHub releases, download
+  // the platform installer with explicit consent, launch it. The manager's
+  // auto-check timer uses unref() so it never keeps the process alive.
+  const updater = new SelfUpdateManager({
+    dataDir: config.dataDir,
+    currentVersion: process.env.KRIYADOT_VERSION ?? '0.1.0',
+  });
+  app.use('/api/updates', createSelfUpdateRouter(updater));
+
   app.use('/api/routines', routinesRouter);
   app.use('/webhooks/routines', routineWebhookRouter);
   // n8n workflow import/export.
@@ -1064,6 +1075,11 @@ async function boot(): Promise<void> {
     }
     try {
       shutdownFusionRuns();
+    } catch {
+      // ignore
+    }
+    try {
+      updater.stopAutoCheck();
     } catch {
       // ignore
     }

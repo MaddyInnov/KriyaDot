@@ -49,3 +49,4 @@ export * from './teams.js';
 export * from './hooks.js';
 export * from './worktrees.js';
 export * from './fusion.js';
+export * from './self-update.js';

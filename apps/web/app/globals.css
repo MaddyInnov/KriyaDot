@@ -4345,3 +4345,20 @@ html[data-ux='simple'] .mic-btn.recording {
 .privacy-data { margin-top: 0.7rem; }
 .privacy-data h4 { font-size: 0.85rem; margin: 0.6rem 0 0.3rem; }
 .privacy-json { font-size: 0.72rem; max-height: 300px; overflow: auto; padding: 0.6rem; border-radius: 8px; background: var(--surface-2, #1a1a24); white-space: pre-wrap; word-break: break-word; }
+
+/* Self-update panel */
+.updates-panel .status-dot { width: 10px; height: 10px; border-radius: 50%; background: #4ade80; display: inline-block; flex-shrink: 0; }
+.updates-panel .status-dot.state-checking { background: #fbbf24; animation: pulse 1s infinite; }
+.updates-panel .status-dot.state-downloading { background: #60a5fa; animation: pulse 1s infinite; }
+.updates-panel .status-dot.state-available { background: #fbbf24; }
+.updates-panel .status-dot.state-ready { background: #60a5fa; }
+.updates-panel .status-dot.state-installing { background: #a78bfa; animation: pulse 1s infinite; }
+.updates-panel .status-dot.state-error { background: #f87171; }
+@keyframes pulse { 50% { opacity: 0.4; } }
+.release-notes { margin-top: 12px; padding: 0.7rem 0.8rem; border-radius: 10px; background: var(--surface-2, #1a1a24); border: 1px solid var(--border, #33333f); }
+.release-notes h4 { margin: 0 0 0.3rem; font-size: 0.9rem; }
+.release-body { font-size: 0.78rem; white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow: auto; margin: 0.4rem 0 0; font-family: inherit; }
+.progress-wrap { margin-top: 12px; display: flex; align-items: center; gap: 0.6rem; }
+.progress-bar { flex: 1; height: 8px; border-radius: 4px; background: var(--surface-2, #23232e); overflow: hidden; }
+.progress-fill { height: 100%; background: #60a5fa; border-radius: 4px; transition: width 0.3s; }
+.update-badge-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #fbbf24; margin-left: 6px; vertical-align: middle; }
