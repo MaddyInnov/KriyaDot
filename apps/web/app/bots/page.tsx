@@ -667,6 +667,11 @@ function BotsPageInner() {
       <p className="page-sub">
         {t('bots.subtitle')}
       </p>
+      <p>
+        <a className="btn btn-ghost" href="/groups">
+          👥 Group chats — several bots in one room
+        </a>
+      </p>
       {error && <div className="error-box">{error}</div>}
       <div className="chat-layout">
         <aside className="bot-roster">

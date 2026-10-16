@@ -40,6 +40,7 @@ import { mountWebAssets } from './web-assets.js';
 import { createComputerView } from './computer-view.js';
 import { createChatThreadsRouter } from './chat-threads-routes.js';
 import { createMessageThreadsRouter } from './message-threads-routes.js';
+import { createGroupChatsRouter } from './group-chats-routes.js';
 import { applyImportedBots, createBotRosterRouter } from './bot-roster-routes.js';
 import { registerRoutineRoutes } from './bot-routines.js';
 import { createRoutineWebhookRouter } from './webhooks.js';
@@ -733,6 +734,27 @@ async function boot(): Promise<void> {
     createBotRosterRouter({
       dataDir: config.dataDir,
       getBots: () => seed.bots,
+      audit: (action, fields) => governance.audit(action, fields),
+    }),
+  );
+  // Group chats (multi-bot rooms): roster rows with room-turn orchestration.
+  app.use(
+    '/api/groups',
+    createGroupChatsRouter({
+      dataDir: config.dataDir,
+      getBots: () => seed.bots,
+      runMemberTurn: async (bot, prompt) => {
+        let content = '';
+        await agentRuntime.runTurn({
+          bot,
+          message: prompt,
+          taskType: 'chat',
+          onEvent: (e) => {
+            if (e.type === 'token' && typeof e.content === 'string') content += e.content;
+          },
+        });
+        return { text: content };
+      },
       audit: (action, fields) => governance.audit(action, fields),
     }),
   );
