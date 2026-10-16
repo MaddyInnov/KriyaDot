@@ -184,6 +184,19 @@ export interface BotConfig {
    */
   memoryKeeper?: boolean;
   /**
+   * Memory fabric (Atomic parity): when true, a background reflection pass
+   * runs every 50 turns for this bot — reviewing its memories, proposing
+   * new lessons/procedures, and flagging contradictions. Opt-in; default
+   * false. The pass is low-priority and never blocks chat.
+   */
+  memoryReflection?: boolean;
+  /**
+   * Memory fabric: when true, the keeper distills turns with the bot's own
+   * model (costs tokens) instead of the zero-cost heuristic, and also
+   * extracts lessons and procedures. Default false.
+   */
+  memoryLiveDistill?: boolean;
+  /**
    * Push notification preference (Codync parity):
    * - 'all' (default): "done" + "failed" + "needs you" pushes.
    * - 'approvals': only "needs you" (approval requested) pushes.

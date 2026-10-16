@@ -77,6 +77,8 @@ import type { CompanionHub, CompanionStore } from './companion.js';
 import { createRemoteScreenRouter } from './remote-screen-routes.js';
 import { createVoiceCallRouter } from './voice-call-routes.js';
 import { saveBotVoice } from './bot-voice.js';
+import { buildBotChatFn, saveBotMemorySettings, wireMemoryDistillers } from './memory-fabric.js';
+import { createMemoryFabricRouter } from './memory-fabric-routes.js';
 import { TieredMemoryStore } from '@mvp/agent-runtime';
 import { PERSONAS, MBTI_TYPES, QUIZ_QUESTIONS, scoreQuiz, resolvePersona } from '@mvp/agent-runtime';
 import { saveBotPersona } from './bot-personas.js';
@@ -1014,6 +1016,19 @@ export function createRouter(deps: RouteDeps): express.Router {
     }
   });
 
+  // ---- Memory fabric (Atomic parity): links, conflicts, reflection -------
+  // Typed links between atoms, contradiction conflicts with voting, and
+  // the on-demand reflection pass live in their own router (testable in
+  // isolation); the per-bot settings overlay stays next to the other
+  // /bots/:id/* settings routes below.
+  router.use(
+    '/memory',
+    createMemoryFabricRouter({
+      tieredMemoryStore,
+      findBot: (id: string) => bots.find((b) => b.id === id),
+    }),
+  );
+
   // ---- MBTI personas --------------------------------------------------------
   // Octop parity: 16 personality templates shaping bot tone/working style.
   router.get('/personas', (_req, res) => {
@@ -1115,6 +1130,39 @@ export function createRouter(deps: RouteDeps): express.Router {
       const status = message.startsWith('Unknown bot') ? 404 : 400;
       res.status(status).json(errorBody('Failed to save voice settings', message));
     }
+  });
+
+  // ---- Per-bot memory fabric settings (Atomic parity) ----------------------
+  // PUT body: { memoryReflection?: boolean, memoryLiveDistill?: boolean }.
+  // Persisted to <dataDir>/bot-memory-settings.json and applied to the
+  // in-memory bot immediately (live distiller is re-wired without a
+  // restart); also applied at boot (see memory-fabric.ts).
+  router.put('/bots/:id/memory-settings', (req, res) => {
+    try {
+      const settings = saveBotMemorySettings(config.dataDir, bots, req.params.id, req.body ?? {});
+      wireMemoryDistillers(bots, tieredMemoryStore);
+      res.json({ ok: true, botId: req.params.id, settings });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const status = message.startsWith('Unknown bot') ? 404 : 400;
+      res.status(status).json(errorBody('Failed to save memory settings', message));
+    }
+  });
+
+  router.get('/bots/:id/memory-settings', (req, res) => {
+    const bot = bots.find((b) => b.id === req.params.id);
+    if (!bot) {
+      res.status(404).json(errorBody(`Unknown bot "${req.params.id}"`));
+      return;
+    }
+    res.json({
+      ok: true,
+      botId: bot.id,
+      settings: {
+        memoryReflection: bot.memoryReflection === true,
+        memoryLiveDistill: bot.memoryLiveDistill === true,
+      },
+    });
   });
 
   // Read-only file browser scoped to a bot's workspace.
@@ -1550,6 +1598,22 @@ export function createRouter(deps: RouteDeps): express.Router {
       // The keeper is per-bot toggleable (bot.memoryKeeper, default true).
       if (bot.memoryKeeper !== false) {
         tieredMemoryStore.ingestTurn(bot.id, sessionKey ?? 'default', turnMessage, turnAssistantText, turnToolCalls);
+      }
+      // Memory fabric: periodic reflection pass (opt-in per bot via
+      // memoryReflection). Every 50 turns the bot's own model reviews its
+      // memories in the background — lessons, procedures, contradictions.
+      // Fire-and-forget; memory must never break chat.
+      if (bot.memoryReflection === true) {
+        try {
+          if (tieredMemoryStore.noteTurnForReflection(bot.id)) {
+            const chat = buildBotChatFn(bot);
+            if (chat) {
+              void tieredMemoryStore.runReflectionPass(bot.id, chat).catch(() => undefined);
+            }
+          }
+        } catch {
+          // reflection bookkeeping must never break chat
+        }
       }
       // The runtime should emit done/error itself; emit a terminal event only
       // if it resolved without one so clients never hang.

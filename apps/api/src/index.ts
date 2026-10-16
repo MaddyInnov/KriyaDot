@@ -230,6 +230,10 @@ async function boot(): Promise<void> {
   // overlay from <dataDir>/bot-voice.json.
   const { applyBotVoice } = await import('./bot-voice.js');
   applyBotVoice(seed.bots, config.dataDir);
+  // Per-bot memory fabric settings (Atomic parity: reflection + live
+  // distiller flags): overlay from <dataDir>/bot-memory-settings.json.
+  const { applyBotMemorySettings, wireMemoryDistillers } = await import('./memory-fabric.js');
+  applyBotMemorySettings(seed.bots, config.dataDir);
   // Chat branching / roster import: overlay previously imported bots.
   applyImportedBots(seed.bots, config.dataDir);
   // Auto-allocated per-bot workspaces (Codync parity): every bot gets
@@ -781,6 +785,9 @@ async function boot(): Promise<void> {
   // the router deps share one instance.
   const { TieredMemoryStore: TieredMemoryStoreCtor } = await import('@mvp/agent-runtime');
   const tieredMemoryStore = new TieredMemoryStoreCtor(config.dataDir);
+  // Memory fabric: install the live (model) distiller for bots that opted
+  // in via memoryLiveDistill; everyone else keeps the zero-cost heuristic.
+  wireMemoryDistillers(seed.bots, tieredMemoryStore);
   const { VoiceCallService } = await import('./voice-call.js');
   const { createVoiceCallUpgrade } = await import('./voice-call-routes.js');
   const voiceCallService = new VoiceCallService({

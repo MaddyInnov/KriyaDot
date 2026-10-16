@@ -187,14 +187,34 @@ export interface AtomCard {
   tier: PrivacyTier;
   /** Pinned memories always surface first in recall and are never auto-pruned. */
   pinned: boolean;
-  /** Memory category: fact | preference | summary | decision. */
+  /** Memory category: fact | preference | summary | decision | lesson | procedure | reflection. */
   category: MemoryCategory;
+  /**
+   * Active memories participate in recall/search. Memories superseded by a
+   * conflict resolution are kept (audit trail) but marked inactive.
+   */
+  active: boolean;
 }
 
-/** Durable memory categories (Engram parity). */
-export type MemoryCategory = 'fact' | 'preference' | 'summary' | 'decision';
+/** Durable memory categories (Engram + Atomic parity). */
+export type MemoryCategory =
+  | 'fact'
+  | 'preference'
+  | 'summary'
+  | 'decision'
+  | 'lesson'
+  | 'procedure'
+  | 'reflection';
 
-const MEMORY_CATEGORIES: ReadonlySet<string> = new Set(['fact', 'preference', 'summary', 'decision']);
+const MEMORY_CATEGORIES: ReadonlySet<string> = new Set([
+  'fact',
+  'preference',
+  'summary',
+  'decision',
+  'lesson',
+  'procedure',
+  'reflection',
+]);
 
 function normalizeCategory(c: unknown): MemoryCategory {
   return typeof c === 'string' && MEMORY_CATEGORIES.has(c) ? (c as MemoryCategory) : 'fact';
@@ -214,6 +234,53 @@ export interface DistilledFact {
   fact: string;
   entities: string[];
   confidence: number;
+  /** Optional explicit category (used by the advanced LLM distiller for lessons/procedures). */
+  category?: MemoryCategory;
+}
+
+/** A typed link between two memory atoms (Atomic parity). */
+export type MemoryLinkKind = 'relates' | 'contradicts' | 'supersedes';
+
+export interface MemoryLink {
+  id: string;
+  botId: string;
+  fromAtomId: string;
+  toAtomId: string;
+  kind: MemoryLinkKind;
+  createdAt: number;
+  /** Who created the link: 'user' | 'reflection' | 'system'. */
+  createdBy: string;
+}
+
+/** One vote in a memory conflict (Atomic parity: voting/consensus). */
+export interface ConflictVote {
+  by: string;
+  winnerId: string;
+  ts: number;
+}
+
+/** A contradiction between two memories awaiting (or having received) a verdict. */
+export interface MemoryConflict {
+  id: string;
+  botId: string;
+  atomAId: string;
+  atomBId: string;
+  status: 'open' | 'resolved';
+  votes: ConflictVote[];
+  winnerId: string | null;
+  createdAt: number;
+  resolvedAt: number | null;
+}
+
+/** Result of one reflection pass. */
+export interface ReflectionResult {
+  ok: boolean;
+  skipped: boolean;
+  reason?: string;
+  lessonsCreated: number;
+  proceduresCreated: number;
+  conflictsOpened: number;
+  reflectionAtomId: string | null;
 }
 
 /**
@@ -239,34 +306,72 @@ If nothing is worth remembering, return [].
 Example: [{"fact": "The user's preferred name is \\"Ashutosh\\".", "entities": ["Ashutosh"], "confidence": 0.95}]`;
 
 /**
+ * Advanced extraction prompt (memory fabric / Atomic parity): in addition
+ * to facts, extracts reusable lessons (what the bot learned from a mistake
+ * or a success) and procedures (multi-step processes the bot should reuse).
+ * Each item carries a "category": "fact" | "preference" | "decision" |
+ * "lesson" | "procedure".
+ */
+const KEEPER_ADVANCED_SYSTEM_PROMPT = `You extract durable memories from conversations for a long-term memory fabric.
+Return ONLY a JSON array of objects, each with:
+- "fact": a concise declarative sentence (for procedures: the procedure name followed by numbered steps)
+- "entities": array of proper nouns mentioned
+- "confidence": 0-1
+- "category": one of "fact", "preference", "decision", "lesson", "procedure"
+
+Rules:
+- "fact": durable personal facts (names, projects, goals, context).
+- "preference": likes, dislikes, stated preferences.
+- "decision": decisions or agreements made in the conversation.
+- "lesson": something the bot learned from a mistake, a correction, or a success
+  (e.g. "Always run the test suite before committing"). Only when the turn shows
+  learning — do not invent lessons.
+- "procedure": a reusable multi-step process demonstrated or agreed in the turn
+  (e.g. "Deploy procedure: 1. Build the app. 2. Run smoke tests. 3. Publish the release.").
+  Only when the turn actually contains a repeatable sequence.
+Exclude transient chit-chat, greetings, one-off questions with no lasting value.
+If nothing is worth remembering, return [].
+Example: [{"fact": "Always run npm test before pushing to main.", "entities": [], "confidence": 0.9, "category": "lesson"}]`;
+
+/**
  * Build an LLM distiller from a chat function. Parses the model's JSON
  * response; falls back to the heuristic extractor on any failure
  * (bad JSON, model error) — the keeper must never lose facts to a
  * malformed response.
+ *
+ * Pass { advanced: true } to also extract lessons and procedures with
+ * explicit categories (memory fabric). The advanced prompt is only used
+ * for the live bot-model distiller (memoryLiveDistill), never for the
+ * zero-cost heuristic path.
  */
-export function createLlmDistiller(chat: KeeperChatFn): LlmDistiller {
+export function createLlmDistiller(chat: KeeperChatFn, opts: { advanced?: boolean } = {}): LlmDistiller {
+  const systemPrompt = opts.advanced ? KEEPER_ADVANCED_SYSTEM_PROMPT : KEEPER_SYSTEM_PROMPT;
   return async (turnText: string): Promise<DistilledFact[]> => {
     let raw: string;
     try {
-      raw = await chat(KEEPER_SYSTEM_PROMPT, turnText.slice(0, 4000));
+      raw = await chat(systemPrompt, turnText.slice(0, 4000));
     } catch {
       return heuristicDistill(turnText);
     }
     try {
       // Strip markdown code fences if the model wrapped the JSON.
       const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
-      const parsed = JSON.parse(cleaned) as Array<{ fact?: unknown; entities?: unknown; confidence?: unknown }>;
+      const parsed = JSON.parse(cleaned) as Array<{ fact?: unknown; entities?: unknown; confidence?: unknown; category?: unknown }>;
       if (!Array.isArray(parsed)) return heuristicDistill(turnText);
       const facts: DistilledFact[] = [];
       for (const item of parsed.slice(0, 10)) {
         if (typeof item?.fact !== 'string' || !item.fact.trim()) continue;
-        facts.push({
+        const distilled: DistilledFact = {
           fact: item.fact.trim().slice(0, 500),
           entities: Array.isArray(item.entities)
             ? (item.entities.filter((e): e is string => typeof e === 'string').map((e) => e.trim()).filter(Boolean).slice(0, 10))
             : [],
           confidence: typeof item.confidence === 'number' ? Math.min(1, Math.max(0, item.confidence)) : 0.7,
-        });
+        };
+        if (opts.advanced && typeof item.category === 'string' && MEMORY_CATEGORIES.has(item.category)) {
+          distilled.category = item.category as MemoryCategory;
+        }
+        facts.push(distilled);
       }
       return facts;
     } catch {
@@ -326,6 +431,45 @@ const ATOM_FTS_TABLE = `
     bot_id UNINDEXED,
     fact,
     entities
+  );
+`;
+
+// Memory fabric (Atomic parity): explicit links between atoms,
+// contradiction conflicts with votes, and reflection turn counters.
+const LINK_TABLE = `
+  CREATE TABLE IF NOT EXISTS memory_links (
+    id TEXT PRIMARY KEY,
+    bot_id TEXT NOT NULL,
+    from_atom_id TEXT NOT NULL,
+    to_atom_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    created_by TEXT NOT NULL DEFAULT 'user',
+    UNIQUE (bot_id, from_atom_id, to_atom_id, kind)
+  );
+  CREATE INDEX IF NOT EXISTS idx_memory_links_bot ON memory_links(bot_id);
+  CREATE INDEX IF NOT EXISTS idx_memory_links_atoms ON memory_links(bot_id, from_atom_id, to_atom_id);
+`;
+
+const CONFLICT_TABLE = `
+  CREATE TABLE IF NOT EXISTS memory_conflicts (
+    id TEXT PRIMARY KEY,
+    bot_id TEXT NOT NULL,
+    atom_a_id TEXT NOT NULL,
+    atom_b_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    votes_json TEXT NOT NULL DEFAULT '[]',
+    winner_id TEXT,
+    created_at INTEGER NOT NULL,
+    resolved_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_memory_conflicts_bot ON memory_conflicts(bot_id, status);
+`;
+
+const REFLECTION_COUNTER_TABLE = `
+  CREATE TABLE IF NOT EXISTS memory_reflection_counters (
+    bot_id TEXT PRIMARY KEY,
+    turns INTEGER NOT NULL DEFAULT 0
   );
 `;
 
@@ -446,6 +590,9 @@ export class TieredMemoryStore {
     this.db.exec(ENTITY_TABLE);
     this.db.exec(EVENT_TABLE);
     this.db.exec(ATOM_FTS_TABLE);
+    this.db.exec(LINK_TABLE);
+    this.db.exec(CONFLICT_TABLE);
+    this.db.exec(REFLECTION_COUNTER_TABLE);
     // Vector leg of hybrid recall: hash embedding per atom. Column added
     // idempotently so databases created before this feature keep working.
     const cols = this.db.prepare('PRAGMA table_info(memory_atoms)').all() as Array<{ name: string }>;
@@ -465,6 +612,10 @@ export class TieredMemoryStore {
     }
     if (!atomCols.some((c) => c.name === 'category')) {
       this.db.exec("ALTER TABLE memory_atoms ADD COLUMN category TEXT NOT NULL DEFAULT 'fact'");
+    }
+    // Memory fabric: active flag for superseded memories (kept, not recalled).
+    if (!atomCols.some((c) => c.name === 'active')) {
+      this.db.exec('ALTER TABLE memory_atoms ADD COLUMN active INTEGER NOT NULL DEFAULT 1');
     }
     const eventCols = this.db.prepare('PRAGMA table_info(memory_events)').all() as Array<{ name: string }>;
     if (!eventCols.some((c) => c.name === 'tier')) {
@@ -540,7 +691,7 @@ export class TieredMemoryStore {
     }
     for (const f of facts) {
       try {
-        this.storeAtom(botId, f, sessionId);
+        this.storeAtom(botId, f, sessionId, undefined, { category: f.category });
       } catch {
         // skip bad facts, keep going
       }
@@ -697,13 +848,18 @@ export class TieredMemoryStore {
     }
   }
 
-  getAtoms(botId: string, limit = 200): AtomCard[] {
+  /**
+   * List a bot's atoms. Inactive (superseded) atoms are excluded unless
+   * includeInactive is set — recall and search must never see them.
+   */
+  getAtoms(botId: string, limit = 200, opts: { includeInactive?: boolean } = {}): AtomCard[] {
+    const where = opts.includeInactive ? 'bot_id = ?' : 'bot_id = ? AND active = 1';
     const rows = this.db
-      .prepare('SELECT * FROM memory_atoms WHERE bot_id = ? ORDER BY pinned DESC, created_at DESC LIMIT ?')
+      .prepare(`SELECT * FROM memory_atoms WHERE ${where} ORDER BY pinned DESC, created_at DESC LIMIT ?`)
       .all(botId, limit) as Array<{
         id: string; bot_id: string; fact: string; entities_json: string;
         confidence: number; source_turn: string; created_at: number; tier: string | null;
-        pinned: number | null; category: string | null;
+        pinned: number | null; category: string | null; active: number | null;
       }>;
     return rows.map((r) => ({
       id: r.id,
@@ -716,7 +872,14 @@ export class TieredMemoryStore {
       tier: readTier(r.tier),
       pinned: (r.pinned ?? 0) === 1,
       category: normalizeCategory(r.category),
+      active: (r.active ?? 1) === 1,
     }));
+  }
+
+  /** Fetch one atom by id (includes inactive ones; returns undefined when unknown). */
+  getAtom(botId: string, id: string): AtomCard | undefined {
+    const rows = this.getAtoms(botId, 20000, { includeInactive: true });
+    return rows.find((a) => a.id === id);
   }
 
   deleteAtom(botId: string, id: string): boolean {
@@ -725,6 +888,13 @@ export class TieredMemoryStore {
       this.db.prepare('DELETE FROM memory_atoms_fts WHERE atom_id = ?').run(id);
     } catch {
       // FTS cleanup is best-effort
+    }
+    // Links referencing a forgotten atom are meaningless; drop them.
+    // Conflicts are kept as an audit trail of what was decided.
+    try {
+      this.db.prepare('DELETE FROM memory_links WHERE bot_id = ? AND (from_atom_id = ? OR to_atom_id = ?)').run(botId, id, id);
+    } catch {
+      // link cleanup is best-effort
     }
     return res.changes > 0;
   }
@@ -936,5 +1106,378 @@ export class TieredMemoryStore {
       block += line;
     }
     return block;
+  }
+
+  // ---- Memory fabric (Atomic parity): links, conflicts, reflection --------
+
+  private static readonly LINK_KINDS: ReadonlySet<string> = new Set(['relates', 'contradicts', 'supersedes']);
+
+  private static normalizeLinkKind(kind: unknown): MemoryLinkKind {
+    if (typeof kind === 'string' && TieredMemoryStore.LINK_KINDS.has(kind)) return kind as MemoryLinkKind;
+    throw new Error(`Invalid link kind "${String(kind)}": must be relates | contradicts | supersedes`);
+  }
+
+  private static rowToLink(r: {
+    id: string; bot_id: string; from_atom_id: string; to_atom_id: string;
+    kind: string; created_at: number; created_by: string;
+  }): MemoryLink {
+    return {
+      id: r.id,
+      botId: r.bot_id,
+      fromAtomId: r.from_atom_id,
+      toAtomId: r.to_atom_id,
+      kind: r.kind as MemoryLinkKind,
+      createdAt: r.created_at,
+      createdBy: r.created_by,
+    };
+  }
+
+  private static rowToConflict(r: {
+    id: string; bot_id: string; atom_a_id: string; atom_b_id: string;
+    status: string; votes_json: string; winner_id: string | null;
+    created_at: number; resolved_at: number | null;
+  }): MemoryConflict {
+    let votes: ConflictVote[] = [];
+    try {
+      const parsed = JSON.parse(r.votes_json) as unknown;
+      if (Array.isArray(parsed)) votes = parsed as ConflictVote[];
+    } catch {
+      votes = [];
+    }
+    return {
+      id: r.id,
+      botId: r.bot_id,
+      atomAId: r.atom_a_id,
+      atomBId: r.atom_b_id,
+      status: r.status === 'resolved' ? 'resolved' : 'open',
+      votes,
+      winnerId: r.winner_id,
+      createdAt: r.created_at,
+      resolvedAt: r.resolved_at,
+    };
+  }
+
+  /**
+   * Create a typed link between two of the bot's atoms.
+   * - 'contradicts' also opens a conflict (deduped) so the contradiction
+   *   can be voted on and resolved.
+   * - 'supersedes' marks the target atom inactive immediately (the source
+   *   replaces it); the old atom is kept for the audit trail.
+   * Returns the link id (existing id when deduped).
+   */
+  createLink(botId: string, fromAtomId: string, toAtomId: string, kind: MemoryLinkKind, createdBy = 'user'): string {
+    const k = TieredMemoryStore.normalizeLinkKind(kind);
+    if (fromAtomId === toAtomId) throw new Error('Cannot link an atom to itself');
+    const from = this.getAtom(botId, fromAtomId);
+    const to = this.getAtom(botId, toAtomId);
+    if (!from) throw new Error(`Unknown atom "${fromAtomId}"`);
+    if (!to) throw new Error(`Unknown atom "${toAtomId}"`);
+    const existing = this.db
+      .prepare('SELECT id FROM memory_links WHERE bot_id = ? AND from_atom_id = ? AND to_atom_id = ? AND kind = ?')
+      .get(botId, fromAtomId, toAtomId, k) as { id: string } | undefined;
+    if (existing) return existing.id;
+    const id = randomUUID();
+    this.db
+      .prepare(
+        'INSERT INTO memory_links (id, bot_id, from_atom_id, to_atom_id, kind, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(id, botId, fromAtomId, toAtomId, k, Date.now(), createdBy);
+    if (k === 'contradicts') {
+      this.openConflict(botId, fromAtomId, toAtomId, createdBy);
+    } else if (k === 'supersedes') {
+      this.db.prepare('UPDATE memory_atoms SET active = 0 WHERE bot_id = ? AND id = ?').run(botId, toAtomId);
+    }
+    return id;
+  }
+
+  /** All links touching an atom (either direction), newest first. */
+  getLinksForAtom(botId: string, atomId: string): MemoryLink[] {
+    const rows = this.db
+      .prepare('SELECT * FROM memory_links WHERE bot_id = ? AND (from_atom_id = ? OR to_atom_id = ?) ORDER BY created_at DESC')
+      .all(botId, atomId, atomId) as Array<{
+        id: string; bot_id: string; from_atom_id: string; to_atom_id: string;
+        kind: string; created_at: number; created_by: string;
+      }>;
+    return rows.map(TieredMemoryStore.rowToLink);
+  }
+
+  /** All of a bot's links, newest first (bounded). */
+  getLinks(botId: string, limit = 500): MemoryLink[] {
+    const rows = this.db
+      .prepare('SELECT * FROM memory_links WHERE bot_id = ? ORDER BY created_at DESC LIMIT ?')
+      .all(botId, limit) as Array<{
+        id: string; bot_id: string; from_atom_id: string; to_atom_id: string;
+        kind: string; created_at: number; created_by: string;
+      }>;
+    return rows.map(TieredMemoryStore.rowToLink);
+  }
+
+  /** Delete a link. 'contradicts' links do NOT close their conflict (history is kept). */
+  deleteLink(botId: string, id: string): boolean {
+    const res = this.db.prepare('DELETE FROM memory_links WHERE bot_id = ? AND id = ?').run(botId, id);
+    return res.changes > 0;
+  }
+
+  /**
+   * Open a contradiction conflict between two atoms. Deduped: an existing
+   * open conflict for the same pair (either order) returns its id.
+   */
+  openConflict(botId: string, atomAId: string, atomBId: string, createdBy = 'user'): string {
+    if (atomAId === atomBId) throw new Error('A conflict needs two different atoms');
+    const a = this.getAtom(botId, atomAId);
+    const b = this.getAtom(botId, atomBId);
+    if (!a) throw new Error(`Unknown atom "${atomAId}"`);
+    if (!b) throw new Error(`Unknown atom "${atomBId}"`);
+    const existing = this.db
+      .prepare(
+        `SELECT id FROM memory_conflicts WHERE bot_id = ? AND status = 'open'
+         AND ((atom_a_id = ? AND atom_b_id = ?) OR (atom_a_id = ? AND atom_b_id = ?))`,
+      )
+      .get(botId, atomAId, atomBId, atomBId, atomAId) as { id: string } | undefined;
+    if (existing) return existing.id;
+    const id = randomUUID();
+    this.db
+      .prepare(
+        `INSERT INTO memory_conflicts (id, bot_id, atom_a_id, atom_b_id, status, votes_json, winner_id, created_at, resolved_at)
+         VALUES (?, ?, ?, ?, 'open', '[]', NULL, ?, NULL)`,
+      )
+      .run(id, botId, atomAId, atomBId, Date.now());
+    return id;
+  }
+
+  /** List conflicts, open by default; pass 'all' or 'resolved' for the rest. */
+  listConflicts(botId: string, status: 'open' | 'resolved' | 'all' = 'open'): MemoryConflict[] {
+    const where = status === 'all' ? 'bot_id = ?' : 'bot_id = ? AND status = ?';
+    const args = status === 'all' ? [botId] : [botId, status];
+    const rows = this.db
+      .prepare(`SELECT * FROM memory_conflicts WHERE ${where} ORDER BY created_at DESC`)
+      .all(...args) as Array<{
+        id: string; bot_id: string; atom_a_id: string; atom_b_id: string;
+        status: string; votes_json: string; winner_id: string | null;
+        created_at: number; resolved_at: number | null;
+      }>;
+    return rows.map(TieredMemoryStore.rowToConflict);
+  }
+
+  /** Record a vote for one side of an open conflict (non-binding; see resolveConflict). */
+  voteConflict(botId: string, conflictId: string, winnerId: string, by = 'user'): MemoryConflict {
+    const conflict = this.getConflict(botId, conflictId);
+    if (!conflict) throw new Error(`Unknown conflict "${conflictId}"`);
+    if (conflict.status !== 'open') throw new Error('Conflict is already resolved');
+    if (winnerId !== conflict.atomAId && winnerId !== conflict.atomBId) {
+      throw new Error('winnerId must be one of the two conflicting atoms');
+    }
+    const votes: ConflictVote[] = [...conflict.votes, { by, winnerId, ts: Date.now() }];
+    this.db
+      .prepare('UPDATE memory_conflicts SET votes_json = ? WHERE bot_id = ? AND id = ?')
+      .run(JSON.stringify(votes), botId, conflictId);
+    return { ...conflict, votes };
+  }
+
+  /**
+   * Resolve an open conflict: the winner stays active, the loser is marked
+   * inactive (kept for the audit trail) and a 'supersedes' link is recorded
+   * winner → loser. Inactive atoms are excluded from recall and search.
+   */
+  resolveConflict(botId: string, conflictId: string, winnerId: string): MemoryConflict {
+    const conflict = this.getConflict(botId, conflictId);
+    if (!conflict) throw new Error(`Unknown conflict "${conflictId}"`);
+    if (conflict.status !== 'open') throw new Error('Conflict is already resolved');
+    if (winnerId !== conflict.atomAId && winnerId !== conflict.atomBId) {
+      throw new Error('winnerId must be one of the two conflicting atoms');
+    }
+    const loserId = winnerId === conflict.atomAId ? conflict.atomBId : conflict.atomAId;
+    this.db.prepare('UPDATE memory_atoms SET active = 0 WHERE bot_id = ? AND id = ?').run(botId, loserId);
+    // Supersede link (dedupe-safe): the winner replaces the loser.
+    try {
+      this.createLink(botId, winnerId, loserId, 'supersedes', 'system');
+    } catch {
+      // link dedupe or atom issues must not block resolution
+    }
+    const now = Date.now();
+    this.db
+      .prepare("UPDATE memory_conflicts SET status = 'resolved', winner_id = ?, resolved_at = ? WHERE bot_id = ? AND id = ?")
+      .run(winnerId, now, botId, conflictId);
+    return { ...conflict, status: 'resolved', winnerId, resolvedAt: now };
+  }
+
+  private getConflict(botId: string, conflictId: string): MemoryConflict | undefined {
+    const row = this.db
+      .prepare('SELECT * FROM memory_conflicts WHERE bot_id = ? AND id = ?')
+      .get(botId, conflictId) as {
+        id: string; bot_id: string; atom_a_id: string; atom_b_id: string;
+        status: string; votes_json: string; winner_id: string | null;
+        created_at: number; resolved_at: number | null;
+      } | undefined;
+    return row ? TieredMemoryStore.rowToConflict(row) : undefined;
+  }
+
+  // ---- Reflection -----------------------------------------------------------
+
+  /** Turns per reflection pass (memoryReflection bots). */
+  static readonly REFLECTION_EVERY_TURNS = 50;
+
+  /**
+   * Increment the bot's turn counter; returns true when a reflection pass
+   * is due (every REFLECTION_EVERY_TURNS turns) and resets the counter.
+   * Call after ingestTurn for bots with memoryReflection enabled.
+   */
+  noteTurnForReflection(botId: string): boolean {
+    this.db
+      .prepare(
+        `INSERT INTO memory_reflection_counters (bot_id, turns) VALUES (?, 1)
+         ON CONFLICT(bot_id) DO UPDATE SET turns = turns + 1`,
+      )
+      .run(botId);
+    const row = this.db
+      .prepare('SELECT turns FROM memory_reflection_counters WHERE bot_id = ?')
+      .get(botId) as { turns: number };
+    if (row.turns >= TieredMemoryStore.REFLECTION_EVERY_TURNS) {
+      this.db.prepare('UPDATE memory_reflection_counters SET turns = 0 WHERE bot_id = ?').run(botId);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * One reflection pass (Atomic parity): the model reviews the bot's
+   * recent active memories, proposes new lessons/procedures, flags
+   * contradictions (opened as conflicts, with a 'reflection' vote), and
+   * writes a reflection summary atom. Low-priority by design: callers
+   * should fire-and-forget it; it never throws into the caller.
+   */
+  async runReflectionPass(botId: string, chat: KeeperChatFn, opts: { maxAtoms?: number } = {}): Promise<ReflectionResult> {
+    const maxAtoms = Math.min(Math.max(opts.maxAtoms ?? 60, 1), 200);
+    try {
+      const atoms = this.getAtoms(botId, maxAtoms);
+      if (atoms.length < 3) {
+        return { ok: true, skipped: true, reason: 'not enough memories yet', lessonsCreated: 0, proceduresCreated: 0, conflictsOpened: 0, reflectionAtomId: null };
+      }
+      const numbered = atoms.map((a, i) => `[${i}] (${a.category}) ${a.fact}`).join('\n');
+      const userText =
+        `Here are this bot's current memories (numbered):\n${numbered}\n\n` +
+        'Review them and respond with ONLY a JSON object:\n' +
+        '{ "lessons": [{"fact": "...", "entities": [], "confidence": 0-1}],\n' +
+        '  "procedures": [{"name": "...", "steps": ["...", "..."], "entities": [], "confidence": 0-1}],\n' +
+        '  "contradictions": [{"a": <number>, "b": <number>, "note": "..."}],\n' +
+        '  "reflection": "one paragraph: what is working, what is stale, what should change" }\n' +
+        'Rules: propose at most 5 lessons and 3 procedures, only for genuinely new durable knowledge. ' +
+        'Flag a contradiction only when two memories genuinely disagree. ' +
+        'If there is nothing new, return {"lessons": [], "procedures": [], "contradictions": [], "reflection": "..."}.';
+      let raw: string;
+      try {
+        raw = await chat(REFLECTION_SYSTEM_PROMPT, userText);
+      } catch {
+        return { ok: false, skipped: true, reason: 'reflection model call failed', lessonsCreated: 0, proceduresCreated: 0, conflictsOpened: 0, reflectionAtomId: null };
+      }
+      const parsed = parseReflectionJson(raw);
+      if (!parsed) {
+        return { ok: false, skipped: true, reason: 'reflection returned invalid JSON', lessonsCreated: 0, proceduresCreated: 0, conflictsOpened: 0, reflectionAtomId: null };
+      }
+      let lessonsCreated = 0;
+      let proceduresCreated = 0;
+      let conflictsOpened = 0;
+      for (const item of parsed.lessons.slice(0, 5)) {
+        if (typeof item.fact !== 'string' || !item.fact.trim()) continue;
+        try {
+          this.storeAtom(
+            botId,
+            {
+              fact: item.fact.trim().slice(0, 500),
+              entities: Array.isArray(item.entities) ? item.entities.filter((e): e is string => typeof e === 'string') : [],
+              confidence: typeof item.confidence === 'number' ? item.confidence : 0.7,
+              category: 'lesson',
+            },
+            `reflection:${Date.now()}`,
+            undefined,
+            { category: 'lesson' },
+          );
+          lessonsCreated++;
+        } catch {
+          // keep going
+        }
+      }
+      for (const proc of parsed.procedures.slice(0, 3)) {
+        if (typeof proc.name !== 'string' || !proc.name.trim()) continue;
+        const steps = Array.isArray(proc.steps) ? proc.steps.filter((s): s is string => typeof s === 'string') : [];
+        const fact = `Procedure: ${proc.name.trim()}\n` + steps.map((s, i) => `${i + 1}. ${s.trim()}`).join('\n');
+        try {
+          this.storeAtom(
+            botId,
+            {
+              fact: fact.slice(0, 1000),
+              entities: Array.isArray(proc.entities) ? proc.entities.filter((e): e is string => typeof e === 'string') : [],
+              confidence: typeof proc.confidence === 'number' ? proc.confidence : 0.7,
+              category: 'procedure',
+            },
+            `reflection:${Date.now()}`,
+            undefined,
+            { category: 'procedure' },
+          );
+          proceduresCreated++;
+        } catch {
+          // keep going
+        }
+      }
+      for (const c of parsed.contradictions.slice(0, 10)) {
+        const aIdx = typeof c.a === 'number' ? c.a : -1;
+        const bIdx = typeof c.b === 'number' ? c.b : -1;
+        if (aIdx < 0 || bIdx < 0 || aIdx >= atoms.length || bIdx >= atoms.length || aIdx === bIdx) continue;
+        try {
+          const conflictId = this.openConflict(botId, atoms[aIdx].id, atoms[bIdx].id, 'reflection');
+          // The reflection pass votes for the higher-confidence atom as a
+          // starting position; the user has the final say via resolve.
+          const winnerId = atoms[aIdx].confidence >= atoms[bIdx].confidence ? atoms[aIdx].id : atoms[bIdx].id;
+          this.voteConflict(botId, conflictId, winnerId, 'reflection');
+          conflictsOpened++;
+        } catch {
+          // keep going
+        }
+      }
+      let reflectionAtomId: string | null = null;
+      if (typeof parsed.reflection === 'string' && parsed.reflection.trim()) {
+        try {
+          reflectionAtomId = this.storeAtom(
+            botId,
+            { fact: parsed.reflection.trim().slice(0, 1000), entities: [], confidence: 0.8, category: 'reflection' },
+            `reflection:${Date.now()}`,
+            undefined,
+            { category: 'reflection' },
+          );
+        } catch {
+          reflectionAtomId = null;
+        }
+      }
+      return { ok: true, skipped: false, lessonsCreated, proceduresCreated, conflictsOpened, reflectionAtomId };
+    } catch {
+      return { ok: false, skipped: true, reason: 'reflection pass failed', lessonsCreated: 0, proceduresCreated: 0, conflictsOpened: 0, reflectionAtomId: null };
+    }
+  }
+}
+
+const REFLECTION_SYSTEM_PROMPT = `You review an AI assistant's long-term memories and extract higher-order knowledge.
+You return ONLY valid JSON, no prose, no code fences. Be conservative: only propose
+memories that are genuinely new and durable. Never invent facts that are not supported
+by the listed memories.`;
+
+/** Parse the reflection model's JSON; returns null on any failure. */
+export function parseReflectionJson(raw: string): {
+  lessons: Array<{ fact?: unknown; entities?: unknown; confidence?: unknown }>;
+  procedures: Array<{ name?: unknown; steps?: unknown; entities?: unknown; confidence?: unknown }>;
+  contradictions: Array<{ a?: unknown; b?: unknown; note?: unknown }>;
+  reflection?: unknown;
+} | null {
+  try {
+    const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+    const parsed = JSON.parse(cleaned) as Record<string, unknown>;
+    if (typeof parsed !== 'object' || parsed === null) return null;
+    return {
+      lessons: Array.isArray(parsed.lessons) ? parsed.lessons : [],
+      procedures: Array.isArray(parsed.procedures) ? parsed.procedures : [],
+      contradictions: Array.isArray(parsed.contradictions) ? parsed.contradictions : [],
+      reflection: parsed.reflection,
+    };
+  } catch {
+    return null;
   }
 }
