@@ -45,6 +45,20 @@ export const DEFAULT_POLICY: Policy = {
         'Interactive question to the user: the human answer IS the decision; the tool cannot act without it',
     },
     {
+      id: 'allow-create-skill',
+      toolPattern: '^create_skill$',
+      effect: 'allow',
+      reason:
+        'New skills start DISABLED and cannot affect any bot until a human explicitly enables them',
+    },
+    {
+      id: 'allow-learn-skill',
+      toolPattern: '^learn_skill$',
+      effect: 'allow',
+      reason:
+        'Learned skills are draft proposals only: saving needs human approval and starts disabled',
+    },
+    {
       id: 'mcp-require-approval',
       toolPattern: '^mcp:',
       effect: 'require-approval',

@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { authedFetch } from '../../lib/api';
+import SkillsPanel from '../../components/skills/skills-panel';
 
 interface MarketplaceEntry {
   id: string;
@@ -43,7 +44,7 @@ const api = (path: string, init?: RequestInit): Promise<unknown> =>
 const fmtMoney = (cents: number): string =>
   `$${(cents / 100).toFixed(2).replace(/\.00$/, '')}`;
 
-type Tab = 'browse' | 'revenue';
+type Tab = 'browse' | 'skills' | 'revenue';
 
 export default function MarketplacePage() {
   const [tab, setTab] = useState<Tab>('browse');
@@ -85,7 +86,7 @@ export default function MarketplacePage() {
 
   useEffect(() => {
     if (tab === 'browse') void loadEntries();
-    else void loadRevenue();
+    else if (tab === 'revenue') void loadRevenue();
   }, [tab, loadEntries, loadRevenue]);
 
   const install = async (entry: MarketplaceEntry) => {
@@ -149,6 +150,9 @@ export default function MarketplacePage() {
         <div>
           <button className={`btn btn-sm${tab === 'browse' ? ' btn-primary' : ''}`} onClick={() => setTab('browse')}>
             Browse
+          </button>{' '}
+          <button className={`btn btn-sm${tab === 'skills' ? ' btn-primary' : ''}`} onClick={() => setTab('skills')}>
+            Skills
           </button>{' '}
           <button className={`btn btn-sm${tab === 'revenue' ? ' btn-primary' : ''}`} onClick={() => setTab('revenue')}>
             Creator revenue
@@ -242,6 +246,8 @@ export default function MarketplacePage() {
           {entries.length === 0 && <p className="muted">No marketplace entries match.</p>}
         </>
       )}
+
+      {tab === 'skills' && <SkillsPanel />}
 
       {tab === 'revenue' && (
         <>

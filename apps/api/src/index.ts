@@ -278,6 +278,10 @@ async function boot(): Promise<void> {
   // overlay from <dataDir>/bot-voice.json.
   const { applyBotVoice } = await import('./bot-voice.js');
   applyBotVoice(seed.bots, config.dataDir);
+  // Per-bot skill lists (OpenMausBot parity P1 #20: skill review): overlay
+  // from <dataDir>/bot-skills.json.
+  const { applyBotSkills } = await import('./bot-skills.js');
+  applyBotSkills(seed.bots, config.dataDir);
   // Per-bot approval modes (Atomic parity: plan/auto/bypass): overlay from
   // <dataDir>/bot-approval-modes.json.
   const { applyBotApprovalModes } = await import('./bot-approval-modes.js');
@@ -384,7 +388,7 @@ async function boot(): Promise<void> {
     getPreference: (botId, toolName) => preferenceStore.getPreference(botId, toolName)?.preference,
   });
 
-  const { registry: toolRegistry, connections: mcpConnections, connectMcp, close: closeMcp } =
+  const { registry: toolRegistry, connections: mcpConnections, userSkillStore, connectMcp, close: closeMcp } =
     await buildToolRegistry({
       workspaceDir: config.workspaceDir,
       dataDir: config.dataDir,
@@ -551,6 +555,11 @@ async function boot(): Promise<void> {
     dbPath: `${config.dataDir}/agent.db`,
     skillsDir: path.join(seedDir, 'skills'),
     additionalSkillsDirs: [path.join(config.dataDir, 'skills')],
+    // OpenMausBot parity P1 #20: disabled-by-default skill gate. Seed and
+    // imported skills are unaffected; user-managed skills must be active
+    // and in scope for the bot.
+    skillUsabilityGate: (name, botId) =>
+      userSkillStore.isUserSkill(name) ? userSkillStore.isUsable(name, botId) : true,
     peerApprovalGate,
     governance: governanceAdapter,
     toolRegistry,
@@ -1399,6 +1408,34 @@ async function boot(): Promise<void> {
       audit: (action, fields) => governance.audit(action, fields),
     }),
   );
+
+  // User skill lifecycle (OpenMausBot parity P1 #20): authoring, learning
+  // proposals, review queue, enable/disable, scoping, per-bot attachment.
+  {
+    const { createSkillStoreRouter } = await import('./skill-store-routes.js');
+    const { getBotSkills, setBotSkills } = await import('./bot-skills.js');
+    const { SkillLoader } = await import('@mvp/agent-runtime');
+    // Seed skill names for the read-only section of the skills UI.
+    let seedSkillLoader: { list(): string[] } | undefined;
+    try {
+      seedSkillLoader = new SkillLoader(path.join(seedDir, 'skills'));
+    } catch {
+      seedSkillLoader = undefined;
+    }
+    app.use(
+      '/api/skills',
+      createSkillStoreRouter({
+        store: userSkillStore,
+        audit: (action, fields) => governance.audit(action, fields),
+        getApprovalStatus: (id) => governance.getApproval(id)?.status,
+        decideApproval: (id, decision) => governance.decide(id, decision),
+        getBot: (id) => botsById.get(id),
+        getBotSkills: (id) => getBotSkills(seed.bots, id),
+        setBotSkills: (id, skills) => setBotSkills(config.dataDir, seed.bots, id, skills),
+        seedSkillNames: () => seedSkillLoader?.list() ?? [],
+      }),
+    );
+  }
   const widgetSweep = setInterval(() => {
     try {
       sweepWidgets(widgetCoordinator, (action, fields) => governance.audit(action, fields));

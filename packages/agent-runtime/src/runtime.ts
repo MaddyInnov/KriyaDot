@@ -60,6 +60,13 @@ export interface AgentRuntimeOptions {
   skillsDir: string;
   /** Extra skill dirs (e.g. <dataDir>/skills for user-imported skills). */
   additionalSkillsDirs?: string[];
+  /**
+   * Skill usability gate (OpenMausBot parity P1 #20, disabled-by-default
+   * skills). Wired into the runtime's SkillLoader: user-managed skills are
+   * disclosed/loaded only when active and in scope for the bot; seed and
+   * imported skills are unaffected. Unset → previous behaviour.
+   */
+  skillUsabilityGate?: (name: string, botId?: string) => boolean;
   governance: GovernanceGateway;
   toolRegistry: Map<string, ToolDefinition>;
   defaultProviderId?: string;
@@ -379,7 +386,10 @@ export class AgentRuntime {
 
   constructor(opts: AgentRuntimeOptions) {
     this.store = new SessionStore(opts.dbPath, opts.sessionStoreOptions);
-    this.skills = new SkillLoader(opts.skillsDir, { additionalDirs: opts.additionalSkillsDirs });
+    this.skills = new SkillLoader(opts.skillsDir, {
+      additionalDirs: opts.additionalSkillsDirs,
+      usabilityGate: opts.skillUsabilityGate,
+    });
     this.governance = opts.governance;
     this.toolRegistry = opts.toolRegistry;
     this.defaultProviderId = opts.defaultProviderId ?? 'groq';
@@ -522,7 +532,10 @@ export class AgentRuntime {
       const summaries: string[] = [];
       for (const name of bot.skills) {
         try {
-          const summary = await this.skills.getSummary(name);
+          // P1 #20: bot.id goes to the usability gate — disabled or
+          // out-of-scope skills throw SkillNotUsableError and are skipped,
+          // so they never reach any bot's prompt.
+          const summary = await this.skills.getSummary(name, bot.id);
           loadedSkills.push(summary.name);
           summaries.push(`- ${summary.name}: ${summary.description}`);
         } catch {
@@ -1643,7 +1656,8 @@ export class AgentRuntime {
     const skills: string[] = [];
     for (const name of bot.skills) {
       try {
-        const loaded = await this.skills.load(name);
+        // P1 #20: preview honors the same usability gate as real turns.
+        const loaded = await this.skills.load(name, bot.id);
         skills.push(loaded.name);
       } catch {
         warnings.push(`Skill "${name}" not found in skills dir.`);

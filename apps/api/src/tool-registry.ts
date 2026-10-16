@@ -13,10 +13,12 @@ import {
   McpOAuthClient,
   McpOAuthRequiredError,
   SkillLoader,
+  UserSkillStore,
   createBuiltInTools,
   createCodingTools,
   createGitTools,
   createMemoryTools,
+  createSkillAuthoringTools,
   createSkillTools,
   createVerifyTools,
   makeWorkspaceResolver,
@@ -38,6 +40,12 @@ export interface McpConnection {
 export interface BuiltRegistry {
   registry: Map<string, ToolDefinition>;
   connections: McpConnection[];
+  /**
+   * User skill lifecycle store (OpenMausBot parity P1 #20): authoring,
+   * learning proposals, review, and the disabled-by-default gate. Shared
+   * with the API skill routes and the runtime usability gate.
+   */
+  userSkillStore: UserSkillStore;
   /**
    * Connect to configured MCP servers and register their tools.
    * Deferred until after the HTTP server is listening so a slow/failing
@@ -98,6 +106,26 @@ export async function buildToolRegistry(opts: {
   for (const tool of createMemoryTools({ store: new BotMemoryStore(opts.dataDir) })) {
     registry.set(tool.name, tool);
   }
+  // OpenMausBot parity P1 #20: user skill lifecycle. The store owns status,
+  // scope, and draft proposals; skill files land in <dataDir>/skills (an
+  // additionalDir below). The usability gate keeps disabled/out-of-scope
+  // skills out of every bot's prompt and read_skill — seed and imported
+  // skills are unaffected.
+  const userSkillStore = new UserSkillStore(opts.dataDir, path.join(opts.dataDir, 'skills'), {
+    seedSkillsDir: opts.skillsDir,
+  });
+  const skillUsabilityGate = (name: string, botId?: string): boolean =>
+    userSkillStore.isUserSkill(name) ? userSkillStore.isUsable(name, botId) : true;
+  for (const tool of createSkillAuthoringTools({
+    store: userSkillStore,
+    approval: opts.approvalBroker
+      ? {
+          requestApproval: (toolName, args, ctx) => opts.approvalBroker!.requestApproval(toolName, args, ctx),
+        }
+      : undefined,
+  })) {
+    registry.set(tool.name, tool);
+  }
   for (const tool of createSkillTools(
     new SkillLoader(opts.skillsDir, {
       pinDbPath: path.join(opts.dataDir, 'skill-pins.db'),
@@ -105,6 +133,7 @@ export async function buildToolRegistry(opts: {
       // User-imported skills (e.g. from Claude Code) land here; the primary
       // seed dir wins on name collisions.
       additionalDirs: [path.join(opts.dataDir, 'skills')],
+      usabilityGate: skillUsabilityGate,
     }),
   )) {
     registry.set(tool.name, tool);
@@ -190,9 +219,15 @@ export async function buildToolRegistry(opts: {
   return {
     registry,
     connections,
+    userSkillStore,
     connectMcp,
     close: async () => {
       await Promise.allSettled(clients.map((c) => c.close()));
+      try {
+        userSkillStore.close();
+      } catch {
+        // ignore
+      }
     },
   };
 }

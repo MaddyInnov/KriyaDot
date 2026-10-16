@@ -39,6 +39,14 @@ export interface SkillPin {
   pinnedAt: string;
 }
 
+/**
+ * Thrown when a skill exists but must not be used: disabled/draft/rejected
+ * status, or out of scope for the requesting bot. The runtime treats this
+ * like a missing skill (skips disclosure); `read_skill` surfaces it as a
+ * clear error.
+ */
+export class SkillNotUsableError extends Error {}
+
 export interface SkillLoaderOptions {
   /**
    * SQLite path for the TOFU pin store (`<dataDir>/skill-pins.db`). When
@@ -61,6 +69,17 @@ export interface SkillLoaderOptions {
    * `skillsDir` first. Additive and backward compatible.
    */
   additionalDirs?: string[];
+  /**
+   * Usability gate (OpenMausBot parity P1 #20, disabled-by-default skills).
+   * Called with the skill name and the requesting bot id; return false to
+   * make the skill invisible (getSummary skips, loadFull/load throw
+   * SkillNotUsableError). Unset → every found skill is usable (previous
+   * behaviour). The host wires e.g.
+   * `(name, botId) => store.isUserSkill(name) ? store.isUsable(name, botId) : true`
+   * so seed/imported skills keep working while user-managed skills are
+   * gated on active status + scope.
+   */
+  usabilityGate?: (name: string, botId?: string) => boolean;
 }
 
 /** SQLite TOFU pin store for skill content hashes (one row per skill name). */
@@ -155,26 +174,45 @@ export class SkillLoader {
    * Cheap summary for system-prompt disclosure: name + description only,
    * no full content. (The file is still read for frontmatter — "cheap"
    * means nothing but the summary enters the prompt.)
+   *
+   * When a usabilityGate is configured and the skill is not usable for
+   * `botId` (disabled or out of scope), this throws SkillNotUsableError so
+   * the caller can skip disclosure — disabled skills never reach a prompt.
    */
-  async getSummary(name: string): Promise<SkillSummary> {
+  async getSummary(name: string, botId?: string): Promise<SkillSummary> {
     const file = this.skillFile(name);
     if (file) {
       try {
         const s = statSync(file);
         const cached = this.summaryCache.get(name);
         if (cached && cached.mtimeMs === s.mtimeMs && cached.size === s.size) {
+          this.assertUsable(cached.summary.name, botId);
           return cached.summary;
         }
         const raw = this.readSkillFile(file, name);
+        this.assertUsable(raw.name, botId);
         const summary = { name: raw.name, description: raw.description };
         this.summaryCache.set(name, { mtimeMs: s.mtimeMs, size: s.size, summary });
         return summary;
-      } catch {
-        // fall through to the uncached path below
+      } catch (err) {
+        // SkillNotUsableError must propagate (it is the gate); anything
+        // else falls through to the uncached path below.
+        if (err instanceof SkillNotUsableError) throw err;
       }
     }
     const raw = this.readSkill(name);
+    this.assertUsable(raw.name, botId);
     return { name: raw.name, description: raw.description };
+  }
+
+  /** Enforce the usability gate; throws SkillNotUsableError when blocked. */
+  private assertUsable(resolvedName: string, botId?: string): void {
+    const gate = this.options.usabilityGate;
+    if (gate && !gate(resolvedName, botId)) {
+      throw new SkillNotUsableError(
+        `Skill "${resolvedName}" is not usable${botId ? ` for bot "${botId}"` : ''} (disabled, not yet reviewed, or out of scope).`,
+      );
+    }
   }
 
   /**
@@ -182,9 +220,13 @@ export class SkillLoader {
    * content hash; later drift requests human approval through the injected
    * broker — approved drift re-pins, denied/timed-out/broker-less drift
    * fails closed (throws).
+   *
+   * The usability gate applies first: disabled/out-of-scope skills throw
+   * SkillNotUsableError before any content is returned.
    */
-  async loadFull(name: string): Promise<LoadedSkill> {
+  async loadFull(name: string, botId?: string): Promise<LoadedSkill> {
     const raw = this.readSkill(name);
+    this.assertUsable(raw.name, botId);
     const sha256 = createHash('sha256').update(raw.content, 'utf8').digest('hex');
     await this.checkPin(raw.name, sha256);
     return { ...raw, sha256 };
@@ -195,8 +237,8 @@ export class SkillLoader {
    * applies when a pin store is configured); the returned sha256 is new
    * but purely additive for existing callers.
    */
-  async load(name: string): Promise<LoadedSkill> {
-    return this.loadFull(name);
+  async load(name: string, botId?: string): Promise<LoadedSkill> {
+    return this.loadFull(name, botId);
   }
 
   private readSkill(name: string): RawSkill {
@@ -298,12 +340,14 @@ export function createSkillTools(skillLoader: SkillLoader): ToolDefinition[] {
         required: ['name'],
         additionalProperties: false,
       },
-      handler: async (args) => {
+      handler: async (args, ctx) => {
         const name = args['name'];
         if (typeof name !== 'string' || !name.trim()) {
           throw new Error('read_skill: "name" is required');
         }
-        const skill = await skillLoader.loadFull(name.trim());
+        // P1 #20: disabled/out-of-scope skills fail closed here too — the
+        // usability gate throws SkillNotUsableError before content loads.
+        const skill = await skillLoader.loadFull(name.trim(), ctx?.botId);
         return {
           name: skill.name,
           description: skill.description,

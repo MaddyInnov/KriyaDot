@@ -29,7 +29,9 @@
       "ask_bot",
       "message_bot",
       "type_login",
-      "ask_user_question"
+      "ask_user_question",
+      "create_skill",
+      "learn_skill"
     ]
   },
   {
@@ -55,7 +57,9 @@
       "list_bots",
       "ask_bot",
       "message_bot",
-      "ask_user_question"
+      "ask_user_question",
+      "create_skill",
+      "learn_skill"
     ]
   },
   {
@@ -88,7 +92,9 @@
       "ask_bot",
       "message_bot",
       "type_login",
-      "ask_user_question"
+      "ask_user_question",
+      "create_skill",
+      "learn_skill"
     ]
   },
   {
@@ -115,7 +121,9 @@
       "list_bots",
       "ask_bot",
       "message_bot",
-      "ask_user_question"
+      "ask_user_question",
+      "create_skill",
+      "learn_skill"
     ],
     "mcpServers": []
   },
@@ -137,7 +145,9 @@
       "list_bots",
       "ask_bot",
       "message_bot",
-      "ask_user_question"
+      "ask_user_question",
+      "create_skill",
+      "learn_skill"
     ],
     "mcpServers": []
   },
@@ -160,7 +170,9 @@
       "list_bots",
       "ask_bot",
       "message_bot",
-      "ask_user_question"
+      "ask_user_question",
+      "create_skill",
+      "learn_skill"
     ],
     "mcpServers": []
   },
@@ -185,7 +197,9 @@
       "list_bots",
       "ask_bot",
       "message_bot",
-      "ask_user_question"
+      "ask_user_question",
+      "create_skill",
+      "learn_skill"
     ],
     "mcpServers": []
   },
@@ -206,7 +220,9 @@
       "list_bots",
       "ask_bot",
       "message_bot",
-      "ask_user_question"
+      "ask_user_question",
+      "create_skill",
+      "learn_skill"
     ],
     "mcpServers": []
   },
@@ -227,7 +243,9 @@
       "list_bots",
       "ask_bot",
       "message_bot",
-      "ask_user_question"
+      "ask_user_question",
+      "create_skill",
+      "learn_skill"
     ],
     "mcpServers": []
   },
@@ -249,7 +267,9 @@
       "list_bots",
       "ask_bot",
       "message_bot",
-      "ask_user_question"
+      "ask_user_question",
+      "create_skill",
+      "learn_skill"
     ],
     "mcpServers": []
   },
@@ -272,7 +292,9 @@
       "list_bots",
       "ask_bot",
       "message_bot",
-      "ask_user_question"
+      "ask_user_question",
+      "create_skill",
+      "learn_skill"
     ],
     "mcpServers": []
   },
@@ -294,7 +316,9 @@
       "list_bots",
       "ask_bot",
       "message_bot",
-      "ask_user_question"
+      "ask_user_question",
+      "create_skill",
+      "learn_skill"
     ],
     "mcpServers": []
   }
