@@ -45,6 +45,43 @@ export interface IdentifiedMessage {
   threadRootId?: string | null;
 }
 
+/** A single full-text search hit over chat messages. */
+export interface MessageSearchHit {
+  messageId: number;
+  sessionId: string;
+  botId: string;
+  role: ChatMessage['role'];
+  ts: string;
+  /**
+   * Snippet around the match. Matched terms are wrapped in
+   * \u0001..\u0002 markers so callers can highlight without HTML injection.
+   */
+  snippet: string;
+  /** FTS5 rank (lower = better). */
+  rank: number;
+}
+
+export interface MessageSearchOptions {
+  botId?: string;
+  sessionId?: string;
+  limit?: number;
+}
+
+/**
+ * Build a safe FTS5 MATCH expression from a raw user query: an implicit
+ * AND of double-quoted terms, with all FTS5 syntax characters stripped.
+ * Returns undefined when the query has no searchable terms.
+ */
+function buildMatchExpression(query: string): string | undefined {
+  const terms = query
+    .split(/\s+/)
+    .map((t) => t.replace(/[^\p{L}\p{N}_-]+/gu, '').slice(0, 64))
+    .filter((t) => t.length > 0)
+    .slice(0, 10);
+  if (terms.length === 0) return undefined;
+  return terms.map((t) => `"${t}"`).join(' ');
+}
+
 /** Result of {@link SessionStore.branchSession}. */
 export type BranchSessionResult =
   | { ok: true; session: SessionRecord; copiedMessages: number }
@@ -177,6 +214,38 @@ export class SessionStore {
         created_at TEXT NOT NULL
       );
     `);
+    // Full-text search (OpenMausBot parity): FTS5 index over message
+    // content, maintained incrementally by triggers so search stays fresh
+    // on every insert/delete (branch copies, rewinds, new messages).
+    // NOTE: the FTS5 'delete' pseudo-command is broken in this runtime's
+    // SQLite build (SQL logic error), so the triggers use a plain
+    // DELETE ... WHERE rowid = ... instead — equivalent for this table.
+    this.db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, tokenize='porter');
+      DROP TRIGGER IF EXISTS messages_fts_ai;
+      DROP TRIGGER IF EXISTS messages_fts_ad;
+      DROP TRIGGER IF EXISTS messages_fts_au;
+      CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages BEGIN
+        INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+      END;
+      CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages BEGIN
+        DELETE FROM messages_fts WHERE rowid = old.id;
+      END;
+      CREATE TRIGGER messages_fts_au AFTER UPDATE ON messages BEGIN
+        DELETE FROM messages_fts WHERE rowid = old.id;
+        INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+      END;
+    `);
+    // Self-healing sync on every open: index rows missing from FTS (e.g.
+    // written before the FTS table existed, or while an older trigger
+    // revision was in place) and drop stale FTS rows with no message.
+    // Triggers keep it fresh after this.
+    this.db
+      .prepare(
+        'INSERT INTO messages_fts(rowid, content) SELECT m.id, m.content FROM messages m WHERE NOT EXISTS (SELECT 1 FROM messages_fts f WHERE f.rowid = m.id)',
+      )
+      .run();
+    this.db.prepare('DELETE FROM messages_fts WHERE rowid NOT IN (SELECT id FROM messages)').run();
   }
 
   createSession(botId: string): string {
@@ -367,6 +436,82 @@ export class SessionStore {
     const newSession = this.getSession(newSessionId);
     if (!newSession) return { ok: false, reason: 'thread-not-found' };
     return { ok: true, session: newSession, copiedMessages: Number(copied.changes) };
+  }
+
+  /**
+   * Full-text search over all chat messages (FTS5, porter stemming).
+   * Results carry a snippet with \u0001..\u0002 match markers, ordered by
+   * rank (best first). Never throws on hostile input: queries with no
+   * searchable terms return [].
+   */
+  searchMessages(query: string, opts: MessageSearchOptions = {}): MessageSearchHit[] {
+    const match = buildMatchExpression(query);
+    if (!match) return [];
+    const limit = Math.min(Math.max(Math.floor(opts.limit ?? 20), 1), 100);
+    const conditions: string[] = [];
+    const params: Array<string | number | null> = [match];
+    if (opts.sessionId) {
+      conditions.push('m.session_id = ?');
+      params.push(opts.sessionId);
+    }
+    if (opts.botId) {
+      conditions.push('s.bot_id = ?');
+      params.push(opts.botId);
+    }
+    const where = conditions.length > 0 ? `AND ${conditions.join(' AND ')}` : '';
+    const rows = this.db
+      .prepare(
+        `SELECT m.id AS messageId, m.session_id AS sessionId,
+                COALESCE(s.bot_id, '') AS botId, m.role AS role, m.ts AS ts,
+                snippet(messages_fts, 0, char(1), char(2), ' … ', 12) AS snippet,
+                messages_fts.rank AS rank
+         FROM messages_fts
+         JOIN messages m ON m.id = messages_fts.rowid
+         LEFT JOIN sessions s ON s.id = m.session_id
+         WHERE messages_fts MATCH ?
+         ${where}
+         ORDER BY rank
+         LIMIT ?`,
+      )
+      .all(...params, limit) as Array<{
+      messageId: number;
+      sessionId: string;
+      botId: string;
+      role: string;
+      ts: string;
+      snippet: string;
+      rank: number;
+    }>;
+    return rows.map((r) => ({
+      messageId: r.messageId,
+      sessionId: r.sessionId,
+      botId: r.botId,
+      role: r.role as ChatMessage['role'],
+      ts: r.ts,
+      snippet: r.snippet,
+      rank: r.rank,
+    }));
+  }
+
+  /**
+   * Rebuild the FTS index from scratch (e.g. after an upgrade or if the
+   * index is suspected stale). Returns the number of messages indexed.
+   */
+  rebuildSearchIndex(): number {
+    this.db.exec('BEGIN');
+    try {
+      this.db.exec('DELETE FROM messages_fts');
+      this.db.prepare('INSERT INTO messages_fts(rowid, content) SELECT id, content FROM messages').run();
+      this.db.exec('COMMIT');
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // ignore rollback failure; rethrow the original error
+      }
+      throw err;
+    }
+    return (this.db.prepare('SELECT COUNT(*) AS c FROM messages_fts').get() as { c: number }).c;
   }
 
   close(): void {

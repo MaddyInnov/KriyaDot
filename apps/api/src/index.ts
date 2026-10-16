@@ -65,7 +65,8 @@ import { mountWebAssets } from './web-assets.js';
 // Parity workstreams (OpenMausBot/n8n/Notion/Dots/Groq/OpenCode/Laya/Boosthis/Muse):
 // each module exports a factory; mounted below without touching other wiring.
 import { createComputerView } from './computer-view.js';
-import { createChatThreadsRouter } from './chat-threads-routes.js';
+import { createChatThreadsRouter, ThreadTitleStore } from './chat-threads-routes.js';
+import { createMessageSearchRouter } from './message-search-routes.js';
 import { createMessageThreadsRouter } from './message-threads-routes.js';
 import { createMessageReactionsRouter } from './message-reactions-routes.js';
 import { MessageReactionStore } from './message-reactions.js';
@@ -1209,12 +1210,26 @@ async function boot(): Promise<void> {
   // switch below; REST here).
   app.use('/api/computer', computerView.router);
   // Chat branching + bot roster import/export.
+  // The title store is shared with message search so result snippets can
+  // show thread titles.
+  const threadTitles = new ThreadTitleStore(config.dataDir);
   app.use(
     '/api/chat/threads',
     createChatThreadsRouter({
       dataDir: config.dataDir,
       branchSession: (id, msgId, opts) => agentRuntime.branchSession(id, msgId, opts),
       listThreadMessages: (id) => agentRuntime.listThreadMessages(id),
+      audit: (action, fields) => governance.audit(action, fields),
+      titles: threadTitles,
+    }),
+  );
+  // Full-text message search (OpenMausBot parity): FTS5 over chat sessions.
+  app.use(
+    '/api/search/messages',
+    createMessageSearchRouter({
+      searchMessages: (q, opts) => agentRuntime.sessionStore.searchMessages(q, opts),
+      rebuildSearchIndex: () => agentRuntime.sessionStore.rebuildSearchIndex(),
+      getThreadTitle: (id) => threadTitles.getTitle(id),
       audit: (action, fields) => governance.audit(action, fields),
     }),
   );

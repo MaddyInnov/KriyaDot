@@ -536,6 +536,52 @@ export const branchChatThread = (
     body: JSON.stringify({ fromMessageId, ...(opts?.title ? { title: opts.title } : {}), ...(opts?.botId ? { botId: opts.botId } : {}) }),
   });
 
+/** One version in a thread's branch family (root = version 1). */
+export interface ChatThreadVersion {
+  id: string;
+  title: string;
+  branchedFrom: string | null;
+  createdAt: number;
+  version: number;
+  isRoot: boolean;
+}
+
+/** Branch family of a thread: root + all descendant branches, versioned. */
+export const getChatThreadBranches = (
+  threadId: string,
+): Promise<{ ok: boolean; root: string; threads: ChatThreadVersion[] }> =>
+  apiJson(`/api/chat/threads/${encodeURIComponent(threadId)}/branches`);
+
+// ---- Full-text message search (OpenMausBot parity) --------------------------
+
+/** One message-search hit. snippet wraps matched terms in \u0001..\u0002. */
+export interface MessageSearchResult {
+  messageId: number;
+  sessionId: string;
+  botId: string;
+  role: string;
+  ts: string;
+  snippet: string;
+  rank: number;
+  title?: string;
+}
+
+/** Full-text search across chat sessions. */
+export const searchMessages = (
+  q: string,
+  opts?: { botId?: string; sessionId?: string; limit?: number },
+): Promise<{ ok: boolean; results: MessageSearchResult[] }> => {
+  const params = new URLSearchParams({ q });
+  if (opts?.botId) params.set('botId', opts.botId);
+  if (opts?.sessionId) params.set('sessionId', opts.sessionId);
+  if (opts?.limit) params.set('limit', String(opts.limit));
+  return apiJson(`/api/search/messages?${params.toString()}`);
+};
+
+/** Rebuild the full-text message index from all stored messages. */
+export const rebuildMessageSearchIndex = (): Promise<{ ok: boolean; indexed: number }> =>
+  apiJson('/api/search/messages/rebuild', { method: 'POST' });
+
 // ---- Slack-style reply threads ---------------------------------------------
 
 export interface MessageThread {

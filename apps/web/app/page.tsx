@@ -12,6 +12,7 @@ import {
   deleteSlashCommand,
   ensureApiReady,
   getBots,
+  getChatThreadBranches,
   getChatThreadMessages,
   getMessageReactions,
   getMessageThread,
@@ -42,6 +43,7 @@ import {
 } from '../components/fusion/fusion-progress';
 import type {
   BotConfig,
+  MessageSearchResult,
   MessageThreadSummary,
   ModelPriceInfo,
   ProviderInfo,
@@ -65,6 +67,7 @@ import { CallPanel, VoiceNoteBubble, VoiceNoteRecorder } from '../components/voi
 import { NoteAttachButton } from '../components/chat/note-attach-button';
 import { BotConversationSheet, BotNoticeRow, type BotNoticeData } from '../components/chat/bot-notice';
 import { MessageReactions } from '../components/chat/message-reactions';
+import { BranchPicker, MessageSearchBox } from '../components/chat/message-search';
 import { useCodeSession } from '../components/code/useCodeSession';
 import { CodeSessionView } from '../components/code/CodeSessionView';
 import { CodingSessionStrip } from '../components/code/CodingSessionStrip';
@@ -130,6 +133,8 @@ interface Conversation {
   id: string;
   title: string;
   createdAt: number;
+  /** Thread this conversation was branched from (if it is a branch). */
+  branchedFrom?: string;
 }
 
 function loadConvos(): Record<string, Conversation[]> {
@@ -762,7 +767,7 @@ function ChatPageInner() {
       const thread = res.thread;
 
       const branchedBlocks = current.slice(0, idx + 1);
-      const newConvo: Conversation = { id: thread.id, title: thread.title, createdAt: Date.now() };
+      const newConvo: Conversation = { id: thread.id, title: thread.title, createdAt: Date.now(), branchedFrom: cid };
       const list = convosRef.current[botId] ?? [];
       persistConvos({ ...convosRef.current, [botId]: [newConvo, ...list] });
       persistActiveConvo({ ...activeConvoRef.current, [botId]: newConvo.id });
@@ -777,6 +782,116 @@ function ChatPageInner() {
     } finally {
       setBranching(false);
     }
+  };
+
+  /**
+   * Build displayable blocks from a server thread message log (used when
+   * jumping to a search hit or switching to a branch version whose blocks
+   * were never stored locally).
+   */
+  const blocksFromServerLog = (
+    messages: { role: string; content: string; ts: string }[],
+  ): ChatBlock[] => {
+    const out: ChatBlock[] = [];
+    for (const m of messages) {
+      if (m.role === 'user') {
+        out.push({ kind: 'user', id: newId(), text: m.content, ts: Date.parse(m.ts) || Date.now() });
+      } else if (m.role === 'assistant') {
+        out.push({
+          kind: 'assistant',
+          id: newId(),
+          text: m.content,
+          ts: Date.parse(m.ts) || Date.now(),
+          streaming: false,
+        });
+      }
+    }
+    return out;
+  };
+
+  /**
+   * Ensure a conversation exists locally for a server thread id, fetching
+   * its message log when the blocks were never stored on this device.
+   */
+  const ensureLocalConvo = async (botId: string, threadId: string, title?: string): Promise<void> => {
+    const list = convosRef.current[botId] ?? [];
+    if (list.some((c) => c.id === threadId)) return;
+    const convo: Conversation = { id: threadId, title: (title ?? 'Chat').slice(0, 120), createdAt: Date.now() };
+    persistConvos({ ...convosRef.current, [botId]: [convo, ...list] });
+    try {
+      const log = await getChatThreadMessages(threadId);
+      saveBlocks(threadId, blocksFromServerLog(log.messages ?? []));
+    } catch {
+      // leave blocks empty; the conversation still opens
+    }
+  };
+
+  /** Scroll the message list to the block holding a server message id. */
+  const scrollToServerMessage = async (threadId: string, messageId: number): Promise<void> => {
+    try {
+      const log = await getChatThreadMessages(threadId);
+      const candidates = (log.messages ?? []).filter((m) => m.role === 'user' || m.role === 'assistant');
+      const ordinal = candidates.findIndex((m) => m.id === messageId);
+      if (ordinal < 0) return;
+      const blocks = blocksRef.current.filter(
+        (b) => b.kind === 'user' || b.kind === 'assistant' || b.kind === 'voice-note',
+      );
+      const target = blocks[Math.min(ordinal, blocks.length - 1)];
+      if (!target) return;
+      requestAnimationFrame(() => {
+        const el = messagesRef.current?.querySelector(`[data-block-id="${CSS.escape(target.id)}"]`);
+        el?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        if (el instanceof HTMLElement) {
+          el.style.transition = 'box-shadow 0.3s';
+          el.style.boxShadow = '0 0 0 2px var(--accent, #7c6cf0)';
+          window.setTimeout(() => {
+            el.style.boxShadow = '';
+          }, 1600);
+        }
+      });
+    } catch {
+      // best-effort scroll; the conversation is already open
+    }
+  };
+
+  /**
+   * Jump to a message-search hit: open its conversation (creating the local
+   * entry + fetching history when needed) and scroll to the message.
+   */
+  const jumpToSearchResult = async (r: MessageSearchResult): Promise<void> => {
+    if (sending) return;
+    const botId = r.botId && bots.some((b) => b.id === r.botId) ? r.botId : selectedBotId;
+    if (!botId) return;
+    await ensureLocalConvo(botId, r.sessionId, r.title);
+    if (botId !== selectedBotId) setSelectedBotId(botId);
+    persistActiveConvo({ ...activeConvoRef.current, [botId]: r.sessionId });
+    setBlocks(loadBlocks(r.sessionId));
+    setSideOpen(false);
+    closeThread();
+    void loadThreadSummaries(r.sessionId);
+    void loadMessageReactions(r.sessionId);
+    // Wait a beat for the blocks to render before scrolling.
+    window.setTimeout(() => void scrollToServerMessage(r.sessionId, r.messageId), 120);
+  };
+
+  /**
+   * Switch to another version of the active thread's branch family.
+   * Each version is its own session, so continuations stay isolated.
+   */
+  const switchBranchVersion = async (versionThreadId: string): Promise<void> => {
+    if (sending || branching) return;
+    const botId = botIdRef.current;
+    const cid = activeConvoRef.current[botId];
+    if (!cid || versionThreadId === cid) return;
+    try {
+      const fam = await getChatThreadBranches(cid);
+      const info = (fam.threads ?? []).find((t) => t.id === versionThreadId);
+      await ensureLocalConvo(botId, versionThreadId, info?.title);
+    } catch {
+      // fall through: switch anyway with a bare local entry
+      await ensureLocalConvo(botId, versionThreadId);
+    }
+    switchConvo(botId, versionThreadId);
   };
 
   /**
@@ -1681,6 +1796,7 @@ function ChatPageInner() {
                         onClick={() => switchConvo(selectedBotId, c.id)}
                         title={new Date(c.createdAt).toLocaleString()}
                       >
+                        {c.branchedFrom ? '⑂ ' : ''}
                         {c.title}
                       </button>
                     )}
@@ -1846,6 +1962,20 @@ function ChatPageInner() {
             </button>
           </div>
           <LanguageSwitcher />
+          {chatMode === 'chat' && selectedBotId && (
+            <BranchPicker
+              threadId={activeConvo[selectedBotId] ?? ''}
+              onSwitch={(id) => void switchBranchVersion(id)}
+              disabled={sending || branching}
+            />
+          )}
+          {chatMode === 'chat' && (
+            <MessageSearchBox
+              botId={selectedBotId}
+              botName={(id) => bots.find((b) => b.id === id)?.name ?? id}
+              onJump={(r) => void jumpToSearchResult(r)}
+            />
+          )}
           <div className="spacer" style={{ flex: 1 }} />
           {autoApprove && <span className="mode-badge auto">AUTO-APPROVE ON</span>}
           {planMode && <span className="mode-badge plan">PLAN MODE</span>}
@@ -2015,7 +2145,7 @@ function ChatPageInner() {
               case 'user': {
                 const summary = threadSummaries[b.id];
                 return (
-                  <div key={b.id} className="msg user" title={new Date(b.ts).toLocaleString()}>
+                  <div key={b.id} data-block-id={b.id} className="msg user" title={new Date(b.ts).toLocaleString()}>
                     <div className="msg-head">
                       <span className="avatar you" aria-hidden="true">
                         You
@@ -2051,7 +2181,7 @@ function ChatPageInner() {
               }
               case 'voice-note':
                 return (
-                  <div key={b.id} className="msg user" title={new Date(b.ts).toLocaleString()}>
+                  <div key={b.id} data-block-id={b.id} className="msg user" title={new Date(b.ts).toLocaleString()}>
                     <div className="msg-head">
                       <span className="avatar you" aria-hidden="true">
                         You
@@ -2080,7 +2210,7 @@ function ChatPageInner() {
                 const botLabel = b.botName ?? selectedBot?.name ?? 'Assistant';
                 const summary = threadSummaries[b.id];
                 return (
-                  <div key={b.id} className="msg assistant" title={new Date(b.ts).toLocaleString()}>
+                  <div key={b.id} data-block-id={b.id} className="msg assistant" title={new Date(b.ts).toLocaleString()}>
                     <div className="msg-head">
                       <span className="avatar bot" aria-hidden="true">
                         {botLabel.charAt(0).toUpperCase()}
