@@ -64,23 +64,29 @@ describe('VoiceNoteRecorder', () => {
 
 describe('CallPanel', () => {
   const props = {
-    stt: new MockSTTProvider(),
-    tts: new MockTTSProvider(),
-    respond: async () => 'mock reply',
+    botId: 'bot_1',
     botName: 'TestBot',
   };
 
-  it('renders the pre-call state with the start button', () => {
+  it('renders the pre-call state with the start button and provider pickers', () => {
     const html = renderToStaticMarkup(React.createElement(CallPanel, props));
     expect(html).toContain('Voice call');
     expect(html).toContain('Start call');
     expect(html).toContain('TestBot');
-    // Mock-first notice is shown before the call starts.
-    expect(html).toContain('Mock voice providers');
+    expect(html).toContain('Speech-to-text');
+    expect(html).toContain('Auto voice detection');
   });
 
-  it('does not show the talk controls before the call starts', () => {
+  it('does not show the mic button before the call starts', () => {
     const html = renderToStaticMarkup(React.createElement(CallPanel, props));
-    expect(html).not.toContain('Tap to talk');
+    // The mic button (mic-big) only renders once the call is live.
+    expect(html).not.toContain('mic-big');
+    // But the idle hint still explains tap-to-talk.
+    expect(html).toContain('tap the mic');
+  });
+
+  it('prompts for a bot when none is selected is handled by the page, not the panel', () => {
+    const html = renderToStaticMarkup(React.createElement(CallPanel, { botId: 'bot_1' }));
+    expect(html).toContain('aria-label="Voice call"');
   });
 });

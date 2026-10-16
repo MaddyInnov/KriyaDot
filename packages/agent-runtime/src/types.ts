@@ -121,6 +121,24 @@ export interface ModelOptions {
   maxTokens?: number;
 }
 
+/**
+ * Per-bot voice-call settings (Codync parity: realtime voice calls).
+ * Provider ids: 'mock' (offline, zero-cost default), 'groq', 'openai'
+ * (both key-gated BYOK). Unset → mock.
+ */
+export interface VoiceSettings {
+  /** STT provider for voice calls. */
+  sttProvider?: 'mock' | 'groq' | 'openai';
+  /** TTS provider for voice calls. */
+  ttsProvider?: 'mock' | 'groq' | 'openai';
+  /** Provider-specific TTS voice id (e.g. 'alloy', 'Fritz-PlayAI'). */
+  ttsVoice?: string;
+  /** Client-side auto VAD instead of push-to-talk. */
+  autoVad?: boolean;
+  /** VAD sensitivity 1–10 (higher = more sensitive). */
+  vadSensitivity?: number;
+}
+
 export interface BotConfig {
   id: string;
   name: string;
@@ -172,6 +190,8 @@ export interface BotConfig {
    * - 'none': no pushes for this bot.
    */
   notifications?: 'all' | 'approvals' | 'none';
+  /** Per-bot voice-call settings (STT/TTS providers, TTS voice, VAD). */
+  voice?: VoiceSettings;
 }
 
 export interface LLMProvider {

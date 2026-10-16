@@ -207,7 +207,59 @@ function validateBotEntry(raw: unknown, index: number): { bot?: BotConfig; error
       bot.notifications = raw.notifications as BotConfig['notifications'];
     }
   }
+  if (raw.voice !== undefined) {
+    const vErr = validateVoiceSettings(raw.voice, `${where}.voice`);
+    if (vErr.errors.length > 0) errors.push(...vErr.errors);
+    else if (vErr.voice) bot.voice = vErr.voice;
+  }
   return errors.length > 0 ? { errors } : { bot, errors };
+}
+
+/** Validate per-bot voice-call settings (Codync parity: realtime voice calls). */
+export function validateVoiceSettings(
+  raw: unknown,
+  where: string,
+): { voice?: BotConfig['voice']; errors: string[] } {
+  const errors: string[] = [];
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return { errors: [`${where}: must be an object`] };
+  }
+  const r = raw as Record<string, unknown>;
+  const voice: NonNullable<BotConfig['voice']> = {};
+  const providers = ['mock', 'groq', 'openai'];
+  for (const key of ['sttProvider', 'ttsProvider'] as const) {
+    if (r[key] !== undefined) {
+      if (typeof r[key] !== 'string' || !providers.includes(r[key])) {
+        errors.push(`${where}.${key}: must be one of ${providers.join('|')}`);
+      } else {
+        voice[key] = r[key] as 'mock' | 'groq' | 'openai';
+      }
+    }
+  }
+  if (r.ttsVoice !== undefined) {
+    if (typeof r.ttsVoice !== 'string' || !r.ttsVoice.trim() || r.ttsVoice.length > 120) {
+      errors.push(`${where}.ttsVoice: must be a non-empty string (max 120 chars)`);
+    } else {
+      voice.ttsVoice = r.ttsVoice.trim();
+    }
+  }
+  if (r.autoVad !== undefined) {
+    if (typeof r.autoVad !== 'boolean') errors.push(`${where}.autoVad: must be a boolean`);
+    else voice.autoVad = r.autoVad;
+  }
+  if (r.vadSensitivity !== undefined) {
+    if (
+      typeof r.vadSensitivity !== 'number' ||
+      !Number.isFinite(r.vadSensitivity) ||
+      r.vadSensitivity < 1 ||
+      r.vadSensitivity > 10
+    ) {
+      errors.push(`${where}.vadSensitivity: must be a number between 1 and 10`);
+    } else {
+      voice.vadSensitivity = r.vadSensitivity;
+    }
+  }
+  return { voice: Object.keys(voice).length > 0 ? voice : undefined, errors };
 }
 
 /** Validate one team entry. Bot references are checked at import time. */

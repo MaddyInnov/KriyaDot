@@ -300,6 +300,51 @@ Threat notes: a stolen device token can *request* a session but cannot see a
 single pixel without the PC owner's explicit approval; the red banner makes
 an active session impossible to miss; frames are never stored server-side.
 
+## 11. Realtime voice calls with bots (Codync parity)
+
+The server owns the voice turn loop — STT → real bot turn (the agent
+runtime, with the bot's memory recall) → TTS — and streams progress over a
+WebSocket as JSON text frames with base64 audio. The transport is
+provider-agnostic: any STT/TTS pair from `@mvp/voice` plugs in
+(`mock` = offline zero-cost default; `groq` and `openai` = key-gated BYOK).
+
+**Status: web client only.** The API below is final and the Android app can
+adopt it as-is (AudioRecord → base64 utterance frames → AudioTrack
+playback), but the companion app does not have a call UI yet — the web
+console's Chat → 📞 Call mode is the supported client today.
+
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | `/api/voice/call-providers` | No auth (local API) → `{providers:[{id,label,configured,hint}]}`; `configured:false` means no BYOK key found (vault `voice_<id>_api_key` or env) |
+| POST | `/api/voice/calls` | `{botId, sttProvider?, ttsProvider?}` → 201 `{callId, botId, botName, stt, tts, wsPath}`; 404 unknown bot, 400 unconfigured provider |
+| GET | `/api/voice/calls/:id` | Call summary (turns, no audio bytes) |
+| POST | `/api/voice/calls/:id/end` | → `{ok}` (idempotent) |
+| WS | `/api/voice/calls/ws?callId=` | Frame protocol below; one call per socket |
+
+Wire protocol (JSON text frames):
+- client → server: `{t:'utterance', audio: base64, mimeType?}` (one complete
+  utterance; `audio/webm` from MediaRecorder works, `audio/wav` PCM works),
+  `{t:'end'}`.
+- server → client: `{t:'call_started', callId, botId, botName, stt, tts}`,
+  `{t:'transcript', text}`, `{t:'approval_required', approvalId, tool}`,
+  `{t:'reply', text}`, `{t:'audio', data: base64, mimeType}`,
+  `{t:'turn_done', skipped?}`, `{t:'error', detail}`, `{t:'call_ended'}`.
+
+Behavior notes for the Android workstream:
+- Each call is one continuous chat session (`sessionId` per call) — the bot
+  remembers the conversation.
+- If the bot's turn raises an approval card, the server emits
+  `approval_required` immediately and the turn *waits* for the normal
+  Approvals-inbox decision (the user approves on the PC/web); the reply
+  audio follows after the decision. Never auto-approve from the phone.
+- Limits: 10 MB per utterance, 120 s per turn, 30 min per call.
+- Keys are BYOK and server-side only: vault secret `voice_groq_api_key` /
+  `voice_openai_api_key` (namespace `default-user`) or the `GROQ_API_KEY` /
+  `OPENAI_API_KEY` env vars. The wire never carries key material.
+- Suggested Android UX: a 📞 button on the chat header → call screen with
+  push-to-talk (or on-device VAD), live transcript list, call timer, and an
+  end-call button; show a notice when `approval_required` arrives.
+
 ## MCP connector OAuth sign-in from the phone
 
 The API supports completing an MCP OAuth sign-in from the Android companion:

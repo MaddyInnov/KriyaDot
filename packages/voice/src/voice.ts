@@ -10,10 +10,11 @@
 
 import { randomUUID } from 'node:crypto';
 import { GroqSTTProvider, GroqTTSProvider } from './groq.js';
+import { OpenAISTTProvider, OpenAITTSProvider } from './openai.js';
 
-/** Provider ids the platform recognises. 'mock' is the default; 'groq' is key-gated. */
-export type STTProviderId = 'mock' | 'groq';
-export type TTSProviderId = 'mock' | 'groq';
+/** Provider ids the platform recognises. 'mock' is the default; 'groq' and 'openai' are key-gated. */
+export type STTProviderId = 'mock' | 'groq' | 'openai';
+export type TTSProviderId = 'mock' | 'groq' | 'openai';
 
 export interface STTResult {
   text: string;
@@ -152,23 +153,25 @@ export class MockTTSProvider implements TTSProvider {
   }
 }
 
-/** Env-driven provider selection. 'mock' is the default; 'groq' needs GROQ_API_KEY. */
+/** Env-driven provider selection. 'mock' is the default; 'groq'/'openai' need their API keys. */
 export function selectSTTProvider(env: NodeJS.ProcessEnv = process.env): STTProvider {
   const id = (env['VOICE_STT_PROVIDER'] ?? 'mock').toLowerCase();
   if (id === 'mock') return new MockSTTProvider();
   if (id === 'groq') return new GroqSTTProvider({ env });
+  if (id === 'openai') return new OpenAISTTProvider({ env });
   throw new Error(
-    `unknown STT provider "${id}" (VOICE_STT_PROVIDER). Available in this MVP: "mock", "groq".`,
+    `unknown STT provider "${id}" (VOICE_STT_PROVIDER). Available in this MVP: "mock", "groq", "openai".`,
   );
 }
 
-/** Env-driven provider selection. 'mock' is the default; 'groq' needs GROQ_API_KEY. */
+/** Env-driven provider selection. 'mock' is the default; 'groq'/'openai' need their API keys. */
 export function selectTTSProvider(env: NodeJS.ProcessEnv = process.env): TTSProvider {
   const id = (env['VOICE_TTS_PROVIDER'] ?? 'mock').toLowerCase();
   if (id === 'mock') return new MockTTSProvider();
   if (id === 'groq') return new GroqTTSProvider({ env });
+  if (id === 'openai') return new OpenAITTSProvider({ env });
   throw new Error(
-    `unknown TTS provider "${id}" (VOICE_TTS_PROVIDER). Available in this MVP: "mock", "groq".`,
+    `unknown TTS provider "${id}" (VOICE_TTS_PROVIDER). Available in this MVP: "mock", "groq", "openai".`,
   );
 }
 

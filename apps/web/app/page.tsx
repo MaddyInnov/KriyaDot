@@ -45,7 +45,7 @@ import LazyClayScene from '../components/three';
 import { Pet } from '../components/pet/Pet';
 import { usePet, type PetMood } from '../lib/pet';
 import { I18nProvider, LanguageSwitcher, useI18n } from '../lib/i18n';
-import { getWebSTTProvider, getWebTTSProvider } from '../lib/voice-http';
+import { getWebSTTProvider } from '../lib/voice-http';
 import { VOICE_NOTE_PERSIST_LIMIT, type VoiceNote } from '../lib/voice-notes';
 import { CallPanel, VoiceNoteBubble, VoiceNoteRecorder } from '../components/voice';
 import { NoteAttachButton } from '../components/chat/note-attach-button';
@@ -397,7 +397,7 @@ const SUGGESTIONS = [
 ];
 
 function ChatPageInner() {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const [bots, setBots] = useState<BotConfig[]>([]);
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [selectedBotId, setSelectedBotId] = useState<string>('');
@@ -1182,13 +1182,6 @@ function ChatPageInner() {
     void sendImpl(note.transcript.trim() || '(voice note)', voiceBlock);
   };
 
-  /** Mock brain for the live-call panel (MVP): acknowledges the transcript.
-   *  Wire to streamChat() for a real bot turn — see docs/I18N.md "voice roadmap". */
-  const callRespond = useCallback(async (transcript: string): Promise<string> => {
-    const name = selectedBotRef.current?.name ?? 'the bot';
-    return `You said: "${transcript}". This is ${name} on a mock voice line — STT and TTS are both mocked in the MVP, so I can't really hear you yet.`;
-  }, []);
-
   const decide = async (blockId: string, approvalId: string, decision: 'approved' | 'denied') => {
     setBlocks((prev) =>
       prev.map((b) => (b.kind === 'approval' && b.id === blockId ? { ...b, status: decision } : b)),
@@ -1662,12 +1655,18 @@ function ChatPageInner() {
 
         {chatMode === 'call' ? (
           <div className="chat-messages">
-            <CallPanel
-              stt={getWebSTTProvider()}
-              tts={getWebTTSProvider()}
-              respond={callRespond}
-              botName={selectedBot?.name}
-            />
+            {selectedBot ? (
+              <CallPanel
+                key={selectedBot.id}
+                botId={selectedBot.id}
+                botName={selectedBot.name}
+                language={locale}
+              />
+            ) : (
+              <p className="muted" style={{ padding: 16 }}>
+                {t('chat.composerPlaceholderNoBot')}
+              </p>
+            )}
           </div>
         ) : (
           <>

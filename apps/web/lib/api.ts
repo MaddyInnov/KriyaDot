@@ -46,6 +46,16 @@ export interface BotConfig {
   persona?: string | null;
   /** Per-bot workspace (Octop-style isolation); unset = global workspace. */
   workspace?: string;
+  /** Per-bot voice-call settings (STT/TTS providers, TTS voice, VAD). */
+  voice?: VoiceSettings;
+}
+
+export interface VoiceSettings {
+  sttProvider?: 'mock' | 'groq' | 'openai';
+  ttsProvider?: 'mock' | 'groq' | 'openai';
+  ttsVoice?: string;
+  autoVad?: boolean;
+  vadSensitivity?: number;
 }
 
 export interface PersonaInfo {
@@ -600,6 +610,15 @@ export const setBotModel = (
   apiJson(`/api/bots/${encodeURIComponent(botId)}/model`, {
     method: 'PUT',
     body: JSON.stringify({ model, modelOptions }),
+  });
+
+export const setBotVoice = (
+  botId: string,
+  voice: VoiceSettings,
+): Promise<{ ok: boolean; botId: string; voice: VoiceSettings }> =>
+  apiJson(`/api/bots/${encodeURIComponent(botId)}/voice`, {
+    method: 'PUT',
+    body: JSON.stringify({ voice }),
   });
 export const getProviders = (): Promise<ProviderInfo[]> => apiJson('/api/providers');
 export const getModels = (freeOnly = false): Promise<ModelPriceInfo[]> =>

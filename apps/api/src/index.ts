@@ -222,6 +222,10 @@ async function boot(): Promise<void> {
   // <dataDir>/bot-models.json.
   const { applyBotModels } = await import('./bot-models.js');
   applyBotModels(seed.bots, config.dataDir);
+  // Per-bot voice-call settings (Codync parity: realtime voice calls):
+  // overlay from <dataDir>/bot-voice.json.
+  const { applyBotVoice } = await import('./bot-voice.js');
+  applyBotVoice(seed.bots, config.dataDir);
   // Chat branching / roster import: overlay previously imported bots.
   applyImportedBots(seed.bots, config.dataDir);
   // Auto-allocated per-bot workspaces (Codync parity): every bot gets
@@ -764,6 +768,44 @@ async function boot(): Promise<void> {
     service: remoteScreenService,
     audit: (action, fields) => governance.audit(action, fields),
   });
+  // Realtime voice calls with bots (Codync parity): the service owns the
+  // STT → bot turn → TTS loop; utterances stream over
+  // /api/voice/calls/ws (upgrade branch below). The bot turn reuses the
+  // agent runtime with the bot's memory recall; approvals raised mid-call
+  // surface as WS events and resolve through the normal Approvals inbox.
+  // The tiered memory store is hoisted here so both the call service and
+  // the router deps share one instance.
+  const { TieredMemoryStore: TieredMemoryStoreCtor } = await import('@mvp/agent-runtime');
+  const tieredMemoryStore = new TieredMemoryStoreCtor(config.dataDir);
+  const { VoiceCallService } = await import('./voice-call.js');
+  const { createVoiceCallUpgrade } = await import('./voice-call-routes.js');
+  const voiceCallService = new VoiceCallService({
+    dataDir: config.dataDir,
+    findBot: (botId: string) => (seed.bots as Array<{ id: string }>).find((b) => b.id === botId) as
+      | import('@mvp/agent-runtime').BotConfig
+      | undefined,
+    runBotTurn: async ({ bot, message, sessionId, signal, onText, onApproval }) => {
+      let memoryContext: string | undefined;
+      try {
+        memoryContext = tieredMemoryStore.recallForPrompt(bot.id, message) || undefined;
+      } catch {
+        memoryContext = undefined; // memory must never break calls
+      }
+      await agentRuntime.runTurn({
+        bot,
+        message,
+        sessionId,
+        signal,
+        memoryContext,
+        onEvent: (e) => {
+          if (e.type === 'token') onText(e.content);
+          else if (e.type === 'approval_required') onApproval(e.approvalId, e.call.name);
+        },
+      });
+    },
+    audit: (action, fields) => governance.audit(action, fields),
+  });
+  const voiceCallUpgrade = createVoiceCallUpgrade({ service: voiceCallService });
   // Phase 2: workflow webhook triggers (shared-secret authenticated).
   app.use('/webhooks', createWebhookRouter({ runner: workflowRunner, triggerStore }));
   app.use(
@@ -786,6 +828,9 @@ async function boot(): Promise<void> {
       companion: { store: companionStore, hub: companionHub },
       // Remote screen viewing (phone -> PC, Codync parity): approval-gated.
       remoteScreen: { store: companionStore, service: remoteScreenService },
+      // Realtime voice calls with bots (Codync parity): STT → bot turn →
+      // TTS over /api/voice/calls (REST) + /api/voice/calls/ws.
+      voiceCall: { service: voiceCallService },
       // Encrypted push notifications (Codync parity): FCM fan-out to paired
       // devices, sealed per device. No-op when FCM isn't configured.
       push: new (await import('./push.js')).PushService({
@@ -800,7 +845,7 @@ async function boot(): Promise<void> {
       recordingStore,
       chatQueueStore,
       mcpServers: seed.mcpServers,
-      tieredMemoryStore: new (await import('@mvp/agent-runtime')).TieredMemoryStore(config.dataDir),
+      tieredMemoryStore,
       runHealth,
       omniStore,
       omniCollector,
@@ -957,6 +1002,8 @@ async function boot(): Promise<void> {
       computerView.handleUpgrade(req, socket, head);
     } else if (path === '/api/remote-screen/ws') {
       remoteScreenUpgrade.handleUpgrade(req, socket, head);
+    } else if (path === '/api/voice/calls/ws') {
+      voiceCallUpgrade.handleUpgrade(req, socket, head);
     } else {
       socket.destroy();
     }

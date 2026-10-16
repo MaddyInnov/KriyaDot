@@ -75,6 +75,8 @@ import type { PhoneSessionHub, PhoneStore } from './phone.js';
 import { getLanIp, registerCompanionRoutes } from './companion-routes.js';
 import type { CompanionHub, CompanionStore } from './companion.js';
 import { createRemoteScreenRouter } from './remote-screen-routes.js';
+import { createVoiceCallRouter } from './voice-call-routes.js';
+import { saveBotVoice } from './bot-voice.js';
 import { TieredMemoryStore } from '@mvp/agent-runtime';
 import { PERSONAS, MBTI_TYPES, QUIZ_QUESTIONS, scoreQuiz, resolvePersona } from '@mvp/agent-runtime';
 import { saveBotPersona } from './bot-personas.js';
@@ -210,6 +212,14 @@ export interface RouteDeps {
   remoteScreen?: {
     store: CompanionStore;
     service: import('./remote-screen.js').RemoteScreenService;
+  };
+  /**
+   * Realtime voice calls with bots (Codync parity). Optional: omitted in
+   * tests that don't exercise it; created by index.ts otherwise. The WS
+   * endpoint (/api/voice/calls/ws) is wired in index.ts's upgrade handler.
+   */
+  voiceCall?: {
+    service: import('./voice-call.js').VoiceCallService;
   };
 }
 
@@ -1088,6 +1098,22 @@ export function createRouter(deps: RouteDeps): express.Router {
       const message = err instanceof Error ? err.message : String(err);
       const status = message.startsWith('Unknown bot') ? 404 : 400;
       res.status(status).json(errorBody('Failed to save model', message));
+    }
+  });
+
+  // ---- Per-bot voice-call settings (Codync parity: realtime voice calls) --
+  // PUT body: { voice?: VoiceSettings }.
+  // Persisted to <dataDir>/bot-voice.json and applied to the in-memory bot
+  // immediately; also applied at boot (see bot-voice.ts).
+  router.put('/bots/:id/voice', (req, res) => {
+    const body = (req.body ?? {}) as { voice?: unknown };
+    try {
+      const voice = saveBotVoice(config.dataDir, bots, req.params.id, body.voice);
+      res.json({ ok: true, botId: req.params.id, voice });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const status = message.startsWith('Unknown bot') ? 404 : 400;
+      res.status(status).json(errorBody('Failed to save voice settings', message));
     }
   });
 
@@ -2326,6 +2352,12 @@ export function createRouter(deps: RouteDeps): express.Router {
   const voiceRouter = express.Router();
   registerVoiceRoutes(voiceRouter, {});
   router.use('/voice', voiceRouter);
+
+  // Realtime voice calls with bots (Codync parity): session REST + the
+  // utterance WebSocket (/api/voice/calls/ws, wired in index.ts).
+  if (deps.voiceCall) {
+    router.use('/voice', createVoiceCallRouter({ service: deps.voiceCall.service }));
+  }
 
   // ---- Phase 4: muse-parity modules -------------------------------------
   const modulesRouter = express.Router();

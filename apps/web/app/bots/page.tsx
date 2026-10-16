@@ -3,10 +3,11 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { exportBotRoster, getAgentModels, getBots, getPersonas, getProviders, getRedteamReports, importBotRoster, runRedteamSuite, setBotModel, setBotPersona, setBotWorkspace, simulatePolicy, updateBotPolicy } from '../../lib/api';
-import type { AgentModel, BotConfig, BotPolicyEffect, BotPolicyRule, ModelOptions, PersonaInfo, PolicySimulationResult, ProviderInfo, RedteamReport, RosterImportReport } from '../../lib/api';
+import type { AgentModel, BotConfig, BotPolicyEffect, BotPolicyRule, ModelOptions, PersonaInfo, PolicySimulationResult, ProviderInfo, RedteamReport, RosterImportReport, VoiceSettings } from '../../lib/api';
 import { useUxMode } from '../../lib/ux-mode';
 import { I18nProvider, LanguageSwitcher, useI18n } from '../../lib/i18n';
 import ComputerPanel from '../../components/panels/computer-panel';
+import VoiceSettingsPanel from '../../components/panels/voice-settings-panel';
 import { MemoryPanel } from '../../components/panels/memory-panel';
 import { RoutinesPanel } from '../../components/panels/routines-panel';
 
@@ -795,6 +796,10 @@ function BotsPageInner() {
     setBots((prev) => prev.map((b) => (b.id === botId ? { ...b, model, modelOptions } : b)));
   };
 
+  const onVoiceSaved = (botId: string, voice: VoiceSettings) => {
+    setBots((prev) => prev.map((b) => (b.id === botId ? { ...b, voice } : b)));
+  };
+
   const selectedBot = bots.find((b) => b.id === selectedBotId);
 
   return (
@@ -918,7 +923,14 @@ function BotsPageInner() {
                   <PolicySimulator key={`sim-${selectedBot.id}`} bot={selectedBot} />
                 </>
               ) : activeTab === 'model' ? (
-                <ModelPicker key={`model-${selectedBot.id}`} bot={selectedBot} onSaved={onModelSaved} />
+                <>
+                  <ModelPicker key={`model-${selectedBot.id}`} bot={selectedBot} onSaved={onModelSaved} />
+                  <VoiceSettingsPanel
+                    key={`voice-${selectedBot.id}`}
+                    bot={selectedBot}
+                    onSaved={onVoiceSaved}
+                  />
+                </>
               ) : activeTab === 'computer' ? (
                 <ComputerPanel key={`computer-${selectedBot.id}`} botId={selectedBot.id} />
               ) : activeTab === 'memory' ? (
