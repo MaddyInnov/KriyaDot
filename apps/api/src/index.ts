@@ -30,6 +30,8 @@ import { syncProviderKeysToEnv } from './providers.js';
 import { applyBotPolicies } from './bot-policies.js';
 import { buildToolRegistry } from './tool-registry.js';
 import { registerDelegateTools } from './delegate-wiring.js';
+import { registerBotTeamToolsWiring } from './bot-team-wiring.js';
+import { createBotConversationsRouter } from './bot-conversations-routes.js';
 import { createSummarizer } from './summarizer.js';
 import { createRouter } from './routes.js';
 import { renderKriyaDotMeter } from './kriyadot-meter.js';
@@ -389,6 +391,18 @@ async function boot(): Promise<void> {
     audit: (action, fields) => governance.audit(action, fields),
   });
 
+  // Bot-to-bot collaboration tools (Codync team parity): list_bots, ask_bot,
+  // message_bot. Exchanges persist to bot-conversations.db for the sheet API.
+  const botConversationStore = registerBotTeamToolsWiring({
+    registry: toolRegistry,
+    agentRuntime,
+    dataDir: config.dataDir,
+    governanceAdapter,
+    getBotConfig: (id) => botsById.get(id),
+    getBots: () => seed.bots,
+    audit: (action, fields) => governance.audit(action, fields),
+  });
+
   const workflowRunner = new WorkflowRunner({
     dbPath: `${config.dataDir}/workflows.db`,
     agentRuntime,
@@ -738,6 +752,13 @@ async function boot(): Promise<void> {
     }),
   );
   // Group chats (multi-bot rooms): roster rows with room-turn orchestration.
+  app.use(
+    '/api/bots',
+    createBotConversationsRouter({
+      store: botConversationStore,
+      getBots: () => seed.bots,
+    }),
+  );
   app.use(
     '/api/groups',
     createGroupChatsRouter({

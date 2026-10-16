@@ -46,6 +46,7 @@ import { getWebSTTProvider, getWebTTSProvider } from '../lib/voice-http';
 import { VOICE_NOTE_PERSIST_LIMIT, type VoiceNote } from '../lib/voice-notes';
 import { CallPanel, VoiceNoteBubble, VoiceNoteRecorder } from '../components/voice';
 import { NoteAttachButton } from '../components/chat/note-attach-button';
+import { BotConversationSheet, BotNoticeRow, type BotNoticeData } from '../components/chat/bot-notice';
 import { useCodeSession } from '../components/code/useCodeSession';
 import { CodeSessionView } from '../components/code/CodeSessionView';
 import { CodingSessionStrip } from '../components/code/CodingSessionStrip';
@@ -411,6 +412,7 @@ function ChatPageInner() {
   // Queued messages waiting for the turn boundary (queue-at-boundary mode).
   const [queuedCount, setQueuedCount] = useState(0);
   const [blocks, setBlocks] = useState<ChatBlock[]>([]);
+  const [convSheetPeer, setConvSheetPeer] = useState<string | null>(null);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [loadError, setLoadError] = useState('');
@@ -1809,7 +1811,25 @@ function ChatPageInner() {
                     onAction={(a, w) => void handleWidgetAction(a, w)}
                   />
                 );
-              case 'tool':
+              case 'tool': {
+                const notice =
+                  (b.call.name === 'ask_bot' || b.call.name === 'message_bot') &&
+                  b.result !== undefined &&
+                  typeof b.result === 'object' &&
+                  b.result !== null &&
+                  'notice' in b.result
+                    ? (b.result as { notice: BotNoticeData }).notice
+                    : null;
+                if (notice) {
+                  return (
+                    <BotNoticeRow
+                      key={b.id}
+                      notice={notice}
+                      bots={bots.map((x) => ({ id: x.id, name: x.name }))}
+                      onOpenSheet={(peerId) => setConvSheetPeer(peerId)}
+                    />
+                  );
+                }
                 return (
                   <details key={b.id} className="tool-row">
                     <summary>
@@ -1829,6 +1849,7 @@ function ChatPageInner() {
                     </div>
                   </details>
                 );
+              }
               case 'approval':
                 return (
                   <div key={b.id} className="approval-card">
@@ -2244,6 +2265,14 @@ function ChatPageInner() {
             </div>
           </div>
         </div>
+      )}
+      {convSheetPeer && selectedBotId && (
+        <BotConversationSheet
+          botId={selectedBotId}
+          peerId={convSheetPeer}
+          peerName={bots.find((x) => x.id === convSheetPeer)?.name ?? convSheetPeer}
+          onClose={() => setConvSheetPeer(null)}
+        />
       )}
     </div>
   );

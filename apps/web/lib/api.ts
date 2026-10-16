@@ -997,3 +997,43 @@ export async function deleteUploadedFile(id: string): Promise<void> {
   const res = await apiFetch(`/api/files/${encodeURIComponent(id)}`, { method: 'DELETE' });
   if (!res.ok) throw new Error(`Delete failed (${res.status})`);
 }
+
+/** Bot-to-bot conversation sheets. */
+export interface BotExchangeDto {
+  id: string;
+  sourceBotId: string;
+  targetBotId: string;
+  type: 'ask' | 'message';
+  text: string;
+  reply?: string;
+  status: 'pending' | 'completed' | 'failed';
+  detail?: string;
+  createdAt: string;
+  completedAt?: string;
+}
+
+export interface BotPeerDto {
+  peerId: string;
+  exchangeCount: number;
+  lastAt: string;
+}
+
+export async function fetchBotConversation(
+  botId: string,
+  otherBotId: string,
+  limit = 200,
+): Promise<BotExchangeDto[]> {
+  const res = await apiFetch(
+    `/api/bots/${encodeURIComponent(botId)}/conversations/${encodeURIComponent(otherBotId)}?limit=${limit}`,
+  );
+  if (!res.ok) throw new Error(`Conversation sheet failed (${res.status})`);
+  const body = (await res.json()) as { exchanges: BotExchangeDto[] };
+  return body.exchanges;
+}
+
+export async function fetchBotPeers(botId: string): Promise<BotPeerDto[]> {
+  const res = await apiFetch(`/api/bots/${encodeURIComponent(botId)}/conversations`);
+  if (!res.ok) throw new Error(`Peers failed (${res.status})`);
+  const body = (await res.json()) as { peers: BotPeerDto[] };
+  return body.peers;
+}

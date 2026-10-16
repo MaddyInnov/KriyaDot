@@ -39,6 +39,7 @@ export * from './memory.js';
 export * from './hybrid-search.js';
 export * from './personas.js';
 export * from './tools/delegate.js';
+export * from './tools/bot-team.js';
 export * from './teams.js';
 export * from './hooks.js';
 export * from './worktrees.js';
