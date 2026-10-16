@@ -72,6 +72,8 @@ import { createWorkspaceBackupRouter } from './workspace-backup-routes.js';
 import { createMessageThreadsRouter } from './message-threads-routes.js';
 import { createMessageReactionsRouter } from './message-reactions-routes.js';
 import { MessageReactionStore } from './message-reactions.js';
+import { createAcpSessionsRouter } from './acp-sessions-routes.js';
+import { AcpSessionManager, AcpSessionStore } from '@mvp/agent-runtime';
 import { createGroupChatsRouter } from './group-chats-routes.js';
 import { applyImportedBots, createBotRosterRouter } from './bot-roster-routes.js';
 import { registerRoutineRoutes } from './bot-routines.js';
@@ -1310,6 +1312,28 @@ async function boot(): Promise<void> {
       audit: (action, fields) => governance.audit(action, fields),
     }),
   );
+  // ACP sessions (OpenMausBot parity P1 #26 — ACP completion): lifecycle,
+  // streaming prompts, and tool-call bridging for external ACP agents
+  // (OpenCode, Claude Code, Codex, …) over stdio JSON-RPC. The manager is
+  // closed on shutdown so no child processes are orphaned.
+  const acpSessionStore = new AcpSessionStore(config.dataDir);
+  const acpSessionManager = new AcpSessionManager(acpSessionStore);
+  app.use(
+    '/api/acp',
+    createAcpSessionsRouter({
+      manager: acpSessionManager,
+      workspaceDir: config.workspaceDir,
+      governance,
+      audit: (action, fields) => governance.audit(action, fields),
+    }),
+  );
+  process.on('SIGTERM', () => {
+    try {
+      acpSessionManager.closeAll();
+    } catch {
+      // ignore
+    }
+  });
   // Slack-style reply threads on chat messages (flat, one level).
   app.use(
     '/api/chat/:sessionId/message-threads',

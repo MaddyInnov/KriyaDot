@@ -7,6 +7,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { authedFetch } from '../../lib/api';
 import { normalizeBots } from '../../lib/teams';
 import GoalsPanel from '../../components/goals/goals-panel';
+import AcpPanel from '../../components/acp/acp-panel';
 
 interface Bot {
   id: string;
@@ -66,7 +67,9 @@ export default function TeamsPage() {
   const importFileRef = useRef<HTMLInputElement>(null);
   // Group goals tab (OpenMausBot parity P1 #11): bounded multi-turn
   // coordinator/worker goal runs. No new top-level nav — lives under Teams.
-  const [tab, setTab] = useState<'teams' | 'goals'>('teams');
+  // ACP tab (OpenMausBot parity P1 #26): external Agent Client Protocol
+  // sessions. Same rule — no new top-level nav.
+  const [tab, setTab] = useState<'teams' | 'goals' | 'acp'>('teams');
 
   const active = teams.find((t) => t.id === activeId) ?? null;
   const botName = (id: string) => bots.find((b) => b.id === id)?.name ?? id;
@@ -311,9 +314,14 @@ export default function TeamsPage() {
         <button className={tab === 'goals' ? 'tab active' : 'tab'} onClick={() => setTab('goals')}>
           🎯 Group goals
         </button>
+        <button className={tab === 'acp' ? 'tab active' : 'tab'} onClick={() => setTab('acp')}>
+          🔌 ACP agents
+        </button>
       </div>
 
       {tab === 'goals' && <GoalsPanel bots={bots} />}
+
+      {tab === 'acp' && <AcpPanel />}
 
       {tab === 'teams' && (
       <div className="two-col">

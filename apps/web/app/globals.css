@@ -5010,3 +5010,27 @@ select.input-sm {
   font-size: 0.85rem;
   color: var(--success, #1e7e34);
 }
+
+/* ACP panel (OpenMausBot parity P1 #26) */
+.acp-panel { display: flex; flex-direction: column; gap: 12px; }
+.acp-note { font-size: 0.85rem; opacity: 0.8; }
+.acp-new { display: flex; gap: 8px; flex-wrap: wrap; }
+.acp-new input { flex: 1 1 140px; }
+.acp-error { color: #c0392b; font-size: 0.85rem; }
+.acp-layout { display: grid; grid-template-columns: 240px 1fr; gap: 12px; min-height: 420px; }
+.acp-sessions { display: flex; flex-direction: column; gap: 6px; }
+.acp-session { display: flex; gap: 4px; align-items: center; border: 1px solid var(--border, #ddd); border-radius: 8px; padding: 4px; }
+.acp-session.active { border-color: var(--accent, #6c5ce7); }
+.acp-session-main { flex: 1; text-align: left; background: none; border: none; cursor: pointer; display: flex; flex-direction: column; gap: 2px; }
+.acp-session-label { font-weight: 600; }
+.acp-session-meta { font-size: 0.75rem; opacity: 0.7; }
+.acp-empty { opacity: 0.6; font-size: 0.85rem; padding: 12px; }
+.acp-thread { display: flex; flex-direction: column; border: 1px solid var(--border, #ddd); border-radius: 8px; overflow: hidden; }
+.acp-transcript { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; max-height: 480px; }
+.acp-msg { border-radius: 8px; padding: 8px 10px; background: rgba(0,0,0,0.03); }
+.acp-msg-head { display: flex; justify-content: space-between; font-size: 0.75rem; opacity: 0.85; margin-bottom: 4px; }
+.acp-msg-body { white-space: pre-wrap; word-break: break-word; font-size: 0.9rem; }
+.acp-msg-error .acp-msg-body { color: #c0392b; }
+.acp-untrusted { background: #f39c12; color: #fff; border-radius: 4px; padding: 0 6px; font-size: 0.7rem; }
+.acp-input { display: flex; gap: 8px; padding: 8px; border-top: 1px solid var(--border, #ddd); }
+.acp-input textarea { flex: 1; resize: vertical; }

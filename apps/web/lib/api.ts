@@ -1938,3 +1938,112 @@ export const resolveChiefIncident = (id: string, note?: string): Promise<{ ok: b
 
 export const retryChiefIncident = (id: string): Promise<{ ok: boolean; incidentId: string; attempts: number; incident: ChiefIncidentDto }> =>
   apiJson(`/api/teams/incidents/${encodeURIComponent(id)}/retry`, { method: 'POST' });
+
+// ---------------------------------------------------------------------------
+// ACP sessions (OpenMausBot parity P1 #26 — ACP completion)
+// ---------------------------------------------------------------------------
+
+export interface AcpSessionDto {
+  id: string;
+  label: string;
+  command: string;
+  args: string[];
+  cwd?: string;
+  agentName: string;
+  status: 'active' | 'busy' | 'closed' | 'error';
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AcpTranscriptEventDto {
+  seq: number;
+  type: 'user' | 'agent' | 'tool_call' | 'tool_result' | 'system' | 'error';
+  text: string;
+  untrusted: boolean;
+  toolCallId?: string;
+  toolName?: string;
+  ts: string;
+}
+
+export type AcpPromptStreamEvent =
+  | { type: 'chunk'; text: string }
+  | { type: 'tool_call'; toolCall: { toolCallId: string; name: string; args: Record<string, unknown> } }
+  | { type: 'tool_result'; toolCallId: string; approved: boolean }
+  | { type: 'done'; text: string }
+  | { type: 'error'; kind: string; message: string }
+  | { type: 'cancelled' };
+
+export const listAcpSessions = (): Promise<{ ok: boolean; sessions: AcpSessionDto[] }> =>
+  apiJson('/api/acp');
+
+export const createAcpSession = (input: { command: string; args?: string[]; label?: string }): Promise<{ ok: boolean; session: AcpSessionDto }> =>
+  apiJson('/api/acp', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+
+export const getAcpSession = (id: string): Promise<{ ok: boolean; session: AcpSessionDto; transcript: AcpTranscriptEventDto[] }> =>
+  apiJson(`/api/acp/${encodeURIComponent(id)}`);
+
+export const resumeAcpSession = (id: string): Promise<{ ok: boolean; session: AcpSessionDto }> =>
+  apiJson(`/api/acp/${encodeURIComponent(id)}/resume`, { method: 'POST' });
+
+export const cancelAcpPrompt = (id: string): Promise<{ ok: boolean; cancelled: boolean }> =>
+  apiJson(`/api/acp/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+
+export const closeAcpSession = (id: string): Promise<{ ok: boolean }> =>
+  apiJson(`/api/acp/${encodeURIComponent(id)}`, { method: 'DELETE' });
+
+/**
+ * Stream an ACP prompt as SSE. Returns an unsubscribe function.
+ * Fetch + reader pattern (EventSource can't send the Authorization header).
+ */
+export function streamAcpPrompt(
+  sessionId: string,
+  text: string,
+  onEvent: (e: AcpPromptStreamEvent) => void,
+  onError?: (err: Error) => void,
+): () => void {
+  const controller = new AbortController();
+  let buffer = '';
+  const dispatch = (chunk: string): void => {
+    buffer += chunk;
+    let idx: number;
+    while ((idx = buffer.indexOf('\n\n')) >= 0) {
+      const frame = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      for (const line of frame.split('\n')) {
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload) continue;
+        try {
+          onEvent(JSON.parse(payload) as AcpPromptStreamEvent);
+        } catch {
+          // ignore malformed frame
+        }
+      }
+    }
+  };
+  (async () => {
+    try {
+      const res = await authedFetch(`/api/acp/${encodeURIComponent(sessionId)}/prompt`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text }),
+        signal: controller.signal,
+      });
+      if (!res.ok || !res.body) throw new Error(`ACP prompt failed (${res.status})`);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        dispatch(decoder.decode(value, { stream: true }));
+      }
+    } catch (err) {
+      if (!controller.signal.aborted) onError?.(err instanceof Error ? err : new Error(String(err)));
+    }
+  })();
+  return () => controller.abort();
+}

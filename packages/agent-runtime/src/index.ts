@@ -50,6 +50,7 @@ export * from './product-analytics.js';
 export * from './subagent-store.js';
 export * from './subagents.js';
 export * from './acp.js';
+export * from './acp-sessions.js';
 export * from './memory.js';
 export * from './hybrid-search.js';
 export * from './personas.js';

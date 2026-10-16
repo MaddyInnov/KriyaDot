@@ -21,6 +21,13 @@ export interface AcpClientOptions {
   cwd?: string;
   /** Spawn timeout ms. */
   spawnTimeoutMs?: number;
+  /**
+   * Notification handler for agent-initiated messages (no `id`), e.g.
+   * `session/update` text chunks or tool-call requests. Replaces the
+   * previous "ignore everything" behavior so callers can stream and
+   * bridge tool calls.
+   */
+  onNotification?: (method: string, params: unknown) => void;
 }
 
 export class AcpError extends Error {}
@@ -91,13 +98,81 @@ export class AcpClient {
    * standard tool-output tagging, exactly like any other tool result.
    */
   async prompt(text: string, opts?: { sessionId?: string; timeoutMs?: number }): Promise<string> {
-    const result = (await this.request(
-      'prompt',
-      { prompt: text, ...(opts?.sessionId ? { sessionId: opts.sessionId } : {}) },
-      opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    )) as { text?: string } | string;
-    if (typeof result === 'string') return result;
-    return result?.text ?? '';
+    const result = await this.promptStream(text, {
+      ...(opts?.sessionId ? { sessionId: opts.sessionId } : {}),
+      ...(opts?.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+    });
+    return result.text;
+  }
+
+  /**
+   * Streaming prompt. The agent may emit `session/update` notifications
+   * with `{ sessionId, update: { kind: 'text_chunk', text } }` while the
+   * `prompt` request is in flight; each chunk is delivered to `onChunk`.
+   * Resolves with the final text when the request's response arrives
+   * (agents that don't stream simply respond with `{ text }`).
+   */
+  async promptStream(
+    text: string,
+    opts?: { sessionId?: string; timeoutMs?: number; onChunk?: (chunk: string) => void },
+  ): Promise<{ text: string }> {
+    const prev = this.opts.onNotification;
+    const sessionId = opts?.sessionId;
+    this.opts.onNotification = (method, params) => {
+      try {
+        prev?.(method, params);
+      } catch {
+        // A failing outer handler must not break streaming.
+      }
+      if (method === 'session/update') {
+        const p = params as { sessionId?: string; update?: { kind?: string; text?: string } } | undefined;
+        if (sessionId && p?.sessionId && p.sessionId !== sessionId) return;
+        if (p?.update?.kind === 'text_chunk' && typeof p.update.text === 'string' && p.update.text) {
+          try {
+            opts?.onChunk?.(p.update.text);
+          } catch {
+            // ignore chunk-handler errors
+          }
+        }
+      }
+    };
+    try {
+      const result = (await this.request(
+        'prompt',
+        { prompt: text, ...(sessionId ? { sessionId } : {}) },
+        opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      )) as { text?: string } | string;
+      const finalText = typeof result === 'string' ? result : (result?.text ?? '');
+      return { text: finalText };
+    } finally {
+      this.opts.onNotification = prev;
+    }
+  }
+
+  /**
+   * Deliver the outcome of an agent-initiated tool call back to the agent.
+   * Sent as a `tool_result` request so the agent can acknowledge receipt.
+   */
+  async sendToolResult(
+    toolCallId: string,
+    outcome: { approved: boolean; output?: string; error?: string },
+    timeoutMs = 30_000,
+  ): Promise<void> {
+    await this.request(
+      'tool_result',
+      {
+        toolCallId,
+        approved: outcome.approved,
+        ...(outcome.output !== undefined ? { output: outcome.output } : {}),
+        ...(outcome.error !== undefined ? { error: outcome.error } : {}),
+      },
+      timeoutMs,
+    );
+  }
+
+  /** Whether the underlying process is still alive and usable. */
+  isConnected(): boolean {
+    return !!this.proc && !this.closed && this.proc.exitCode === null && this.proc.signalCode === null;
   }
 
   /** Best-effort cancellation notification. */
@@ -160,8 +235,17 @@ export class AcpClient {
         clearTimeout(pending.timer);
         if (msg.error) pending.reject(new AcpError(`ACP error: ${msg.error.message ?? 'unknown'}`));
         else pending.resolve(msg.result);
+      } else if (typeof msg.method === 'string' && msg.id === undefined) {
+        // Agent-initiated notification (streaming chunks, tool-call
+        // requests, …). Dispatched to the registered handler; unknown
+        // methods are still ignored by default.
+        try {
+          this.opts.onNotification?.(msg.method, (msg as { params?: unknown }).params);
+        } catch {
+          // never let a handler break the protocol loop
+        }
       }
-      // Notifications / unknown methods from the agent are ignored.
+      // Anything else is ignored.
     }
   }
 
