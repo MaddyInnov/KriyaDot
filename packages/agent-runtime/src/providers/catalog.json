@@ -59,7 +59,7 @@
       "liveModels": false,
       "models": [],
       "name": "OmniRush (bring your own)",
-      "notes": "Bring-your-own preset. Paste YOUR OWN OmniRush API key/token from your own OmniRush account \u2014 never a shared or pooled key. Set the base URL from your OmniRush app/account; no endpoint is pre-configured."
+      "notes": "Bring-your-own preset. Paste YOUR OWN OmniRush API key/token from your own OmniRush account — never a shared or pooled key. Set the base URL from your OmniRush app/account; no endpoint is pre-configured."
     },
     "openai": {
       "api": "openai-compatible",
@@ -157,7 +157,7 @@
       ],
       "id": "opencode-zen",
       "name": "OpenCode Zen (bring your own)",
-      "notes": "Bring-your-own preset. Sign up at opencode.ai/zen for your own API key (no card needed for the free rotation). Free roster checked 2026-10-09 \u2014 it rotates, so the live /models fetch is authoritative; only -free models are zero-cost, most other Zen models are pay-as-you-go."
+      "notes": "Bring-your-own preset. Sign up at opencode.ai/zen for your own API key (no card needed for the free rotation). Free roster checked 2026-10-09 — it rotates, so the live /models fetch is authoritative; only -free models are zero-cost, most other Zen models are pay-as-you-go."
     },
     "openrouter": {
       "api": "openai-compatible",
@@ -194,7 +194,7 @@
           "name": "Claude Haiku 4.5"
         }
       ],
-      "notes": "Uses YOUR Claude Code CLI login (~/.claude/.credentials.json) \u2014 no API key needed. Shown only when the CLI is detected; requires your explicit Connect consent. Token is read at request time and never stored or logged.",
+      "notes": "Uses YOUR Claude Code CLI login (~/.claude/.credentials.json) — no API key needed. Shown only when the CLI is detected; requires your explicit Connect consent. Token is read at request time and never stored or logged.",
       "liveModels": true
     },
     "codex-subscription": {
@@ -247,7 +247,7 @@
           "name": "o4-mini"
         }
       ],
-      "notes": "Uses YOUR Codex CLI login (~/.codex/auth.json) \u2014 no API key needed. Shown only when the CLI is detected; requires your explicit Connect consent. Token is read at request time and never stored or logged.",
+      "notes": "Uses YOUR Codex CLI login (~/.codex/auth.json) — no API key needed. Shown only when the CLI is detected; requires your explicit Connect consent. Token is read at request time and never stored or logged.",
       "liveModels": true
     },
     "ollama": {
@@ -259,7 +259,7 @@
       "liveModels": true,
       "models": [],
       "name": "Ollama (local)",
-      "notes": "Fully local models via Ollama \u2014 no API key needed, ever. Install from https://ollama.com/download, pull a model (e.g. \"ollama pull llama3.1\"), and it just works. Set OLLAMA_HOST if Ollama runs on another host."
+      "notes": "Fully local models via Ollama — no API key needed, ever. Install from https://ollama.com/download, pull a model (e.g. \"ollama pull llama3.1\"), and it just works. Set OLLAMA_HOST if Ollama runs on another host."
     },
     "opencode-subscription": {
       "id": "opencode-subscription",
@@ -276,7 +276,18 @@
           "default": true
         }
       ],
-      "notes": "Uses YOUR OpenCode CLI login (~/.local/share/opencode/auth.json) \u2014 no API key needed. Shown only when the CLI is detected; requires your explicit Connect consent. Token is read at request time and never stored or logged."
+      "notes": "Uses YOUR OpenCode CLI login (~/.local/share/opencode/auth.json) — no API key needed. Shown only when the CLI is detected; requires your explicit Connect consent. Token is read at request time and never stored or logged."
+    },
+    "llamacpp": {
+      "api": "llamacpp",
+      "baseUrl": "http://127.0.0.1:11435",
+      "envKey": "KRIYADOT_LLAMACPP_PORT",
+      "id": "llamacpp",
+      "local": true,
+      "liveModels": true,
+      "models": [],
+      "name": "Local LLM (llama.cpp)",
+      "notes": "Managed local models via stock llama.cpp — zero-config binary download, GPU auto-detect, served on 127.0.0.1 only. No API key, ever. Manage it in Settings → Local LLM. Set KRIYADOT_LLAMACPP_PORT to change the server port."
     }
   }
 }

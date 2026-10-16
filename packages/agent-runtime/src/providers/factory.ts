@@ -12,6 +12,7 @@ import {
 } from './catalog.js';
 import { MockProvider } from './mock.js';
 import { OllamaProvider } from './ollama.js';
+import { LlamaCppProvider } from './llamacpp.js';
 import { OpenAICompatibleProvider } from './openai-compatible.js';
 import { createAgentCliProvider, parseAgentProviderId } from './agent-cli.js';
 
@@ -88,10 +89,13 @@ export function createProvider(providerId: string, opts?: { apiKey?: string }): 
   }
 
   const apiKey = opts?.apiKey ?? resolveApiKey(providerId);
-  // Local providers (Ollama): no API key, ever. Skip the key requirement.
+  // Local providers (Ollama, managed llama.cpp): no API key, ever. Skip the key requirement.
   if (preset.local) {
     if (preset.api === 'ollama') {
       return new OllamaProvider();
+    }
+    if (preset.api === 'llamacpp') {
+      return new LlamaCppProvider();
     }
     // Future local providers fall through to the openai-compatible driver
     // with a dummy key (local endpoints ignore auth).

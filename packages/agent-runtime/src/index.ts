@@ -9,6 +9,8 @@ export * from './providers/openai-compatible.js';
 export * from './providers/anthropic.js';
 export * from './providers/mock.js';
 export * from './providers/rate-limit.js';
+export * from './providers/llamacpp.js';
+export * from './local-llm.js';
 export * from './usage.js';
 export * from './reviewer.js';
 export * from './runtime.js';

@@ -34,6 +34,8 @@ import { registerBotTeamToolsWiring } from './bot-team-wiring.js';
 import { createBotConversationsRouter } from './bot-conversations-routes.js';
 import { createAgentDetectRouter } from './agent-detect-routes.js';
 import { createAnalyticsRouter } from './analytics-routes.js';
+import { createLocalLlmRouter } from './local-llm-routes.js';
+import { LocalLlmManager } from '@mvp/agent-runtime';
 import { createSummarizer } from './summarizer.js';
 import { createRouter } from './routes.js';
 import { renderKriyaDotMeter } from './kriyadot-meter.js';
@@ -926,6 +928,11 @@ async function boot(): Promise<void> {
   app.use('/api/agents', createAgentDetectRouter());
   // Opt-in product analytics (off by default; local-first privacy posture).
   app.use('/api/analytics', createAnalyticsRouter({ dataDir: config.dataDir }));
+  // Managed local LLM (Atomic Agent parity): zero-config llama.cpp binary +
+  // model management + local server lifecycle. Created once and shared with
+  // the shutdown path below.
+  const localLlm = new LocalLlmManager(config.dataDir);
+  app.use('/api/local-llm', createLocalLlmRouter(localLlm));
 
   app.use('/api/routines', routinesRouter);
   app.use('/webhooks/routines', routineWebhookRouter);
@@ -1017,6 +1024,11 @@ async function boot(): Promise<void> {
     await closeMcp();
     try {
       await computerSandbox.kill();
+    } catch {
+      // ignore
+    }
+    try {
+      await localLlm.stop();
     } catch {
       // ignore
     }

@@ -7,6 +7,7 @@ import { McpScopesPanel } from '../../components/panels/mcp-scopes-panel';
 import { McpOAuthPanel } from '../../components/panels/mcp-oauth-panel';
 import { DetectedAgentsPanel } from '../../components/panels/detected-agents-panel';
 import { AnalyticsPanel } from '../../components/panels/analytics-panel';
+import { LocalLlmPanel } from '../../components/panels/local-llm-panel';
 import { useUxMode } from '../../lib/ux-mode';
 
 interface LearnedPreference {
@@ -171,6 +172,15 @@ export default function PreferencesPage() {
           prompts, or anything you typed.
         </p>
         <AnalyticsPanel />
+      </section>
+
+      <section className="card">
+        <h2>Local LLM (llama.cpp)</h2>
+        <p className="muted small">
+          Run small models entirely on this machine — zero-config download of stock llama.cpp,
+          GPU auto-detect, served on 127.0.0.1 only. No API key, no cloud, no cost.
+        </p>
+        <LocalLlmPanel />
       </section>
 
       <section className="card">
