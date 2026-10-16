@@ -26,6 +26,7 @@ import {
   discoverAuthorizationServerMetadata,
   generateCodeVerifier,
   generateOAuthState,
+  probeMcpServerAuth,
   registerOAuthClient,
 } from '@mvp/agent-runtime';
 import type { GovernanceGateway } from '@mvp/governance';
@@ -205,6 +206,8 @@ interface PendingFlow {
   serverId: string;
   codeVerifier: string;
   redirectUri: string;
+  /** 'deeplink' → callback 302s to kriyadot://oauth-callback for phone handoff. */
+  display?: string;
   expires: number;
 }
 
@@ -263,9 +266,11 @@ export function registerMcpOAuthRoutes(router: express.Router, deps: McpOAuthRou
       resolveClient: (sid, metadata) => resolveMcpOAuthClient(config.dataDir, sid, metadata, redirectUri),
     });
 
-  // GET /api/mcp/oauth/start?server=<id>[&scope=...] — begin the connect flow.
-  // Returns the authorization URL as JSON (the UI opens it); the PKCE
-  // verifier is kept server-side keyed by `state`.
+  // GET /api/mcp/oauth/start?server=<id>[&scope=...][&display=deeplink] —
+  // begin the connect flow. Returns the authorization URL as JSON (the UI
+  // opens it); the PKCE verifier is kept server-side keyed by `state`.
+  // display=deeplink: for the Android companion — the callback redirects
+  // to kriyadot://oauth-callback instead of returning JSON.
   router.get('/mcp/oauth/start', async (req, res) => {
     const serverId = typeof req.query.server === 'string' ? req.query.server : '';
     if (!serverId) {
@@ -281,6 +286,7 @@ export function registerMcpOAuthRoutes(router: express.Router, deps: McpOAuthRou
     }
     const redirectUri = `${req.protocol}://${req.get('host')}/api/mcp/oauth/callback`;
     const scope = typeof req.query.scope === 'string' ? req.query.scope : undefined;
+    const display = req.query.display === 'deeplink' ? 'deeplink' : undefined;
     try {
       // Metadata discovery also validates the server speaks OAuth.
       await discoverAuthorizationServerMetadata(serverUrl);
@@ -291,6 +297,7 @@ export function registerMcpOAuthRoutes(router: express.Router, deps: McpOAuthRou
         serverId,
         codeVerifier,
         redirectUri,
+        display,
         expires: Date.now() + FLOW_TTL_MS,
       });
       const client = makeClient(serverId, serverUrl, redirectUri);
@@ -304,6 +311,13 @@ export function registerMcpOAuthRoutes(router: express.Router, deps: McpOAuthRou
   // GET /api/mcp/oauth/callback?code=...&state=... — the authorization
   // server redirects the user's browser here. Exchanges the code (PKCE)
   // and stores the tokens encrypted.
+  //
+  // Phone handoff: pass `display=deeplink` at /start time and the callback
+  // 302-redirects to `kriyadot://oauth-callback?code=...&state=...` instead
+  // of returning JSON. The companion app intercepts the deep link and POSTs
+  // { code, state } to /api/mcp/oauth/manual. The authorization code is
+  // useless without the PKCE verifier, which never leaves this host —
+  // the same security property as Codync's stateless cloud page.
   router.get('/mcp/oauth/callback', async (req, res) => {
     const state = typeof req.query.state === 'string' ? req.query.state : '';
     const flow = state ? pendingFlows.get(state) : undefined;
@@ -316,6 +330,16 @@ export function registerMcpOAuthRoutes(router: express.Router, deps: McpOAuthRou
     const code = typeof req.query.code === 'string' ? req.query.code : '';
     if (!code) {
       res.status(400).json(errorBody('Missing authorization code'));
+      return;
+    }
+    if (flow.display === 'deeplink') {
+      // Don't consume the code here — hand it to the phone via deep link.
+      // Re-register the flow so /manual can complete it.
+      pendingFlows.set(state, flow);
+      const deepLink =
+        `kriyadot://oauth-callback?code=${encodeURIComponent(code)}` +
+        `&state=${encodeURIComponent(state)}&server=${encodeURIComponent(flow.serverId)}`;
+      res.redirect(302, deepLink);
       return;
     }
     let serverUrl: string;
@@ -341,6 +365,99 @@ export function registerMcpOAuthRoutes(router: express.Router, deps: McpOAuthRou
       res.json({ ok: true, server: flow.serverId, expiresAt: tokens.expiresAt });
     } catch (err) {
       res.status(400).json(errorBody('MCP OAuth callback failed', err instanceof Error ? err.message : String(err)));
+    }
+  });
+
+  // POST /api/mcp/oauth/manual — complete the flow with a pasted code.
+  // Body: { code, state } — or { callbackUrl } containing both as query
+  // params (for browsers that can't reach the loopback callback, or the
+  // phone deep-link handoff). The PKCE verifier stays server-side.
+  router.post('/mcp/oauth/manual', async (req, res) => {
+    let { code, state } = req.body as { code?: unknown; state?: unknown; callbackUrl?: unknown };
+    if (typeof req.body?.callbackUrl === 'string') {
+      try {
+        const u = new URL(req.body.callbackUrl);
+        code = u.searchParams.get('code') ?? undefined;
+        state = u.searchParams.get('state') ?? undefined;
+      } catch {
+        res.status(400).json(errorBody('callbackUrl is not a valid URL'));
+        return;
+      }
+    }
+    if (typeof code !== 'string' || !code || typeof state !== 'string' || !state) {
+      res.status(400).json(errorBody('Body must contain { code, state } or { callbackUrl }'));
+      return;
+    }
+    const flow = pendingFlows.get(state);
+    pruneFlows();
+    if (!flow) {
+      res.status(400).json(errorBody('Invalid or expired OAuth state — restart the connect flow'));
+      return;
+    }
+    pendingFlows.delete(state);
+    let serverUrl: string;
+    try {
+      ({ url: serverUrl } = oauthServerConfig(mcpServers, flow.serverId));
+    } catch (err) {
+      res.status(404).json(errorBody(err instanceof Error ? err.message : String(err)));
+      return;
+    }
+    try {
+      const client = makeClient(flow.serverId, serverUrl, flow.redirectUri);
+      const tokens = await client.handleCallback({
+        code,
+        codeVerifier: flow.codeVerifier,
+        redirectUri: flow.redirectUri,
+      });
+      governance.audit('mcp.oauth.connected', {
+        actor: 'api',
+        toolName: 'mcp-oauth',
+        detail: { server: flow.serverId, expiresAt: tokens.expiresAt, via: 'manual' },
+      });
+      console.log(`[mcp-oauth] connected MCP server "${flow.serverId}" via manual code entry`);
+      res.json({ ok: true, server: flow.serverId, expiresAt: tokens.expiresAt });
+    } catch (err) {
+      res.status(400).json(errorBody('MCP OAuth code exchange failed', err instanceof Error ? err.message : String(err)));
+    }
+  });
+
+  // POST /api/mcp/oauth/probe — Codync-style install probe: does this MCP
+  // server require OAuth? Body: { server } (configured id) or { url }.
+  // A server that refuses unauthenticated initialize, or whose
+  // protected-resource metadata names an authorization server, is reported
+  // as requiresOAuth (signed out) — bots don't get it until sign-in.
+  router.post('/mcp/oauth/probe', async (req, res) => {
+    const serverId = typeof req.body?.server === 'string' ? req.body.server : '';
+    const rawUrl = typeof req.body?.url === 'string' ? req.body.url : '';
+    let serverUrl = rawUrl;
+    if (serverId) {
+      try {
+        ({ url: serverUrl } = oauthServerConfig(mcpServers, serverId));
+      } catch (err) {
+        res.status(404).json(errorBody(err instanceof Error ? err.message : String(err)));
+        return;
+      }
+    }
+    if (!serverUrl) {
+      res.status(400).json(errorBody('Body must contain { server } or { url }'));
+      return;
+    }
+    try {
+      const probe = await probeMcpServerAuth(serverUrl);
+      const tokens = serverId ? loadTokens(config.dataDir, serverId) : undefined;
+      res.json({
+        ok: true,
+        server: serverId || undefined,
+        url: serverUrl,
+        requiresOAuth: probe.requiresOAuth,
+        signedOut: probe.requiresOAuth && !tokens,
+        connected: tokens !== undefined,
+        authorizationServers: probe.authorizationServers,
+        scopesSupported: probe.scopesSupported,
+        detail: probe.detail,
+      });
+    } catch (err) {
+      res.status(400).json(errorBody('Probe failed', err instanceof Error ? err.message : String(err)));
     }
   });
 

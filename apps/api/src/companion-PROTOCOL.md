@@ -264,3 +264,21 @@ KRIYADOT_PUBLIC_URL=https://kriyadot.example.com bun src/index.ts
   revoke unknown devices from Workspace → Devices.
 - Pairing and WS auth failures are IP rate-limited and audit-logged
   (`companion.*`); the limiter keys off `X-Forwarded-For` behind a proxy.
+
+## MCP connector OAuth sign-in from the phone
+
+The API supports completing an MCP OAuth sign-in from the Android companion:
+
+1. Phone opens the system browser at
+   `GET /api/mcp/oauth/start?server=<id>&display=deeplink` (same JSON as
+   desktop: `{ authUrl, state }`).
+2. After the user consents, the callback 302-redirects to
+   `kriyadot://oauth-callback?code=...&state=...&server=...` instead of
+   returning JSON.
+3. The companion intercepts the deep link and POSTs
+   `{ code, state }` to `/api/mcp/oauth/manual`, which completes the PKCE
+   exchange server-side and stores the tokens encrypted.
+
+Security property: the authorization code is useless without the PKCE
+`code_verifier`, which never leaves the API host (in-memory pending flow,
+10-minute TTL). This mirrors Codync's stateless cloud page design.

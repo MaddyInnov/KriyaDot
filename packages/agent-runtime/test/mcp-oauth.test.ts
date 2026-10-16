@@ -390,3 +390,166 @@ describe('McpOAuthClient', () => {
     expect(store.getTokens(serverId)?.accessToken).toBe('new-at');
   });
 });
+
+describe('protected-resource metadata (RFC 9728)', () => {
+  const serverId = 'test-mcp';
+  const serverUrl = 'https://mcp.example.com/';
+
+  function makeClient(store: McpOAuthTokenStore, fetchFn: FetchFn) {
+    return new McpOAuthClient({
+      serverId,
+      serverUrl,
+      store,
+      resolveClient: async () => ({ clientId: 'client-123' }),
+      fetchFn,
+    });
+  }
+
+  const PRM = {
+    resource: 'https://mcp.example.com/',
+    authorization_servers: ['https://auth.example.com'],
+    scopes_supported: ['read', 'write'],
+  };
+
+  // Extended mock supporting status + headers.
+  function mockFetchFull(
+    handler: (url: string, init?: RequestInit) => { ok?: boolean; status?: number; body?: unknown; headers?: Record<string, string> },
+  ): FetchFn {
+    return (async (url: unknown, init?: unknown) => {
+      const r = handler(String(url), init as RequestInit | undefined);
+      return {
+        ok: r.ok ?? true,
+        status: r.status ?? 200,
+        headers: { get: (k: string) => r.headers?.[k.toLowerCase()] ?? null },
+        json: () => Promise.resolve(r.body ?? {}),
+      } as unknown as Response;
+    }) as unknown as FetchFn;
+  }
+
+  it('parses a valid protected-resource document', async () => {
+    const { parseProtectedResourceMetadata } = await import('../src/mcp-oauth.js');
+    const m = parseProtectedResourceMetadata(PRM);
+    expect(m.resource).toBe('https://mcp.example.com/');
+    expect(m.authorizationServers).toEqual(['https://auth.example.com']);
+    expect(m.scopesSupported).toEqual(['read', 'write']);
+  });
+
+  it('rejects protected-resource metadata without authorization servers', async () => {
+    const { parseProtectedResourceMetadata } = await import('../src/mcp-oauth.js');
+    expect(() => parseProtectedResourceMetadata({ resource: 'x' })).toThrow(/authorization_servers/);
+    expect(() => parseProtectedResourceMetadata(null)).toThrow(/JSON object/);
+  });
+
+  it('extracts resource_metadata from WWW-Authenticate', async () => {
+    const { parseWwwAuthenticateResourceMetadata } = await import('../src/mcp-oauth.js');
+    expect(
+      parseWwwAuthenticateResourceMetadata(
+        'Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource", scope="read"',
+      ),
+    ).toBe('https://mcp.example.com/.well-known/oauth-protected-resource');
+    expect(parseWwwAuthenticateResourceMetadata('Bearer')).toBeUndefined();
+    expect(parseWwwAuthenticateResourceMetadata(null)).toBeUndefined();
+  });
+
+  it('probe: 2xx initialize → no OAuth', async () => {
+    const { probeMcpServerAuth } = await import('../src/mcp-oauth.js');
+    const fetchFn = mockFetchFull(() => ({ status: 200 }));
+    const r = await probeMcpServerAuth('https://mcp.example.com/', fetchFn);
+    expect(r.requiresOAuth).toBe(false);
+  });
+
+  it('probe: 401 with resource_metadata → requiresOAuth with auth servers', async () => {
+    const { probeMcpServerAuth } = await import('../src/mcp-oauth.js');
+    const fetchFn = mockFetchFull((url) => {
+      if (url === 'https://mcp.example.com/') {
+        return {
+          status: 401,
+          headers: {
+            'www-authenticate':
+              'Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"',
+          },
+        };
+      }
+      return { body: PRM };
+    });
+    const r = await probeMcpServerAuth('https://mcp.example.com/', fetchFn);
+    expect(r.requiresOAuth).toBe(true);
+    expect(r.authorizationServers).toEqual(['https://auth.example.com']);
+    expect(r.scopesSupported).toEqual(['read', 'write']);
+  });
+
+  it('probe: 401 without metadata → requiresOAuth, static-token hint', async () => {
+    const { probeMcpServerAuth } = await import('../src/mcp-oauth.js');
+    const fetchFn = mockFetchFull((url) => {
+      if (url === 'https://mcp.example.com/') return { status: 401 };
+      return { status: 404 };
+    });
+    const r = await probeMcpServerAuth('https://mcp.example.com/', fetchFn);
+    expect(r.requiresOAuth).toBe(true);
+    expect(r.detail).toMatch(/static bearer token/);
+  });
+
+  it('probe: metadata without 401 still marks OAuth-gated', async () => {
+    const { probeMcpServerAuth } = await import('../src/mcp-oauth.js');
+    const fetchFn = mockFetchFull((url) => {
+      if (url === 'https://mcp.example.com/') return { status: 400 };
+      if (url.includes('.well-known/oauth-protected-resource')) return { body: PRM };
+      return { status: 404 };
+    });
+    const r = await probeMcpServerAuth('https://mcp.example.com/', fetchFn);
+    expect(r.requiresOAuth).toBe(true);
+    expect(r.authorizationServers).toEqual(['https://auth.example.com']);
+  });
+
+  it('probe: invalid URL throws', async () => {
+    const { probeMcpServerAuth } = await import('../src/mcp-oauth.js');
+    await expect(probeMcpServerAuth('not-a-url', mockFetchFull(() => ({})))).rejects.toThrow(/Invalid MCP server URL/);
+  });
+
+  it('authenticatedFetch attaches bearer and retries once after 401 refresh', async () => {
+    const { McpOAuthClient } = await import('../src/mcp-oauth.js');
+    const store = memoryStore();
+    store.saveTokens(serverId, {
+      accessToken: 'stale-at',
+      refreshToken: 'rt-1',
+      expiresAt: Date.now() + 3600_000,
+    });
+    let calls = 0;
+    const fetchFn = mockFetchFull((url) => {
+      if (String(url).includes('.well-known')) return { body: METADATA };
+      if (String(url) === 'https://auth.example.com/token') {
+        return { body: { access_token: 'fresh-at', refresh_token: 'rt-2', expires_in: 3600 } };
+      }
+      calls += 1;
+      // First call 401s (token rotated server-side), second succeeds.
+      return calls === 1 ? { status: 401 } : { body: { ok: true } };
+    });
+    const client = makeClient(store, fetchFn);
+    const res = await client.authenticatedFetch('https://mcp.example.com/tools');
+    expect(res.status).toBe(200);
+    expect(store.getTokens(serverId)?.accessToken).toBe('fresh-at');
+    expect(calls).toBe(2);
+  });
+
+  it('authenticatedFetch throws McpOAuthRequiredError when refresh fails', async () => {
+    const { McpOAuthClient, McpOAuthRequiredError } = await import('../src/mcp-oauth.js');
+    const store = memoryStore();
+    store.saveTokens(serverId, {
+      accessToken: 'stale-at',
+      refreshToken: 'bad-rt',
+      expiresAt: Date.now() + 3600_000,
+    });
+    const fetchFn = mockFetchFull((url) => {
+      if (String(url).includes('.well-known')) return { body: METADATA };
+      if (String(url) === 'https://auth.example.com/token') {
+        return { status: 400, ok: false, body: { error: 'invalid_grant' } };
+      }
+      return { status: 401 };
+    });
+    const client = makeClient(store, fetchFn);
+    await expect(client.authenticatedFetch('https://mcp.example.com/tools')).rejects.toBeInstanceOf(
+      McpOAuthRequiredError,
+    );
+    expect(store.getTokens(serverId)).toBeUndefined();
+  });
+});

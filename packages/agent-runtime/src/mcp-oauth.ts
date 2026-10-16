@@ -85,6 +85,273 @@ export function parseAuthorizationServerMetadata(body: unknown): AuthorizationSe
   return meta;
 }
 
+// ---------------------------------------------------------------------------
+// RFC 9728 protected-resource metadata
+// ---------------------------------------------------------------------------
+
+/**
+ * Protected-resource metadata document (RFC 9728), served by the MCP
+ * server at `/.well-known/oauth-protected-resource`. This is the first
+ * discovery step in the MCP authorization spec: on a 401 the server
+ * advertises this document (directly or via the WWW-Authenticate
+ * `resource_metadata` parameter), and it names the authorization
+ * server(s) to use.
+ */
+export interface ProtectedResourceMetadata {
+  /** The protected resource identifier (usually the MCP server URL). */
+  resource: string;
+  /** Authorization server issuer URLs that can mint tokens for this resource. */
+  authorizationServers: string[];
+  scopesSupported?: string[];
+  bearerMethodsSupported?: string[];
+}
+
+/** Parse + validate a protected-resource metadata document. Throws on bad shape. */
+export function parseProtectedResourceMetadata(body: unknown): ProtectedResourceMetadata {
+  if (typeof body !== 'object' || body === null) {
+    throw new Error('Protected-resource metadata is not a JSON object');
+  }
+  const b = body as Record<string, unknown>;
+  if (typeof b.resource !== 'string' || !b.resource) {
+    throw new Error('Protected-resource metadata missing required field "resource"');
+  }
+  const servers = b.authorization_servers;
+  if (!Array.isArray(servers) || servers.length === 0 || !servers.every((s) => typeof s === 'string')) {
+    throw new Error('Protected-resource metadata missing non-empty "authorization_servers"');
+  }
+  const meta: ProtectedResourceMetadata = {
+    resource: b.resource,
+    authorizationServers: servers as string[],
+  };
+  if (Array.isArray(b.scopes_supported)) {
+    meta.scopesSupported = b.scopes_supported.filter((s): s is string => typeof s === 'string');
+  }
+  if (Array.isArray(b.bearer_methods_supported)) {
+    meta.bearerMethodsSupported = b.bearer_methods_supported.filter((s): s is string => typeof s === 'string');
+  }
+  return meta;
+}
+
+/**
+ * Fetch protected-resource metadata for an MCP server URL (RFC 9728 §3).
+ * Tries the path-scoped well-known URI first, then the origin-scoped one.
+ * Returns undefined (does not throw) when the server serves no metadata —
+ * many plain servers simply have none.
+ */
+export async function discoverProtectedResourceMetadata(
+  mcpServerUrl: string,
+  fetchFn: FetchFn = fetch,
+): Promise<ProtectedResourceMetadata | undefined> {
+  let serverUrl: URL;
+  try {
+    serverUrl = new URL(mcpServerUrl);
+  } catch {
+    return undefined;
+  }
+  const candidates = [
+    `${serverUrl.origin}/.well-known/oauth-protected-resource${serverUrl.pathname}`,
+    `${serverUrl.origin}/.well-known/oauth-protected-resource`,
+  ];
+  for (const url of candidates) {
+    try {
+      const res = await fetchFn(url, { headers: { accept: 'application/json' } });
+      if (!res.ok) continue;
+      return parseProtectedResourceMetadata(await res.json());
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Extract the `resource_metadata` URI from a WWW-Authenticate header.
+ * Servers refusing a request advertise e.g.:
+ *   WWW-Authenticate: Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"
+ * Returns undefined when the header is absent or has no resource_metadata param.
+ */
+export function parseWwwAuthenticateResourceMetadata(header: string | null | undefined): string | undefined {
+  if (!header) return undefined;
+  const m = /resource_metadata="([^"]+)"/i.exec(header);
+  return m ? m[1] : undefined;
+}
+
+/**
+ * Fetch protected-resource metadata from an explicit URI (e.g. the one
+ * advertised in WWW-Authenticate). Throws on fetch/parse failure.
+ */
+export async function fetchProtectedResourceMetadata(
+  metadataUrl: string,
+  fetchFn: FetchFn = fetch,
+): Promise<ProtectedResourceMetadata> {
+  const res = await fetchFn(metadataUrl, { headers: { accept: 'application/json' } });
+  if (!res.ok) {
+    throw new Error(`Protected-resource metadata fetch failed (HTTP ${res.status})`);
+  }
+  return parseProtectedResourceMetadata(await res.json());
+}
+
+// ---------------------------------------------------------------------------
+// MCP authorization probe — does this server need OAuth?
+// ---------------------------------------------------------------------------
+
+export interface McpAuthProbeResult {
+  /** True when the server requires OAuth before bots may use it. */
+  requiresOAuth: boolean;
+  /** Where protected-resource metadata was found, if anywhere. */
+  resourceMetadataUrl?: string;
+  /** Authorization server issuers named by the metadata, if any. */
+  authorizationServers?: string[];
+  /** Scopes the resource advertises, if any. */
+  scopesSupported?: string[];
+  /** Human-readable explanation of the verdict. */
+  detail: string;
+}
+
+function mcpInitializeBody(): string {
+  return JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'mvp-agent-runtime', version: '0.1.0' },
+    },
+  });
+}
+
+/**
+ * Probe an MCP server to determine whether it requires OAuth.
+ *
+ * Follows the MCP authorization spec / Codync behavior:
+ *  1. POST an unauthenticated `initialize`. 2xx → no OAuth needed.
+ *  2. On 401, look for `WWW-Authenticate: ... resource_metadata="..."`,
+ *     fetch that document, and report the authorization servers.
+ *  3. Even without a 401 challenge, protected-resource metadata that
+ *     names an authorization server marks the server as OAuth-gated
+ *     (some servers only refuse at tool-call time).
+ *
+ * Never throws for "not OAuth" verdicts — only for invalid URLs.
+ */
+export async function probeMcpServerAuth(
+  mcpServerUrl: string,
+  fetchFn: FetchFn = fetch,
+): Promise<McpAuthProbeResult> {
+  let serverUrl: URL;
+  try {
+    serverUrl = new URL(mcpServerUrl);
+  } catch {
+    throw new Error(`Invalid MCP server URL "${mcpServerUrl}"`);
+  }
+
+  const unauthenticatedInit = async (): Promise<{ status: number; wwwAuthenticate: string | null }> => {
+    try {
+      const res = await fetchFn(serverUrl.toString(), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+        body: mcpInitializeBody(),
+      });
+      const header =
+        typeof res.headers?.get === 'function' ? res.headers.get('www-authenticate') : null;
+      return { status: res.status, wwwAuthenticate: header };
+    } catch (err) {
+      // Unreachable server: not an OAuth verdict — say so plainly.
+      return {
+        status: -1,
+        wwwAuthenticate: null,
+      };
+    }
+  };
+
+  const { status, wwwAuthenticate } = await unauthenticatedInit();
+  if (status === -1) {
+    return { requiresOAuth: false, detail: 'Server unreachable — cannot determine auth requirements' };
+  }
+  if (status >= 200 && status < 300) {
+    return { requiresOAuth: false, detail: `Unauthenticated initialize succeeded (HTTP ${status})` };
+  }
+
+  if (status === 401 || status === 403) {
+    // 1) Advertised metadata URI wins.
+    const advertised = parseWwwAuthenticateResourceMetadata(wwwAuthenticate);
+    if (advertised) {
+      try {
+        const prm = await fetchProtectedResourceMetadata(advertised, fetchFn);
+        return {
+          requiresOAuth: true,
+          resourceMetadataUrl: advertised,
+          authorizationServers: prm.authorizationServers,
+          scopesSupported: prm.scopesSupported,
+          detail: `Server refused unauthenticated initialize (HTTP ${status}) and advertises protected-resource metadata`,
+        };
+      } catch (err) {
+        return {
+          requiresOAuth: true,
+          detail:
+            `Server refused unauthenticated initialize (HTTP ${status}) and advertises ` +
+            `protected-resource metadata, but it could not be fetched: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+    }
+    // 2) Fall back to well-known discovery.
+    const prm = await discoverProtectedResourceMetadata(mcpServerUrl, fetchFn);
+    if (prm) {
+      return {
+        requiresOAuth: true,
+        authorizationServers: prm.authorizationServers,
+        scopesSupported: prm.scopesSupported,
+        detail: `Server refused unauthenticated initialize (HTTP ${status}); protected-resource metadata names an authorization server`,
+      };
+    }
+    return {
+      requiresOAuth: true,
+      detail: `Server refused unauthenticated initialize (HTTP ${status}) without OAuth metadata — likely needs a static bearer token`,
+    };
+  }
+
+  // Non-401 errors: check metadata anyway (servers that only refuse at
+  // tool-call time, per Codync behavior).
+  const prm = await discoverProtectedResourceMetadata(mcpServerUrl, fetchFn);
+  if (prm) {
+    return {
+      requiresOAuth: true,
+      authorizationServers: prm.authorizationServers,
+      scopesSupported: prm.scopesSupported,
+      detail: `Protected-resource metadata names an authorization server (initialize returned HTTP ${status})`,
+    };
+  }
+  return { requiresOAuth: false, detail: `Initialize returned HTTP ${status} with no OAuth metadata` };
+}
+
+/**
+ * Full discovery chain for an MCP server: protected-resource metadata →
+ * first authorization server → RFC 8414 authorization-server metadata.
+ * Falls back to direct RFC 8414 discovery when the server serves no
+ * protected-resource metadata.
+ */
+export async function discoverAuthServerForMcp(
+  mcpServerUrl: string,
+  fetchFn: FetchFn = fetch,
+): Promise<AuthorizationServerMetadata> {
+  const prm = await discoverProtectedResourceMetadata(mcpServerUrl, fetchFn);
+  if (prm && prm.authorizationServers.length > 0) {
+    const issuer = prm.authorizationServers[0];
+    // RFC 8414 well-known for the issuer.
+    const issuerUrl = new URL(issuer);
+    const wellKnown = `${issuerUrl.origin}/.well-known/oauth-authorization-server${issuerUrl.pathname}`;
+    try {
+      const res = await fetchFn(wellKnown, { headers: { accept: 'application/json' } });
+      if (res.ok) {
+        return parseAuthorizationServerMetadata(await res.json());
+      }
+    } catch {
+      // fall through to direct discovery
+    }
+  }
+  return discoverAuthorizationServerMetadata(mcpServerUrl, fetchFn);
+}
+
 /**
  * Discover the authorization server for an MCP server URL (RFC 8414 §3).
  * Tries the path-scoped well-known URI first, then the origin-scoped one.
@@ -389,7 +656,8 @@ export class McpOAuthClient {
   /** Discover (and cache) the authorization server metadata. */
   async metadata(): Promise<AuthorizationServerMetadata> {
     if (!this.metadataCache) {
-      this.metadataCache = await discoverAuthorizationServerMetadata(this.opts.serverUrl, this.fetchFn);
+      // Full MCP chain: protected-resource metadata → auth server → RFC 8414.
+      this.metadataCache = await discoverAuthServerForMcp(this.opts.serverUrl, this.fetchFn);
     }
     return this.metadataCache;
   }
@@ -456,6 +724,48 @@ export class McpOAuthClient {
       scope: args.scope,
       resource: this.opts.serverUrl,
     });
+  }
+
+  /**
+   * Authenticated fetch against the MCP server: attaches the bearer token,
+   * and on a 401 refreshes once and retries (Codync "refreshed on use (or
+   * after a 401)" behavior). Throws McpOAuthRequiredError when no usable
+   * token exists.
+   */
+  async authenticatedFetch(url: string, init?: RequestInit): Promise<Response> {
+    const doFetch = async (token: string): Promise<Response> => {
+      const headers = new Headers(init?.headers);
+      headers.set('authorization', `Bearer ${token}`);
+      return this.fetchFn(url, { ...init, headers });
+    };
+    let token = await this.getValidAccessToken();
+    let res = await doFetch(token);
+    if (res.status !== 401) return res;
+    // Possibly revoked/rotated since the proactive check — refresh once.
+    const stored = this.opts.store.getTokens(this.opts.serverId);
+    if (!stored?.refreshToken) {
+      this.opts.store.removeTokens(this.opts.serverId);
+      throw new McpOAuthRequiredError(this.opts.serverId, this.startUrl);
+    }
+    const metadata = await this.metadata();
+    const client = await this.opts.resolveClient(this.opts.serverId, metadata);
+    try {
+      const refreshed = await refreshAccessToken(
+        {
+          tokenEndpoint: metadata.token_endpoint,
+          refreshToken: stored.refreshToken,
+          client,
+          resource: this.opts.serverUrl,
+        },
+        this.fetchFn,
+      );
+      this.opts.store.saveTokens(this.opts.serverId, refreshed);
+      token = refreshed.accessToken;
+    } catch {
+      this.opts.store.removeTokens(this.opts.serverId);
+      throw new McpOAuthRequiredError(this.opts.serverId, this.startUrl);
+    }
+    return doFetch(token);
   }
 
   /**

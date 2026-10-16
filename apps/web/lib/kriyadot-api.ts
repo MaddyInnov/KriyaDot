@@ -287,6 +287,62 @@ export function patchMcpToolScopes(
   });
 }
 
+// ---- MCP OAuth (connector sign-in) --------------------------------------------------
+
+export interface McpOAuthServerStatus {
+  server: string;
+  url?: string;
+  oauth: boolean;
+  connected: boolean;
+  expiresAt?: number;
+  hasRefreshToken: boolean;
+}
+
+export interface McpOAuthProbe {
+  ok: boolean;
+  server?: string;
+  url: string;
+  requiresOAuth: boolean;
+  signedOut: boolean;
+  connected: boolean;
+  authorizationServers?: string[];
+  scopesSupported?: string[];
+  detail: string;
+}
+
+export const getMcpOAuthStatus = (): Promise<{ ok: boolean; servers: McpOAuthServerStatus[] }> =>
+  kriyadotJson('/api/mcp/oauth/status');
+
+export const startMcpOAuth = (
+  server: string,
+  opts?: { scope?: string; display?: string },
+): Promise<{ ok: boolean; server: string; authUrl: string; state: string }> => {
+  const q = new URLSearchParams({ server });
+  if (opts?.scope) q.set('scope', opts.scope);
+  if (opts?.display) q.set('display', opts.display);
+  return kriyadotJson(`/api/mcp/oauth/start?${q.toString()}`);
+};
+
+export const probeMcpOAuth = (server: string): Promise<McpOAuthProbe> =>
+  kriyadotJson('/api/mcp/oauth/probe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ server }),
+  });
+
+export const completeMcpOAuthManual = (
+  code: string,
+  state: string,
+): Promise<{ ok: boolean; server: string; expiresAt: number }> =>
+  kriyadotJson('/api/mcp/oauth/manual', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code, state }),
+  });
+
+export const revokeMcpOAuth = (server: string): Promise<{ ok: boolean; server: string }> =>
+  kriyadotJson(`/api/mcp/oauth/${encodeURIComponent(server)}`, { method: 'DELETE' });
+
 // ---- Processing rules (firing log UI hook, read-only for now) ------------------------
 
 export interface RuleFiring {

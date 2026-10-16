@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { PetPicker } from '../../components/pet/PetPicker';
 import { AccentPicker } from '../../components/accent/AccentPicker';
 import { McpScopesPanel } from '../../components/panels/mcp-scopes-panel';
+import { McpOAuthPanel } from '../../components/panels/mcp-oauth-panel';
 import { DetectedAgentsPanel } from '../../components/panels/detected-agents-panel';
 import { useUxMode } from '../../lib/ux-mode';
 
@@ -139,6 +140,17 @@ export default function PreferencesPage() {
             turning off <em>Egress</em> blocks its network access. Changes apply immediately.
           </p>
           <McpScopesPanel />
+        </section>
+      )}
+
+      {mode === 'pro' && (
+        <section className="card">
+          <h2>MCP connector sign-in</h2>
+          <p className="muted small">
+            OAuth-protected MCP servers need a one-time sign-in before bots can use them.
+            Tokens stay encrypted on this computer and refresh automatically.
+          </p>
+          <McpOAuthPanel />
         </section>
       )}
 
