@@ -31,6 +31,8 @@ import path from 'node:path';
 import {
   TeamStore,
   resolvePersona,
+  validateApprovalMode,
+  type ApprovalMode,
   type BotConfig,
   type BotPolicy,
   type BotPolicyRule,
@@ -206,6 +208,11 @@ function validateBotEntry(raw: unknown, index: number): { bot?: BotConfig; error
     } else {
       bot.notifications = raw.notifications as BotConfig['notifications'];
     }
+  }
+  if (raw.approvalMode !== undefined) {
+    const v = validateApprovalMode(raw.approvalMode, where);
+    if (v.errors.length > 0) errors.push(...v.errors);
+    else if (v.mode) bot.approvalMode = v.mode as ApprovalMode;
   }
   if (raw.voice !== undefined) {
     const vErr = validateVoiceSettings(raw.voice, `${where}.voice`);

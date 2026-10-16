@@ -1798,6 +1798,25 @@ function ChatPageInner() {
               />
             )}
         <div className="chat-messages" ref={messagesRef}>
+          {selectedBot?.approvalMode === 'bypass' && (
+            <div
+              role="alert"
+              style={{
+                margin: '0 0 12px',
+                padding: '10px 14px',
+                borderRadius: 12,
+                border: '2px solid var(--danger, #d33)',
+                background: 'color-mix(in srgb, var(--danger, #d33) 10%, transparent)',
+                fontSize: 13,
+              }}
+            >
+              <strong style={{ color: 'var(--danger, #d33)' }}>⚠️ Bypass mode active</strong>
+              <span style={{ marginLeft: 8 }}>
+                {selectedBot.name} will execute actions without asking for approval. Change it in
+                Bots → {selectedBot.name} → Policy.
+              </span>
+            </div>
+          )}
           {blocks.length === 0 && (
             <div className="empty-state">
               <LazyClayScene className="empty-3d" />
@@ -2022,8 +2041,19 @@ function ChatPageInner() {
               case 'approval':
                 return (
                   <div key={b.id} className="approval-card">
-                    <h4>Approval required — <span className="mono">{b.call.name}</span></h4>
-                    <pre>{prettyJson(b.call.args)}</pre>
+                    {b.call.name === 'approve_plan' ? (
+                      <>
+                        <h4>📋 Plan approval — review before the agent acts</h4>
+                        <div style={{ whiteSpace: 'pre-wrap', margin: '8px 0', fontSize: 14 }}>
+                          {String((b.call.args as Record<string, unknown>).plan ?? '')}
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <h4>Approval required — <span className="mono">{b.call.name}</span></h4>
+                        <pre>{prettyJson(b.call.args)}</pre>
+                      </>
+                    )}
                     {b.status === 'pending' ? (
                       <div className="approval-actions">
                         <button className="btn btn-primary btn-sm" disabled={b.remembering} onClick={() => decide(b.id, b.approvalId, 'approved')}>
@@ -2032,14 +2062,16 @@ function ChatPageInner() {
                         <button className="btn btn-danger btn-sm" disabled={b.remembering} onClick={() => decide(b.id, b.approvalId, 'denied')}>
                           Deny
                         </button>
-                        <button
-                          className="btn btn-sm"
-                          disabled={b.remembering}
-                          onClick={() => void alwaysAllow(b.id, b.approvalId, b.call.name)}
-                          title={`Never ask for ${b.call.name} again on this bot — saves a persistent allow rule, then approves this call.`}
-                        >
-                          {b.remembering ? 'Saving…' : `Always allow ${b.call.name}`}
-                        </button>
+                        {b.call.name !== 'approve_plan' && (
+                          <button
+                            className="btn btn-sm"
+                            disabled={b.remembering}
+                            onClick={() => void alwaysAllow(b.id, b.approvalId, b.call.name)}
+                            title={`Never ask for ${b.call.name} again on this bot — saves a persistent allow rule, then approves this call.`}
+                          >
+                            {b.remembering ? 'Saving…' : `Always allow ${b.call.name}`}
+                          </button>
+                        )}
                       </div>
                     ) : (
                       <div className="small muted mt">

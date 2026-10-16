@@ -8,6 +8,7 @@ import { useUxMode } from '../../lib/ux-mode';
 import { I18nProvider, LanguageSwitcher, useI18n } from '../../lib/i18n';
 import ComputerPanel from '../../components/panels/computer-panel';
 import VoiceSettingsPanel from '../../components/panels/voice-settings-panel';
+import { ApprovalModeSelector } from '../../components/panels/approval-mode-selector';
 import { MemoryPanel } from '../../components/panels/memory-panel';
 import { RoutinesPanel } from '../../components/panels/routines-panel';
 
@@ -792,6 +793,10 @@ function BotsPageInner() {
     setBots((prev) => prev.map((b) => (b.id === botId ? { ...b, workspace: workspace ?? undefined } : b)));
   };
 
+  const onApprovalModeSaved = (botId: string, approvalMode: 'plan' | 'auto' | 'bypass') => {
+    setBots((prev) => prev.map((b) => (b.id === botId ? { ...b, approvalMode } : b)));
+  };
+
   const onModelSaved = (botId: string, model: string, modelOptions?: ModelOptions) => {
     setBots((prev) => prev.map((b) => (b.id === botId ? { ...b, model, modelOptions } : b)));
   };
@@ -922,6 +927,11 @@ function BotsPageInner() {
                 <>
                   <PersonaPicker key={`persona-${selectedBot.id}`} bot={selectedBot} onSaved={onPersonaSaved} />
                   <WorkspacePicker key={`workspace-${selectedBot.id}`} bot={selectedBot} onSaved={onWorkspaceSaved} />
+                  <ApprovalModeSelector
+                    key={`approval-mode-${selectedBot.id}`}
+                    bot={selectedBot}
+                    onSaved={onApprovalModeSaved}
+                  />
                   <RulesEditor key={selectedBot.id} bot={selectedBot} onSaved={onSaved} />
                   <PolicySimulator key={`sim-${selectedBot.id}`} bot={selectedBot} />
                 </>

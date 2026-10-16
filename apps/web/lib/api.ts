@@ -48,6 +48,8 @@ export interface BotConfig {
   workspace?: string;
   /** Per-bot voice-call settings (STT/TTS providers, TTS voice, VAD). */
   voice?: VoiceSettings;
+  /** Approval mode (Atomic parity): 'plan' | 'auto' | 'bypass'. Default 'auto'. */
+  approvalMode?: 'plan' | 'auto' | 'bypass';
 }
 
 export interface VoiceSettings {
@@ -620,6 +622,22 @@ export const setBotVoice = (
     method: 'PUT',
     body: JSON.stringify({ voice }),
   });
+
+export type ApprovalMode = 'plan' | 'auto' | 'bypass';
+
+export const setBotApprovalMode = (
+  botId: string,
+  approvalMode: ApprovalMode,
+): Promise<{ ok: boolean; botId: string; approvalMode: ApprovalMode }> =>
+  apiJson(`/api/bots/${encodeURIComponent(botId)}/approval-mode`, {
+    method: 'PUT',
+    body: JSON.stringify({ approvalMode }),
+  });
+
+export const getBotApprovalMode = (
+  botId: string,
+): Promise<{ ok: boolean; botId: string; approvalMode: ApprovalMode }> =>
+  apiJson(`/api/bots/${encodeURIComponent(botId)}/approval-mode`);
 export const getProviders = (): Promise<ProviderInfo[]> => apiJson('/api/providers');
 export const getModels = (freeOnly = false): Promise<ModelPriceInfo[]> =>
   apiJson(`/api/models${freeOnly ? '?freeOnly=1' : ''}`);

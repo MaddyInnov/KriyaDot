@@ -36,6 +36,14 @@ import { createSystem1Router } from './system1.js';
 import type { TaskType } from './routing.js';
 import type { LearnedRoutingRule } from './routing-learn.js';
 import { resolvePersona } from './personas.js';
+import type { ApprovalMode } from './approval-modes.js';
+import { PLAN_APPROVAL_TOOL, buildPlanPrompt } from './approval-modes.js';
+import {
+  ProgressGuard,
+  classifyTurnError,
+  noProgressReport,
+  type TurnFailureKind,
+} from './progress-guard.js';
 
 export interface AgentRuntimeOptions {
   dbPath: string;
@@ -134,6 +142,12 @@ export interface RunTurnOptions {
   onEvent: (e: StreamEvent) => void | Promise<void>;
   maxIterations?: number;
   approvalTimeoutMs?: number;
+  /**
+   * No-progress guard threshold (Atomic parity): how many consecutive tool
+   * calls without new information trip the guard and stop the turn.
+   * Default 5. Set 0 to disable.
+   */
+  noProgressThreshold?: number;
   /**
    * AbortSignal for mid-turn interruption (Claude Code-style steering).
    * When aborted, the turn stops at the next checkpoint, pending approvals
@@ -556,6 +570,15 @@ export class AgentRuntime {
     // (fail-closed) instead of leaving stale cards in the inbox.
     const turnApprovalIds: string[] = [];
 
+    // Approval mode (Atomic parity): 'plan' gates the turn on a human-
+    // approved plan; 'bypass' auto-grants every approval (audited loudly).
+    const approvalMode: ApprovalMode = opts.bot.approvalMode ?? 'auto';
+
+    // No-progress guard (Atomic parity): trips when the agent makes too
+    // many consecutive tool calls without producing new information.
+    const noProgressThreshold = opts.noProgressThreshold ?? 5;
+    const progressGuard = noProgressThreshold > 0 ? new ProgressGuard(noProgressThreshold) : null;
+
     // Runtime telemetry ("eyes for your AI"): one run record per turn with
     // per-step latency, error/retry counts, and token cost. Metadata-tier
     // fields only; the collector's ingestion guard normalizes names and
@@ -568,7 +591,33 @@ export class AgentRuntime {
       telRunId = null;
     }
 
+    // Record a classified turn failure in the audit trail (failure
+    // taxonomy — visible in the audit/activity UI).
+    const recordTurnFailure = (kind: TurnFailureKind, message: string, detail?: Record<string, unknown>) => {
+      this.audit({
+        type: 'turn.failed',
+        sessionId,
+        botId: ctx.botId,
+        detail: { kind, message, ...(detail ?? {}) },
+      });
+    };
+
     try {
+      // Plan-mode gate: ask the model for a step-by-step plan and wait for
+      // human approval BEFORE any tool may run. Denial (or timeout) ends
+      // the turn fail-closed — nothing has executed yet.
+      if (approvalMode === 'plan') {
+        const planOk = await this.runPlanGate(
+          provider, model, opts, ctx, messages, emit, turnApprovalIds,
+          approvalTimeoutMs, recordTurnFailure,
+        );
+        totalUsage = addUsage(totalUsage, planOk.usage);
+        if (!planOk.approved) {
+          this.finishTelemetryRun(telRunId, 'interrupted', totalUsage, providerId, model, telIterations);
+          return totalUsage;
+        }
+        messages.push(planOk.planMessage);
+      }
       for (let iteration = 0; iteration < maxIterations; iteration++) {
         telIterations += 1;
         opts.signal?.throwIfAborted();
@@ -612,6 +661,7 @@ export class AgentRuntime {
           if (cost > opts.maxBudgetUsd) {
             const msg = `Budget cap reached: $${cost.toFixed(4)} spent (cap $${opts.maxBudgetUsd.toFixed(4)}). Turn stopped.`;
             this.audit({ type: 'turn.budget_cap', sessionId, botId: ctx.botId, detail: { cost, cap: opts.maxBudgetUsd } });
+            recordTurnFailure('budget_exceeded', msg, { cost, cap: opts.maxBudgetUsd });
             await emit({ type: 'error', message: msg });
             this.finishTelemetryRun(telRunId, 'interrupted', totalUsage, providerId, model, telIterations);
             return totalUsage;
@@ -747,6 +797,32 @@ export class AgentRuntime {
 
           let approvalId: string | undefined;
           if (decision === 'require-approval') {
+            // Bypass mode (DANGEROUS, explicit per-bot opt-in): auto-grant
+            // every approval, but audit each one loudly so the trail shows
+            // exactly what bypass allowed. The catastrophic-command
+            // denylist still applies at the tool floor — bypass can never
+            // approve what the tools refuse.
+            if (approvalMode === 'bypass') {
+              this.audit({
+                type: 'tool.approval_bypassed',
+                sessionId,
+                botId: ctx.botId,
+                call,
+                detail: {
+                  mode: 'bypass',
+                  warning: 'Approval auto-granted: bot is in bypass mode.',
+                },
+                provenance: 'bypass',
+              });
+              await emit({
+                type: 'notice',
+                kind: 'approval-bypass',
+                message: `Bypass mode: auto-approved ${call.name}.`,
+              });
+              await emit({ type: 'tool_call', call, approvalRequired: false });
+              toExecute.push({ def, call });
+              continue;
+            }
             // Circuit breaker: if this session tripped (too many denials),
             // force manual approvals even when autoApprove was requested.
             const circuitTripped = this.trippedSessions.has(sessionId);
@@ -803,6 +879,7 @@ export class AgentRuntime {
                 if (verdict !== 'approved') {
                   const result = { denied: true, reason: 'approval denied or timed out' };
                   await emit({ type: 'tool_result', call, result, denied: true });
+                  recordTurnFailure('approval_denied', `Approval denied for tool "${call.name}".`, { approvalId });
                   const toolMsg: ChatMessage = {
                     role: 'tool',
                     content: 'Tool call was not approved.',
@@ -843,6 +920,7 @@ export class AgentRuntime {
               if (verdict !== 'approved') {
                 const result = { denied: true, reason: 'approval denied or timed out' };
                 await emit({ type: 'tool_result', call, result, denied: true });
+                recordTurnFailure('approval_denied', `Approval denied for tool "${call.name}".`, { approvalId });
                 const toolMsg: ChatMessage = {
                   role: 'tool',
                   content: 'Tool call was not approved.',
@@ -895,6 +973,22 @@ export class AgentRuntime {
             result = { error: settled.reason instanceof Error ? settled.reason.message : String(settled.reason) };
           }
           await emit({ type: 'tool_result', call, result });
+          // No-progress guard: feed each executed call; trip → stop the
+          // turn with a clear report instead of looping on tokens.
+          if (progressGuard) {
+            const tripped = progressGuard.observe({
+              name: call.name,
+              args: call.args,
+              result,
+            });
+            if (tripped) {
+              const failure = noProgressReport(progressGuard);
+              recordTurnFailure(failure.kind, failure.message, failure.detail);
+              await emit({ type: 'error', message: failure.message });
+              this.finishTelemetryRun(telRunId, 'error', totalUsage, providerId, model, telIterations);
+              return totalUsage;
+            }
+          }
           // Live code session view: after a SUCCESSFUL write_file, emit the
           // before/after so the UI can animate the edit streaming in.
           // Approval gates are untouched — this fires only after the
@@ -937,6 +1031,7 @@ export class AgentRuntime {
       }
 
       await emit({ type: 'error', message: `Max iterations (${maxIterations}) reached without a final answer` });
+      recordTurnFailure('max_iterations', `Max iterations (${maxIterations}) reached without a final answer.`, { maxIterations });
       this.finishTelemetryRun(telRunId, 'error', totalUsage, providerId, model, telIterations);
       return totalUsage;
     } catch (err) {
@@ -954,6 +1049,7 @@ export class AgentRuntime {
         return totalUsage;
       }
       const message = err instanceof Error ? err.message : String(err);
+      recordTurnFailure(classifyTurnError(err, { aborted: opts.signal?.aborted }), message);
       await emit({ type: 'error', message });
       this.finishTelemetryRun(telRunId, 'error', totalUsage, providerId, model, telIterations);
       throw err;
@@ -1030,8 +1126,94 @@ export class AgentRuntime {
    * awaitDecision that also resolves when `signal` aborts (rejects with the
    * abort reason so the turn's catch block treats it as an interruption).
    */
-  private awaitDecisionAbortable(
-    approvalId: string,
+  /**
+   * Plan-approval gate (approvalMode 'plan'): ask the model for a
+   * step-by-step plan, present it as an approval card, and wait for the
+   * human verdict before any tool may run. Returns the approved plan as a
+   * message to inject into the turn context, plus the planning usage.
+   */
+  private async runPlanGate(
+    provider: LLMProvider,
+    model: string,
+    opts: RunTurnOptions,
+    ctx: ToolContext,
+    messages: RichMessage[],
+    emit: (e: StreamEvent) => Promise<void>,
+    turnApprovalIds: string[],
+    approvalTimeoutMs: number,
+    recordTurnFailure: (kind: TurnFailureKind, message: string, detail?: Record<string, unknown>) => void,
+  ): Promise<{ approved: boolean; usage: TokenUsage; planMessage: RichMessage }> {
+    const emptyPlan: RichMessage = { role: 'assistant', content: '' };
+    let plan = '';
+    let usage = emptyUsage();
+    try {
+      const planTurn = await provider.chat(
+        [
+          { role: 'system', content: 'You are a planning assistant. Output only the numbered plan, no preamble.' },
+          { role: 'user', content: buildPlanPrompt(opts.message) },
+        ],
+        [],
+        { model, signal: opts.signal },
+      );
+      plan = planTurn.content.trim();
+      usage = addUsage(usage, planTurn.usage);
+    } catch (err) {
+      const message = `Plan generation failed: ${err instanceof Error ? err.message : String(err)}`;
+      recordTurnFailure('model_error', message);
+      await emit({ type: 'error', message });
+      return { approved: false, usage, planMessage: emptyPlan };
+    }
+    if (!plan) {
+      const message = 'The model did not produce a plan. Turn stopped before any action.';
+      recordTurnFailure('model_error', message);
+      await emit({ type: 'error', message });
+      return { approved: false, usage, planMessage: emptyPlan };
+    }
+
+    const approvalId = newApprovalId();
+    turnApprovalIds.push(approvalId);
+    const planCall: ToolCall = {
+      id: `plan_${approvalId}`,
+      name: PLAN_APPROVAL_TOOL,
+      args: { plan, task: opts.message },
+    };
+    this.audit({
+      type: 'plan.approval_requested',
+      sessionId: ctx.sessionId,
+      botId: ctx.botId,
+      call: planCall,
+      detail: { approvalId },
+    });
+    await emit({ type: 'approval_required', approvalId, call: planCall });
+    let verdict: 'approved' | 'denied';
+    try {
+      verdict = await this.awaitDecisionAbortable(approvalId, approvalTimeoutMs, opts.signal);
+    } catch {
+      verdict = 'denied';
+    }
+    this.audit({
+      type: 'plan.approval_decided',
+      sessionId: ctx.sessionId,
+      botId: ctx.botId,
+      call: planCall,
+      detail: { approvalId, verdict },
+      provenance: 'human',
+    });
+    if (verdict !== 'approved') {
+      const message = 'Plan was not approved. No actions were taken.';
+      recordTurnFailure('approval_denied', message, { approvalId });
+      await emit({ type: 'error', message });
+      return { approved: false, usage, planMessage: emptyPlan };
+    }
+    const planMessage: RichMessage = {
+      role: 'assistant',
+      content: `Approved plan (the user approved this plan — follow it):\n${plan}`,
+    };
+    this.store.appendMessage(ctx.sessionId, planMessage);
+    return { approved: true, usage, planMessage };
+  }
+
+  private awaitDecisionAbortable(    approvalId: string,
     timeoutMs: number,
     signal?: AbortSignal,
   ): Promise<'approved' | 'denied'> {

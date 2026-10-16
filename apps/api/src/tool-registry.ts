@@ -18,6 +18,7 @@ import {
   createGitTools,
   createMemoryTools,
   createSkillTools,
+  createVerifyTools,
   makeWorkspaceResolver,
 } from '@mvp/agent-runtime';
 import type { BotConfig, SchemaDriftApprovalBroker, ToolDefinition } from '@mvp/agent-runtime';
@@ -85,6 +86,13 @@ export async function buildToolRegistry(opts: {
   // PR integration: git tools (status/diff auto-allowed; commit/branch/push
   // require approval via the default deny-by-default policy).
   for (const tool of createGitTools({ workspaceDir: resolveWorkspace })) {
+    registry.set(tool.name, tool);
+  }
+  // Atomic parity: verify-before-commit tools. verify_changes runs the
+  // project's own test/lint/build checks; diff_review summarizes the
+  // session's changes. The host (index.ts) may add a session tracker later
+  // for non-git workspaces — git-based diff works without one.
+  for (const tool of createVerifyTools({ workspaceDir: resolveWorkspace })) {
     registry.set(tool.name, tool);
   }
   for (const tool of createMemoryTools({ store: new BotMemoryStore(opts.dataDir) })) {

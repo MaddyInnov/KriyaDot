@@ -235,6 +235,10 @@ async function boot(): Promise<void> {
   // overlay from <dataDir>/bot-voice.json.
   const { applyBotVoice } = await import('./bot-voice.js');
   applyBotVoice(seed.bots, config.dataDir);
+  // Per-bot approval modes (Atomic parity: plan/auto/bypass): overlay from
+  // <dataDir>/bot-approval-modes.json.
+  const { applyBotApprovalModes } = await import('./bot-approval-modes.js');
+  applyBotApprovalModes(seed.bots, config.dataDir);
   // Per-bot memory fabric settings (Atomic parity: reflection + live
   // distiller flags): overlay from <dataDir>/bot-memory-settings.json.
   const { applyBotMemorySettings, wireMemoryDistillers } = await import('./memory-fabric.js');

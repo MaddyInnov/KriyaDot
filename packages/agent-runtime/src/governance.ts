@@ -37,6 +37,7 @@ export type ApprovalProvenance =
   | 'reviewer'
   | 'standing-rule'
   | 'learned'
+  | 'bypass'
   | 'hard-floor-escalated';
 
 export interface AuditEntry {

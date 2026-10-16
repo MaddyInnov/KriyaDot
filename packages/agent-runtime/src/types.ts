@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import type { ApprovalMode } from './approval-modes.js';
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
@@ -205,6 +207,16 @@ export interface BotConfig {
   notifications?: 'all' | 'approvals' | 'none';
   /** Per-bot voice-call settings (STT/TTS providers, TTS voice, VAD). */
   voice?: VoiceSettings;
+  /**
+   * Approval mode (Atomic parity):
+   * - 'plan' (default 'auto'): the agent presents a step-by-step plan and
+   *   waits for human approval before acting.
+   * - 'auto': low-risk actions proceed under policy; risky ones raise
+   *   approval cards.
+   * - 'bypass': DANGEROUS — all approvals auto-granted. Explicit per-bot
+   *   opt-in only; the catastrophic-command denylist still applies.
+   */
+  approvalMode?: ApprovalMode;
 }
 
 export interface LLMProvider {

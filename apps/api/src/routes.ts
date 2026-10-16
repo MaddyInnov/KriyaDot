@@ -77,6 +77,7 @@ import type { CompanionHub, CompanionStore } from './companion.js';
 import { createRemoteScreenRouter } from './remote-screen-routes.js';
 import { createVoiceCallRouter } from './voice-call-routes.js';
 import { saveBotVoice } from './bot-voice.js';
+import { saveBotApprovalModeForBot } from './bot-approval-modes.js';
 import { buildBotChatFn, saveBotMemorySettings, wireMemoryDistillers } from './memory-fabric.js';
 import { createMemoryFabricRouter } from './memory-fabric-routes.js';
 import { TieredMemoryStore } from '@mvp/agent-runtime';
@@ -1130,6 +1131,33 @@ export function createRouter(deps: RouteDeps): express.Router {
       const status = message.startsWith('Unknown bot') ? 404 : 400;
       res.status(status).json(errorBody('Failed to save voice settings', message));
     }
+  });
+
+  // ---- Per-bot approval modes (Atomic parity: plan/auto/bypass) ---------
+  // PUT body: { approvalMode?: 'plan'|'auto'|'bypass' }.
+  // Persisted to <dataDir>/bot-approval-modes.json and applied to the
+  // in-memory bot immediately; also applied at boot (see
+  // bot-approval-modes.ts). 'bypass' is dangerous: the UI must confirm
+  // explicitly before sending it.
+  router.put('/bots/:id/approval-mode', (req, res) => {
+    const body = (req.body ?? {}) as { approvalMode?: unknown };
+    try {
+      const mode = saveBotApprovalModeForBot(config.dataDir, bots, req.params.id, body.approvalMode);
+      res.json({ ok: true, botId: req.params.id, approvalMode: mode });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const status = message.startsWith('Unknown bot') ? 404 : 400;
+      res.status(status).json(errorBody('Failed to save approval mode', message));
+    }
+  });
+
+  router.get('/bots/:id/approval-mode', (req, res) => {
+    const bot = bots.find((b) => b.id === req.params.id);
+    if (!bot) {
+      res.status(404).json(errorBody(`Unknown bot "${req.params.id}"`));
+      return;
+    }
+    res.json({ ok: true, botId: bot.id, approvalMode: bot.approvalMode ?? 'auto' });
   });
 
   // ---- Per-bot memory fabric settings (Atomic parity) ----------------------
