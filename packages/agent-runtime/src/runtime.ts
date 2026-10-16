@@ -37,6 +37,7 @@ import type { TaskType } from './routing.js';
 import type { LearnedRoutingRule } from './routing-learn.js';
 import { resolvePersona } from './personas.js';
 import type { ApprovalMode } from './approval-modes.js';
+import type { PeerApprovalGate } from './peer-approval.js';
 import { PLAN_APPROVAL_TOOL, buildPlanPrompt } from './approval-modes.js';
 import {
   ProgressGuard,
@@ -90,6 +91,18 @@ export interface AgentRuntimeOptions {
    * Optional; unset → no hook traffic (previous behavior).
    */
   hooks?: HookBus;
+  /**
+   * Peer-approval gate (OpenMausBot parity, peer-approval.ts). Consulted
+   * BEFORE governance on bot→bot tool calls (`ask_bot`, `message_bot`,
+   * `delegate` targeting another bot): raises a per-action Allow / Deny /
+   * Always-allow card with 15-min expiry. When the gate allows, the call is
+   * marked peer-covered and governance does NOT raise a second (generic)
+   * approval card for the same call — no double-prompting. In team
+   * coordinator runs the per-turn `delegateGate` (team policy) takes
+   * precedence for `delegate` calls and the peer gate is skipped there.
+   * Unset → no peer gating (previous behavior).
+   */
+  peerApprovalGate?: PeerApprovalGate;
 }
 
 /**
@@ -312,6 +325,11 @@ export class AgentRuntime {
   private readonly onBeforeFileMutate?: AgentRuntimeOptions['onBeforeFileMutate'];
   private readonly telemetry?: TelemetryCollector;
   private readonly hooks?: HookBus;
+  /**
+   * Peer-approval gate for bot→bot calls (OpenMausBot parity). Set from
+   * AgentRuntimeOptions.peerApprovalGate; consulted before governance.
+   */
+  private readonly peerApprovalGate?: PeerApprovalGate;
   /** Provider instances cached per providerId (see resolveProvider). */
   private readonly providerCache = new Map<string, LLMProvider>();
   /**
@@ -337,6 +355,7 @@ export class AgentRuntime {
     this.onBeforeFileMutate = opts.onBeforeFileMutate;
     this.telemetry = opts.telemetry;
     this.hooks = opts.hooks;
+    this.peerApprovalGate = opts.peerApprovalGate;
   }
 
   /** Direct access to the session store (host API layers, e.g. worktree binding). */
@@ -570,6 +589,11 @@ export class AgentRuntime {
     // (fail-closed) instead of leaving stale cards in the inbox.
     const turnApprovalIds: string[] = [];
 
+    // Calls covered by the peer-approval gate this turn (OpenMausBot
+    // parity): call id → how the gate allowed it. Governance skips its own
+    // approval card for these — the user already decided via the peer card.
+    const peerCoveredCalls = new Map<string, { via: string; cardId?: string }>();
+
     // Approval mode (Atomic parity): 'plan' gates the turn on a human-
     // approved plan; 'bypass' auto-grants every approval (audited loudly).
     const approvalMode: ApprovalMode = opts.bot.approvalMode ?? 'auto';
@@ -708,10 +732,15 @@ export class AgentRuntime {
           // bot→bot approval policy, consulted BEFORE governance. A deny
           // aborts the subtask with the gate's reason; allow continues
           // into the normal governance flow below.
-          if (call.name === 'delegate' && opts.delegateGate) {
+          //
+          // When the team gate handles a `delegate` call (team coordinator
+          // runs), it is the peer-approval mechanism for that call and the
+          // global peer-approval gate is skipped — no double-prompting.
+          const teamGateHandled = call.name === 'delegate' && opts.delegateGate;
+          if (teamGateHandled) {
             let gateVerdict: DelegateGateVerdict;
             try {
-              gateVerdict = await opts.delegateGate(call, ctx);
+              gateVerdict = await opts.delegateGate!(call, ctx);
             } catch (err) {
               gateVerdict = {
                 decision: 'deny',
@@ -737,6 +766,63 @@ export class AgentRuntime {
               this.store.appendMessage(sessionId, toolMsg);
               messages.push(toolMsg);
               continue;
+            }
+          }
+
+          // Peer-approval gate (OpenMausBot parity): per-action Allow / Deny
+          // / Always-allow cards for bot→bot calls (`ask_bot`, `message_bot`,
+          // `delegate` targeting another bot), consulted BEFORE governance.
+          // A deny aborts the call with the gate's reason. An allow marks
+          // the call peer-covered so governance does NOT raise a second
+          // (generic) approval card for the same call.
+          if (
+            !teamGateHandled &&
+            this.peerApprovalGate &&
+            (call.name === 'ask_bot' || call.name === 'message_bot' || call.name === 'delegate')
+          ) {
+            let peerVerdict;
+            try {
+              peerVerdict = await this.peerApprovalGate(call, ctx, { onEvent: emit, signal: opts.signal });
+            } catch (err) {
+              peerVerdict = {
+                decision: 'deny' as const,
+                reason: `peer-approval gate failed: ${err instanceof Error ? err.message : String(err)}`,
+              };
+            }
+            if (peerVerdict.decision === 'deny') {
+              const result = { denied: true, reason: peerVerdict.reason };
+              this.audit({
+                type: 'tool.peer_approval_denied',
+                sessionId,
+                botId: ctx.botId,
+                call,
+                detail: {
+                  reason: peerVerdict.reason,
+                  cardId: peerVerdict.cardId,
+                  expired: peerVerdict.expired ?? false,
+                },
+              });
+              recordTurnFailure(
+                peerVerdict.expired ? 'timeout' : 'approval_denied',
+                `Peer approval ${peerVerdict.expired ? 'expired' : 'denied'} for "${call.name}".`,
+                { cardId: peerVerdict.cardId },
+              );
+              await emit({ type: 'tool_result', call, result, denied: true });
+              const toolMsg: ChatMessage = {
+                role: 'tool',
+                content: `Peer request not approved: ${peerVerdict.reason}`,
+                toolCallId: call.id,
+                toolName: call.name,
+              };
+              this.store.appendMessage(sessionId, toolMsg);
+              messages.push(toolMsg);
+              continue;
+            }
+            if (peerVerdict.via !== 'not-peer' && peerVerdict.via !== 'self') {
+              peerCoveredCalls.set(call.id, {
+                via: peerVerdict.via,
+                cardId: peerVerdict.cardId,
+              });
             }
           }
 
@@ -800,6 +886,27 @@ export class AgentRuntime {
 
           let approvalId: string | undefined;
           if (decision === 'require-approval') {
+            // Peer-approval coverage (OpenMausBot parity): the user already
+            // decided this exact bot→bot call via a peer card (or a
+            // persisted always-allow grant). Execute without a second,
+            // generic approval card — no double-prompting.
+            const peerCover = peerCoveredCalls.get(call.id);
+            if (peerCover) {
+              this.audit({
+                type: 'tool.peer_approval_covered',
+                sessionId,
+                botId: ctx.botId,
+                call,
+                detail: {
+                  via: peerCover.via,
+                  cardId: peerCover.cardId,
+                  note: 'Generic tool approval skipped: covered by peer approval.',
+                },
+              });
+              await emit({ type: 'tool_call', call, approvalRequired: false });
+              toExecute.push({ def, call });
+              continue;
+            }
             // Bypass mode (DANGEROUS, explicit per-bot opt-in): auto-grant
             // every approval, but audit each one loudly so the trail shows
             // exactly what bypass allowed. The catastrophic-command

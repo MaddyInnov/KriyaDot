@@ -223,6 +223,23 @@ export type StreamEvent =
   | { type: 'interrupted'; reason: string }
   | { type: 'approval_required'; approvalId: string; call: ToolCall }
   /**
+   * Peer-approval card raised for a bot→bot call (OpenMausBot parity).
+   * Emitted when the card is raised (sender is "waiting on user") and when
+   * it is decided. Rendered as an inline peer card with Allow / Deny /
+   * Always-allow.
+   */
+  | {
+      type: 'peer_approval_required';
+      cardId: string;
+      senderBotId: string;
+      senderBotName: string;
+      targetBotId: string;
+      targetBotName: string;
+      actionType: 'ask' | 'message' | 'delegate';
+      preview: string;
+    }
+  | { type: 'peer_approval_decided'; cardId: string; decision: 'allowed' | 'denied' | 'expired' }
+  /**
    * Non-fatal informational notice from the server (e.g. "queued behind an
    * in-flight turn"). Rendered inline; never aborts the turn.
    */
@@ -759,6 +776,73 @@ export function allowTool(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ tool }),
+  });
+}
+
+// ---- Peer approvals (OpenMausBot parity) ------------------------------------
+
+export interface PeerApprovalCard {
+  id: string;
+  senderBotId: string;
+  senderBotName: string;
+  targetBotId: string;
+  targetBotName: string;
+  actionType: 'ask' | 'message' | 'delegate';
+  preview: string;
+  sessionId: string;
+  status: 'pending' | 'allowed' | 'denied' | 'expired' | 'dismissed';
+  createdAt: number;
+  expiresAt: number;
+  decidedAt?: number;
+  decidedBy?: string;
+}
+
+export interface PeerGrant {
+  senderBotId: string;
+  targetBotId: string;
+  actionType: 'ask' | 'message' | 'delegate';
+  grantedAt: number;
+  grantedBy?: string;
+}
+
+export type PeerDecision = 'allow' | 'deny' | 'always-allow';
+
+export async function getPeerApprovals(status?: string): Promise<PeerApprovalCard[]> {
+  const q = status ? `?status=${encodeURIComponent(status)}` : '';
+  const res = await apiJson<{ ok: boolean; cards: PeerApprovalCard[] }>(`/api/peer-approvals${q}`);
+  return res.cards;
+}
+
+export async function decidePeerApproval(
+  id: string,
+  decision: PeerDecision,
+  decidedBy?: string,
+): Promise<PeerApprovalCard> {
+  const res = await apiJson<{ ok: boolean; card: PeerApprovalCard }>(
+    `/api/peer-approvals/${encodeURIComponent(id)}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision, decidedBy }),
+    },
+  );
+  return res.card;
+}
+
+export async function getPeerGrants(): Promise<PeerGrant[]> {
+  const res = await apiJson<{ ok: boolean; grants: PeerGrant[] }>('/api/peer-grants');
+  return res.grants;
+}
+
+export function revokePeerGrant(
+  senderBotId: string,
+  targetBotId: string,
+  actionType: PeerGrant['actionType'],
+): Promise<{ ok: boolean; revoked: boolean }> {
+  return apiJson('/api/peer-grants', {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ senderBotId, targetBotId, actionType }),
   });
 }
 

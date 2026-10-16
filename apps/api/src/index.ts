@@ -53,6 +53,8 @@ import { FusionRunStore } from './fusion.js';
 import { createEvalRouter, shutdownEvalRuns } from './eval-routes.js';
 import { EvalRunStore, EvalSuiteStore } from './evals.js';
 import { createSummarizer } from './summarizer.js';
+import { createPeerApprovalRouter, createPeerApprovalBroker } from './peer-approval-routes.js';
+import { PeerApprovalStore, createPeerApprovalGate } from '@mvp/agent-runtime';
 import { createRouter } from './routes.js';
 import { renderKriyaDotMeter } from './kriyadot-meter.js';
 import { createWebhookRouter } from './webhooks.js';
@@ -454,10 +456,45 @@ async function boot(): Promise<void> {
   } catch (err) {
     console.error('[hooks] plugin load failed:', err instanceof Error ? err.message : err);
   }
+
+  // Peer approval cards (OpenMausBot parity): per-action Allow / Deny /
+  // Always-allow for bot→bot calls (ask_bot / message_bot / delegate),
+  // 15-minute expiry, persisted per-pair grants. The gate is consulted by
+  // the runtime BEFORE governance; a peer-allowed call does not raise a
+  // second generic tool card (no double-prompting).
+  const peerApprovalStore = new PeerApprovalStore(config.dataDir);
+  // "Needs you" push for peer cards is wired after the PushService exists
+  // below (best-effort; never blocks card minting).
+  let peerCardPush: ((card: { senderBotId: string; senderBotName: string; targetBotName: string; actionType: string; id: string }) => void) | undefined;
+  const peerApprovalBroker = createPeerApprovalBroker(peerApprovalStore, {
+    audit: (action, fields) => governance.audit(action, fields),
+    onCard: (card) => {
+      try {
+        peerCardPush?.(card);
+      } catch {
+        // Push must never break card minting.
+      }
+    },
+  });
+  const peerApprovalGate = createPeerApprovalGate({
+    store: peerApprovalStore,
+    broker: peerApprovalBroker,
+    getBotName: (id) => botsById.get(id)?.name ?? id,
+    isBypassMode: (botId) => botsById.get(botId)?.approvalMode === 'bypass',
+    audit: (type, detail) => {
+      try {
+        governance.audit(type, { actor: 'peer-approval-gate', detail });
+      } catch {
+        // Audit failures must never break the gate.
+      }
+    },
+  });
+
   const agentRuntime = new AgentRuntime({
     dbPath: `${config.dataDir}/agent.db`,
     skillsDir: path.join(seedDir, 'skills'),
     additionalSkillsDirs: [path.join(config.dataDir, 'skills')],
+    peerApprovalGate,
     governance: governanceAdapter,
     toolRegistry,
     hooks: hookBus,
@@ -894,6 +931,30 @@ async function boot(): Promise<void> {
   const voiceCallUpgrade = createVoiceCallUpgrade({ service: voiceCallService, loopbackToken });
   // Phase 2: workflow webhook triggers (shared-secret authenticated).
   app.use('/webhooks', createWebhookRouter({ runner: workflowRunner, triggerStore }));
+  // Encrypted push notifications (Codync parity): FCM fan-out to paired
+  // devices, sealed per device. No-op when FCM isn't configured.
+  // Built before the router so peer-approval "needs you" pushes
+  // (OpenMausBot parity) can hook in, best-effort.
+  const pushService = new (await import('./push.js')).PushService({
+    listPushDevices: () => companionStore.listPushDevices(),
+    getBotPref: (botId) => {
+      const bot = (seed.bots as Array<{ id: string; notifications?: 'all' | 'approvals' | 'none' }>).find(
+        (b) => b.id === botId,
+      );
+      return bot?.notifications ?? 'all';
+    },
+  });
+  peerCardPush = (card) => {
+    void pushService
+      .notifyApprovalNeeded(
+        card.senderBotId,
+        card.senderBotName,
+        card.id,
+        `peer:${card.actionType}`,
+        `${card.senderBotName} wants to ${card.actionType === 'delegate' ? 'delegate a subtask to' : card.actionType} ${card.targetBotName}`,
+      )
+      .catch(() => {});
+  };
   app.use(
     '/api',
     createRouter({
@@ -917,17 +978,7 @@ async function boot(): Promise<void> {
       // Realtime voice calls with bots (Codync parity): STT → bot turn →
       // TTS over /api/voice/calls (REST) + /api/voice/calls/ws.
       voiceCall: { service: voiceCallService },
-      // Encrypted push notifications (Codync parity): FCM fan-out to paired
-      // devices, sealed per device. No-op when FCM isn't configured.
-      push: new (await import('./push.js')).PushService({
-        listPushDevices: () => companionStore.listPushDevices(),
-        getBotPref: (botId) => {
-          const bot = (seed.bots as Array<{ id: string; notifications?: 'all' | 'approvals' | 'none' }>).find(
-            (b) => b.id === botId,
-          );
-          return bot?.notifications ?? 'all';
-        },
-      }),
+      push: pushService,
       recordingStore,
       chatQueueStore,
       mcpServers: seed.mcpServers,
@@ -1053,6 +1104,31 @@ async function boot(): Promise<void> {
     currentVersion: process.env.KRIYADOT_VERSION ?? '0.1.0',
   });
   app.use('/api/updates', createSelfUpdateRouter(updater));
+
+  // Peer approval cards (OpenMausBot parity): per-action Allow / Deny /
+  // Always-allow for bot→bot calls, 15-minute expiry, revokable per-pair
+  // grants. Backstop sweep expires stale cards even when no waiter watches.
+  app.use(
+    '/api',
+    createPeerApprovalRouter({
+      store: peerApprovalStore,
+      broker: peerApprovalBroker,
+      audit: (action, fields) => governance.audit(action, fields),
+      getBotName: (id) => botsById.get(id)?.name,
+    }),
+  );
+  const peerApprovalSweep = setInterval(() => {
+    try {
+      const expired = peerApprovalStore.expireStale();
+      for (const id of expired) {
+        peerApprovalBroker.settle(id, 'expired');
+        governance.audit('peer-approval.expired', { detail: { cardId: id } });
+      }
+    } catch {
+      // Sweeps must never break the server.
+    }
+  }, 60_000);
+  if (typeof peerApprovalSweep.unref === 'function') peerApprovalSweep.unref();
 
   // Chief of Staff (OpenMausBot parity): chief assignment, managed
   // sections, team-setup proposals, incidents/escalations inbox. The store
@@ -1203,6 +1279,16 @@ async function boot(): Promise<void> {
     }
     try {
       shutdownEvalRuns();
+    } catch {
+      // ignore
+    }
+    try {
+      clearInterval(peerApprovalSweep);
+    } catch {
+      // ignore
+    }
+    try {
+      peerApprovalStore.close();
     } catch {
       // ignore
     }

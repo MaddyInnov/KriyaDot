@@ -28,8 +28,10 @@ import {
   uploadFile,
   deleteUploadedFile,
   fileTypeIcon,
+  decidePeerApproval,
   type FusionStreamEvent,
   type MessageReaction,
+  type PeerDecision,
 } from '../lib/api';
 import {
   FusionProgressView,
@@ -77,6 +79,21 @@ type ChatBlock =
       call: ToolCall;
       status: 'pending' | 'approved' | 'denied';
       remembering?: boolean;
+    }
+  /**
+   * Peer-approval card for a bot→bot call (OpenMausBot parity). Rendered
+   * inline when the sender bot is "waiting on user"; decidable here or in
+   * the Approvals inbox.
+   */
+  | {
+      kind: 'peer-approval';
+      id: string;
+      cardId: string;
+      senderBotName: string;
+      targetBotName: string;
+      actionType: 'ask' | 'message' | 'delegate';
+      preview: string;
+      status: 'pending' | 'allowed' | 'denied' | 'expired';
     }
   | { kind: 'widget'; id: string; widget: Widget }
   | { kind: 'error'; id: string; text: string }
@@ -1058,6 +1075,34 @@ function ChatPageInner() {
           });
           break;
         }
+        case 'peer_approval_required': {
+          // Sender bot is "waiting on user": show the peer card inline,
+          // decidable here or in the Approvals inbox.
+          if (last && last.kind === 'assistant') {
+            next[next.length - 1] = { ...last, streaming: false };
+          }
+          next.push({
+            kind: 'peer-approval',
+            id: nextId(),
+            cardId: event.cardId,
+            senderBotName: event.senderBotName,
+            targetBotName: event.targetBotName,
+            actionType: event.actionType,
+            preview: event.preview,
+            status: 'pending',
+          });
+          break;
+        }
+        case 'peer_approval_decided': {
+          const idx = next.findIndex(
+            (b) => b.kind === 'peer-approval' && (b as { cardId: string }).cardId === event.cardId,
+          );
+          if (idx >= 0) {
+            const b = next[idx];
+            if (b.kind === 'peer-approval') next[idx] = { ...b, status: event.decision };
+          }
+          break;
+        }
         case 'interrupted': {
           next.push({ kind: 'interrupted', id: nextId(), text: event.reason || 'Turn interrupted.' });
           break;
@@ -1304,8 +1349,7 @@ function ChatPageInner() {
     }
   };
 
-  /** "Always allow <tool>": persist an allow rule, then approve the pending card. */
-  const alwaysAllow = async (blockId: string, approvalId: string, toolName: string) => {
+  /** "Always allow <tool>": persist an allow rule, then approve the pending card. */  const alwaysAllow = async (blockId: string, approvalId: string, toolName: string) => {
     const botId = botIdRef.current;
     if (!botId) return;
     setBlocks((prev) =>
@@ -1329,6 +1373,26 @@ function ChatPageInner() {
       setBlocks((prev) =>
         prev.map((b) => (b.kind === 'approval' && b.id === blockId ? { ...b, remembering: false } : b)),
       );
+    }
+  };
+
+  /** Decide a peer-approval card inline (Allow / Deny / Always-allow). */
+  const decidePeer = async (blockId: string, cardId: string, decision: PeerDecision) => {
+    const doneStatus = decision === 'deny' ? 'denied' : 'allowed';
+    setBlocks((prev) =>
+      prev.map((b) => (b.kind === 'peer-approval' && b.id === blockId ? { ...b, status: doneStatus } : b)),
+    );
+    try {
+      await decidePeerApproval(cardId, decision);
+    } catch (err) {
+      // The POST failed — revert the card to pending so the user can retry.
+      setBlocks((prev) =>
+        prev.map((b) => (b.kind === 'peer-approval' && b.id === blockId ? { ...b, status: 'pending' } : b)),
+      );
+      setBlocks((prev) => [
+        ...prev,
+        { kind: 'error', id: nextId(), text: err instanceof Error ? err.message : String(err) },
+      ]);
     }
   };
 
@@ -2106,6 +2170,49 @@ function ChatPageInner() {
                     )}
                   </div>
                 );
+              case 'peer-approval': {
+                const verb = b.actionType === 'ask' ? 'ask' : b.actionType === 'message' ? 'message' : 'delegate a subtask to';
+                return (
+                  <div key={b.id} className="approval-card" style={{ borderLeft: '3px solid var(--accent, #7c6cf0)' }}>
+                    <h4>
+                      🤝 {b.senderBotName} <span className="muted">wants to {verb}</span> {b.targetBotName}
+                    </h4>
+                    {b.preview && (
+                      <div style={{ whiteSpace: 'pre-wrap', margin: '8px 0', fontSize: 14 }} className="mono small">
+                        {b.preview}
+                      </div>
+                    )}
+                    {b.status === 'pending' ? (
+                      <>
+                        <div className="small muted">⏳ Waiting on you — the bot is paused until you decide.</div>
+                        <div className="approval-actions">
+                          <button className="btn btn-primary btn-sm" onClick={() => void decidePeer(b.id, b.cardId, 'allow')}>
+                            Allow
+                          </button>
+                          <button className="btn btn-danger btn-sm" onClick={() => void decidePeer(b.id, b.cardId, 'deny')}>
+                            Deny
+                          </button>
+                          <button
+                            className="btn btn-sm"
+                            onClick={() => void decidePeer(b.id, b.cardId, 'always-allow')}
+                            title={`Always allow ${b.senderBotName} → ${b.targetBotName} (${b.actionType}) without asking again.`}
+                          >
+                            Always allow
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="small muted mt">
+                        {b.status === 'allowed'
+                          ? 'Allowed — the bot continues.'
+                          : b.status === 'expired'
+                            ? 'Expired — the request timed out.'
+                            : 'Denied.'}
+                      </div>
+                    )}
+                  </div>
+                );
+              }
               case 'interrupted':
                 return (
                   <div key={b.id} className="msg interrupted">

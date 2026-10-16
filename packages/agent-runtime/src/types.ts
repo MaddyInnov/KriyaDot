@@ -29,6 +29,22 @@ export type StreamEvent =
   | { type: 'error'; message: string }
   | { type: 'interrupted'; reason: string }
   | { type: 'approval_required'; approvalId: string; call: ToolCall }
+  /**
+   * Peer-approval card raised for a bot→bot call (ask_bot / message_bot /
+   * delegate-to-another-bot). Emitted when the card is raised (the sender
+   * bot is now "waiting on user") and again when it is decided.
+   */
+  | {
+      type: 'peer_approval_required';
+      cardId: string;
+      senderBotId: string;
+      senderBotName: string;
+      targetBotId: string;
+      targetBotName: string;
+      actionType: 'ask' | 'message' | 'delegate';
+      preview: string;
+    }
+  | { type: 'peer_approval_decided'; cardId: string; decision: 'allowed' | 'denied' | 'expired' }
   | { type: 'queued_turn_start'; queueId: string; message: string }
   | { type: 'notice'; kind: string; message: string }
   /**
