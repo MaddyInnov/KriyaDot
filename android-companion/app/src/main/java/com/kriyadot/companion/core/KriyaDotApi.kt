@@ -68,7 +68,25 @@ class KriyaDotApi(
         return PairingResult(
             deviceToken = token,
             deviceId = json.optString("deviceId", ""),
+            pushKey = json.optString("pushKey", ""),
         )
+    }
+
+    /**
+     * Registers this device's FCM registration token so the server can push
+     * "done" / "needs you" notifications while the app is backgrounded.
+     * Best-effort: failures are swallowed (the WebSocket covers foreground).
+     */
+    suspend fun registerFcmToken(fcmToken: String): Boolean {
+        return try {
+            val json = post(
+                "/api/companion/devices/${store.deviceId}/fcm-token",
+                JSONObject().put("fcmToken", fcmToken),
+            )
+            json.optBoolean("ok", false)
+        } catch (_: Exception) {
+            false
+        }
     }
 
     // ---- Authed helpers -----------------------------------------------------

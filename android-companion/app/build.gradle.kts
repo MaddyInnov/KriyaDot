@@ -63,4 +63,12 @@ dependencies {
 
     // QR scanning without Google Play Services (works on de-Googled devices).
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+
+    // Push notifications (Codync parity: "done" / "needs you" alerts).
+    // FirebaseApp is initialized manually from assets/fcm_config.json (see
+    // PushConfig.kt) so the build works without Firebase configured; FCM is
+    // simply disabled when the config is absent. No google-services plugin.
+    implementation(platform("com.google.firebase:firebase-bom:33.1.2"))
+    implementation("com.google.firebase:firebase-messaging")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.8.1")
 }

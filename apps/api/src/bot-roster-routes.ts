@@ -200,6 +200,13 @@ function validateBotEntry(raw: unknown, index: number): { bot?: BotConfig; error
     if (typeof raw.workspace !== 'string') errors.push(`${where}.workspace: must be a string`);
     else if (raw.workspace) bot.workspace = raw.workspace;
   }
+  if (raw.notifications !== undefined) {
+    if (typeof raw.notifications !== 'string' || !['all', 'approvals', 'none'].includes(raw.notifications)) {
+      errors.push(`${where}.notifications: must be one of all|approvals|none`);
+    } else {
+      bot.notifications = raw.notifications as BotConfig['notifications'];
+    }
+  }
   return errors.length > 0 ? { errors } : { bot, errors };
 }
 

@@ -419,8 +419,36 @@ export function registerCompanionRoutes(router: Router, deps: CompanionRouteDeps
       toolName: 'companion',
       detail: { deviceId: result.deviceId, ip },
     });
-    // The raw token is shown exactly once, here. The server keeps only its hash.
-    res.json({ ok: true, deviceToken: result.token, deviceId: result.deviceId });
+    // The raw token and push key are shown exactly once, here. The server
+    // keeps only the token's hash (the push key is retained to seal pushes).
+    res.json({ ok: true, deviceToken: result.token, deviceId: result.deviceId, pushKey: result.pushKey });
+  });
+
+  // ---- Push registration -----------------------------------------------------
+
+  /**
+   * Register the device's FCM registration token so the server can push
+   * "done" / "needs you" notifications when the app is backgrounded.
+   * Device-authenticated; a device may only register its own token.
+   */
+  router.post('/devices/:id/fcm-token', requireAuth, (req: AuthedRequest, res: Response) => {
+    const me = deviceOf(req);
+    if (req.params.id !== me.id) {
+      err(res, 403, 'forbidden', 'A device can only register its own push token.');
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const ok = store.setFcmToken(me.id, typeof body.fcmToken === 'string' ? body.fcmToken : '');
+    if (!ok) {
+      err(res, 400, 'invalid_token', 'A valid FCM registration token is required.');
+      return;
+    }
+    audit('companion.fcm_registered', {
+      actor: 'api',
+      toolName: 'companion',
+      detail: { deviceId: me.id },
+    });
+    res.json({ ok: true });
   });
 
   // ---- Devices --------------------------------------------------------------

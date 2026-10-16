@@ -32,6 +32,8 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.google.zxing.integration.android.IntentIntegrator
+import com.kriyadot.companion.core.KriyaDotMessagingService
+import com.kriyadot.companion.core.PushConfig
 import com.kriyadot.companion.core.QrParser
 import com.kriyadot.companion.ui.ActivityScreen
 import com.kriyadot.companion.ui.ApprovalsScreen
@@ -64,14 +66,45 @@ class MainActivity : ComponentActivity() {
         scanLauncher.launch(integrator.createScanIntent())
     }
 
+    /** Last push-tap intent, as observable state so taps re-route navigation. */
+    private val pushNavTarget = androidx.compose.runtime.mutableStateOf<String?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Push notifications (Codync parity): manual Firebase init from
+        // assets/fcm_config.json; silently disabled when unconfigured.
+        PushConfig.init(this)
+        requestNotificationPermission()
+        pushNavTarget.value = pushRouteFor(intent)
         setContent {
             KriyaDotTheme {
                 val paired by vm.paired.collectAsState()
-                if (paired) MainShell(vm) else PairingScreen(vm, ::startQrScan)
+                if (paired) MainShell(vm, pushNavTarget) else PairingScreen(vm, ::startQrScan)
             }
         }
+    }
+
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        pushNavTarget.value = pushRouteFor(intent)
+    }
+
+    /** Maps a push-tap intent to a bottom-nav route, or null when not a push tap. */
+    private fun pushRouteFor(intent: android.content.Intent?): String? {
+        val kind = intent?.getStringExtra(KriyaDotMessagingService.EXTRA_KIND) ?: return null
+        return if (kind == "needsInput") "approvals" else "chat"
+    }
+
+    /** Android 13+ runtime permission for push; no-op on older versions. */
+    private fun requestNotificationPermission() {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.TIRAMISU) return
+        if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) return
+        registerForActivityResult(
+            ActivityResultContracts.RequestPermission(),
+        ) { }.launch(android.Manifest.permission.POST_NOTIFICATIONS)
     }
 }
 
@@ -86,9 +119,18 @@ private sealed class Tab(val route: String, val label: String, val icon: ImageVe
 private val TABS = listOf(Tab.Home, Tab.Approvals, Tab.Runs, Tab.Chat, Tab.More)
 
 @Composable
-private fun MainShell(vm: CompanionViewModel) {
+private fun MainShell(
+    vm: CompanionViewModel,
+    pushNavTarget: androidx.compose.runtime.State<String?>,
+) {
     val nav = rememberNavController()
     val approvals by vm.approvals.collectAsState()
+
+    // Push tap routing: "needs you" -> approvals inbox, "done"/"failed" -> chat.
+    val target by pushNavTarget
+    androidx.compose.runtime.LaunchedEffect(target) {
+        if (target != null) nav.navigate(target!!) { launchSingleTop = true }
+    }
     Scaffold(
         bottomBar = {
             NavigationBar {

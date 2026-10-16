@@ -117,9 +117,18 @@ export class CompanionStore {
         platform TEXT NOT NULL,
         paired_at INTEGER NOT NULL,
         last_seen INTEGER NOT NULL,
-        token_hash TEXT NOT NULL
+        token_hash TEXT NOT NULL,
+        push_key TEXT,
+        fcm_token TEXT
       );
     `);
+    // Migrate pre-push databases.
+    for (const col of ['push_key', 'fcm_token']) {
+      const has = this.db
+        .prepare(`SELECT COUNT(*) AS n FROM pragma_table_info('companion_devices') WHERE name = ?`)
+        .get(col) as unknown as { n: number };
+      if (has.n === 0) this.db.exec(`ALTER TABLE companion_devices ADD COLUMN ${col} TEXT`);
+    }
   }
 
   // ---- Pairing handshake -------------------------------------------------
@@ -156,6 +165,8 @@ export class CompanionStore {
     ok: true;
     deviceId: string;
     token: string;
+    /** base64 AES-256 key for sealed push payloads (stored on the device). */
+    pushKey: string;
   } | { ok: false; error: string } {
     const { ott, deviceName, platform } = input;
     if (typeof ott !== 'string' || !/^[0-9a-f]{32}$/.test(ott)) {
@@ -172,19 +183,46 @@ export class CompanionStore {
 
     const deviceId = `comp_${randomBytes(8).toString('hex')}`;
     const token = randomBytes(32).toString('hex'); // 256-bit
+    // Per-device push key for sealed notification payloads. Stored raw: the DB
+    // lives on the user's own machine and the key is needed to seal pushes.
+    const pushKey = randomBytes(32).toString('base64');
     const now = Date.now();
     this.db
       .prepare(
-        'INSERT INTO companion_devices (id, name, platform, paired_at, last_seen, token_hash) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO companion_devices (id, name, platform, paired_at, last_seen, token_hash, push_key) VALUES (?, ?, ?, ?, ?, ?, ?)',
       )
-      .run(deviceId, name, plat, now, now, hashToken(token));
-    return { ok: true, deviceId, token };
+      .run(deviceId, name, plat, now, now, hashToken(token), pushKey);
+    return { ok: true, deviceId, token, pushKey };
   }
 
   /** Revoke a device (unpair): deletes the device row and its token hash. */
   revoke(deviceId: string): boolean {
     if (!DEVICE_ID_RE.test(deviceId)) return false;
     return this.db.prepare('DELETE FROM companion_devices WHERE id = ?').run(deviceId).changes > 0;
+  }
+
+  /** Register (or refresh) the device's FCM registration token for push. */
+  setFcmToken(deviceId: string, fcmToken: string): boolean {
+    if (!DEVICE_ID_RE.test(deviceId)) return false;
+    if (typeof fcmToken !== 'string' || fcmToken.length < 10 || fcmToken.length > 4096) return false;
+    return (
+      this.db.prepare('UPDATE companion_devices SET fcm_token = ? WHERE id = ?').run(fcmToken, deviceId)
+        .changes > 0
+    );
+  }
+
+  /**
+   * Devices eligible for push: have an FCM token. Includes each device's
+   * push key (null for devices paired before push keys existed — those get
+   * the generic fallback payload).
+   */
+  listPushDevices(): Array<{ deviceId: string; fcmToken: string; pushKey: string | null }> {
+    const rows = this.db
+      .prepare(
+        "SELECT id, fcm_token, push_key FROM companion_devices WHERE fcm_token IS NOT NULL AND fcm_token != ''",
+      )
+      .all() as unknown as Array<{ id: string; fcm_token: string; push_key: string | null }>;
+    return rows.map((r) => ({ deviceId: r.id, fcmToken: r.fcm_token, pushKey: r.push_key ?? null }));
   }
 
   /**

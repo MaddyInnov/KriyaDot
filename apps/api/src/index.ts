@@ -767,6 +767,17 @@ async function boot(): Promise<void> {
       preferenceStore,
       phone: { store: phoneStore, hub: phoneHub, adb: phoneAdb },
       companion: { store: companionStore, hub: companionHub },
+      // Encrypted push notifications (Codync parity): FCM fan-out to paired
+      // devices, sealed per device. No-op when FCM isn't configured.
+      push: new (await import('./push.js')).PushService({
+        listPushDevices: () => companionStore.listPushDevices(),
+        getBotPref: (botId) => {
+          const bot = (seed.bots as Array<{ id: string; notifications?: 'all' | 'approvals' | 'none' }>).find(
+            (b) => b.id === botId,
+          );
+          return bot?.notifications ?? 'all';
+        },
+      }),
       recordingStore,
       chatQueueStore,
       mcpServers: seed.mcpServers,

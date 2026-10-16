@@ -95,6 +95,34 @@ picker (`GET /api/bots`) or a settings field once the server exposes one.
 - Unpairing wipes the token from the phone. (Server-side revocation is the
   server workstream's job.)
 
+## Push notifications ("done" / "needs you")
+
+The server pushes encrypted alerts via Firebase Cloud Messaging when a bot
+turn completes, fails, or needs an approval — so they arrive even with the
+app backgrounded (Codync parity). Payloads carry only ciphertext: the title
+and body are sealed with AES-256-GCM under a per-device key issued at
+pairing, and decrypted locally on the phone. Without the key, the app shows
+the server's generic fallback text.
+
+Setup (all local, no keys committed):
+
+1. Create a Firebase project at https://console.firebase.google.com (free).
+2. Add an Android app with package `com.kriyadot.companion`.
+3. Copy `app/src/main/assets/fcm_config.json.template` to
+   `app/src/main/assets/fcm_config.json` (gitignored) and fill in
+   `applicationId`, `apiKey`, `projectId`, `senderId` from the Firebase
+   console (Project settings → General → Your apps).
+4. On the KriyaDot server, set `FCM_SERVICE_ACCOUNT_JSON` to the path of a
+   Firebase service-account JSON (Project settings → Service accounts →
+   Generate new private key), then restart the API.
+5. Re-pair the phone (or just reopen the app): it registers its FCM token
+   automatically. Per-bot prefs (`all` / `approvals` / `none`) live in the
+   bot config.
+
+Without `fcm_config.json` the app builds and runs normally — pushes are
+silently disabled and the WebSocket covers the foreground case. Without
+`FCM_SERVICE_ACCOUNT_JSON` the server skips sending (logged once).
+
 ## Files
 
 - `app/src/main/java/com/kriyadot/companion/MainActivity.kt` — activity, QR-scan launcher, bottom-nav shell.

@@ -35,6 +35,13 @@ class PairingStore(context: Context) {
     val deviceId: String get() = prefs.getString(KEY_DEVICE_ID, "") ?: ""
     val deviceName: String get() = prefs.getString(KEY_DEVICE_NAME, "") ?: ""
 
+    /**
+     * Per-device AES-256 key (base64) for sealed push payloads, issued at
+     * pairing. Null for pairings made before push keys existed — pushes then
+     * fall back to generic text.
+     */
+    val pushKey: String? get() = prefs.getString(KEY_PUSH_KEY, null)?.ifEmpty { null }
+
     /** Hosted-mode public base URL (https://…), or null for LAN pairing. */
     val serverUrl: String? get() = prefs.getString(KEY_SERVER_URL, null)?.ifEmpty { null }
 
@@ -58,14 +65,15 @@ class PairingStore(context: Context) {
         }
 
     fun save(host: String, port: Int, deviceName: String, result: PairingResult, serverUrl: String? = null) {
-        prefs.edit()
+        val e = prefs.edit()
             .putString(KEY_HOST, host)
             .putInt(KEY_PORT, port)
             .putString(KEY_SERVER_URL, serverUrl ?: "")
             .putString(KEY_DEVICE_NAME, deviceName)
             .putString(KEY_DEVICE_TOKEN, result.deviceToken)
             .putString(KEY_DEVICE_ID, result.deviceId)
-            .apply()
+        if (result.pushKey.isNotBlank()) e.putString(KEY_PUSH_KEY, result.pushKey)
+        e.apply()
     }
 
     fun clear() {
@@ -80,5 +88,6 @@ class PairingStore(context: Context) {
         private const val KEY_DEVICE_NAME = "device_name"
         private const val KEY_DEVICE_TOKEN = "device_token"
         private const val KEY_DEVICE_ID = "device_id"
+        private const val KEY_PUSH_KEY = "push_key"
     }
 }

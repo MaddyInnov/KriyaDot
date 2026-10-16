@@ -10,6 +10,10 @@
     <!-- Network access to the KriyaDot instance on your LAN. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Push notifications for "done" / "needs you" alerts (Android 13+ asks
+         at runtime; the app works without it via the WebSocket). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <!-- MVP talks to the PC over plain HTTP on the LAN (no TLS yet).
          usesCleartextTraffic is REQUIRED for this to work; switch the app
          and server to HTTPS/WSS before any use outside a trusted LAN. -->
@@ -30,5 +34,14 @@
         </activity>
         <!-- zxing-android-embedded declares its CaptureActivity in its own
              manifest; it is merged in automatically, no entry needed here. -->
+
+        <!-- FCM data messages: decrypted locally, never contain plaintext. -->
+        <service
+            android:name=".core.KriyaDotMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

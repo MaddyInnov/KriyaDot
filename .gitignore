@@ -42,3 +42,7 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Firebase (push notifications) — never commit real project keys.
+android-companion/app/src/main/assets/fcm_config.json
+android-companion/app/google-services.json

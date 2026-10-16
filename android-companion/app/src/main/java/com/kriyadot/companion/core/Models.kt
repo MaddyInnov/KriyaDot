@@ -36,6 +36,8 @@ data class PairingPayload(
 data class PairingResult(
     val deviceToken: String,
     val deviceId: String,
+    /** base64 AES-256 key for sealed pushes; empty when the server predates push keys. */
+    val pushKey: String = "",
 )
 
 data class ServerStatus(

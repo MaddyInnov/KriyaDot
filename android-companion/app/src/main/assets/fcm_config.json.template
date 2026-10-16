@@ -1,0 +1,1 @@
+{"_comment":"Copy to fcm_config.json (same directory, gitignored) and fill in your Firebase project's values. See the companion README 'Push notifications' section.","apiKey":"AIzaSy-...","applicationId":"1:123456789012:android:abcdef1234567890","projectId":"your-firebase-project-id","senderId":"123456789012"}

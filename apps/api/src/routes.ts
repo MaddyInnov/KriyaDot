@@ -196,6 +196,11 @@ export interface RouteDeps {
     store: CompanionStore;
     hub: CompanionHub;
   };
+  /**
+   * Encrypted push notifications (Codync parity). Optional: omitted in tests
+   * that don't exercise push; created by index.ts otherwise.
+   */
+  push?: import('./push.js').PushService;
 }
 
 const TERMINAL_RUN_STATUSES: ReadonlySet<WorkflowRun['status']> = new Set(['succeeded', 'failed']);
@@ -1274,12 +1279,47 @@ export function createRouter(deps: RouteDeps): express.Router {
       turnController?.abort('client disconnected');
     });
 
+    // One-line human summary of an approval request for push notifications.
+    // Never includes secrets — only the tool name and a short arg hint.
+    const summarizeApprovalCall = (call: { name: string; args?: Record<string, unknown> } | undefined): string => {
+      if (!call) return 'wants to run a tool';
+      const argHint = (() => {
+        const a = call.args ?? {};
+        for (const k of ['command', 'path', 'file', 'url', 'query', 'text']) {
+          const v = a[k];
+          if (typeof v === 'string' && v.trim()) return v.trim().slice(0, 120);
+        }
+        return '';
+      })();
+      return argHint ? `wants to run ${call.name} (${argHint})` : `wants to run ${call.name}`;
+    };
+
     const onEvent = async (event: StreamEvent): Promise<void> => {
       if (closed) return;
       if (event.type === 'done' || event.type === 'error' || event.type === 'interrupted') terminalEmitted = true;
       // Tiered memory: accumulate this turn's assistant text + tool calls for L0.
       if (event.type === 'token') turnAssistantText += event.content;
       else if (event.type === 'tool_call') turnToolCalls.push(event.call.name);
+      // Encrypted push (Codync parity): "needs you" on approval requests,
+      // "done"/"failed" on terminal turn outcomes. Best-effort, never blocks.
+      if (deps.push) {
+        const push = deps.push;
+        const bId = bot.id;
+        const bName = bot.name;
+        const chatId = sessionKey ?? undefined;
+        if (event.type === 'approval_required') {
+          const toolName = typeof event.call?.name === 'string' ? event.call.name : 'tool';
+          const summary = summarizeApprovalCall(event.call);
+          void push.notifyApprovalNeeded(bId, bName, event.approvalId, toolName, summary).catch(() => {});
+        } else if (event.type === 'done') {
+          void push.notifyTurnDone(bId, bName, turnAssistantText, chatId).catch(() => {});
+        } else if (event.type === 'error') {
+          const msg = typeof (event as { message?: unknown }).message === 'string'
+            ? (event as { message: string }).message
+            : 'The run failed.';
+          void push.notifyTurnFailed(bId, bName, msg, chatId).catch(() => {});
+        }
+      }
       res.write(`data: ${serializeEvent(event)}\n\n`);
     };
 

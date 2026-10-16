@@ -165,6 +165,13 @@ export interface BotConfig {
    * for this bot (manual memory_store tool still works).
    */
   memoryKeeper?: boolean;
+  /**
+   * Push notification preference (Codync parity):
+   * - 'all' (default): "done" + "failed" + "needs you" pushes.
+   * - 'approvals': only "needs you" (approval requested) pushes.
+   * - 'none': no pushes for this bot.
+   */
+  notifications?: 'all' | 'approvals' | 'none';
 }
 
 export interface LLMProvider {

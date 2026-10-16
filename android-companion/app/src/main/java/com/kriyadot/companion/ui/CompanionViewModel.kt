@@ -132,6 +132,7 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun startLive() {
         refreshAll()
+        registerPushToken()
         socket.start(object : CompanionSocket.Listener {
             override fun onEvent(type: String, payload: JSONObject) {
                 // Any push invalidates the affected list; simplest correct
@@ -149,6 +150,23 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
                 if (connected) refreshAll()
             }
         })
+    }
+
+    /**
+     * Registers this device's FCM token with the server so "done" / "needs
+     * you" pushes arrive while the app is backgrounded. Best-effort: FCM may
+     * be unconfigured (PushConfig.init false) or Play Services absent.
+     */
+    private fun registerPushToken() {
+        viewModelScope.launch {
+            try {
+                val messaging = com.google.firebase.messaging.FirebaseMessaging.getInstance()
+                val token = kotlinx.coroutines.tasks.await(messaging.token)
+                api.registerFcmToken(token)
+            } catch (_: Exception) {
+                // FCM unavailable — the WebSocket covers the foreground case.
+            }
+        }
     }
 
     fun refreshAll() {
