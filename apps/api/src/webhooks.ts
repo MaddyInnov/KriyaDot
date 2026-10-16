@@ -60,6 +60,12 @@ export interface RoutineWebhookRouterOptions {
   getBots: () => BotConfig[];
   /** Override prompt rendering (default: {{payload}} substitution). */
   renderPrompt?: (template: string, body: unknown) => string;
+  /**
+   * Run executor (routine-runs.ts). When set, webhook-triggered turns
+   * leave run records (trigger 'webhook'); when omitted, the legacy
+   * fire-and-forget path is used.
+   */
+  runExecutor?: import('./routine-runs.js').RoutineRunExecutor;
 }
 
 /**
@@ -103,11 +109,27 @@ export function createRoutineWebhookRouter(opts: RoutineWebhookRouterOptions): R
       res.status(500).json({ error: `routine bot "${routine.botId}" no longer exists` });
       return;
     }
-    const message = render(routine.promptTemplate, req.body);
     const sessionId = routine.sessionId ?? `routine_${routine.id}`;
     // Fire-and-forget: enqueue the turn and acknowledge immediately.
     // Webhook senders must not wait on a full agent turn.
     void (async () => {
+      if (opts.runExecutor) {
+        try {
+          await opts.runExecutor.execute({
+            routine,
+            trigger: 'webhook',
+            payload: req.body,
+            sessionId,
+          });
+        } catch (err) {
+          console.error(
+            `[routine-webhook] run failed for routine "${routine.id}":`,
+            err instanceof Error ? err.message : err,
+          );
+        }
+        return;
+      }
+      const message = render(routine.promptTemplate, req.body);
       try {
         await opts.agentRuntime.runTurn({
           bot,

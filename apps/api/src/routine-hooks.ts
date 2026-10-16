@@ -510,6 +510,12 @@ export interface HookWorkerOptions {
   /** Max deliveries per pump; default 5. */
   batchSize?: number;
   renderPrompt?: (template: string, body: unknown) => string;
+  /**
+   * Run executor (routine-runs.ts). When set, each processed delivery
+   * leaves a run record (trigger 'webhook'); when omitted, the legacy
+   * direct runTurn path is used.
+   */
+  runExecutor?: import('./routine-runs.js').RoutineRunExecutor;
 }
 
 export class WebhookDeliveryWorker {
@@ -568,6 +574,30 @@ export class WebhookDeliveryWorker {
     const bot = getBots().find((b) => b.id === routine.botId);
     if (!bot) {
       hookStore.markFailedTerminal(delivery.id, `routine bot "${routine.botId}" no longer exists`);
+      return;
+    }
+    if (this.opts.runExecutor) {
+      try {
+        const res = await this.opts.runExecutor.executeWait({
+          routine,
+          trigger: 'webhook',
+          payload: delivery.event,
+          sessionId: routine.sessionId ?? `routine_${routine.id}`,
+        });
+        if (res.status === 'succeeded') {
+          hookStore.markDone(delivery.id);
+        } else if (res.status === 'cancelled') {
+          // A user-cancelled run must not be retried as a delivery.
+          hookStore.markFailedTerminal(delivery.id, 'routine run cancelled by user');
+        } else {
+          const status = hookStore.markAttemptFailed(delivery.id, res.error ?? 'routine run failed');
+          console.error(`[routine-hooks] delivery ${delivery.id} attempt failed (${status}):`, res.error);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const status = hookStore.markAttemptFailed(delivery.id, msg);
+        console.error(`[routine-hooks] delivery ${delivery.id} attempt failed (${status}):`, msg);
+      }
       return;
     }
     try {

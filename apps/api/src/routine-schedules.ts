@@ -28,6 +28,11 @@
 
 import type { AgentRuntime, BotConfig } from '@mvp/agent-runtime';
 import type { BotRoutine, RoutineStore } from './bot-routines.js';
+import {
+  RoutineRunExecutor,
+  type RoutineRunStore,
+  type RunSettledResult,
+} from './routine-runs.js';
 
 // ---------------------------------------------------------------------------
 // Timezone helpers (Intl-based, no dependencies)
@@ -298,6 +303,17 @@ interface ScheduleBase {
   timezone: string;
   enabled: boolean;
   overlap: OverlapPolicy;
+  /**
+   * Catch up missed occurrences after server downtime: the most recent
+   * missed occurrences (bounded, max 3) actually run; all missed
+   * occurrences get 'missed' run records regardless. Default false.
+   */
+  catchUp?: boolean;
+  /**
+   * Consecutive run failures before the schedule auto-pauses (the user is
+   * notified). Integer 1..20, default 3.
+   */
+  failureStreakLimit?: number;
 }
 
 /** Run once at a specific datetime. */
@@ -425,12 +441,27 @@ export function validateRoutineSchedule(input: unknown): RoutineSchedule {
   if (s.enabled !== undefined && typeof s.enabled !== 'boolean') {
     throw new Error('schedule.enabled must be a boolean');
   }
+  // Run-governance options (OpenMausBot parity P0 #7): missed-run catch-up
+  // and the failure-streak auto-pause limit.
+  let catchUp = false;
+  if (s.catchUp !== undefined) {
+    if (typeof s.catchUp !== 'boolean') throw new Error('schedule.catchUp must be a boolean');
+    catchUp = s.catchUp;
+  }
+  let failureStreakLimit = 3;
+  if (s.failureStreakLimit !== undefined) {
+    if (!Number.isInteger(s.failureStreakLimit) || (s.failureStreakLimit as number) < 1 || (s.failureStreakLimit as number) > 20) {
+      throw new Error('schedule.failureStreakLimit must be an integer 1..20');
+    }
+    failureStreakLimit = s.failureStreakLimit as number;
+  }
+  const governance = { catchUp, failureStreakLimit };
 
   if (kind === 'once') {
     const runAt = s.runAt;
     if (typeof runAt !== 'string' || !runAt.trim()) throw new Error('once schedule requires runAt');
     parseScheduleInstant(runAt, timezone as string, 'once runAt'); // validates
-    return { kind, timezone: timezone as string, enabled, overlap, runAt: runAt.trim() };
+    return { kind, timezone: timezone as string, enabled, overlap, ...governance, runAt: runAt.trim() };
   }
 
   if (kind === 'daily') {
@@ -438,7 +469,7 @@ export function validateRoutineSchedule(input: unknown): RoutineSchedule {
     const weekdays = s.weekdays === undefined ? [0, 1, 2, 3, 4, 5, 6] : s.weekdays;
     if (!validWeekdays(weekdays)) throw new Error('daily weekdays must be a non-empty array of 0..6 (0=Sunday)');
     const time = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
-    return { kind, timezone: timezone as string, enabled, overlap, time, weekdays: [...weekdays].sort((a, b) => a - b) };
+    return { kind, timezone: timezone as string, enabled, overlap, ...governance, time, weekdays: [...weekdays].sort((a, b) => a - b) };
   }
 
   if (kind === 'cron') {
@@ -446,7 +477,7 @@ export function validateRoutineSchedule(input: unknown): RoutineSchedule {
       throw new Error('cron schedule requires expression');
     }
     parseCron(s.expression); // throws with details
-    return { kind, timezone: timezone as string, enabled, overlap, expression: s.expression.trim() };
+    return { kind, timezone: timezone as string, enabled, overlap, ...governance, expression: s.expression.trim() };
   }
 
   // interval
@@ -455,7 +486,7 @@ export function validateRoutineSchedule(input: unknown): RoutineSchedule {
     throw new Error('interval everyMinutes must be an integer 1..10080');
   }
   const out: IntervalSchedule = {
-    kind, timezone: timezone as string, enabled, overlap, everyMinutes: everyMinutes as number,
+    kind, timezone: timezone as string, enabled, overlap, ...governance, everyMinutes: everyMinutes as number,
   };
   if (s.anchorTime !== undefined) {
     const { hour, minute } = parseWallClock(String(s.anchorTime), 'interval anchorTime');
@@ -700,7 +731,30 @@ export interface RoutineSchedulerDeps {
   onFire?: (info: RoutineFireInfo) => void;
   /** Clock override for tests. */
   now?: () => number;
+  /**
+   * Run-record store (routine-runs.ts). When set, every fire leaves a run
+   * record and manual controls (run-now / cancel / retry) are available.
+   * Omit it and the scheduler behaves exactly as before (no records).
+   */
+  runStore?: RoutineRunStore;
+  /**
+   * Turn executor. Defaults to a RoutineRunExecutor over runStore +
+   * agentRuntime when runStore is set; inject a stub in tests.
+   */
+  runExecutor?: RoutineRunExecutor;
+  /**
+   * Missed-occurrence window for reconcileMissedRuns (boot): occurrences
+   * older than this are too stale to record. Default 24h.
+   */
+  catchUpWindowMs?: number;
+  /** Called when a failure streak auto-pauses a schedule. */
+  onScheduleAutoPaused?: (routine: BotRoutine, streak: number) => void;
 }
+
+/** Missed occurrences older than this are too stale to record (boot catch-up). */
+export const DEFAULT_CATCH_UP_WINDOW_MS = 24 * 60 * 60 * 1000;
+/** Bounded backfill: at most this many catch-up runs per routine per boot. */
+export const MAX_CATCH_UP_RUNS = 3;
 
 /**
  * Ticks on an interval; for each routine with an enabled schedule, fires
@@ -708,8 +762,10 @@ export interface RoutineSchedulerDeps {
  *
  * Restart behavior: a routine's last-fired watermark is persisted in the
  * store. On boot, routines with no watermark get watermarked at the boot
- * time — missed occurrences during downtime do NOT backfill (no
- * missed-run execution; that's the run-lifecycle item). The epoch-anchored
+ * time. Missed occurrences from downtime are handled by
+ * reconcileMissedRuns() (call once before start()): occurrences inside the
+ * catch-up window are recorded as 'missed' run records, and routines with
+ * catchUp:true get a bounded backfill (max 3 runs). The epoch-anchored
  * interval grid and minute-granular cron matching mean a restart can
  * neither double-fire nor skip an occurrence that falls after boot.
  */
@@ -718,8 +774,20 @@ export class RoutineScheduler {
   private ticking = false;
   private readonly inFlight = new Set<string>();
   private booted = false;
+  private readonly executor: RoutineRunExecutor | undefined;
 
-  constructor(private readonly deps: RoutineSchedulerDeps) {}
+  constructor(private readonly deps: RoutineSchedulerDeps) {
+    this.executor =
+      deps.runExecutor ??
+      (deps.runStore
+        ? new RoutineRunExecutor({
+            runStore: deps.runStore,
+            agentRuntime: deps.agentRuntime,
+            getBots: deps.getBots,
+            renderPrompt: deps.renderPrompt,
+          })
+        : undefined);
+  }
 
   start(intervalMs = 30_000): void {
     if (this.timer) return;
@@ -783,6 +851,8 @@ export class RoutineScheduler {
 
     for (const occ of due) {
       if (schedule.overlap === 'skip' && this.inFlight.has(routine.id)) {
+        // A skip is a missed run: record it so the history shows the gap.
+        this.recordMissed(routine, occ.at, 'skipped: previous run still in flight (overlap: skip)');
         this.emit({ routine, at: occ.at, ok: true, skipped: true });
         continue;
       }
@@ -790,6 +860,138 @@ export class RoutineScheduler {
       // scheduler (or other routines). The 'skip' overlap policy is
       // enforced via the inFlight set, which fire() maintains.
       void this.fire(routine, occ.at);
+    }
+  }
+
+  /**
+   * Boot reconciliation for missed occurrences. Call once before start().
+   *
+   * For each routine with an enabled schedule and a stale watermark:
+   * occurrences in (watermark, now] inside the catch-up window
+   * (default 24h) are recorded as 'missed' runs; routines with
+   * catchUp:true also run the 3 most recent missed occurrences as
+   * catch-up runs (bounded backfill). Older windows are simply
+   * re-anchored — no records, no fires.
+   */
+  async reconcileMissedRuns(nowMs?: number): Promise<{ routines: number; missed: number; catchUpRuns: number }> {
+    const now = nowMs ?? this.deps.now?.() ?? Date.now();
+    const windowMs = this.deps.catchUpWindowMs ?? DEFAULT_CATCH_UP_WINDOW_MS;
+    let routines = 0;
+    let missed = 0;
+    let catchUpRuns = 0;
+    for (const routine of this.deps.routineStore.list()) {
+      const schedule = routine.schedule;
+      if (!routine.enabled || !schedule || !schedule.enabled) continue;
+      const watermark = this.deps.routineStore.getLastFiredAt(routine.id);
+      if (watermark === undefined || watermark >= now) continue;
+      const gap = now - watermark;
+      if (gap <= 0 || gap > windowMs) continue;
+      const due = occurrencesBetween(schedule, watermark, now);
+      if (due.length === 0) continue;
+      routines += 1;
+      for (const occ of due) {
+        this.recordMissed(routine, occ.at, 'missed while the server was down');
+        missed += 1;
+      }
+      if (schedule.catchUp === true && this.executor) {
+        for (const occ of due.slice(-MAX_CATCH_UP_RUNS)) {
+          void this.fire(routine, occ.at, { catchUp: true });
+          catchUpRuns += 1;
+        }
+      }
+      // Advance the watermark so the first tick doesn't reprocess.
+      this.deps.routineStore.setLastFiredAt(routine.id, now);
+    }
+    return { routines, missed, catchUpRuns };
+  }
+
+  /**
+   * Manually fire a routine right now (trigger 'manual'). Returns the run
+   * id; the turn runs in the background.
+   */
+  async runNow(routineId: string): Promise<string> {
+    const routine = this.deps.routineStore.get(routineId);
+    if (!routine) throw new Error(`Unknown routine "${routineId}"`);
+    if (!routine.enabled) throw new Error(`Routine "${routine.name}" is paused`);
+    const bot = this.deps.getBots().find((b) => b.id === routine.botId);
+    if (!bot) throw new Error(`Unknown bot "${routine.botId}"`);
+    if (!this.executor) throw new Error('run records are not enabled');
+    return this.executor.execute({
+      routine,
+      trigger: 'manual',
+      payload: { source: 'manual', routineId: routine.id, routineName: routine.name },
+      sessionId: routine.sessionId ?? `routine_${routine.id}`,
+      onSettled: () => this.checkStreak(routine),
+    });
+  }
+
+  /**
+   * Retry a failed/cancelled/missed run as a fresh manual run. Returns the
+   * new run id.
+   */
+  async retryRun(runId: string): Promise<string> {
+    const runStore = this.deps.runStore;
+    if (!runStore) throw new Error('run records are not enabled');
+    const run = runStore.get(runId);
+    if (!run) throw new Error(`Unknown run "${runId}"`);
+    if (run.status !== 'failed' && run.status !== 'cancelled' && run.status !== 'missed') {
+      throw new Error(`Run ${runId} is ${run.status} — only failed/cancelled/missed runs can be retried`);
+    }
+    const routine = this.deps.routineStore.get(run.routineId);
+    if (!routine) throw new Error(`Routine for run "${runId}" was deleted`);
+    if (!routine.enabled) throw new Error(`Routine "${routine.name}" is paused`);
+    const bot = this.deps.getBots().find((b) => b.id === routine.botId);
+    if (!bot) throw new Error(`Unknown bot "${routine.botId}"`);
+    if (!this.executor) throw new Error('run records are not enabled');
+    return this.executor.execute({
+      routine,
+      trigger: 'manual',
+      scheduledFor: run.scheduledFor,
+      payload: {
+        source: 'retry',
+        routineId: routine.id,
+        routineName: routine.name,
+        originalRunId: run.id,
+        originalTrigger: run.trigger,
+      },
+      sessionId: routine.sessionId ?? `routine_${routine.id}`,
+      onSettled: () => this.checkStreak(routine),
+    });
+  }
+
+  /** Cancel a queued/running run (aborts the turn). */
+  cancelRun(runId: string): boolean {
+    return this.executor?.cancel(runId) ?? false;
+  }
+
+  /** Record a missed occurrence (best-effort; never breaks the scheduler). */
+  private recordMissed(routine: BotRoutine, at: number, note: string): void {
+    try {
+      this.deps.runStore?.markMissed(routine.id, routine.name, at, note);
+    } catch (err) {
+      console.error('[routine-scheduler] failed to record missed run:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  /**
+   * After a run settles, check the failure streak: at failureStreakLimit
+   * (default 3) consecutive failures the schedule auto-pauses and the
+   * onScheduleAutoPaused hook notifies the user.
+   */
+  private checkStreak(routine: BotRoutine): void {
+    const { runStore, routineStore } = this.deps;
+    const schedule = routine.schedule;
+    if (!runStore || !schedule || !schedule.enabled) return;
+    const limit = schedule.failureStreakLimit ?? 3;
+    const { consecutiveFailures } = runStore.getStreak(routine.id);
+    if (consecutiveFailures >= limit) {
+      routineStore.setScheduleEnabled(routine.id, false);
+      const paused: BotRoutine = { ...routine, schedule: { ...schedule, enabled: false } };
+      try {
+        this.deps.onScheduleAutoPaused?.(paused, consecutiveFailures);
+      } catch (err) {
+        console.error('[routine-scheduler] onScheduleAutoPaused threw:', err instanceof Error ? err.message : err);
+      }
     }
   }
 
@@ -802,39 +1004,65 @@ export class RoutineScheduler {
     }
   }
 
-  private async fire(routine: BotRoutine, at: number): Promise<void> {
+  private async fire(routine: BotRoutine, at: number, opts?: { catchUp?: boolean }): Promise<void> {
     const { agentRuntime, getBots } = this.deps;
     const bot = getBots().find((b) => b.id === routine.botId);
     if (!bot) {
       this.emit({ routine, at, ok: false, error: `Unknown bot "${routine.botId}"` });
       return;
     }
-    const render = this.deps.renderPrompt ?? defaultRenderPrompt;
     this.inFlight.add(routine.id);
-    try {
-      const message = render(routine.promptTemplate, {
-        source: 'schedule',
-        routineId: routine.id,
-        routineName: routine.name,
-        scheduledAt: new Date(at).toISOString(),
-      });
-      await agentRuntime.runTurn({
-        bot,
-        message,
-        sessionId: routine.sessionId ?? `routine_${routine.id}`,
-        taskType: 'chat',
-        onEvent: () => {},
-      });
-      this.emit({ routine, at, ok: true });
-    } catch (err) {
-      this.emit({
-        routine,
-        at,
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
+    const settle = (ok: boolean, error?: string): void => {
       this.inFlight.delete(routine.id);
+      this.emit({ routine, at, ok, error });
+    };
+    try {
+      if (this.executor) {
+        // Run-record path: the executor owns the turn and its bookkeeping.
+        // inFlight is held until the turn settles (onSettled), preserving
+        // the 'skip' overlap semantics for long runs.
+        const onSettled = (res: RunSettledResult): void => {
+          settle(res.status === 'succeeded', res.error ?? undefined);
+          this.checkStreak(routine);
+        };
+        await this.executor.execute({
+          routine,
+          trigger: 'schedule',
+          scheduledFor: at,
+          payload: {
+            source: 'schedule',
+            routineId: routine.id,
+            routineName: routine.name,
+            scheduledAt: new Date(at).toISOString(),
+            ...(opts?.catchUp ? { catchUp: true } : {}),
+          },
+          sessionId: routine.sessionId ?? `routine_${routine.id}`,
+          onSettled,
+        });
+      } else {
+        // Legacy path (no runStore): direct turn, same as before.
+        const render = this.deps.renderPrompt ?? defaultRenderPrompt;
+        try {
+          const message = render(routine.promptTemplate, {
+            source: 'schedule',
+            routineId: routine.id,
+            routineName: routine.name,
+            scheduledAt: new Date(at).toISOString(),
+          });
+          await agentRuntime.runTurn({
+            bot,
+            message,
+            sessionId: routine.sessionId ?? `routine_${routine.id}`,
+            taskType: 'chat',
+            onEvent: () => {},
+          });
+          settle(true);
+        } catch (err) {
+          settle(false, err instanceof Error ? err.message : String(err));
+        }
+      }
+    } catch (err) {
+      settle(false, err instanceof Error ? err.message : String(err));
     }
   }
 }

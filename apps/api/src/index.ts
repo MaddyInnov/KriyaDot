@@ -576,6 +576,25 @@ async function boot(): Promise<void> {
   // are mounted on `app` in the HTTP section below.
   const routinesRouter = express.Router();
   const routineHookStore = new RoutineHookStore(config.dataDir);
+  // Routine run lifecycle (OpenMausBot parity P0 #7): every routine fire
+  // leaves a run record in routine-runs.db. The executor is shared by the
+  // scheduler, the webhook ingress router, and the public-hook delivery
+  // worker so all trigger paths record the same way.
+  const { RoutineRunStore, RoutineRunExecutor } = await import('./routine-runs.js');
+  const routineRunStore = new RoutineRunStore(config.dataDir);
+  // Restart recovery: runs stuck queued/running when the server died are
+  // marked failed ("server restarted") instead of lingering forever.
+  const recoveredRuns = routineRunStore.reconcileRunning();
+  if (recoveredRuns > 0) {
+    console.log(`[routines] marked ${recoveredRuns} interrupted run(s) as failed (server restart)`);
+  }
+  const { renderRoutinePrompt: renderRoutinePromptForRuns } = await import('./webhooks.js');
+  const routineRunExecutor = new RoutineRunExecutor({
+    runStore: routineRunStore,
+    agentRuntime,
+    getBots: () => seed.bots,
+    renderPrompt: renderRoutinePromptForRuns,
+  });
   const { routineStore, triggerStore: routineTriggerStore } = registerRoutineRoutes(
     routinesRouter,
     {
@@ -583,6 +602,7 @@ async function boot(): Promise<void> {
       getBots: () => seed.bots,
       hookStore: routineHookStore,
       getBaseUrls: () => ({ publicBaseUrl: config.publicBaseUrl, localPort: config.port }),
+      runStore: routineRunStore,
     },
   );
   const routineWebhookRouter = createRoutineWebhookRouter({
@@ -590,6 +610,7 @@ async function boot(): Promise<void> {
     triggerStore: routineTriggerStore,
     agentRuntime,
     getBots: () => seed.bots,
+    runExecutor: routineRunExecutor,
   });
   // Public webhook ingress (Codync parity): per-routine URL + secret with
   // HMAC verification and a queued delivery worker. The router is created
@@ -601,6 +622,7 @@ async function boot(): Promise<void> {
     hookStore: routineHookStore,
     agentRuntime,
     getBots: () => seed.bots,
+    runExecutor: routineRunExecutor,
   });
 
   // Companion app (phone → PC remote control). The hub is created here (not
@@ -795,13 +817,21 @@ async function boot(): Promise<void> {
   // Routine schedules (OpenMausBot parity): timezone-aware once/daily/
   // cron/interval schedules on bot routines. Each scheduled fire runs the
   // routine's bot turn; overlap policy ('skip' | 'queue') is per schedule.
+  // Assigned after the PushService exists (below); invoked on the failure
+  // streak auto-pause path.
+  let notifyRoutinePaused:
+    | ((routine: import('./bot-routines.js').BotRoutine, streak: number) => void)
+    | undefined;
   const { RoutineScheduler } = await import('./routine-schedules.js');
   const { renderRoutinePrompt } = await import('./webhooks.js');
   const routineScheduler = new RoutineScheduler({
     routineStore,
+    runStore: routineRunStore,
+    runExecutor: routineRunExecutor,
     agentRuntime,
     getBots: () => seed.bots,
     renderPrompt: renderRoutinePrompt,
+    onScheduleAutoPaused: (routine, streak) => notifyRoutinePaused?.(routine, streak),
     onFire: ({ routine, at, ok, error, skipped }) => {
       try {
         createTask({
@@ -822,7 +852,25 @@ async function boot(): Promise<void> {
       }
     },
   });
+  // Boot: occurrences missed while the server was down become 'missed'
+  // run records; catchUp:true schedules get a bounded backfill (max 3).
+  const missedRuns = await routineScheduler.reconcileMissedRuns();
+  if (missedRuns.missed > 0) {
+    console.log(
+      `[routines] marked ${missedRuns.missed} missed run(s) across ${missedRuns.routines} routine(s); ` +
+        `${missedRuns.catchUpRuns} catch-up run(s) started`,
+    );
+  }
   routineScheduler.start();
+
+  // Routine run history API (OpenMausBot parity P0 #7): run records,
+  // manual run-now / cancel / retry. Same router as the routine routes.
+  const { registerRoutineRunRoutes } = await import('./routine-run-routes.js');
+  registerRoutineRunRoutes(routinesRouter, {
+    routineStore,
+    runStore: routineRunStore,
+    scheduler: routineScheduler,
+  });
 
   // Omni rolling summary (Omni panel backend): the collector feeds the
   // store from the governance audit log, pending approvals, and workflow
@@ -985,6 +1033,32 @@ async function boot(): Promise<void> {
         `peer:${card.actionType}`,
         `${card.senderBotName} wants to ${card.actionType === 'delegate' ? 'delegate a subtask to' : card.actionType} ${card.targetBotName}`,
       )
+      .catch(() => {});
+  };
+  // Failure-streak auto-pause (routine run lifecycle, OpenMausBot parity
+  // P0 #7): "routine X failing repeatedly, paused" — a task for the UI
+  // badge plus a "needs you"-style push.
+  notifyRoutinePaused = (routine, streak) => {
+    try {
+      createTask({
+        title: `Routine auto-paused after ${streak} failures: ${routine.name}`,
+        notes:
+          `Routine "${routine.name}" failed ${streak} times in a row, so its schedule was auto-paused. ` +
+          `Check the run history for the errors, fix the cause, then re-enable the schedule.`,
+        dueAt: null,
+      });
+    } catch (err) {
+      console.error('[tasks] failed to record routine auto-pause:', err instanceof Error ? err.message : err);
+    }
+    const bot = (seed.bots as Array<{ id: string; name: string }>).find((b) => b.id === routine.botId);
+    void pushService
+      .notify({
+        kind: 'failed',
+        botId: routine.botId,
+        botName: bot?.name ?? routine.botId,
+        title: `${routine.name} — paused after failures`,
+        body: `Routine "${routine.name}" failed ${streak} times in a row and its schedule was paused. Open KriyaDot to investigate.`,
+      })
       .catch(() => {});
   };
   app.use(

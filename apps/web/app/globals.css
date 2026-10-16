@@ -4341,6 +4341,28 @@ html[data-ux='simple'] .mic-btn.recording {
 .deliveries-table th { opacity: 0.6; font-weight: 600; }
 .deliveries-table code { font-size: 0.72rem; }
 
+/* Routine run history */
+.run-history { margin-top: 0.6rem; }
+.runs-actions { display: flex; gap: 0.4rem; }
+.runs-table { width: 100%; font-size: 0.78rem; border-collapse: collapse; margin-top: 0.4rem; }
+.runs-table th, .runs-table td { text-align: left; padding: 0.3rem 0.4rem; border-bottom: 1px solid var(--border, #33333f); }
+.runs-table th { opacity: 0.6; font-weight: 600; }
+tr.run-row { cursor: pointer; }
+tr.run-row:hover td { background: rgba(255, 255, 255, 0.03); }
+.run-status { font-size: 0.72rem; padding: 0.1rem 0.45rem; border-radius: 20px; white-space: nowrap; }
+.run-status.succeeded { background: rgba(110, 231, 183, 0.15); color: #6ee7b7; }
+.run-status.failed { background: rgba(252, 165, 165, 0.15); color: #fca5a5; }
+.run-status.running { background: rgba(147, 197, 253, 0.15); color: #93c5fd; }
+.run-status.queued { background: rgba(252, 211, 77, 0.15); color: #fcd34d; }
+.run-status.missed { background: rgba(196, 181, 253, 0.15); color: #c4b5fd; }
+.run-status.cancelled { opacity: 0.6; }
+.trigger-badge { font-size: 0.72rem; opacity: 0.8; white-space: nowrap; }
+.run-output { font-size: 0.72rem; max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word; background: var(--surface-2, #23232e); padding: 0.5rem 0.6rem; border-radius: 8px; margin: 0.4rem 0; }
+.run-detail-row td { background: rgba(255, 255, 255, 0.02); }
+.streak-banner { font-size: 0.8rem; padding: 0.5rem 0.7rem; border-radius: 8px; background: rgba(252, 211, 77, 0.12); color: #fcd34d; margin: 0.5rem 0 0; }
+.streak-banner.paused { background: rgba(252, 165, 165, 0.12); color: #fca5a5; }
+.runs-pager { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.5rem; }
+
 /* Privacy & analytics panel */
 .privacy-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; padding: 0.7rem 0; border-bottom: 1px solid var(--border, #33333f); }
 .privacy-row:last-of-type { border-bottom: none; }

@@ -415,6 +415,8 @@ export interface RoutineRouteDeps {
   hookStore: import('./routine-hooks.js').RoutineHookStore;
   /** Base URLs for building the public/local hook URLs shown in the UI. */
   getBaseUrls: () => { publicBaseUrl?: string; localPort: number };
+  /** Run-record store (routine-runs.ts). When set, deleting a routine also deletes its run history. */
+  runStore?: import('./routine-runs.js').RoutineRunStore;
 }
 
 function errorBody(message: string, detail?: string): Record<string, unknown> {
@@ -564,6 +566,12 @@ export function registerRoutineRoutes(
     if (!routineStore.remove(id)) {
       res.status(404).json(errorBody(`Unknown routine "${id}"`));
       return;
+    }
+    // Cascade: the routine's run history goes with it.
+    try {
+      deps.runStore?.deleteByRoutine(id);
+    } catch (err) {
+      console.error('[routines] failed to delete run history:', err instanceof Error ? err.message : err);
     }
     res.json({ ok: true, deleted: id });
   });

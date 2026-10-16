@@ -22,6 +22,10 @@ interface RoutineSchedule {
   timezone: string;
   enabled: boolean;
   overlap: 'skip' | 'queue';
+  /** Catch up missed occurrences after downtime (max 3 backfill runs). */
+  catchUp?: boolean;
+  /** Auto-pause the schedule after this many consecutive failures. */
+  failureStreakLimit?: number;
   runAt?: string;
   time?: string;
   weekdays?: number[];
@@ -31,6 +35,27 @@ interface RoutineSchedule {
   windowStart?: string;
   windowEnd?: string;
   endsAt?: string;
+}
+
+interface RunRecord {
+  id: string;
+  routineId: string;
+  routineName: string;
+  trigger: 'schedule' | 'webhook' | 'manual';
+  scheduledFor: number | null;
+  startedAt: number | null;
+  endedAt: number | null;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'missed' | 'cancelled';
+  outputExcerpt: string | null;
+  error: string | null;
+  tokens: number | null;
+  costUsd: number | null;
+  createdAt: number;
+}
+
+interface RunStreak {
+  consecutiveFailures: number;
+  lastFailedAt: number | null;
 }
 
 interface Routine {
@@ -226,40 +251,55 @@ function ScheduleBuilder({
   const [useWeekdays, setUseWeekdays] = useState(Boolean(initial?.weekdays));
   const [intervalWeekdays, setIntervalWeekdays] = useState<number[]>(initial?.weekdays ?? [1, 2, 3, 4, 5]);
   const [endsAt, setEndsAt] = useState(initial?.endsAt?.slice(0, 16) ?? '');
+  const [catchUp, setCatchUp] = useState(initial?.catchUp ?? false);
+  const [streakLimit, setStreakLimit] = useState(String(initial?.failureStreakLimit ?? 3));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
   const build = (): RoutineSchedule => {
     const base = { timezone: timezone.trim(), enabled: initial?.enabled ?? true, overlap };
+    let s: RoutineSchedule;
     switch (kind) {
       case 'once':
         if (!onceRunAt) throw new Error('Pick a date and time');
-        return { ...base, kind, runAt: onceRunAt };
+        s = { ...base, kind, runAt: onceRunAt };
+        break;
       case 'daily':
         if (dailyWeekdays.length === 0) throw new Error('Pick at least one weekday');
-        return { ...base, kind, time: dailyTime, weekdays: dailyWeekdays };
+        s = { ...base, kind, time: dailyTime, weekdays: dailyWeekdays };
+        break;
       case 'cron':
         if (!cronExpr.trim()) throw new Error('Enter a cron expression');
-        return { ...base, kind, expression: cronExpr.trim() };
+        s = { ...base, kind, expression: cronExpr.trim() };
+        break;
       case 'interval': {
         const mins = Number(everyMinutes);
         if (!Number.isInteger(mins) || mins < 1 || mins > 10080) {
           throw new Error('Every N minutes must be an integer 1..10080');
         }
-        const s: RoutineSchedule = { ...base, kind, everyMinutes: mins };
-        if (anchorTime) s.anchorTime = anchorTime;
+        const iv: RoutineSchedule = { ...base, kind, everyMinutes: mins };
+        if (anchorTime) iv.anchorTime = anchorTime;
         if (useWindow) {
-          s.windowStart = windowStart;
-          s.windowEnd = windowEnd;
+          iv.windowStart = windowStart;
+          iv.windowEnd = windowEnd;
         }
         if (useWeekdays) {
           if (intervalWeekdays.length === 0) throw new Error('Pick at least one weekday');
-          s.weekdays = intervalWeekdays;
+          iv.weekdays = intervalWeekdays;
         }
-        if (endsAt) s.endsAt = endsAt;
-        return s;
+        if (endsAt) iv.endsAt = endsAt;
+        s = iv;
+        break;
       }
     }
+    // Run governance (only sent when non-default, to keep the JSON tidy).
+    if (catchUp) s.catchUp = true;
+    const limit = Number(streakLimit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 20) {
+      throw new Error('Auto-pause limit must be an integer 1..20');
+    }
+    if (limit !== 3) s.failureStreakLimit = limit;
+    return s;
   };
 
   const onSave = async () => {
@@ -384,6 +424,22 @@ function ScheduleBuilder({
         </select>
       </label>
 
+      <label className="check-row">
+        <input type="checkbox" checked={catchUp} onChange={(e) => setCatchUp(e.target.checked)} />
+        Catch up missed runs after downtime <span className="muted">(runs the 3 most recent missed occurrences)</span>
+      </label>
+      <label className="field-label">
+        Auto-pause the schedule after N consecutive failures
+        <input
+          type="number"
+          className="text-input"
+          min={1}
+          max={20}
+          value={streakLimit}
+          onChange={(e) => setStreakLimit(e.target.value)}
+        />
+      </label>
+
       {error && <p className="error">{error}</p>}
       <div className="sched-actions">
         <button type="button" className="btn-primary" onClick={() => void onSave()} disabled={busy}>
@@ -493,6 +549,8 @@ function ScheduleSection({ routine, onChanged }: { routine: Routine; onChanged: 
       <p className="muted small">
         Timezone <code>{s.timezone}</code>
         {' · '}overlap: <code>{s.overlap}</code>
+        {s.catchUp ? ' · catch-up on' : ''}
+        {s.failureStreakLimit && s.failureStreakLimit !== 3 ? ` · auto-pause after ${s.failureStreakLimit} failures` : ''}
       </p>
       {runs && runs.length > 0 && (
         <div className="next-runs">
@@ -522,6 +580,236 @@ function ScheduleSection({ routine, onChanged }: { routine: Routine; onChanged: 
         </button>
       </div>
     </div>
+  );
+}
+
+const RUN_STATUS_LABEL: Record<RunRecord['status'], string> = {
+  queued: '⏳ queued',
+  running: '⚙️ running',
+  succeeded: '✅ ok',
+  failed: '❌ failed',
+  missed: '⚠️ missed',
+  cancelled: '🚫 cancelled',
+};
+
+const TRIGGER_LABEL: Record<RunRecord['trigger'], string> = {
+  schedule: '⏰ schedule',
+  webhook: '🔗 webhook',
+  manual: '👆 manual',
+};
+
+function formatDuration(run: RunRecord): string {
+  if (!run.startedAt) return '—';
+  const end = run.endedAt ?? Date.now();
+  const s = Math.max(0, Math.round((end - run.startedAt) / 1000));
+  if (s < 60) return `${s}s`;
+  return `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
+/** Run-history tab for one routine: status chips, trigger badges, output viewer, cancel/retry. */
+function RunHistorySection({ routine }: { routine: Routine }) {
+  const limit = 10;
+  const [runs, setRuns] = useState<RunRecord[]>([]);
+  const [total, setTotal] = useState(0);
+  const [streak, setStreak] = useState<RunStreak>({ consecutiveFailures: 0, lastFailedAt: null });
+  const [offset, setOffset] = useState(0);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const load = useCallback(
+    async (o = 0) => {
+      try {
+        const res = await api<{ runs: RunRecord[]; total: number; streak: RunStreak }>(
+          `/api/routines/${encodeURIComponent(routine.id)}/runs?limit=${limit}&offset=${o}`,
+        );
+        setRuns(res.runs);
+        setTotal(res.total);
+        setStreak(res.streak);
+        setOffset(o);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to load runs');
+      }
+    },
+    [routine.id],
+  );
+
+  useEffect(() => {
+    void load(0);
+  }, [load]);
+
+  // Live refresh while a run is active.
+  const anyActive = runs.some((r) => r.status === 'queued' || r.status === 'running');
+  useEffect(() => {
+    if (!anyActive) return;
+    const t = setInterval(() => void load(offset), 3000);
+    return () => clearInterval(t);
+  }, [anyActive, offset, load]);
+
+  const runNow = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      await api(`/api/routines/${encodeURIComponent(routine.id)}/run-now`, { method: 'POST' });
+      await load(0);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Run failed to start');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const cancel = async (runId: string) => {
+    try {
+      await api(`/api/routines/${encodeURIComponent(routine.id)}/runs/${encodeURIComponent(runId)}/cancel`, {
+        method: 'POST',
+      });
+      await load(offset);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Cancel failed');
+    }
+  };
+
+  const retry = async (runId: string) => {
+    setBusy(true);
+    setError('');
+    try {
+      await api(`/api/routines/${encodeURIComponent(routine.id)}/runs/${encodeURIComponent(runId)}/retry`, {
+        method: 'POST',
+      });
+      await load(0);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Retry failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const autoPaused = routine.schedule && !routine.schedule.enabled && streak.consecutiveFailures > 0;
+
+  return (
+    <div className="run-history">
+      <div className="deliveries-head">
+        <label className="field-label">Run history</label>
+        <div className="runs-actions">
+          <button type="button" className="btn-ghost small" onClick={() => void runNow()} disabled={busy}>
+            ▶ Run now
+          </button>
+          <button type="button" className="btn-ghost small" onClick={() => void load(offset)}>
+            Refresh
+          </button>
+        </div>
+      </div>
+      {streak.consecutiveFailures > 0 && (
+        <p className={`streak-banner${autoPaused ? ' paused' : ''}`}>
+          ⚠️ {streak.consecutiveFailures} consecutive failure{streak.consecutiveFailures === 1 ? '' : 's'}
+          {autoPaused
+            ? ' — the schedule was auto-paused. Fix the cause, then re-enable it above.'
+            : ` — the schedule auto-pauses after ${routine.schedule?.failureStreakLimit ?? 3}.`}
+        </p>
+      )}
+      {error && <p className="error">{error}</p>}
+      {runs.length === 0 ? (
+        <p className="muted small">No runs yet — fires, webhooks, and manual runs all appear here.</p>
+      ) : (
+        <table className="runs-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Trigger</th>
+              <th>Status</th>
+              <th>Duration</th>
+              <th aria-label="actions" />
+            </tr>
+          </thead>
+          <tbody>
+            {runs.map((r) => (
+              <FragmentRow key={r.id} run={r} expanded={expanded === r.id}
+                onToggle={() => setExpanded(expanded === r.id ? null : r.id)}
+                onCancel={() => void cancel(r.id)} onRetry={() => void retry(r.id)} />
+            ))}
+          </tbody>
+        </table>
+      )}
+      {total > limit && (
+        <div className="runs-pager">
+          <button type="button" className="btn-ghost small" disabled={offset === 0} onClick={() => void load(offset - limit)}>
+            ← Newer
+          </button>
+          <span className="muted small">
+            {offset + 1}–{Math.min(offset + limit, total)} of {total}
+          </span>
+          <button
+            type="button"
+            className="btn-ghost small"
+            disabled={offset + limit >= total}
+            onClick={() => void load(offset + limit)}
+          >
+            Older →
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FragmentRow({
+  run,
+  expanded,
+  onToggle,
+  onCancel,
+  onRetry,
+}: {
+  run: RunRecord;
+  expanded: boolean;
+  onToggle: () => void;
+  onCancel: () => void;
+  onRetry: () => void;
+}) {
+  const active = run.status === 'queued' || run.status === 'running';
+  const retryable = run.status === 'failed' || run.status === 'cancelled' || run.status === 'missed';
+  return (
+    <>
+      <tr className="run-row" onClick={onToggle} title={run.error ?? undefined}>
+        <td>{new Date(run.startedAt ?? run.createdAt).toLocaleString()}</td>
+        <td>
+          <span className="trigger-badge">{TRIGGER_LABEL[run.trigger]}</span>
+        </td>
+        <td>
+          <span className={`run-status ${run.status}`}>{RUN_STATUS_LABEL[run.status]}</span>
+        </td>
+        <td>{formatDuration(run)}</td>
+        <td onClick={(e) => e.stopPropagation()}>
+          {active && (
+            <button type="button" className="btn-ghost small" onClick={onCancel}>
+              Cancel
+            </button>
+          )}
+          {retryable && (
+            <button type="button" className="btn-ghost small" onClick={onRetry}>
+              Retry
+            </button>
+          )}
+        </td>
+      </tr>
+      {expanded && (
+        <tr className="run-detail-row">
+          <td colSpan={5}>
+            {run.scheduledFor && (
+              <p className="muted small">Scheduled for {new Date(run.scheduledFor).toLocaleString()}</p>
+            )}
+            {run.error && <p className="error small">Error: {run.error}</p>}
+            {run.outputExcerpt && <pre className="run-output">{run.outputExcerpt}</pre>}
+            {run.tokens != null && (
+              <p className="muted small">
+                {run.tokens} tokens{run.costUsd != null ? ` · $${run.costUsd.toFixed(4)}` : ''}
+              </p>
+            )}
+            {!run.error && !run.outputExcerpt && <p className="muted small">No output recorded.</p>}
+          </td>
+        </tr>
+      )}
+    </>
   );
 }
 
@@ -635,6 +923,8 @@ function RoutineRow({ routine, botId, onChanged }: { routine: Routine; botId: st
           {busy && !hook && <p className="muted">Loading…</p>}
           {error && <p className="error">{error}</p>}
           <ScheduleSection routine={routine} onChanged={onChanged} />
+          <hr className="section-sep" />
+          <RunHistorySection routine={routine} />
           <hr className="section-sep" />
           {hook && (
             <>
