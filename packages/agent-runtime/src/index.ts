@@ -16,6 +16,7 @@ export * from './reviewer.js';
 export * from './runtime.js';
 export * from './sessions.js';
 export * from './skills.js';
+export * from './agent-import.js';
 export * from './mcp.js';
 export * from './mcp-oauth.js';
 export * from './tools/builtin.js';

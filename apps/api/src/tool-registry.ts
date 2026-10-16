@@ -94,6 +94,9 @@ export async function buildToolRegistry(opts: {
     new SkillLoader(opts.skillsDir, {
       pinDbPath: path.join(opts.dataDir, 'skill-pins.db'),
       approvalBroker: opts.approvalBroker,
+      // User-imported skills (e.g. from Claude Code) land here; the primary
+      // seed dir wins on name collisions.
+      additionalDirs: [path.join(opts.dataDir, 'skills')],
     }),
   )) {
     registry.set(tool.name, tool);

@@ -40,6 +40,8 @@ import { resolvePersona } from './personas.js';
 export interface AgentRuntimeOptions {
   dbPath: string;
   skillsDir: string;
+  /** Extra skill dirs (e.g. <dataDir>/skills for user-imported skills). */
+  additionalSkillsDirs?: string[];
   governance: GovernanceGateway;
   toolRegistry: Map<string, ToolDefinition>;
   defaultProviderId?: string;
@@ -314,7 +316,7 @@ export class AgentRuntime {
 
   constructor(opts: AgentRuntimeOptions) {
     this.store = new SessionStore(opts.dbPath, opts.sessionStoreOptions);
-    this.skills = new SkillLoader(opts.skillsDir);
+    this.skills = new SkillLoader(opts.skillsDir, { additionalDirs: opts.additionalSkillsDirs });
     this.governance = opts.governance;
     this.toolRegistry = opts.toolRegistry;
     this.defaultProviderId = opts.defaultProviderId ?? 'groq';

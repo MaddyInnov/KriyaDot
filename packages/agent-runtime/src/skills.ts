@@ -55,6 +55,12 @@ export interface SkillLoaderOptions {
   actor?: string;
   /** Timeout for awaiting a drift approval decision; broker default applies when unset. */
   approvalTimeoutMs?: number;
+  /**
+   * Extra skill directories searched after `skillsDir` (e.g. user-imported
+   * skills under `<dataDir>/skills`). Name collisions resolve to the primary
+   * `skillsDir` first. Additive and backward compatible.
+   */
+  additionalDirs?: string[];
 }
 
 /** SQLite TOFU pin store for skill content hashes (one row per skill name). */
@@ -131,13 +137,15 @@ export class SkillLoader {
   }
 
   list(): string[] {
-    if (!existsSync(this.skillsDir)) return [];
     const names = new Set<string>();
-    for (const entry of readdirSync(this.skillsDir, { withFileTypes: true })) {
-      if (entry.isFile() && entry.name.endsWith('.md')) {
-        names.add(entry.name.slice(0, -3));
-      } else if (entry.isDirectory() && existsSync(join(this.skillsDir, entry.name, 'SKILL.md'))) {
-        names.add(entry.name);
+    for (const dir of [this.skillsDir, ...(this.options.additionalDirs ?? [])]) {
+      if (!existsSync(dir)) continue;
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.isFile() && entry.name.endsWith('.md')) {
+          names.add(entry.name.slice(0, -3));
+        } else if (entry.isDirectory() && existsSync(join(dir, entry.name, 'SKILL.md'))) {
+          names.add(entry.name);
+        }
       }
     }
     return [...names].sort();
@@ -199,8 +207,12 @@ export class SkillLoader {
 
   /** Resolve the skill file path without reading it (for cache validation). */
   private skillFile(name: string): string | null {
-    const candidates = [join(this.skillsDir, name, 'SKILL.md'), join(this.skillsDir, `${name}.md`)];
-    return candidates.find((c) => existsSync(c)) ?? null;
+    for (const dir of [this.skillsDir, ...(this.options.additionalDirs ?? [])]) {
+      const candidates = [join(dir, name, 'SKILL.md'), join(dir, `${name}.md`)];
+      const found = candidates.find((c) => existsSync(c));
+      if (found) return found;
+    }
+    return null;
   }
 
   private readSkillFile(file: string, name: string): RawSkill {

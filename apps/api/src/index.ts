@@ -33,6 +33,7 @@ import { registerDelegateTools } from './delegate-wiring.js';
 import { registerBotTeamToolsWiring } from './bot-team-wiring.js';
 import { createBotConversationsRouter } from './bot-conversations-routes.js';
 import { createAgentDetectRouter } from './agent-detect-routes.js';
+import { createAgentImportRouter } from './agent-import-routes.js';
 import { createAnalyticsRouter } from './analytics-routes.js';
 import { createLocalLlmRouter } from './local-llm-routes.js';
 import { LocalLlmManager } from '@mvp/agent-runtime';
@@ -405,6 +406,7 @@ async function boot(): Promise<void> {
   const agentRuntime = new AgentRuntime({
     dbPath: `${config.dataDir}/agent.db`,
     skillsDir: path.join(seedDir, 'skills'),
+    additionalSkillsDirs: [path.join(config.dataDir, 'skills')],
     governance: governanceAdapter,
     toolRegistry,
     hooks: hookBus,
@@ -979,6 +981,17 @@ async function boot(): Promise<void> {
     });
     app.use('/worktrees', worktreesRouter);
   }
+  // Import from other AI agents (Atomic parity): skills/memory/sessions/bots.
+  app.use(
+    '/api/agent-import',
+    createAgentImportRouter({
+      dataDir: config.dataDir,
+      getBots: () => seed.bots,
+      tieredMemoryStore,
+      sessionStore: agentRuntime.sessionStore,
+      audit: (action, fields) => governance.audit(action, fields),
+    }),
+  );
   // Unknown /api paths → JSON 404 (before the SPA fallback claims them).
   app.use('/api', (_req, res) => {
     res.status(404).json({ error: 'Unknown API route' });

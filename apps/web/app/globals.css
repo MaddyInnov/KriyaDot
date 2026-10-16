@@ -4362,3 +4362,21 @@ html[data-ux='simple'] .mic-btn.recording {
 .progress-bar { flex: 1; height: 8px; border-radius: 4px; background: var(--surface-2, #23232e); overflow: hidden; }
 .progress-fill { height: 100%; background: #60a5fa; border-radius: 4px; transition: width 0.3s; }
 .update-badge-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #fbbf24; margin-left: 6px; vertical-align: middle; }
+
+/* Agent import panel (Atomic parity) */
+.import-source-list { display: grid; gap: 0.6rem; margin-top: 0.5rem; }
+.import-source-card { display: flex; flex-direction: column; gap: 0.25rem; text-align: left; padding: 0.8rem 1rem; border-radius: 12px; border: 1px solid var(--border, #33333f); background: var(--surface-2, #1a1a24); cursor: pointer; color: inherit; font: inherit; }
+.import-source-card:hover { border-color: var(--accent, #7c8aff); }
+.import-item-list { display: flex; flex-direction: column; gap: 0.5rem; margin: 0.6rem 0; max-height: 420px; overflow: auto; }
+.import-item { display: flex; gap: 0.6rem; align-items: flex-start; padding: 0.6rem 0.7rem; border-radius: 10px; border: 1px solid var(--border, #33333f); background: var(--surface-2, #1a1a24); cursor: pointer; }
+.import-item input[type="checkbox"] { margin-top: 0.25rem; }
+.import-item-body { display: flex; flex-direction: column; gap: 0.2rem; font-size: 0.85rem; }
+.import-excerpt { font-size: 0.72rem; max-height: 120px; overflow: auto; padding: 0.5rem; border-radius: 8px; background: var(--surface-1, #14141c); white-space: pre-wrap; word-break: break-word; margin: 0.3rem 0 0; }
+.import-lossy { font-size: 0.78rem; color: #fbbf24; }
+.import-run-controls { display: flex; flex-wrap: wrap; gap: 0.8rem; align-items: center; margin-top: 0.6rem; }
+.import-bot-opts { display: flex; gap: 0.4rem; align-items: center; font-size: 0.85rem; }
+.import-report { margin-top: 0.8rem; padding: 0.7rem 0.9rem; border-radius: 10px; border: 1px solid var(--border, #33333f); background: var(--surface-2, #1a1a24); }
+.import-report h4 { margin: 0.5rem 0 0.3rem; font-size: 0.88rem; }
+.import-report ul { margin: 0.2rem 0; padding-left: 1.2rem; font-size: 0.84rem; }
+.import-error { color: #f87171; font-size: 0.85rem; }
+.linklike { background: none; border: none; color: var(--accent, #7c8aff); cursor: pointer; padding: 0; font: inherit; margin-bottom: 0.4rem; }

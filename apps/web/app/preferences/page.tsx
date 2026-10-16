@@ -9,6 +9,7 @@ import { DetectedAgentsPanel } from '../../components/panels/detected-agents-pan
 import { AnalyticsPanel } from '../../components/panels/analytics-panel';
 import { LocalLlmPanel } from '../../components/panels/local-llm-panel';
 import { UpdatesPanel } from '../../components/panels/updates-panel';
+import { AgentImportPanel } from '../../components/panels/agent-import-panel';
 import { useUxMode } from '../../lib/ux-mode';
 
 interface LearnedPreference {
@@ -182,6 +183,16 @@ export default function PreferencesPage() {
           GPU auto-detect, served on 127.0.0.1 only. No API key, no cloud, no cost.
         </p>
         <LocalLlmPanel />
+      </section>
+
+      <section className="card">
+        <h2>Import from other agents</h2>
+        <p className="muted small">
+          Bring your skills, notes, sessions, and configs from Claude Code, Codex, OpenCode,
+          OpenClaw, Pi, or Hermes into KriyaDot. Detection and preview are read-only; secrets
+          are redacted; existing skills and bots are never overwritten.
+        </p>
+        <AgentImportPanel />
       </section>
 
       <section className="card">
