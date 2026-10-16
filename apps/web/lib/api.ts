@@ -1037,3 +1037,42 @@ export async function fetchBotPeers(botId: string): Promise<BotPeerDto[]> {
   const body = (await res.json()) as { peers: BotPeerDto[] };
   return body.peers;
 }
+
+export interface DetectedAgentDto {
+  id: string;
+  name: string;
+  bin: string;
+  path: string;
+  version: string | null;
+  acpCompatible: boolean;
+  homepage: string;
+}
+
+export interface AgentListEntryDto extends Partial<DetectedAgentDto> {
+  id: string;
+  name: string;
+  installed: boolean;
+  bins?: string[];
+  installHint?: string;
+  installHintWindows?: string;
+  homepage: string;
+  acpCompatible: boolean;
+}
+
+export async function fetchDetectedAgents(): Promise<{ agents: DetectedAgentDto[]; scannedAt: number }> {
+  const res = await apiFetch('/api/agents/detected');
+  if (!res.ok) throw new Error(`Detected agents failed (${res.status})`);
+  return res.json();
+}
+
+export async function fetchAllAgents(): Promise<{ agents: AgentListEntryDto[]; scannedAt: number }> {
+  const res = await apiFetch('/api/agents');
+  if (!res.ok) throw new Error(`Agents list failed (${res.status})`);
+  return res.json();
+}
+
+export async function rescanAgents(): Promise<{ agents: DetectedAgentDto[]; scannedAt: number }> {
+  const res = await apiFetch('/api/agents/rescan', { method: 'POST' });
+  if (!res.ok) throw new Error(`Rescan failed (${res.status})`);
+  return res.json();
+}

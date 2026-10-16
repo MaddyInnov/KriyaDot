@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { PetPicker } from '../../components/pet/PetPicker';
 import { AccentPicker } from '../../components/accent/AccentPicker';
 import { McpScopesPanel } from '../../components/panels/mcp-scopes-panel';
+import { DetectedAgentsPanel } from '../../components/panels/detected-agents-panel';
 import { useUxMode } from '../../lib/ux-mode';
 
 interface LearnedPreference {
@@ -140,6 +141,14 @@ export default function PreferencesPage() {
           <McpScopesPanel />
         </section>
       )}
+
+      <section className="card">
+        <h2>Detected coding agents</h2>
+        <p style={{ fontSize: 13, opacity: 0.7, marginBottom: 12 }}>
+          Coding-agent CLIs found on this computer's PATH. Bots can use any installed agent as a backend.
+        </p>
+        <DetectedAgentsPanel />
+      </section>
 
       <section className="card">
         <h2>Teach by recording</h2>

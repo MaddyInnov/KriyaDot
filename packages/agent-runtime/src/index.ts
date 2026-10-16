@@ -26,6 +26,7 @@ export * from './routing.js';
 export * from './routing-learn.js';
 export * from './message-router.js';
 export * from './providers/agent-cli.js';
+export * from './providers/agent-detect.js';
 export * from './prompts.js';
 export * from './system1.js';
 export * from './mcp-server.js';

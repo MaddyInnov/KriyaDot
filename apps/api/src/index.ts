@@ -32,6 +32,7 @@ import { buildToolRegistry } from './tool-registry.js';
 import { registerDelegateTools } from './delegate-wiring.js';
 import { registerBotTeamToolsWiring } from './bot-team-wiring.js';
 import { createBotConversationsRouter } from './bot-conversations-routes.js';
+import { createAgentDetectRouter } from './agent-detect-routes.js';
 import { createSummarizer } from './summarizer.js';
 import { createRouter } from './routes.js';
 import { renderKriyaDotMeter } from './kriyadot-meter.js';
@@ -781,6 +782,9 @@ async function boot(): Promise<void> {
   );
   // Bot routines: management API + signed inbound webhook triggers.
   // (Stores are created once above and shared by both routers.)
+  // Agent auto-detection (Codync parity: detected coding CLIs + install hints).
+  app.use('/api/agents', createAgentDetectRouter());
+
   app.use('/api/routines', routinesRouter);
   app.use('/webhooks/routines', routineWebhookRouter);
   // n8n workflow import/export.
