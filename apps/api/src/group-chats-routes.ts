@@ -8,13 +8,32 @@
 //   DELETE /api/groups/:id
 //   POST   /api/groups/:id/members     { add?: string[], remove?: string[] }
 //   GET    /api/groups/:id/messages    ?limit=
-//   POST   /api/groups/:id/messages    { text } → user message + room turn
+//   POST   /api/groups/:id/messages    { text }[?queue=1][?timeoutMin=] → user message + room turn
 //   POST   /api/groups/:id/stop        → cancel an in-flight room turn
+//   GET    /api/groups/:id/status      → hold/queue/breaker/locks/settings snapshot
+//   GET    /api/groups/:id/settings    → robustness settings (resolved + overrides)
+//   PUT    /api/groups/:id/settings    { turnTimeoutMin?, maxPostsPerMemberPerTurn?,
+//                                        postsPerMinute?, duplicateRepeatLimit?, maxHeld? }
+//   DELETE /api/groups/:id/settings    → reset overrides to global defaults
+//   POST   /api/groups/:id/hold        → pause (new messages queue)
+//   POST   /api/groups/:id/halt        → stop the in-flight turn now + pause
+//   POST   /api/groups/:id/release     → resume + drain the queue in order
+//   GET    /api/groups/:id/queue       → queued messages
+//   DELETE /api/groups/:id/queue       → clear the queue
+//   GET    /api/groups/:id/failures    → failed member turns
+//   POST   /api/groups/:id/failures/:failureId/retry → re-run a failed member turn
 //
 // POST /messages persists the user message, then runs the room turn
-// (group-room-turn.ts): @-mentioned members (or all members) reply in turn,
-// up to 3 rounds / 10 replies. The response includes all replies; clients
+// (group-room-turn.ts, orchestrated by GroupRoomManager in group-rooms.ts):
+// @-mentioned members (or all members) reply in turn, up to 3 rounds / 10
+// replies, guarded by per-room turn timeouts, anti-spam budgets, member
+// locks, and failure recording. The response includes all replies; clients
 // that want streaming can poll GET /messages instead.
+//
+// Queueing: POST /messages?queue=1 while a turn is in flight persists the
+// message and queues it behind the current turn instead of cancelling it.
+// Queued messages dispatch in order when the turn completes. A held/halted
+// room always queues (up to maxHeld, default 20; 429 when full).
 //
 // Per-message threads: a group message can anchor a reply thread via the
 // message-threads infra — POST /api/groups/:id/messages/:msgId/thread
@@ -34,10 +53,13 @@
 // - Group ids: `grp_<base36time>_<rand>`; message ids: `gmsg_<base36time>_<rand>`.
 // - Room turn: sequential replies, each member in its OWN session via
 //   runMemberTurn. A reply of exactly `(pass)` is silent.
-// - Only one room turn runs per group at a time; POST /messages while one
-//   is in flight cancels it first (unless ?queue=1).
+// - Only one room turn runs per group at a time. POST /messages while one
+//   is in flight cancels it first — unless ?queue=1 (queues behind) or the
+//   room is held/halted (always queues).
 // - create is idempotent on exact member sets: returns the existing group
 //   with created:false (Codync's createBot behavior).
+// - System notices (timeouts, breaker, hold/halt/release) are persisted as
+//   messages with authorType 'system'.
 
 import express, { type Router } from 'express';
 import type { BotConfig, StreamEvent, TokenUsage } from '@mvp/agent-runtime';
@@ -48,7 +70,12 @@ import {
   type GroupChat,
   type GroupMessage,
 } from './group-chats.js';
-import { MAX_ROOM_REPLIES, MAX_ROOM_ROUNDS, runRoomTurn } from './group-room-turn.js';
+import { MAX_ROOM_REPLIES, MAX_ROOM_ROUNDS } from './group-room-turn.js';
+import {
+  GroupRoomManager,
+  parseTimeoutOverride,
+  sanitizeRoomSettingsPatch,
+} from './group-rooms.js';
 
 export interface GroupChatsDeps {
   dataDir: string;
@@ -73,12 +100,15 @@ function botById(bots: BotConfig[], id: string): BotConfig | undefined {
   return bots.find((b) => b.id === id);
 }
 
-/** In-flight room turns per group (for cancellation). */
-const inFlightTurns = new Map<string, { cancelled: boolean }>();
-
 export function createGroupChatsRouter(deps: GroupChatsDeps): Router {
   const router = express.Router();
   const store = new GroupChatStore(deps.dataDir);
+  const rooms = new GroupRoomManager({
+    store,
+    getBots: deps.getBots,
+    runMemberTurn: deps.runMemberTurn,
+    audit: deps.audit,
+  });
 
   const groupOf = (req: express.Request, res: express.Response): GroupChat | null => {
     const id = req.params.id as string;
@@ -197,11 +227,7 @@ export function createGroupChatsRouter(deps: GroupChatsDeps): Router {
   router.delete('/:id', (req, res) => {
     const group = groupOf(req, res);
     if (!group) return;
-    const turn = inFlightTurns.get(group.id);
-    if (turn) {
-      turn.cancelled = true;
-      inFlightTurns.delete(group.id);
-    }
+    rooms.deleteRoom(group.id);
     store.deleteGroup(group.id);
     deps.audit('group.delete', { detail: { groupId: group.id } });
     res.json({ ok: true });
@@ -253,14 +279,22 @@ export function createGroupChatsRouter(deps: GroupChatsDeps): Router {
   });
 
   /**
-   * Send a user message → starts a room turn.
-   * Persists the user message, then runs up to 3 rounds / 10 replies.
-   * A running room turn for this group is cancelled first.
+   * Send a user message → starts a room turn (or queues it).
+   *
+   * Query/body options:
+   *   ?queue=1      — when a turn is in flight, queue behind it instead of
+   *                   cancelling it. Queued messages dispatch in order.
+   *   ?timeoutMin=  — per-message turn deadline override (1–1440 min).
+   *
+   * A held/halted room always queues (up to maxHeld; 429 when full).
    */
   router.post('/:id/messages', async (req, res) => {
     const group = groupOf(req, res);
     if (!group) return;
-    const { text } = (req.body ?? {}) as { text?: unknown };
+    const { text, timeoutMin: bodyTimeout } = (req.body ?? {}) as {
+      text?: unknown;
+      timeoutMin?: unknown;
+    };
     if (typeof text !== 'string' || text.trim().length === 0) {
       res.status(400).json(errorBody('text (non-empty string) is required'));
       return;
@@ -269,35 +303,50 @@ export function createGroupChatsRouter(deps: GroupChatsDeps): Router {
       res.status(400).json(errorBody('text is too long (max 20000 chars)'));
       return;
     }
-
-    // Cancel any in-flight turn for this group (Codync: new message ends the old turn).
-    const prev = inFlightTurns.get(group.id);
-    if (prev) prev.cancelled = true;
-    const turn = { cancelled: false };
-    inFlightTurns.set(group.id, turn);
-
-    const userMsg = store.addMessage(group.id, 'user', text.trim());
-    deps.audit('group.message', { detail: { groupId: group.id, messageId: userMsg.id } });
-
-    const bots = deps.getBots();
-    let result;
-    try {
-      result = await runRoomTurn(group, text.trim(), {
-        store,
-        getBot: (id) => botById(bots, id),
-        runMemberTurn: deps.runMemberTurn,
-        isCancelled: () => turn.cancelled,
-      });
-    } finally {
-      if (inFlightTurns.get(group.id) === turn) inFlightTurns.delete(group.id);
+    const queue = req.query.queue === '1' || req.query.queue === 'true';
+    const timeoutOverride = parseTimeoutOverride(
+      req.query.timeoutMin !== undefined ? req.query.timeoutMin : bodyTimeout,
+    );
+    if (timeoutOverride === 'invalid') {
+      res.status(400).json(errorBody('timeoutMin must be an integer 1–1440'));
+      return;
     }
 
+    const posted = await rooms.postMessage(group.id, group, text.trim(), {
+      queue,
+      timeoutMin: timeoutOverride,
+    });
+    if (!posted.ok) {
+      res.status(posted.status).json(
+        errorBody(posted.error, {
+          retryAfterMs: posted.retryAfterMs,
+          maxHeld: posted.maxHeld,
+          queueDepth: posted.queueDepth,
+        }),
+      );
+      return;
+    }
+    if (posted.queued) {
+      res.status(202).json({
+        ok: true,
+        queued: true,
+        position: posted.position,
+        userMessage: posted.message,
+      });
+      return;
+    }
+    const result = posted.result;
     res.json({
       ok: true,
-      userMessage: userMsg,
+      queued: false,
+      userMessage: posted.userMessage,
       replies: result.replies,
       roundsCompleted: result.roundsCompleted,
       stoppedEarly: result.stoppedEarly,
+      timedOut: result.timedOut,
+      failures: result.failures,
+      skipped: result.skipped,
+      breakerTripped: result.breakerTripped,
       limits: { maxRounds: MAX_ROOM_ROUNDS, maxReplies: MAX_ROOM_REPLIES },
     });
   });
@@ -306,13 +355,110 @@ export function createGroupChatsRouter(deps: GroupChatsDeps): Router {
   router.post('/:id/stop', (req, res) => {
     const group = groupOf(req, res);
     if (!group) return;
-    const turn = inFlightTurns.get(group.id);
-    if (turn) {
-      turn.cancelled = true;
-      inFlightTurns.delete(group.id);
-    }
+    const stopped = rooms.stopTurn(group.id);
     deps.audit('group.stop', { detail: { groupId: group.id } });
-    res.json({ ok: true, stopped: !!turn });
+    res.json({ ok: true, stopped });
+  });
+
+  // ---- room robustness --------------------------------------------------------
+
+  /** Full room snapshot: hold state, in-flight turn, queue, breaker, locks, settings. */
+  router.get('/:id/status', (req, res) => {
+    const group = groupOf(req, res);
+    if (!group) return;
+    res.json({ ok: true, status: rooms.getStatus(group.id) });
+  });
+
+  /** Resolved robustness settings + per-room overrides. */
+  router.get('/:id/settings', (req, res) => {
+    const group = groupOf(req, res);
+    if (!group) return;
+    const status = rooms.getStatus(group.id);
+    res.json({ ok: true, settings: status.settings, overrides: status.overrides });
+  });
+
+  /** Update per-room robustness settings (validated ranges). */
+  router.put('/:id/settings', (req, res) => {
+    const group = groupOf(req, res);
+    if (!group) return;
+    const parsed = sanitizeRoomSettingsPatch(req.body);
+    if (!parsed.ok) {
+      res.status(400).json(errorBody(parsed.error));
+      return;
+    }
+    const settings = rooms.updateSettings(group.id, parsed.patch);
+    res.json({ ok: true, settings });
+  });
+
+  /** Reset per-room overrides to global defaults. */
+  router.delete('/:id/settings', (req, res) => {
+    const group = groupOf(req, res);
+    if (!group) return;
+    const settings = rooms.resetSettings(group.id);
+    res.json({ ok: true, settings });
+  });
+
+  /** Pause the room: no new turns start; posted messages queue. */
+  router.post('/:id/hold', (req, res) => {
+    const group = groupOf(req, res);
+    if (!group) return;
+    res.json({ ok: true, status: rooms.hold(group.id) });
+  });
+
+  /** Stop everything now: cancel the in-flight turn and pause the room. */
+  router.post('/:id/halt', (req, res) => {
+    const group = groupOf(req, res);
+    if (!group) return;
+    res.json({ ok: true, status: rooms.halt(group.id) });
+  });
+
+  /** Resume the room (clears any breaker) and drain the queue in order. */
+  router.post('/:id/release', async (req, res) => {
+    const group = groupOf(req, res);
+    if (!group) return;
+    res.json({ ok: true, status: await rooms.release(group.id) });
+  });
+
+  /** Queued messages (visible queue). */
+  router.get('/:id/queue', (req, res) => {
+    const group = groupOf(req, res);
+    if (!group) return;
+    res.json({ ok: true, queue: rooms.getQueue(group.id) });
+  });
+
+  /** Clear the queue without dispatching. */
+  router.delete('/:id/queue', (req, res) => {
+    const group = groupOf(req, res);
+    if (!group) return;
+    res.json({ ok: true, cleared: rooms.clearQueue(group.id) });
+  });
+
+  /** Failed member turns (retryable). */
+  router.get('/:id/failures', (req, res) => {
+    const group = groupOf(req, res);
+    if (!group) return;
+    res.json({ ok: true, failures: rooms.listFailures(group.id) });
+  });
+
+  /** Re-run a failed member turn with its original prompt. */
+  router.post('/:id/failures/:failureId/retry', async (req, res) => {
+    const group = groupOf(req, res);
+    if (!group) return;
+    try {
+      const message = await rooms.retryFailure(group.id, req.params.failureId as string);
+      res.json({ ok: true, message });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg === 'failure-not-found') {
+        res.status(404).json(errorBody('Failure not found'));
+        return;
+      }
+      if (msg === 'bot-not-found') {
+        res.status(400).json(errorBody('The failed member bot no longer exists'));
+        return;
+      }
+      res.status(500).json(errorBody('Retry failed', msg));
+    }
   });
 
   /**

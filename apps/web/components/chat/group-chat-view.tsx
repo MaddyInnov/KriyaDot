@@ -14,6 +14,7 @@ import {
   type GroupMessage,
   type RoomTurnReply,
 } from '../../lib/group-chats';
+import { GroupRoomControls } from './group-room-controls';
 
 interface Props {
   group: GroupChat;
@@ -54,6 +55,7 @@ export function GroupChatView({ group, botNames, onOpenThread }: Props) {
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [liveReply, setLiveReply] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const memberNames = group.memberBotIds.map((id) => botNames.get(id) ?? id);
@@ -79,9 +81,29 @@ export function GroupChatView({ group, botNames, onOpenThread }: Props) {
 
   const send = async () => {
     const text = draft.trim();
-    if (!text || sending) return;
+    if (!text) return;
+    if (sending) {
+      // A room turn is in flight: queue behind it (?queue=1) instead of
+      // cancelling it. The server runs it when the current turn finishes.
+      setDraft('');
+      setError(null);
+      try {
+        const r = await sendGroupMessage(group.id, text, { queue: true });
+        setMessages(await listGroupMessages(group.id));
+        setNotice(
+          r.queued
+            ? `Queued #${r.position} — runs when the current turn finishes.`
+            : 'Sent.',
+        );
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Failed to queue.');
+        setDraft(text);
+      }
+      return;
+    }
     setSending(true);
     setError(null);
+    setNotice(null);
     setDraft('');
     // Optimistic user message.
     const optimistic: GroupMessage = {
@@ -100,8 +122,17 @@ export function GroupChatView({ group, botNames, onOpenThread }: Props) {
       // Replace optimistic + append authoritative transcript.
       const fresh = await listGroupMessages(group.id);
       setMessages(fresh);
-      if (result.stoppedEarly) {
+      if (result.timedOut) {
+        setError('Room turn timed out — stopping to protect your token budget.');
+      } else if (result.breakerTripped) {
+        setError(`Anti-spam breaker tripped: ${result.breakerTripped.detail}`);
+      } else if (result.stoppedEarly) {
         setError('Room turn was stopped early.');
+      }
+      if (result.failures && result.failures.length > 0) {
+        setNotice(
+          `${result.failures.length} member turn${result.failures.length > 1 ? 's' : ''} failed — retry from the room controls below.`,
+        );
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to send.');
@@ -137,7 +168,11 @@ export function GroupChatView({ group, botNames, onOpenThread }: Props) {
       <div className="msg-list" role="log" aria-label={`${group.name} messages`}>
         {messages.map((m) => {
           const authorLabel =
-            m.authorType === 'user' ? 'You' : (botNames.get(m.authorBotId ?? '') ?? 'Bot');
+            m.authorType === 'user'
+              ? 'You'
+              : m.authorType === 'system'
+                ? '🛡 Room'
+                : (botNames.get(m.authorBotId ?? '') ?? 'Bot');
           return (
             <div key={m.id} className={`msg-row${m.authorType === 'user' ? ' mine' : ''}`}>
               <div className="msg-head">
@@ -174,6 +209,13 @@ export function GroupChatView({ group, botNames, onOpenThread }: Props) {
           {error}
         </div>
       )}
+      {notice && !error && (
+        <div className="small muted" role="status">
+          {notice}
+        </div>
+      )}
+
+      <GroupRoomControls key={group.id} groupId={group.id} onTranscriptChanged={load} />
 
       <div className="chat-input-wrap">
         <div className="chat-input">
@@ -187,22 +229,25 @@ export function GroupChatView({ group, botNames, onOpenThread }: Props) {
                 send();
               }
             }}
-            placeholder={`Message ${group.name} — @name to pick who replies`}
-            disabled={sending}
+            placeholder={
+              sending
+                ? `Room is replying — Enter queues behind the turn`
+                : `Message ${group.name} — @name to pick who replies`
+            }
             aria-label={`Message ${group.name}`}
           />
-          {sending ? (
+          {sending && (
             <button className="btn btn-ghost" onClick={stop} title="Stop the room turn">
               ⏹ Stop
             </button>
-          ) : (
-            <button className="btn btn-primary" onClick={send} disabled={!draft.trim()}>
-              Send
-            </button>
           )}
+          <button className="btn btn-primary" onClick={send} disabled={!draft.trim()}>
+            {sending ? 'Queue' : 'Send'}
+          </button>
         </div>
         <div className="small muted hint">
-          Tip: <code>@all</code> or no mentions → everyone replies, up to 3 rounds.
+          Tip: <code>@all</code> or no mentions → everyone replies, up to 3 rounds. While
+          the room is replying, sending queues your message behind the turn.
         </div>
       </div>
     </div>

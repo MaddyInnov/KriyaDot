@@ -354,14 +354,16 @@ describe('runRoomTurn', () => {
     const { dir, store, deps } = makeDeps();
     try {
       const group = store.createGroup('Team', ['coder', 'scout']);
-      // isCancelled is checked at round start (n=1) and before each
-      // speaker (n=2, n=3...). Cancel before the 2nd speaker (n=3).
+      // isCancelled is checked at round start (n=1), before each speaker
+      // (n=2, n=4...), and once more after each member turn resolves (n=3).
+      // Cancelling at n=3 drops the in-flight speaker's stale reply.
       let n = 0;
       const result = await runRoomTurn(group, 'hello', {
         ...deps,
         isCancelled: () => ++n > 2,
       });
-      expect(result.replies).toHaveLength(1);
+      expect(result.replies).toHaveLength(0);
+      expect(result.skipped).toEqual([{ botId: 'coder', reason: 'turn-cancelled' }]);
       expect(result.stoppedEarly).toBe(true);
     } finally {
       store.close();
@@ -416,12 +418,16 @@ describe('group-chats-routes', () => {
   let base: string;
   const bots = MEMBERS;
   const audit = vi.fn();
+  let n = 0;
 
   async function runMemberTurn(bot: BotConfig, _prompt: string) {
-    return { text: `mock reply from ${bot.name}` };
+    // Unique text per call: the room's duplicate-spam breaker must not trip
+    // in tests that are not about spam.
+    return { text: `mock reply ${++n} from ${bot.name}` };
   }
 
   beforeEach(async () => {
+    n = 0;
     dir = mkdtempSync(join(tmpdir(), 'grp-api-'));
     app = express();
     app.use(express.json());

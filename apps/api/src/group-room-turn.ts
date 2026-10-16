@@ -32,6 +32,14 @@ export const MAX_ROOM_REPLIES = 10;
 /** A member reply of exactly this (case-insensitive, trimmed) says nothing. */
 export const PASS_REPLY = '(pass)';
 
+/** Thrown (by the orchestrator's wrapped runMemberTurn) when a room turn exceeds its deadline. */
+export class TurnTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TurnTimeoutError';
+  }
+}
+
 export interface RoomTurnDeps {
   store: GroupChatStore;
   /** Resolve a bot id to its config (seed roster + imports). */
@@ -48,6 +56,53 @@ export interface RoomTurnDeps {
   onSpeakerStart?: (botId: string, round: number) => void;
   /** Abort signal: when true, stop before the next speaker. */
   isCancelled?: () => boolean;
+  /**
+   * Robustness hook: return a non-null reason to skip this speaker this
+   * turn (rate/budget exceeded). The skip is silent — no failure recorded.
+   */
+  skipSpeaker?: (botId: string) => string | null;
+  /**
+   * Robustness hook: claim an exclusive per-turn lock on a member so
+   * parallel dispatches can't double-invoke the same bot. Return false to
+   * skip the speaker.
+   */
+  claimSpeakerLock?: (botId: string) => boolean;
+  /** Robustness hook: release a lock claimed via claimSpeakerLock. */
+  releaseSpeakerLock?: (botId: string) => void;
+  /**
+   * Robustness hook: decide whether a member's reply may be posted.
+   * 'block' skips the reply; 'trip' ends the whole turn immediately
+   * (anti-spam breaker). Returns the failure id when one is recorded.
+   */
+  onMemberError?: (info: {
+    bot: BotConfig;
+    round: number;
+    prompt: string;
+    error: unknown;
+  }) => string | null | undefined;
+  /**
+   * Robustness hook: inspect a member's reply before it is persisted.
+   * 'block' drops the reply silently; 'trip' aborts the entire room turn
+   * (anti-spam breaker escalation).
+   */
+  checkReply?: (bot: BotConfig, text: string) =>
+    | { action: 'allow' }
+    | { action: 'block'; reason: string }
+    | { action: 'trip'; reason: string; detail: string };
+}
+
+export interface MemberFailure {
+  botId: string;
+  botName: string;
+  round: number;
+  error: string;
+  /** Present when the orchestrator persisted the failure for retry. */
+  failureId: string | null;
+}
+
+export interface BreakerTrip {
+  reason: string;
+  detail: string;
 }
 
 export interface RoomTurnResult {
@@ -56,6 +111,14 @@ export interface RoomTurnResult {
   stoppedEarly: boolean;
   /** True when a round produced zero replies (natural end). */
   quietRound: boolean;
+  /** True when the turn was aborted by its deadline. */
+  timedOut: boolean;
+  /** Member turns that threw (recorded for retry by the orchestrator). */
+  failures: MemberFailure[];
+  /** Set when the anti-spam breaker aborted the turn. */
+  breakerTripped: BreakerTrip | null;
+  /** Speakers skipped by the skipSpeaker hook, with reasons. */
+  skipped: Array<{ botId: string; reason: string }>;
 }
 
 /**
@@ -170,7 +233,16 @@ export async function runRoomTurn(
     .map((id) => deps.getBot(id))
     .filter((b): b is BotConfig => b !== undefined);
   if (members.length === 0) {
-    return { replies: [], roundsCompleted: 0, stoppedEarly: false, quietRound: true };
+    return {
+      replies: [],
+      roundsCompleted: 0,
+      stoppedEarly: false,
+      quietRound: true,
+      timedOut: false,
+      failures: [],
+      breakerTripped: null,
+      skipped: [],
+    };
   }
 
   // Who answers: @-mentioned members, or everyone when no mentions.
@@ -178,10 +250,15 @@ export async function runRoomTurn(
   const speakers = mentioned.length > 0 ? mentioned : members;
 
   const replies: RoomTurnResult['replies'] = [];
+  const failures: RoomTurnResult['failures'] = [];
+  const skipped: RoomTurnResult['skipped'] = [];
   const priorReplies: Array<{ botName: string; text: string }> = [];
   let roundsCompleted = 0;
   let stoppedEarly = false;
   let quietRound = false;
+  let timedOut = false;
+  let breakerTripped: BreakerTrip | null = null;
+  let abortAll = false;
 
   // Rotation offset: each round starts one member later in the speaker list.
   for (let round = 1; round <= MAX_ROOM_ROUNDS; round++) {
@@ -195,10 +272,21 @@ export async function runRoomTurn(
     let roundReplies = 0;
 
     for (const bot of ordered) {
+      if (abortAll) break;
       if (replies.length >= MAX_ROOM_REPLIES) break;
       if (deps.isCancelled?.()) {
         stoppedEarly = true;
         break;
+      }
+      const skipReason = deps.skipSpeaker?.(bot.id) ?? null;
+      if (skipReason) {
+        skipped.push({ botId: bot.id, reason: skipReason });
+        continue;
+      }
+      const locked = deps.claimSpeakerLock?.(bot.id) ?? true;
+      if (!locked) {
+        skipped.push({ botId: bot.id, reason: 'member-locked' });
+        continue;
       }
       deps.onSpeakerStart?.(bot.id, round);
       const prompt = buildMemberPrompt({
@@ -212,11 +300,51 @@ export async function runRoomTurn(
       try {
         const result = await deps.runMemberTurn(bot, prompt);
         text = (result.text ?? '').trim();
-      } catch {
-        // A member that errors skips its turn; the room continues.
+      } catch (err) {
+        deps.releaseSpeakerLock?.(bot.id);
+        if (err instanceof TurnTimeoutError) {
+          timedOut = true;
+          stoppedEarly = true;
+          abortAll = true;
+          break;
+        }
+        // A member that errors records a failure (for retry); the room continues.
+        let failureId: string | null = null;
+        try {
+          failureId = deps.onMemberError?.({ bot, round, prompt, error: err }) ?? null;
+        } catch {
+          // The failure recorder must never break the room.
+        }
+        failures.push({
+          botId: bot.id,
+          botName: bot.name,
+          round,
+          error: err instanceof Error ? err.message : String(err),
+          failureId,
+        });
+        continue;
+      }
+      deps.releaseSpeakerLock?.(bot.id);
+      if (deps.isCancelled?.()) {
+        // The turn was cancelled while this member was thinking: drop the
+        // stale reply instead of polluting the new turn's transcript.
+        skipped.push({ botId: bot.id, reason: 'turn-cancelled' });
+        stoppedEarly = true;
         continue;
       }
       if (!text || isPass(text)) continue;
+
+      const check = deps.checkReply?.(bot, text) ?? { action: 'allow' as const };
+      if (check.action === 'block') {
+        skipped.push({ botId: bot.id, reason: check.reason });
+        continue;
+      }
+      if (check.action === 'trip') {
+        breakerTripped = { reason: check.reason, detail: check.detail };
+        stoppedEarly = true;
+        abortAll = true;
+        break;
+      }
 
       const msg = deps.store.addMessage(group.id, 'bot', text, bot.id);
       replies.push({ botId: bot.id, botName: bot.name, text, messageId: msg.id });
@@ -225,6 +353,7 @@ export async function runRoomTurn(
       deps.onReply?.(msg);
     }
 
+    if (abortAll) break;
     roundsCompleted = round;
     if (roundReplies === 0) {
       quietRound = true;
@@ -232,7 +361,7 @@ export async function runRoomTurn(
     }
   }
 
-  return { replies, roundsCompleted, stoppedEarly, quietRound };
+  return { replies, roundsCompleted, stoppedEarly, quietRound, timedOut, failures, breakerTripped, skipped };
 }
 
 /** Re-exported for tests: resolve which members speak for a message. */
