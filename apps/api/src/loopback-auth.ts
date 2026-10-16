@@ -121,6 +121,10 @@ export function corsOriginFn(
  *   - /.well-known         public A2A agent-card discovery
  *   - /api/auth/bootstrap issues the token itself (Origin-gated, not token-
  *                           gated — that would be a chicken-and-egg)
+ *   - any path outside /api and /worktrees: the bundled web UI's static
+ *     assets (the page must load so the browser can call /api/auth/bootstrap),
+ *     /_kriyadot/ (read-only meter), /webhooks (per-trigger secret auth).
+ *     /worktrees stays protected.
  *   - WebSocket upgrade paths below: browsers can't send Authorization
  *     headers on WS handshakes. They authenticate in-protocol (device token
  *     for /api/phone/ws and /api/companion/ws, governance approval tickets
