@@ -2680,6 +2680,31 @@ html[data-theme='midnight'] .tk-fn { color: #67e8f9; }
   opacity: 1;
 }
 
+/* Reply threads */
+.thread-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border, #2a2a35);
+  background: transparent;
+  color: var(--accent, #8b7cf6);
+  font-size: 12px;
+  cursor: pointer;
+}
+.thread-summary:hover {
+  background: var(--surface-2);
+}
+.copy-btn.thread-unread {
+  color: var(--accent, #8b7cf6);
+  font-weight: 700;
+}
+.thread-panel .msg {
+  border-radius: 10px;
+}
+
 /* --- Suggestion chips (empty state) --- */
 .chips {
   display: flex;

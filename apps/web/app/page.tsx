@@ -5,14 +5,19 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   allowTool,
   branchChatThread,
+  createMessageThread,
   decideApproval,
   deleteSlashCommand,
   getApiBase,
   getBots,
   getChatThreadMessages,
+  getMessageThread,
+  getMessageThreads,
   getModels,
   getProviders,
   getSlashCommands,
+  markMessageThreadRead,
+  replyInMessageThread,
   saveSlashCommand,
   streamChat,
   uploadFile,
@@ -20,6 +25,7 @@ import {
 } from '../lib/api';
 import type {
   BotConfig,
+  MessageThreadSummary,
   ModelPriceInfo,
   ProviderInfo,
   SlashCommand,
@@ -346,6 +352,37 @@ function BranchBtn({ onBranch, disabled }: { onBranch: () => void; disabled?: bo
   );
 }
 
+/** "Reply in thread" action: open the Slack-style reply thread on this message. */
+function ThreadBtn({
+  onThread,
+  disabled,
+  replyCount,
+  unread,
+}: {
+  onThread: () => void;
+  disabled?: boolean;
+  replyCount?: number;
+  unread?: boolean;
+}) {
+  const label = replyCount ? `💬 ${replyCount}` : '💬 Thread';
+  return (
+    <button
+      type="button"
+      className={`copy-btn${unread ? ' thread-unread' : ''}`}
+      title="Reply in thread — discuss this message in a side thread"
+      aria-label="Reply in thread"
+      disabled={disabled}
+      onClick={(e) => {
+        e.stopPropagation();
+        onThread();
+      }}
+    >
+      {label}
+      {unread ? ' •' : ''}
+    </button>
+  );
+}
+
 /** Suggestion chips for the empty state. */
 const SUGGESTIONS = [
   'Explain a concept simply',
@@ -399,6 +436,22 @@ function ChatPageInner() {
   const [renameDraft, setRenameDraft] = useState('');
   // Branching a thread at a message (server round-trip in progress).
   const [branching, setBranching] = useState(false);
+  // Slack-style reply threads: the open thread panel, its messages, and
+  // per-root summaries (reply counts + unread flags) for the active convo.
+  const [openThread, setOpenThread] = useState<{
+    id: string;
+    sessionId: string;
+    threadSessionId: string;
+    rootClientId: string;
+    rootText: string;
+  } | null>(null);
+  const [threadBlocks, setThreadBlocks] = useState<ChatBlock[]>([]);
+  const [threadSummaries, setThreadSummaries] = useState<Record<string, MessageThreadSummary>>({});
+  const [threadLoading, setThreadLoading] = useState(false);
+  const [threadInput, setThreadInput] = useState('');
+  const [threadSending, setThreadSending] = useState(false);
+  const openThreadRef = useRef(openThread);
+  openThreadRef.current = openThread;
   // Sidebar (mobile drawer) + settings popover.
   const [sideOpen, setSideOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -527,13 +580,17 @@ function ChatPageInner() {
     const list = convosRef.current[selectedBot.id] ?? [];
     if (cid && list.some((c) => c.id === cid)) {
       setBlocks(loadBlocks(cid));
+      void loadThreadSummaries(cid);
     } else if (list.length > 0 && list[0]) {
       // Fall back to the most recent conversation.
       persistActiveConvo({ ...activeConvoRef.current, [selectedBot.id]: list[0].id });
       setBlocks(loadBlocks(list[0].id));
+      void loadThreadSummaries(list[0].id);
     } else {
       setBlocks([]);
+      setThreadSummaries({});
     }
+    closeThread();
   }, [selectedBotId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Persist overrides.
@@ -603,6 +660,8 @@ function ChatPageInner() {
     persistActiveConvo({ ...activeConvoRef.current, [botId]: convoId });
     setBlocks(loadBlocks(convoId));
     setSideOpen(false);
+    closeThread();
+    void loadThreadSummaries(convoId);
   };
 
   /**
@@ -653,6 +712,179 @@ function ChatPageInner() {
     } finally {
       setBranching(false);
     }
+  };
+
+  /**
+   * Map a UI block id to the server-side message id, using the same ordinal
+   * approach as branching: the n-th user/assistant block pairs with the
+   * n-th user/assistant message in the thread's verbatim log.
+   */
+  const mapBlockToServerMessage = async (
+    blockId: string,
+    cid: string,
+  ): Promise<{ serverId: number; block: Extract<ChatBlock, { kind: 'user' | 'assistant' }> } | null> => {
+    const current = blocksRef.current;
+    const idx = current.findIndex((b) => b.id === blockId);
+    if (idx < 0) return null;
+    const block = current[idx];
+    if (block.kind !== 'user' && block.kind !== 'assistant') return null;
+    const ordinal =
+      current.slice(0, idx + 1).filter((b) => b.kind === 'user' || b.kind === 'assistant').length - 1;
+    const log = await getChatThreadMessages(cid);
+    const candidates = log.messages.filter((m) => m.role === 'user' || m.role === 'assistant');
+    if (candidates.length === 0) return null;
+    const target = candidates[Math.min(ordinal, candidates.length - 1)];
+    return { serverId: target.id, block: block as Extract<ChatBlock, { kind: 'user' | 'assistant' }> };
+  };
+
+  /** Load thread summaries (reply counts + unread) for the active conversation. */
+  const loadThreadSummaries = useCallback(async (cid: string) => {
+    try {
+      const res = await getMessageThreads(cid);
+      const byRoot: Record<string, MessageThreadSummary> = {};
+      for (const t of res.threads ?? []) {
+        if (t.rootClientId) byRoot[t.rootClientId] = t;
+      }
+      setThreadSummaries(byRoot);
+    } catch {
+      // Threads are additive; a failure here must not break the chat.
+    }
+  }, []);
+
+  /**
+   * Open the reply thread anchored to a message block: create the thread
+   * (forking the session) if needed, then load its messages into the panel.
+   */
+  const openThreadFromBlock = async (blockId: string) => {
+    if (threadLoading || threadSending) return;
+    const botId = botIdRef.current;
+    const cid = activeConvoRef.current[botId];
+    if (!cid) return;
+    setThreadLoading(true);
+    try {
+      const mapped = await mapBlockToServerMessage(blockId, cid);
+      if (!mapped) throw new Error('Could not find that message on the server.');
+      const res = await createMessageThread(cid, mapped.serverId, {
+        rootClientId: blockId,
+        botId,
+      });
+      const thread = res.thread;
+      const detail = await getMessageThread(cid, thread.id);
+      const blocks: ChatBlock[] = [];
+      for (const m of detail.messages ?? []) {
+        if (m.role === 'user') {
+          blocks.push({ kind: 'user', id: newId(), text: m.content, ts: Date.parse(m.ts) || Date.now() });
+        } else if (m.role === 'assistant') {
+          blocks.push({
+            kind: 'assistant',
+            id: newId(),
+            text: m.content,
+            streaming: false,
+            ts: Date.parse(m.ts) || Date.now(),
+          });
+        }
+      }
+      setOpenThread({
+        id: thread.id,
+        sessionId: cid,
+        threadSessionId: thread.threadSessionId,
+        rootClientId: blockId,
+        rootText: mapped.block.kind === 'user' ? mapped.block.text : mapped.block.text.slice(0, 140),
+      });
+      setThreadBlocks(blocks);
+      // Opening reads the thread; refresh summaries to clear the unread dot.
+      await loadThreadSummaries(cid);
+    } catch (err) {
+      setThreadBlocks([
+        { kind: 'error', id: newId(), text: `Could not open thread: ${err instanceof Error ? err.message : String(err)}` },
+      ]);
+    } finally {
+      setThreadLoading(false);
+    }
+  };
+
+  const closeThread = useCallback(() => {
+    setOpenThread(null);
+    setThreadBlocks([]);
+    setThreadInput('');
+  }, []);
+
+  /**
+   * Send a reply in the open thread. The reply endpoint returns the
+   * thread's forked session id; the turn runs through the normal chat
+   * stream so approvals/queueing/telemetry all apply.
+   */
+  const sendThreadReply = async () => {
+    const text = threadInput.trim();
+    const thread = openThreadRef.current;
+    if (!text || !thread || threadSending) return;
+    const bot = selectedBotRef.current;
+    if (!bot) return;
+    setThreadSending(true);
+    const userBlock: ChatBlock = { kind: 'user', id: newId(), text, ts: Date.now() };
+    const assistantBlock: ChatBlock = {
+      kind: 'assistant',
+      id: newId(),
+      text: '',
+      streaming: true,
+      ts: Date.now(),
+      botName: bot.name,
+    };
+    setThreadBlocks((prev) => [...prev, userBlock, assistantBlock]);
+    setThreadInput('');
+    try {
+      const rep = await replyInMessageThread(thread.sessionId, thread.id, text);
+      const controller = new AbortController();
+      for await (const event of streamChat({
+        botId: bot.id,
+        message: text,
+        sessionId: rep.threadSessionId,
+        provider: providerIdRef.current || undefined,
+        model: modelIdRef.current || undefined,
+        signal: controller.signal,
+      })) {
+        if ((event as { type?: string }).type === 'queued') continue;
+        // Thread blocks share the ChatBlock shape; apply deltas to
+        // threadBlocks instead of the main blocks.
+        applyThreadEvent(event as StreamEvent, assistantBlock.id);
+      }
+    } catch (err) {
+      setThreadBlocks((prev) => [
+        ...prev.filter((b) => b.id !== assistantBlock.id),
+        { kind: 'error', id: newId(), text: err instanceof Error ? err.message : String(err) },
+      ]);
+    } finally {
+      setThreadBlocks((prev) =>
+        prev.map((b) => (b.kind === 'assistant' ? { ...b, streaming: false } : b)),
+      );
+      setThreadSending(false);
+      // Refresh the summary counts.
+      loadThreadSummaries(thread.sessionId);
+    }
+  };
+
+  /**
+   * Minimal stream-event application for thread replies. Handles text
+   * deltas and completion; tool/approval events in threads are rare and
+   * surface as text fallbacks.
+   */
+  const applyThreadEvent = (event: StreamEvent, assistantId: string) => {
+    const t = (event as { type?: string }).type ?? '';
+    if (t === 'text' || t === 'delta' || t === 'content') {
+      const chunk =
+        (event as { text?: string; delta?: string; content?: string }).text ??
+        (event as { delta?: string }).delta ??
+        (event as { content?: string }).content ??
+        '';
+      if (chunk) {
+        setThreadBlocks((prev) =>
+          prev.map((b) => (b.id === assistantId && b.kind === 'assistant' ? { ...b, text: b.text + chunk } : b)),
+        );
+      }
+      return;
+    }
+    if (t === 'done' || t === 'end' || t === 'complete') return;
+    // Unknown event kinds: ignore (no crash on future event shapes).
   };
 
   const applyEvent = useCallback((event: StreamEvent) => {
@@ -1451,7 +1683,8 @@ function ChatPageInner() {
           )}
           {blocks.map((b) => {
             switch (b.kind) {
-              case 'user':
+              case 'user': {
+                const summary = threadSummaries[b.id];
                 return (
                   <div key={b.id} className="msg user" title={new Date(b.ts).toLocaleString()}>
                     <div className="msg-head">
@@ -1461,10 +1694,27 @@ function ChatPageInner() {
                       <span className="msg-time">{fmtTime(b.ts)}</span>
                       <CopyBtn text={b.text} />
                       <BranchBtn onBranch={() => branchFromBlock(b.id)} disabled={branching || sending} />
+                      <ThreadBtn
+                        onThread={() => openThreadFromBlock(b.id)}
+                        disabled={threadLoading || sending}
+                        replyCount={summary?.replyCount}
+                        unread={summary?.unread}
+                      />
                     </div>
                     <div className="msg-text">{b.text}</div>
+                    {summary && summary.replyCount > 0 && (
+                      <button
+                        type="button"
+                        className="thread-summary"
+                        onClick={() => openThreadFromBlock(b.id)}
+                      >
+                        💬 {summary.replyCount} {summary.replyCount === 1 ? 'reply' : 'replies'}
+                        {summary.unread ? ' • new' : ''}
+                      </button>
+                    )}
                   </div>
                 );
+              }
               case 'voice-note':
                 return (
                   <div key={b.id} className="msg user" title={new Date(b.ts).toLocaleString()}>
@@ -1494,6 +1744,7 @@ function ChatPageInner() {
                 );
               case 'assistant': {
                 const botLabel = b.botName ?? selectedBot?.name ?? 'Assistant';
+                const summary = threadSummaries[b.id];
                 return (
                   <div key={b.id} className="msg assistant" title={new Date(b.ts).toLocaleString()}>
                     <div className="msg-head">
@@ -1506,7 +1757,25 @@ function ChatPageInner() {
                       {!b.streaming && (
                         <BranchBtn onBranch={() => branchFromBlock(b.id)} disabled={branching || sending} />
                       )}
+                      {!b.streaming && (
+                        <ThreadBtn
+                          onThread={() => openThreadFromBlock(b.id)}
+                          disabled={threadLoading || sending}
+                          replyCount={summary?.replyCount}
+                          unread={summary?.unread}
+                        />
+                      )}
                     </div>
+                    {summary && summary.replyCount > 0 && (
+                      <button
+                        type="button"
+                        className="thread-summary"
+                        onClick={() => openThreadFromBlock(b.id)}
+                      >
+                        💬 {summary.replyCount} {summary.replyCount === 1 ? 'reply' : 'replies'}
+                        {summary.unread ? ' • new' : ''}
+                      </button>
+                    )}
                     <div className="msg-text">
                       {b.streaming && b.text.length === 0 ? (
                         <span>
@@ -1770,6 +2039,132 @@ function ChatPageInner() {
           </>
         )}
       </div>
+
+      {/* Reply thread panel (slide-over) */}
+      {openThread && (
+        <div
+          className="thread-panel"
+          role="dialog"
+          aria-label="Reply thread"
+          style={{
+            position: 'fixed',
+            top: 0,
+            right: 0,
+            bottom: 0,
+            width: 420,
+            maxWidth: '94vw',
+            zIndex: 60,
+            display: 'flex',
+            flexDirection: 'column',
+            background: 'var(--bg, #14141c)',
+            borderLeft: '1px solid var(--border, #2a2a35)',
+            boxShadow: '-12px 0 32px rgba(0,0,0,0.35)',
+          }}
+        >
+          <div
+            className="thread-panel-head"
+            style={{ padding: '12px 14px', borderBottom: '1px solid var(--border, #2a2a35)' }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <strong>💬 Thread</strong>
+              <button className="icon-btn" aria-label="Close thread" onClick={closeThread}>
+                ✕
+              </button>
+            </div>
+            <p className="small muted" style={{ margin: '6px 0 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              on: {openThread.rootText.slice(0, 90)}
+            </p>
+          </div>
+          <div className="thread-panel-body" style={{ flex: 1, overflowY: 'auto', padding: 12 }}>
+            {threadLoading ? (
+              <p className="small muted">Loading thread…</p>
+            ) : (
+              threadBlocks.map((b) => {
+                if (b.kind === 'user') {
+                  return (
+                    <div key={b.id} className="msg user" style={{ marginBottom: 10 }}>
+                      <div className="msg-head">
+                        <span className="avatar you" aria-hidden="true">You</span>
+                        <span className="msg-time">{fmtTime(b.ts)}</span>
+                      </div>
+                      <div className="msg-text">{b.text}</div>
+                    </div>
+                  );
+                }
+                if (b.kind === 'assistant') {
+                  return (
+                    <div key={b.id} className="msg assistant" style={{ marginBottom: 10 }}>
+                      <div className="msg-head">
+                        <span className="avatar bot" aria-hidden="true">
+                          {(b.botName ?? selectedBot?.name ?? 'A').charAt(0).toUpperCase()}
+                        </span>
+                        <span className="msg-author">{b.botName ?? selectedBot?.name ?? 'Assistant'}</span>
+                        <span className="msg-time">{fmtTime(b.ts)}</span>
+                        {b.text.length > 0 && <CopyBtn text={b.text} />}
+                      </div>
+                      <div className="msg-text">
+                        {b.streaming && b.text.length === 0 ? (
+                          <span className="typing-dots" aria-label="Thinking">
+                            <i />
+                            <i />
+                            <i />
+                          </span>
+                        ) : (
+                          <>
+                            {b.text}
+                            {b.streaming && <span className="stream-caret" aria-hidden="true" />}
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  );
+                }
+                if (b.kind === 'error') {
+                  return (
+                    <div key={b.id} className="msg error" style={{ marginBottom: 10 }}>
+                      <div className="msg-text">⚠️ {b.text}</div>
+                    </div>
+                  );
+                }
+                return null;
+              })
+            )}
+          </div>
+          <div
+            className="thread-panel-composer"
+            style={{ padding: 12, borderTop: '1px solid var(--border, #2a2a35)' }}
+          >
+            <div style={{ display: 'flex', gap: 8 }}>
+              <textarea
+                className="input composer"
+                value={threadInput}
+                rows={2}
+                onChange={(e) => setThreadInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey || !e.shiftKey)) {
+                    e.preventDefault();
+                    void sendThreadReply();
+                  }
+                }}
+                placeholder="Reply in thread…"
+                disabled={threadSending || threadLoading}
+                aria-label="Reply in thread"
+                style={{ flex: 1 }}
+              />
+              <button
+                className="btn btn-primary"
+                onClick={() => void sendThreadReply()}
+                disabled={!threadInput.trim() || threadSending || threadLoading}
+              >
+                {threadSending ? '…' : 'Send'}
+              </button>
+            </div>
+            <p className="small muted" style={{ margin: '6px 0 0' }}>
+              Replies stay in this thread — the main chat is untouched.
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Slash command manager */}
       {slashMgrOpen && (

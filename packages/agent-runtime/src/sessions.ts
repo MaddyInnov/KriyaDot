@@ -35,6 +35,14 @@ export interface IdentifiedMessage {
   toolName?: string;
   toolCallId?: string;
   toolCalls?: ToolCall[];
+  /**
+   * Reply-thread membership (Slack-style threads). Null/undefined for main
+   * chat messages. threadId is the opaque thread id (`thr_…`); threadRootId
+   * is the client-side id of the root message the thread is anchored to.
+   * Populated by the message-threads API, not stored in the session DB.
+   */
+  threadId?: string | null;
+  threadRootId?: string | null;
 }
 
 /** Result of {@link SessionStore.branchSession}. */

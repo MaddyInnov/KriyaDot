@@ -405,6 +405,85 @@ export const branchChatThread = (
     body: JSON.stringify({ fromMessageId, ...(opts?.title ? { title: opts.title } : {}), ...(opts?.botId ? { botId: opts.botId } : {}) }),
   });
 
+// ---- Slack-style reply threads ---------------------------------------------
+
+export interface MessageThread {
+  id: string;
+  sessionId: string;
+  threadSessionId: string;
+  rootMessageId: number;
+  rootClientId: string | null;
+  createdAt: string;
+}
+
+export interface MessageThreadSummary extends MessageThread {
+  replyCount: number;
+  lastReplyAt: string | null;
+  unread: boolean;
+}
+
+export interface MessageThreadMessage {
+  id: number;
+  role: string;
+  content: string;
+  ts: string;
+  threadId?: string | null;
+  threadRootId?: string | null;
+}
+
+/** Create a reply thread anchored to a root message (forks the session). */
+export const createMessageThread = (
+  sessionId: string,
+  rootMessageId: number,
+  opts?: { rootClientId?: string; botId?: string },
+): Promise<{ ok: boolean; thread: MessageThread; created: boolean }> =>
+  apiJson(`/api/chat/${encodeURIComponent(sessionId)}/message-threads`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      rootMessageId,
+      ...(opts?.rootClientId ? { rootClientId: opts.rootClientId } : {}),
+      ...(opts?.botId ? { botId: opts.botId } : {}),
+    }),
+  });
+
+/** List thread summaries for a session (reply counts + unread flags). */
+export const getMessageThreads = (
+  sessionId: string,
+): Promise<{ ok: boolean; threads: MessageThreadSummary[] }> =>
+  apiJson(`/api/chat/${encodeURIComponent(sessionId)}/message-threads`);
+
+/** Get a thread's messages. */
+export const getMessageThread = (
+  sessionId: string,
+  threadId: string,
+): Promise<{ ok: boolean; thread: MessageThread; messages: MessageThreadMessage[] }> =>
+  apiJson(`/api/chat/${encodeURIComponent(sessionId)}/message-threads/${encodeURIComponent(threadId)}`);
+
+/** Mark a thread as read. */
+export const markMessageThreadRead = (sessionId: string, threadId: string): Promise<{ ok: boolean }> =>
+  apiJson(`/api/chat/${encodeURIComponent(sessionId)}/message-threads/${encodeURIComponent(threadId)}/read`, {
+    method: 'POST',
+  });
+
+/**
+ * Reply in a thread. Returns the thread's forked session id — drive the
+ * agent turn through the normal streamChat() with sessionId set to it.
+ */
+export const replyInMessageThread = (
+  sessionId: string,
+  threadId: string,
+  content: string,
+): Promise<{ ok: boolean; threadId: string; threadSessionId: string }> =>
+  apiJson(
+    `/api/chat/${encodeURIComponent(sessionId)}/message-threads/${encodeURIComponent(threadId)}/reply`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+    },
+  );
+
 // ---- Bot roster import/export ----------------------------------------------
 
 export interface RosterReportItem {

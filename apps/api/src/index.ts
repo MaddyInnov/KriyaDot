@@ -39,6 +39,7 @@ import { mountWebAssets } from './web-assets.js';
 // each module exports a factory; mounted below without touching other wiring.
 import { createComputerView } from './computer-view.js';
 import { createChatThreadsRouter } from './chat-threads-routes.js';
+import { createMessageThreadsRouter } from './message-threads-routes.js';
 import { applyImportedBots, createBotRosterRouter } from './bot-roster-routes.js';
 import { registerRoutineRoutes } from './bot-routines.js';
 import { createRoutineWebhookRouter } from './webhooks.js';
@@ -711,6 +712,16 @@ async function boot(): Promise<void> {
   app.use(
     '/api/chat/threads',
     createChatThreadsRouter({
+      dataDir: config.dataDir,
+      branchSession: (id, msgId, opts) => agentRuntime.branchSession(id, msgId, opts),
+      listThreadMessages: (id) => agentRuntime.listThreadMessages(id),
+      audit: (action, fields) => governance.audit(action, fields),
+    }),
+  );
+  // Slack-style reply threads on chat messages (flat, one level).
+  app.use(
+    '/api/chat/:sessionId/message-threads',
+    createMessageThreadsRouter({
       dataDir: config.dataDir,
       branchSession: (id, msgId, opts) => agentRuntime.branchSession(id, msgId, opts),
       listThreadMessages: (id) => agentRuntime.listThreadMessages(id),
