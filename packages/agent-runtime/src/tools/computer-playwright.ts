@@ -12,7 +12,7 @@
 //
 // SAFETY: this layer is NEVER selected by default. selectOSLayer() returns
 // it only when COMPUTER_USE_PLAYWRIGHT=1 is set in the environment. Like
-// the real foreground layer, every mutating tool call (click/type/key)
+// the real foreground layer, every mutating tool call (click/type/key/scroll/drag/move)
 // still flows through governance (computerUsePolicyRules() →
 // require-approval) before the handler runs — the approval gate is
 // orthogonal to which OS layer is active.
@@ -33,7 +33,7 @@
 //   COMPUTER_PLAYWRIGHT_HEADLESS   — "1" (default) or "0" (visible window)
 
 import { createRequire } from 'node:module';
-import type { DisplaySize, OSScreenLayer, Screenshot } from './computer.js';
+import type { DisplaySize, DragOptions, OSScreenLayer, RealOSAction, Screenshot } from './computer.js';
 
 // ESM-safe require for the optional playwright dependency.
 const requireOptional = createRequire(import.meta.url);
@@ -77,6 +77,14 @@ export interface PlaywrightPageBackend {
   screenshot(): Promise<Uint8Array>;
   /** Click at viewport (CSS-pixel) coordinates. */
   mouseClick(x: number, y: number): Promise<void>;
+  /** Move the mouse to viewport coordinates (no click). */
+  mouseMove(x: number, y: number): Promise<void>;
+  /** Hold a mouse button down at the current position. */
+  mouseDown(button?: 'left' | 'right' | 'middle'): Promise<void>;
+  /** Release a mouse button at the current position. */
+  mouseUp(button?: 'left' | 'right' | 'middle'): Promise<void>;
+  /** Dispatch a wheel event at (x, y); positive deltaY scrolls down. */
+  mouseWheel(x: number, y: number, deltaX: number, deltaY: number): Promise<void>;
   /** Type text into the focused element. */
   keyboardType(text: string): Promise<void>;
   /** Press a key by Playwright key name. */
@@ -99,12 +107,12 @@ export interface PlaywrightOSLayerOptions {
    */
   startUrl?: string;
   /**
-   * Audit hook: called AFTER every mutating action (click/type/key).
+   * Audit hook: called AFTER every mutating action (click/type/key/scroll/drag/move).
    * The host wires this to the governance audit trail. Screenshots are
    * read-only and audited as tool calls by the runtime like any other
    * tool execution.
    */
-  onRealAction?: (action: 'click' | 'type' | 'key', detail: Record<string, unknown>) => void;
+  onRealAction?: (action: RealOSAction, detail: Record<string, unknown>) => void;
 }
 
 /** Parse "WIDTHxHEIGHT"; falls back to 1280×720 on garbage. */
@@ -137,7 +145,13 @@ export function lazyPlaywrightPageFactory(): () => Promise<PlaywrightPageBackend
               viewportSize(): { width: number; height: number } | null;
               goto(url: string): Promise<void>;
               screenshot(opts: { type: 'png' }): Promise<Buffer>;
-              mouse: { click(x: number, y: number): Promise<void> };
+              mouse: {
+                click(x: number, y: number): Promise<void>;
+                move(x: number, y: number): Promise<void>;
+                wheel(deltaX: number, deltaY: number): Promise<void>;
+                down(opts?: { button?: 'left' | 'right' | 'middle' }): Promise<void>;
+                up(opts?: { button?: 'left' | 'right' | 'middle' }): Promise<void>;
+              };
               keyboard: { type(text: string): Promise<void>; press(key: string): Promise<void> };
             }>;
           }>;
@@ -165,6 +179,10 @@ export function lazyPlaywrightPageFactory(): () => Promise<PlaywrightPageBackend
         goto: (url) => page.goto(url),
         screenshot: async () => new Uint8Array(await page.screenshot({ type: 'png' })),
         mouseClick: (x, y) => page.mouse.click(x, y),
+        mouseMove: (x, y) => page.mouse.move(x, y),
+        mouseDown: (button) => page.mouse.down({ button: button ?? 'left' }),
+        mouseUp: (button) => page.mouse.up({ button: button ?? 'left' }),
+        mouseWheel: (x, y, deltaX, deltaY) => page.mouse.move(x, y).then(() => page.mouse.wheel(deltaX, deltaY)),
         keyboardType: (text) => page.keyboard.type(text),
         keyboardPress: (key) => page.keyboard.press(key),
         close: () => browser.close(),
@@ -218,6 +236,32 @@ export class PlaywrightOSScreenLayer implements OSScreenLayer {
   async click(x: number, y: number): Promise<void> {
     await (await this.page()).mouseClick(x, y);
     this.onRealAction?.('click', { x, y, at: Date.now(), backend: 'playwright' });
+  }
+
+  async scroll(x: number, y: number, deltaX: number, deltaY: number): Promise<void> {
+    await (await this.page()).mouseWheel(x, y, deltaX, deltaY);
+    this.onRealAction?.('scroll', { x, y, deltaX, deltaY, at: Date.now(), backend: 'playwright' });
+  }
+
+  async drag(x1: number, y1: number, x2: number, y2: number, opts: DragOptions): Promise<void> {
+    const p = await this.page();
+    const steps = Math.max(1, Math.floor(opts.steps));
+    await p.mouseMove(x1, y1);
+    await p.mouseDown(opts.button);
+    try {
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        await p.mouseMove(Math.round(x1 + (x2 - x1) * t), Math.round(y1 + (y2 - y1) * t));
+      }
+    } finally {
+      await p.mouseUp(opts.button);
+    }
+    this.onRealAction?.('drag', { x1, y1, x2, y2, button: opts.button, steps, at: Date.now(), backend: 'playwright' });
+  }
+
+  async move(x: number, y: number): Promise<void> {
+    await (await this.page()).mouseMove(x, y);
+    this.onRealAction?.('move', { x, y, at: Date.now(), backend: 'playwright' });
   }
 
   async type(text: string): Promise<void> {

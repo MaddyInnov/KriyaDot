@@ -3,10 +3,14 @@
 //
 // Tools:
 //   computer_screenshot — capture the screen (read-only; auto-allowed by policy)
-//   computer_click      — click at (x, y)          [MUTATING → require-approval]
-//   computer_type       — type text                [MUTATING → require-approval]
-//   computer_key        — press a named key         [MUTATING → require-approval]
-//   computer_open_app   — launch a desktop app      [MUTATING → require-approval]
+//   computer_click      — click at (x, y)                    [MUTATING → require-approval]
+//   computer_type       — type text                          [MUTATING → require-approval]
+//   computer_key        — press a named key                   [MUTATING → require-approval]
+//   computer_open_app   — launch a desktop app                [MUTATING → require-approval]
+//   computer_scroll     — scroll at (x, y) by direction/amount
+//                         or (deltaX, deltaY)                 [MUTATING → require-approval]
+//   computer_drag       — drag from (x1, y1) to (x2, y2)      [MUTATING → require-approval]
+//   computer_move       — move the mouse to (x, y), no click  [MUTATING → require-approval]
 //
 // Trust model (never weakened):
 //   - The OS layer sits behind the OSScreenLayer interface. Tests and the
@@ -20,7 +24,7 @@
 //   - Approval gating flows through the governance pattern: the runtime
 //     evaluates every tool call against policy BEFORE the handler runs.
 //     computerUsePolicyRules() declares explicit require-approval rules for
-//     the four mutating actions (screenshot stays allow), so gating is
+//     the seven mutating actions (screenshot stays allow), so gating is
 //     deterministic even if the global default policy changes. Nothing here
 //     bypasses governance — deny-by-default still applies to everything
 //     unmatched.
@@ -61,7 +65,26 @@ export interface OSScreenLayer {
   click(x: number, y: number): Promise<void>;
   type(text: string): Promise<void>;
   key(name: string): Promise<void>;
+  /**
+   * Scroll at (x, y). deltaX/deltaY are wheel deltas in pixels:
+   * positive deltaY scrolls down, positive deltaX scrolls right.
+   */
+  scroll(x: number, y: number, deltaX: number, deltaY: number): Promise<void>;
+  /** Smooth drag from (x1, y1) to (x2, y2) with the given button held. */
+  drag(x1: number, y1: number, x2: number, y2: number, opts: DragOptions): Promise<void>;
+  /** Move the mouse cursor to (x, y) without clicking. */
+  move(x: number, y: number): Promise<void>;
 }
+
+/** Options for OSScreenLayer.drag (resolved with defaults by the tool layer). */
+export interface DragOptions {
+  button: 'left' | 'right' | 'middle';
+  /** Number of interpolated pointer moves between start and end. */
+  steps: number;
+}
+
+/** Real input actions reported to host audit hooks. */
+export type RealOSAction = 'click' | 'type' | 'key' | 'scroll' | 'drag' | 'move';
 
 /**
  * 1×1 transparent PNG fixture (base64). The mock returns real PNG bytes so
@@ -79,8 +102,10 @@ function fixturePng(): Uint8Array {
  * real input, and returns the fixture PNG for screenshots. Reported display
  * geometry is 1920×1080.
  */
+export type MockOSAction = 'click' | 'type' | 'key' | 'screenshot' | 'scroll' | 'drag' | 'move';
+
 export class MockOSScreenLayer implements OSScreenLayer {
-  readonly calls: Array<{ action: 'click' | 'type' | 'key' | 'screenshot'; args: Record<string, unknown> }> = [];
+  readonly calls: Array<{ action: MockOSAction; args: Record<string, unknown> }> = [];
   readonly displayWidth = 1920;
   readonly displayHeight = 1080;
 
@@ -105,8 +130,20 @@ export class MockOSScreenLayer implements OSScreenLayer {
     this.calls.push({ action: 'key', args: { name } });
   }
 
+  async scroll(x: number, y: number, deltaX: number, deltaY: number): Promise<void> {
+    this.calls.push({ action: 'scroll', args: { x, y, deltaX, deltaY } });
+  }
+
+  async drag(x1: number, y1: number, x2: number, y2: number, opts: DragOptions): Promise<void> {
+    this.calls.push({ action: 'drag', args: { x1, y1, x2, y2, button: opts.button, steps: opts.steps } });
+  }
+
+  async move(x: number, y: number): Promise<void> {
+    this.calls.push({ action: 'move', args: { x, y } });
+  }
+
   /** Calls of one action, in order. */
-  callsOf(action: 'click' | 'type' | 'key' | 'screenshot'): Record<string, unknown>[] {
+  callsOf(action: MockOSAction): Record<string, unknown>[] {
     return this.calls.filter((c) => c.action === action).map((c) => c.args);
   }
 }
@@ -118,7 +155,26 @@ export const COMPUTER_TOOL_NAMES = {
   type: 'computer_type',
   key: 'computer_key',
   openApp: OPEN_APP_TOOL_NAME,
+  scroll: 'computer_scroll',
+  drag: 'computer_drag',
+  move: 'computer_move',
 } as const;
+
+/** Mouse buttons the computer_drag tool accepts. */
+export const COMPUTER_DRAG_BUTTONS: ReadonlySet<string> = new Set(['left', 'right', 'middle']);
+
+/** Scroll directions the computer_scroll tool accepts. */
+export const COMPUTER_SCROLL_DIRECTIONS: ReadonlySet<string> = new Set(['up', 'down', 'left', 'right']);
+
+/** Wheel pixels per "notch" when scrolling by direction+amount. */
+const SCROLL_NOTCH_PX = 120;
+/** Hard caps on wheel deltas (pixels) to avoid runaway scrolls. */
+const MAX_SCROLL_DELTA = 2000;
+/** Default scroll amount (notches) when only a direction is given. */
+const DEFAULT_SCROLL_AMOUNT = 3;
+/** Default/max interpolation steps for smooth drags. */
+const DEFAULT_DRAG_STEPS = 20;
+const MAX_DRAG_STEPS = 100;
 
 const MAX_TYPE_CHARS = 2000;
 
@@ -151,9 +207,9 @@ export function computerUsePolicyRules(): BotPolicyRule[] {
   return [
     {
       id: 'computer-use-require-approval',
-      toolPattern: '^computer_(click|type|key|open_app)$',
+      toolPattern: '^computer_(click|type|key|open_app|scroll|drag|move)$',
       effect: 'require-approval',
-      reason: 'Computer-use mutating actions (click/type/key/open_app) always need human approval',
+      reason: 'Computer-use mutating actions (click/type/key/open_app/scroll/drag/move) always need human approval',
     },
     {
       id: 'type-login-require-approval',
@@ -176,6 +232,17 @@ function intArg(args: Record<string, unknown>, key: string): number {
     throw new Error(`"${key}" must be a number`);
   }
   return v;
+}
+
+/**
+ * Bounds-check one coordinate pair against the display. Throws (consistent
+ * with the click tool) rather than clamping: silent clamping would move the
+ * pointer somewhere the model did not intend.
+ */
+function assertInDisplay(x: number, y: number, width: number, height: number, what: string): void {
+  if (x < 0 || y < 0 || x >= width || y >= height) {
+    throw new Error(`${what} (${x}, ${y}) is outside the ${width}×${height} display`);
+  }
 }
 
 function screenshotTool(os: OSScreenLayer): ToolDefinition {
@@ -218,9 +285,7 @@ function clickTool(os: OSScreenLayer): ToolDefinition {
       const x = intArg(args, 'x');
       const y = intArg(args, 'y');
       const { width, height } = await os.displaySize();
-      if (x < 0 || y < 0 || x >= width || y >= height) {
-        throw new Error(`click (${x}, ${y}) is outside the ${width}×${height} display`);
-      }
+      assertInDisplay(x, y, width, height, 'click');
       await os.click(Math.floor(x), Math.floor(y));
       return { clicked: { x: Math.floor(x), y: Math.floor(y) } };
     },
@@ -293,7 +358,171 @@ export interface ComputerUseToolsOptions {
   platform?: LaunchPlatform;
 }
 
-/** Build the five computer-use ToolDefinitions. */
+/**
+ * Resolve the scroll tool's two accepted arg forms to pixel wheel deltas.
+ * Form 1: { direction, amount? } — amount is notches (default 3, 1..50).
+ * Form 2: { deltaX?, deltaY? } — raw pixel deltas, at least one non-zero.
+ * Exactly one form must be used; direction+delta mixing is rejected.
+ */
+function resolveScrollDeltas(args: Record<string, unknown>): { deltaX: number; deltaY: number } {
+  const direction = args['direction'];
+  const hasDeltaX = args['deltaX'] !== undefined;
+  const hasDeltaY = args['deltaY'] !== undefined;
+
+  if (direction !== undefined) {
+    if (typeof direction !== 'string' || !COMPUTER_SCROLL_DIRECTIONS.has(direction)) {
+      throw new Error(
+        `"direction" must be one of ${[...COMPUTER_SCROLL_DIRECTIONS].join(', ')}`,
+      );
+    }
+    if (hasDeltaX || hasDeltaY) {
+      throw new Error('use either { direction, amount } or { deltaX, deltaY }, not both');
+    }
+    const rawAmount = args['amount'] ?? DEFAULT_SCROLL_AMOUNT;
+    if (typeof rawAmount !== 'number' || !Number.isInteger(rawAmount) || rawAmount < 1 || rawAmount > 50) {
+      throw new Error('"amount" must be an integer between 1 and 50');
+    }
+    const px = rawAmount * SCROLL_NOTCH_PX;
+    switch (direction) {
+      case 'up':
+        return { deltaX: 0, deltaY: -px };
+      case 'down':
+        return { deltaX: 0, deltaY: px };
+      case 'left':
+        return { deltaX: -px, deltaY: 0 };
+      default:
+        return { deltaX: px, deltaY: 0 }; // right
+    }
+  }
+
+  const deltaX = hasDeltaX ? intArg(args, 'deltaX') : 0;
+  const deltaY = hasDeltaY ? intArg(args, 'deltaY') : 0;
+  if (deltaX === 0 && deltaY === 0) {
+    throw new Error('scroll needs a non-zero amount: { direction, amount } or { deltaX, deltaY }');
+  }
+  if (Math.abs(deltaX) > MAX_SCROLL_DELTA || Math.abs(deltaY) > MAX_SCROLL_DELTA) {
+    throw new Error(`scroll deltas are capped at ±${MAX_SCROLL_DELTA} pixels`);
+  }
+  return { deltaX, deltaY };
+}
+
+function scrollTool(os: OSScreenLayer): ToolDefinition {
+  return {
+    name: COMPUTER_TOOL_NAMES.scroll,
+    mutating: true,
+    description:
+      'Scroll the element under (x, y) — use after a screenshot to navigate lists, menus, and pages. ' +
+      'Either { direction: up|down|left|right, amount? } (amount = notches, default 3) ' +
+      'or { deltaX?, deltaY? } (pixel wheel deltas; positive deltaY scrolls down). ' +
+      'MUTATING: requires human approval via governance.',
+    parameters: {
+      type: 'object',
+      properties: {
+        x: { type: 'number', description: 'Horizontal pixel coordinate of the scroll target' },
+        y: { type: 'number', description: 'Vertical pixel coordinate of the scroll target' },
+        direction: { type: 'string', enum: ['up', 'down', 'left', 'right'] },
+        amount: { type: 'number', description: 'Scroll notches (1-50, default 3); with direction only' },
+        deltaX: { type: 'number', description: 'Horizontal wheel delta in pixels' },
+        deltaY: { type: 'number', description: 'Vertical wheel delta in pixels (positive = down)' },
+      },
+      required: ['x', 'y'],
+      additionalProperties: false,
+    },
+    handler: async (args, _ctx) => {
+      const x = intArg(args, 'x');
+      const y = intArg(args, 'y');
+      const { width, height } = await os.displaySize();
+      assertInDisplay(x, y, width, height, 'scroll target');
+      const { deltaX, deltaY } = resolveScrollDeltas(args);
+      await os.scroll(Math.floor(x), Math.floor(y), deltaX, deltaY);
+      return { scrolled: { x: Math.floor(x), y: Math.floor(y), deltaX, deltaY } };
+    },
+  };
+}
+
+function dragTool(os: OSScreenLayer): ToolDefinition {
+  return {
+    name: COMPUTER_TOOL_NAMES.drag,
+    mutating: true,
+    description:
+      'Drag the mouse from (x1, y1) to (x2, y2) with a button held — for sliders, drag-and-drop, ' +
+      'text selection, and window moves. button is left|right|middle (default left); ' +
+      'steps is the smoothness (1-100, default 20). MUTATING: requires human approval via governance.',
+    parameters: {
+      type: 'object',
+      properties: {
+        x1: { type: 'number', description: 'Start horizontal pixel coordinate' },
+        y1: { type: 'number', description: 'Start vertical pixel coordinate' },
+        x2: { type: 'number', description: 'End horizontal pixel coordinate' },
+        y2: { type: 'number', description: 'End vertical pixel coordinate' },
+        button: { type: 'string', enum: ['left', 'right', 'middle'] },
+        steps: { type: 'number', description: 'Interpolated pointer moves (1-100, default 20)' },
+      },
+      required: ['x1', 'y1', 'x2', 'y2'],
+      additionalProperties: false,
+    },
+    handler: async (args, _ctx) => {
+      const x1 = intArg(args, 'x1');
+      const y1 = intArg(args, 'y1');
+      const x2 = intArg(args, 'x2');
+      const y2 = intArg(args, 'y2');
+      const { width, height } = await os.displaySize();
+      assertInDisplay(x1, y1, width, height, 'drag start');
+      assertInDisplay(x2, y2, width, height, 'drag end');
+      const buttonRaw = args['button'] ?? 'left';
+      if (typeof buttonRaw !== 'string' || !COMPUTER_DRAG_BUTTONS.has(buttonRaw)) {
+        throw new Error(`"button" must be one of ${[...COMPUTER_DRAG_BUTTONS].join(', ')}`);
+      }
+      const button = buttonRaw as 'left' | 'right' | 'middle';
+      const stepsRaw = args['steps'] ?? DEFAULT_DRAG_STEPS;
+      if (typeof stepsRaw !== 'number' || !Number.isInteger(stepsRaw) || stepsRaw < 1 || stepsRaw > MAX_DRAG_STEPS) {
+        throw new Error(`"steps" must be an integer between 1 and ${MAX_DRAG_STEPS}`);
+      }
+      const opts: DragOptions = { button, steps: stepsRaw };
+      await os.drag(Math.floor(x1), Math.floor(y1), Math.floor(x2), Math.floor(y2), opts);
+      return {
+        dragged: {
+          x1: Math.floor(x1),
+          y1: Math.floor(y1),
+          x2: Math.floor(x2),
+          y2: Math.floor(y2),
+          button,
+          steps: stepsRaw,
+        },
+      };
+    },
+  };
+}
+
+function moveTool(os: OSScreenLayer): ToolDefinition {
+  return {
+    name: COMPUTER_TOOL_NAMES.move,
+    mutating: true,
+    description:
+      'Move the mouse cursor to (x, y) without clicking — for hovers, tooltips, and positioning ' +
+      'before a drag. MUTATING: requires human approval via governance (same policy as the other ' +
+      'computer tools).',
+    parameters: {
+      type: 'object',
+      properties: {
+        x: { type: 'number', description: 'Horizontal pixel coordinate' },
+        y: { type: 'number', description: 'Vertical pixel coordinate' },
+      },
+      required: ['x', 'y'],
+      additionalProperties: false,
+    },
+    handler: async (args, _ctx) => {
+      const x = intArg(args, 'x');
+      const y = intArg(args, 'y');
+      const { width, height } = await os.displaySize();
+      assertInDisplay(x, y, width, height, 'move target');
+      await os.move(Math.floor(x), Math.floor(y));
+      return { moved: { x: Math.floor(x), y: Math.floor(y) } };
+    },
+  };
+}
+
+/** Build the eight computer-use ToolDefinitions. */
 export function createComputerUseTools(opts: ComputerUseToolsOptions = {}): ToolDefinition[] {
   const os = opts.os ?? new MockOSScreenLayer();
   return [
@@ -302,6 +531,9 @@ export function createComputerUseTools(opts: ComputerUseToolsOptions = {}): Tool
     typeTool(os),
     keyTool(os),
     createOpenAppTool({ launcher: opts.appLauncher, platform: opts.platform }),
+    scrollTool(os),
+    dragTool(os),
+    moveTool(os),
   ];
 }
 

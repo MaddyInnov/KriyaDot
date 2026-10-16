@@ -1,7 +1,7 @@
 # Docker computer-use sandbox
 
 The computer-use tools (`computer_screenshot`, `computer_click`, `computer_type`,
-`computer_key`) drive an `OSScreenLayer`. By default that layer is the **local**
+`computer_key`, `computer_scroll`, `computer_drag`, `computer_move`) drive an `OSScreenLayer`. By default that layer is the **local**
 sandbox (`LocalComputerSandbox`): the mock layer, or the real foreground layer
 when `COMPUTER_USE_REAL=1` is set.
 
@@ -98,7 +98,8 @@ shutdown paths.
 ## Governance & safety
 
 - **Approval gating is unchanged.** `computerUsePolicyRules()` still marks
-  `computer_click`/`computer_type`/`computer_key` as `require-approval`; the
+  `computer_click`/`computer_type`/`computer_key`/`computer_scroll`/`computer_drag`/
+  `computer_move` as `require-approval`; the
   runtime evaluates policy before the handler runs, whichever backend is active.
 - The container is the sandbox: Chrome runs `--no-sandbox` *inside* it because
   the container provides the isolation boundary (same reasoning as CI Chrome).

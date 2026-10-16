@@ -2,7 +2,8 @@
 # Computer use: Playwright browser layer (P3-B, open-dots parity)
 
 KriyaDot's computer-use tools (`computer_screenshot` / `computer_click` /
-`computer_type` / `computer_key`) drive an `OSScreenLayer`. Three layers exist:
+`computer_type` / `computer_key` / `computer_scroll` / `computer_drag` /
+`computer_move`) drive an `OSScreenLayer`. Three layers exist:
 
 | Layer | Class | Select with | Install |
 |---|---|---|---|
@@ -45,7 +46,8 @@ clear install error instead.
 The layer choice is orthogonal to governance, exactly like the real
 foreground layer:
 
-- Mutating actions (`computer_click`, `computer_type`, `computer_key`)
+- Mutating actions (`computer_click`, `computer_type`, `computer_key`,
+  `computer_scroll`, `computer_drag`, `computer_move`)
   still evaluate through `computerUsePolicyRules()` → `require-approval`
   **before** the handler runs. The browser does nothing until a human
   approves.
@@ -53,7 +55,7 @@ foreground layer:
 - Coordinate bounds, text length caps, and the key allowlist are enforced
   in the tool handlers (`computer.ts`), not the layer.
 - Hosts can wire the `onRealAction` audit hook (already done in
-  `apps/api/src/index.ts`) so every real click/type/key lands in the
+  `apps/api/src/index.ts`) so every real click/type/key/scroll/drag/move lands in the
   governance audit trail.
 
 ## Notes and limits

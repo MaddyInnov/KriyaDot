@@ -22,6 +22,15 @@ function fakeInput(): RealInputBackend & { log: string[] } {
     async mouseClick() {
       log.push('click');
     },
+    async mouseDown(button) {
+      log.push(`down:${button}`);
+    },
+    async mouseUp(button) {
+      log.push(`up:${button}`);
+    },
+    async scrollAt(x, y, deltaX, deltaY) {
+      log.push(`scroll:${x},${y},${deltaX},${deltaY}`);
+    },
     async typeString(text) {
       log.push(`type:${text.length}`);
     },

@@ -4,7 +4,7 @@
 // SAFETY: this layer is NEVER selected by default. selectOSLayer() returns
 // the mock unless COMPUTER_USE_REAL=1 (or COMPUTER_USE_PLAYWRIGHT=1 for the
 // Playwright browser layer) is set in the environment. Even then,
-// every mutating tool call (click/type/key) still flows through governance
+// every mutating tool call (click/type/key/scroll/drag/move) still flows through governance
 // (computerUsePolicyRules() → require-approval) before the handler runs —
 // the approval gate is orthogonal to which OS layer is active.
 //
@@ -19,11 +19,22 @@
 // (404 as of 2026-10-09); robotjs is the fallback. robotjs needs a C++
 // toolchain (node-gyp) at install time. Screenshots work with
 // screenshot-desktop alone.
+//
+// robotjs is the cross-platform input engine: it wraps X11 (Linux),
+// Cocoa/CoreGraphics (macOS), and Win32 (Windows) natively, so one backend
+// covers per-OS scroll (scrollMouse), drag (mouseToggle + moveMouse), and
+// move (moveMouse) without platform-specific subprocess hacks.
 
 import { createRequire } from 'node:module';
 import { MockOSScreenLayer } from './computer.js';
-import type { DisplaySize, OSScreenLayer, Screenshot } from './computer.js';
+import type { DisplaySize, DragOptions, OSScreenLayer, RealOSAction, Screenshot } from './computer.js';
 import { COMPUTER_USE_PLAYWRIGHT_ENV, PlaywrightOSScreenLayer } from './computer-playwright.js';
+
+/** Mouse button names shared by the real input backends. */
+export type RealMouseButton = 'left' | 'right' | 'middle';
+
+// Re-exported from computer.js (canonical home) so existing deep imports keep working.
+export type { RealOSAction };
 
 // ESM-safe require for optional native dependencies.
 const requireOptional = createRequire(import.meta.url);
@@ -34,6 +45,15 @@ export interface RealInputBackend {
   moveMouse(x: number, y: number): Promise<void>;
   /** Click the current mouse position (left button). */
   mouseClick(): Promise<void>;
+  /** Hold a mouse button down at the current position. */
+  mouseDown(button: RealMouseButton): Promise<void>;
+  /** Release a mouse button at the current position. */
+  mouseUp(button: RealMouseButton): Promise<void>;
+  /**
+   * Scroll at (x, y). deltaX/deltaY are wheel deltas in pixels:
+   * positive deltaY scrolls down, positive deltaX scrolls right.
+   */
+  scrollAt(x: number, y: number, deltaX: number, deltaY: number): Promise<void>;
   /** Type text via the OS keyboard. */
   typeString(text: string): Promise<void>;
   /** Press a key by our allowlist name (Enter, Tab, Escape, ...). */
@@ -41,6 +61,8 @@ export interface RealInputBackend {
   screenWidth(): Promise<number>;
   screenHeight(): Promise<number>;
 }
+
+
 
 /** Minimal screenshot backend. screenshot-desktop-shaped; injectable for tests. */
 export interface RealScreenshotBackend {
@@ -52,12 +74,12 @@ export interface RealOSLayerDeps {
   input?: RealInputBackend;
   screenshotBackend?: RealScreenshotBackend;
   /**
-   * Audit hook: called AFTER every real input action (click/type/key).
-   * The host wires this to the governance audit trail. Screenshots are
-   * read-only and not reported here (they are audited as tool calls by
-   * the runtime like any other tool execution).
+   * Audit hook: called AFTER every real input action (click/type/key/
+   * scroll/drag/move). The host wires this to the governance audit
+   * trail. Screenshots are read-only and not reported here (they are
+   * audited as tool calls by the runtime like any other tool execution).
    */
-  onRealAction?: (action: 'click' | 'type' | 'key', detail: Record<string, unknown>) => void;
+  onRealAction?: (action: RealOSAction, detail: Record<string, unknown>) => void;
 }
 
 /** Map our COMPUTER_KEY_ALLOWLIST names to robotjs key names. */
@@ -86,6 +108,8 @@ function lazyRobotJs(): RealInputBackend {
   let robot: {
     moveMouse(x: number, y: number): void;
     mouseClick(button?: string): void;
+    mouseToggle(down: 'down' | 'up', button?: string): void;
+    scrollMouse(magnitude: number, direction: 'up' | 'down' | 'left' | 'right'): void;
     typeString(text: string): void;
     keyTap(key: string): void;
     getScreenSize(): { width: number; height: number };
@@ -111,6 +135,23 @@ function lazyRobotJs(): RealInputBackend {
     },
     async mouseClick() {
       load().mouseClick('left');
+    },
+    async mouseDown(button) {
+      load().mouseToggle('down', button);
+    },
+    async mouseUp(button) {
+      load().mouseToggle('up', button);
+    },
+    async scrollAt(x, y, deltaX, deltaY) {
+      const r = load();
+      r.moveMouse(x, y);
+      // robotjs scrolls one axis per call: split the deltas into
+      // directional scrolls (magnitude is platform-dependent; the tool
+      // layer already caps deltas at ±2000px).
+      if (deltaY > 0) r.scrollMouse(deltaY, 'down');
+      else if (deltaY < 0) r.scrollMouse(-deltaY, 'up');
+      if (deltaX > 0) r.scrollMouse(deltaX, 'right');
+      else if (deltaX < 0) r.scrollMouse(-deltaX, 'left');
     },
     async typeString(text) {
       load().typeString(text);
@@ -183,6 +224,34 @@ export class RealOSScreenLayer implements OSScreenLayer {
     this.onRealAction?.('click', { x, y, at: Date.now() });
   }
 
+  async scroll(x: number, y: number, deltaX: number, deltaY: number): Promise<void> {
+    await this.input.scrollAt(x, y, deltaX, deltaY);
+    this.onRealAction?.('scroll', { x, y, deltaX, deltaY, at: Date.now() });
+  }
+
+  async drag(x1: number, y1: number, x2: number, y2: number, opts: DragOptions): Promise<void> {
+    const steps = Math.max(1, Math.floor(opts.steps));
+    await this.input.moveMouse(x1, y1);
+    await this.input.mouseDown(opts.button);
+    try {
+      // Interpolated pointer moves make the drag smooth and give the OS
+      // (and drag targets) intermediate positions to react to.
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        await this.input.moveMouse(Math.round(x1 + (x2 - x1) * t), Math.round(y1 + (y2 - y1) * t));
+      }
+    } finally {
+      // Never leave the button held if a move fails mid-drag.
+      await this.input.mouseUp(opts.button);
+    }
+    this.onRealAction?.('drag', { x1, y1, x2, y2, button: opts.button, steps, at: Date.now() });
+  }
+
+  async move(x: number, y: number): Promise<void> {
+    await this.input.moveMouse(x, y);
+    this.onRealAction?.('move', { x, y, at: Date.now() });
+  }
+
   async type(text: string): Promise<void> {
     await this.input.typeString(text);
     this.onRealAction?.('type', { chars: text.length, at: Date.now() });
@@ -206,7 +275,7 @@ export const COMPUTER_USE_REAL_ENV = 'COMPUTER_USE_REAL';
  *      (robotjs + screenshot-desktop).
  *   3. Otherwise the safe MockOSScreenLayer.
  *
- * Even with a real layer active, every mutating tool call (click/type/key)
+ * Even with a real layer active, every mutating tool call (click/type/key/scroll/drag/move)
  * still flows through governance (computerUsePolicyRules() →
  * require-approval) before the handler runs.
  */

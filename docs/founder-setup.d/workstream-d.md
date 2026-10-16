@@ -38,7 +38,8 @@ ElevenLabs/Cartesia for TTS), you must:
 Computer use ships with `MockOSScreenLayer` only
 (`packages/agent-runtime/src/tools/computer.ts`): calls are **recorded**,
 never executed; screenshots return a fixture PNG. Mutating actions
-(`computer_click`, `computer_type`, `computer_key`) are **approval-gated by
+(`computer_click`, `computer_type`, `computer_key`, `computer_scroll`,
+`computer_drag`, `computer_move`) are **approval-gated by
 policy** (`computerUsePolicyRules()` → `require-approval`) and validation
 hardened (click bounds, key allowlist, type length cap) — none of that
 changes when you swap the OS layer.

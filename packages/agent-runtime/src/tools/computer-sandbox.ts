@@ -27,7 +27,7 @@
 //
 // Trust model (never weakened):
 //   - Approval gating is orthogonal to the backend: computerUsePolicyRules()
-//     still marks click/type/key require-approval and the runtime evaluates
+//     still marks click/type/key/scroll/drag/move require-approval and the runtime evaluates
 //     policy BEFORE the handler runs, whichever sandbox is active.
 //   - The Docker backend exposes the container's debugger port on 127.0.0.1
 //     only (never 0.0.0.0), runs Chrome --no-sandbox INSIDE the container
@@ -38,7 +38,7 @@
 import { execFile, spawnSync } from 'node:child_process';
 import { selectOSLayer } from './computer-real.js';
 import type { RealOSLayerDeps } from './computer-real.js';
-import type { DisplaySize, OSScreenLayer, Screenshot } from './computer.js';
+import type { DisplaySize, DragOptions, OSScreenLayer, RealOSAction, Screenshot } from './computer.js';
 
 /** Env var that opts into the Docker-backed computer sandbox. */
 export const COMPUTER_USE_DOCKER_ENV = 'COMPUTER_USE_DOCKER';
@@ -97,6 +97,18 @@ export class LocalComputerSandbox implements ComputerSandbox {
 
   click(x: number, y: number): Promise<void> {
     return this.inner.click(x, y);
+  }
+
+  scroll(x: number, y: number, deltaX: number, deltaY: number): Promise<void> {
+    return this.inner.scroll(x, y, deltaX, deltaY);
+  }
+
+  drag(x1: number, y1: number, x2: number, y2: number, opts: DragOptions): Promise<void> {
+    return this.inner.drag(x1, y1, x2, y2, opts);
+  }
+
+  move(x: number, y: number): Promise<void> {
+    return this.inner.move(x, y);
   }
 
   type(text: string): Promise<void> {
@@ -412,11 +424,14 @@ export interface DockerComputerSandboxOptions {
   listTargets?: ListCdpTargets;
   connectCdp?: (url: string) => Promise<CdpConnection>;
   /**
-   * Audit hook: called AFTER every mutating container action (click/type/key)
+   * Audit hook: called AFTER every mutating container action (click/type/key/scroll/drag/move)
    * and on launch/kill. The host wires this to the governance audit trail —
    * same role as RealOSLayerDeps.onRealAction for the local backend.
    */
-  onEvent?: (action: 'launch' | 'kill' | 'click' | 'type' | 'key', detail: Record<string, unknown>) => void;
+  onEvent?: (
+    action: 'launch' | 'kill' | RealOSAction,
+    detail: Record<string, unknown>,
+  ) => void;
 }
 
 /**
@@ -574,6 +589,65 @@ export class DockerComputerSandbox implements ComputerSandbox {
     this.onEvent?.('click', { x: px, y: py });
   }
 
+  async scroll(x: number, y: number, deltaX: number, deltaY: number): Promise<void> {
+    const cdp = this.requireCdp();
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseWheel',
+      x: Math.floor(x),
+      y: Math.floor(y),
+      deltaX,
+      deltaY,
+    });
+    this.onEvent?.('scroll', { x: Math.floor(x), y: Math.floor(y), deltaX, deltaY });
+  }
+
+  async drag(x1: number, y1: number, x2: number, y2: number, opts: DragOptions): Promise<void> {
+    const cdp = this.requireCdp();
+    const steps = Math.max(1, Math.floor(opts.steps));
+    const sx = Math.floor(x1);
+    const sy = Math.floor(y1);
+    const ex = Math.floor(x2);
+    const ey = Math.floor(y2);
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x: sx,
+      y: sy,
+      button: opts.button,
+      clickCount: 1,
+    });
+    try {
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        await cdp.send('Input.dispatchMouseEvent', {
+          type: 'mouseMoved',
+          x: Math.round(sx + (ex - sx) * t),
+          y: Math.round(sy + (ey - sy) * t),
+          button: opts.button,
+        });
+      }
+    } finally {
+      // Never leave the button held if a move fails mid-drag.
+      await cdp.send('Input.dispatchMouseEvent', {
+        type: 'mouseReleased',
+        x: ex,
+        y: ey,
+        button: opts.button,
+        clickCount: 1,
+      });
+    }
+    this.onEvent?.('drag', { x1: sx, y1: sy, x2: ex, y2: ey, button: opts.button, steps });
+  }
+
+  async move(x: number, y: number): Promise<void> {
+    const cdp = this.requireCdp();
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x: Math.floor(x),
+      y: Math.floor(y),
+    });
+    this.onEvent?.('move', { x: Math.floor(x), y: Math.floor(y) });
+  }
+
   async type(text: string): Promise<void> {
     const cdp = this.requireCdp();
     // Inserts into the focused editable element — callers click the field
@@ -682,7 +756,14 @@ export function selectComputerSandbox(deps: RealOSLayerDeps = {}): ComputerSandb
         ? (action, detail) => {
             // The local-backend audit hook only models input actions;
             // launch/kill lifecycle events are container bookkeeping.
-            if (action === 'click' || action === 'type' || action === 'key') {
+            if (
+              action === 'click' ||
+              action === 'type' ||
+              action === 'key' ||
+              action === 'scroll' ||
+              action === 'drag' ||
+              action === 'move'
+            ) {
               deps.onRealAction?.(action, detail);
             }
           }

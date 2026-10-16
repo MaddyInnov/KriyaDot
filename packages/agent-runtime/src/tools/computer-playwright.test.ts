@@ -29,6 +29,18 @@ function fakePage(): PlaywrightPageBackend & { log: string[] } {
     async mouseClick(x, y) {
       log.push(`click:${x},${y}`);
     },
+    async mouseMove(x, y) {
+      log.push(`move:${x},${y}`);
+    },
+    async mouseDown(button) {
+      log.push(`down:${button ?? 'left'}`);
+    },
+    async mouseUp(button) {
+      log.push(`up:${button ?? 'left'}`);
+    },
+    async mouseWheel(x, y, deltaX, deltaY) {
+      log.push(`wheel:${x},${y},${deltaX},${deltaY}`);
+    },
     async keyboardType(text) {
       log.push(`type:${text.length}`);
     },

@@ -39,13 +39,16 @@ function freshRegistry(os?: MockOSScreenLayer): { registry: Map<string, ToolDefi
 }
 
 describe('registration', () => {
-  it('registers five tools with the canonical names', () => {
+  it('registers eight tools with the canonical names', () => {
     const { registry } = freshRegistry();
     expect([...registry.keys()].sort()).toEqual([
       COMPUTER_TOOL_NAMES.click,
+      COMPUTER_TOOL_NAMES.drag,
       COMPUTER_TOOL_NAMES.key,
+      COMPUTER_TOOL_NAMES.move,
       COMPUTER_TOOL_NAMES.openApp,
       COMPUTER_TOOL_NAMES.screenshot,
+      COMPUTER_TOOL_NAMES.scroll,
       COMPUTER_TOOL_NAMES.type,
     ]);
   });
