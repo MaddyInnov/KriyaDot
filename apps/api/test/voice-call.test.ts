@@ -136,6 +136,22 @@ describe('VoiceCallService lifecycle', () => {
     expect(svc.endCall(call.id)).toBe(false);
     expect(svc.endCall('nope')).toBe(false);
   });
+
+  it('allows only one driving client per call (second attach rejected)', () => {
+    const { svc } = makeService();
+    const call = svc.startCall({ botId: 'bot_voice' });
+    expect(svc.attachClient(call.id)).toBe(true);
+    expect(svc.isClientAttached(call.id)).toBe(true);
+    // A second client must not drive the same call concurrently.
+    expect(svc.attachClient(call.id)).toBe(false);
+    // Releasing the slot lets a (re)connect attach again.
+    svc.detachClient(call.id);
+    expect(svc.isClientAttached(call.id)).toBe(false);
+    expect(svc.attachClient(call.id)).toBe(true);
+    // Ending the call releases the slot automatically.
+    expect(svc.endCall(call.id)).toBe(true);
+    expect(svc.attachClient(call.id)).toBe(false);
+  });
 });
 
 describe('VoiceCallService.processUtterance', () => {

@@ -1244,7 +1244,7 @@ async function boot(): Promise<void> {
       phone: { store: phoneStore, hub: phoneHub, adb: phoneAdb },
       companion: { store: companionStore, hub: companionHub },
       // Remote screen viewing (phone -> PC, Codync parity): approval-gated.
-      remoteScreen: { store: companionStore, service: remoteScreenService },
+      remoteScreen: { store: companionStore, service: remoteScreenService, loopbackToken },
       // Realtime voice calls with bots (Codync parity): STT → bot turn →
       // TTS over /api/voice/calls (REST) + /api/voice/calls/ws.
       voiceCall: { service: voiceCallService },

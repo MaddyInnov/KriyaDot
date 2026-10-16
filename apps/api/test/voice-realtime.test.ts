@@ -204,6 +204,17 @@ describe('RealtimeVoiceService lifecycle', () => {
     expect(svc.endCall(call.id)).toBe(false);
     expect(svc.getCall(call.id)?.endedAt).toBeDefined();
   });
+
+  it('rejects a second client attaching to the same realtime call', async () => {
+    const { svc } = makeService();
+    const { live } = await svc.startRealtimeCall({ botId: 'bot_rt' });
+    expect(live.attach(() => {})).toBe(true);
+    // A second client must not hijack the frame sender.
+    expect(live.attach(() => {})).toBe(false);
+    live.detach();
+    expect(live.attach(() => {})).toBe(true);
+    live.end('test');
+  });
 });
 
 describe('chunked engine turn loop', () => {
@@ -216,7 +227,7 @@ describe('chunked engine turn loop', () => {
     });
     const { call, live } = await svc.startRealtimeCall({ botId: 'bot_rt' });
     const frames: Array<Record<string, unknown>> = [];
-    live.attach((f) => frames.push(f));
+    expect(live.attach((f) => frames.push(f))).toBe(true);
     expect(frames[0].t).toBe('realtime_started');
     expect(frames[0].engine).toBe('chunked');
 

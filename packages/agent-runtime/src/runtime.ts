@@ -330,6 +330,11 @@ export interface PreviewResult {
 
 const DEFAULT_MAX_ITERATIONS = 8;
 const DEFAULT_APPROVAL_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * MEDIUM fix: circuit-breaker state TTL. Denial counts and trips for
+ * sessions idle longer than this are dropped (memory-leak guard).
+ */
+const CIRCUIT_STATE_TTL_MS = 24 * 60 * 60 * 1000;
 
 function toolEffect(name: string): string {
   const n = name.toLowerCase();
@@ -395,9 +400,11 @@ export class AgentRuntime {
   /**
    * Circuit breaker: denial counts per session. When denials reach the
    * threshold, auto-approve is disabled for that session (fail-safe).
+   * MEDIUM fix: entries carry a last-activity timestamp and expire after
+   * CIRCUIT_STATE_TTL_MS so dead sessions don't leak memory forever.
    */
-  private readonly denialCounts = new Map<string, number>();
-  private readonly trippedSessions = new Set<string>();
+  private readonly denialCounts = new Map<string, { count: number; updatedAt: number }>();
+  private readonly trippedSessions = new Map<string, number>(); // sessionId -> trippedAt
   /**
    * Host-registered turn context providers (feature interconnection:
    * attached notes/pages). Each runs before the system prompt is built;
@@ -1172,7 +1179,7 @@ export class AgentRuntime {
             // Consent rule (P1 #13): on bot-originated turns, session
             // auto-approve (and its reviewer model) can never stand in for
             // the human — the approval always goes to a human card.
-            const circuitTripped = this.trippedSessions.has(sessionId);
+            const circuitTripped = this.isCircuitTripped(sessionId);
             const useAutoApprove = opts.autoApprove && !circuitTripped && !botOriginated;
             if (botOriginated && opts.autoApprove && !circuitTripped) {
               this.audit({
@@ -1509,15 +1516,17 @@ export class AgentRuntime {
     verdict: 'approved' | 'denied',
     notify: (message: string) => Promise<void> | void,
   ): void {
+    this.sweepCircuitState();
     if (verdict === 'approved') {
       this.denialCounts.delete(sessionId);
       return;
     }
-    const count = (this.denialCounts.get(sessionId) ?? 0) + 1;
-    this.denialCounts.set(sessionId, count);
+    const prev = this.denialCounts.get(sessionId);
+    const count = (prev?.count ?? 0) + 1;
+    this.denialCounts.set(sessionId, { count, updatedAt: Date.now() });
     const threshold = Math.max(1, parseInt(process.env.CIRCUIT_BREAKER_DENIALS ?? '3', 10) || 3);
-    if (count >= threshold && !this.trippedSessions.has(sessionId)) {
-      this.trippedSessions.add(sessionId);
+    if (count >= threshold && !this.isCircuitTripped(sessionId)) {
+      this.trippedSessions.set(sessionId, Date.now());
       this.audit({
         type: 'autoapprove.circuit_breaker_tripped',
         sessionId,
@@ -1525,10 +1534,52 @@ export class AgentRuntime {
         detail: { denials: count, threshold },
         provenance: 'human',
       });
-      void notify(
-        `Auto-approve paused after ${count} denials — back to manual approvals for this session.`,
-      );
+      // MEDIUM fix: rejection guard — notify() may return a rejecting
+      // promise; an unhandled rejection here would crash the process.
+      void Promise.resolve(
+        notify(
+          `Auto-approve paused after ${count} denials — back to manual approvals for this session.`,
+        ),
+      ).catch(() => {});
     }
+  }
+
+  /**
+   * MEDIUM fix: whether the session's breaker is currently tripped. Trips
+   * expire after CIRCUIT_STATE_TTL_MS so dead sessions stop pinning memory
+   * (and a very old trip doesn't surprise a resumed session).
+   */
+  private isCircuitTripped(sessionId: string): boolean {
+    const trippedAt = this.trippedSessions.get(sessionId);
+    if (trippedAt === undefined) return false;
+    if (Date.now() - trippedAt > CIRCUIT_STATE_TTL_MS) {
+      this.trippedSessions.delete(sessionId);
+      this.denialCounts.delete(sessionId);
+      return false;
+    }
+    return true;
+  }
+
+  /** Drop circuit-breaker entries idle longer than the TTL. */
+  private sweepCircuitState(now = Date.now()): void {
+    for (const [id, trippedAt] of this.trippedSessions) {
+      if (now - trippedAt > CIRCUIT_STATE_TTL_MS) {
+        this.trippedSessions.delete(id);
+        this.denialCounts.delete(id);
+      }
+    }
+    for (const [id, entry] of this.denialCounts) {
+      if (now - entry.updatedAt > CIRCUIT_STATE_TTL_MS) this.denialCounts.delete(id);
+    }
+  }
+
+  /**
+   * MEDIUM fix: explicit per-session circuit-breaker cleanup. Call when a
+   * session/thread is deleted so its breaker state can't leak.
+   */
+  clearSessionCircuitState(sessionId: string): void {
+    this.denialCounts.delete(sessionId);
+    this.trippedSessions.delete(sessionId);
   }
 
   /**

@@ -677,7 +677,12 @@ export function loadImportPayload(
         } catch {
           continue;
         }
-        const messages = parseClaudeSessionJsonl(text);
+        const messages = parseClaudeSessionJsonl(text).map((m) => ({
+          // HIGH fix: imported transcripts bypassed secret redaction — redact
+          // every message before it is stored, same pass as live sessions.
+          ...m,
+          content: redactSecrets(m.content),
+        }));
         payload.sessions.push({ id: s.id, title: s.title, messages });
       }
     }
@@ -697,7 +702,13 @@ export function loadImportPayload(
         } catch {
           continue;
         }
-        payload.sessions.push({ id: s.id, title: s.title, messages: parseGenericSessionFile(text) });
+        payload.sessions.push({
+          id: s.id,
+          title: s.title,
+          // HIGH fix: imported transcripts bypassed secret redaction — redact
+          // every message before it is stored, same pass as live sessions.
+          messages: parseGenericSessionFile(text).map((m) => ({ ...m, content: redactSecrets(m.content) })),
+        });
       }
     }
     if (wanted.has(`memory:${sourceId}:config.toml`)) {

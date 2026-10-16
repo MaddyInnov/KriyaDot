@@ -83,8 +83,16 @@ export const HARD_FLOOR_PATTERNS: HardFloorPattern[] = [
         [/\brm\s+(-r\s+-f|-f\s+-r|-rf?)\s+\/(?![\w])/i, 'rm -rf /'],
         [/\brm\s+(-r\s+-f|-f\s+-r|-rf?)\s+\/\*/, 'rm -rf /*'],
         [/\brm\s+(-r\s+-f|-f\s+-r|-rf?)\s+\/(tmp|etc|home|root|var|usr)(\/|\s|$)/i, 'rm -rf on system dir'],
+        // MEDIUM fix: home-directory wipes (rm -rf ~, $HOME, ${HOME}).
+        // Terminators include `"` because args are matched JSON-serialized.
+        [/\brm\s+(-r\s+-f|-f\s+-r|-rf?)\s+(~(\/|[\s"']|$)|\$HOME(\/|[\s"']|$)|\$\{HOME\}(\/|[\s"']|$))/, 'rm -rf on home directory'],
         [/\bmkfs\b/, 'mkfs'],
         [/\bdd\b[^;&|]*\bof\s*=\s*\/dev\//i, 'dd writing to a raw block device'],
+        // MEDIUM fix: shell redirection straight into a block device
+        // (e.g. `cat img.iso > /dev/sda`) — same destruction as dd.
+        [/(?:^|[;&|])[^;&|]*?>{1,2}\s*\/dev\/[a-zA-Z0-9]+/, 'shell redirection into a block device'],
+        // MEDIUM fix: recursive delete via find on the filesystem root.
+        [/\bfind\s+\/\*?\s+[^;&|]*-delete\b/, 'find / -delete'],
         [/\b(shred|wipefs|fdisk|sfdisk|gdisk|sgdisk|cgdisk|parted)\b/i, 'disk wipe/partition tool'],
         [/:\(\)\s*\{\s*:[|\s]+:[&\s]*\s*\}\s*;?\s*:?/, 'fork bomb'],
         [/\$\{IFS\}/, 'shell IFS obfuscation with destructive command'],

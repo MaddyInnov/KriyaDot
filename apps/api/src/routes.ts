@@ -244,6 +244,8 @@ export interface RouteDeps {
   remoteScreen?: {
     store: CompanionStore;
     service: import('./remote-screen.js').RemoteScreenService;
+    /** Per-boot loopback token for the local web-UI routes (explicit auth). */
+    loopbackToken?: string;
   };
   /**
    * Realtime voice calls with bots (Codync parity). Optional: omitted in
@@ -2759,6 +2761,7 @@ export function createRouter(deps: RouteDeps): express.Router {
           store: deps.remoteScreen.store,
           service: deps.remoteScreen.service,
           audit: (action, fields) => governance.audit(action, fields),
+          loopbackToken: deps.remoteScreen.loopbackToken,
         }),
       );
     }

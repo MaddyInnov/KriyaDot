@@ -219,6 +219,12 @@ function normalizeProviderId(raw: unknown, fallback: VoiceCallProviderId): Voice
  */
 export class VoiceCallService {
   private readonly calls = new Map<string, VoiceCallSession>();
+  /**
+   * MEDIUM fix: one driving client per call. A second WS client attaching
+   * to the same callId is rejected (call_busy) — two clients must never
+   * drive the same turn loop concurrently.
+   */
+  private readonly attachedClients = new Set<string>();
   private readonly deps: VoiceCallServiceDeps;
 
   constructor(deps: VoiceCallServiceDeps) {
@@ -278,6 +284,7 @@ export class VoiceCallService {
     const call = this.calls.get(callId);
     if (!call || call.endedAt) return false;
     call.endedAt = this.now();
+    this.attachedClients.delete(callId);
     try {
       this.deps.audit('voice.call_ended', {
         botId: call.botId,
@@ -288,6 +295,29 @@ export class VoiceCallService {
       // ignore
     }
     return true;
+  }
+
+  /**
+   * Claim the driving-client slot for a call. Returns false when another
+   * client already holds it (the caller must reject with call_busy).
+   * The slot is released by detachClient() or automatically by endCall().
+   */
+  attachClient(callId: string): boolean {
+    const call = this.calls.get(callId);
+    if (!call || call.endedAt) return false;
+    if (this.attachedClients.has(callId)) return false;
+    this.attachedClients.add(callId);
+    return true;
+  }
+
+  /** Release the driving-client slot (e.g. WS closed without ending the call). */
+  detachClient(callId: string): void {
+    this.attachedClients.delete(callId);
+  }
+
+  /** Whether a client currently holds the driving slot for the call. */
+  isClientAttached(callId: string): boolean {
+    return this.attachedClients.has(callId);
   }
 
   /**

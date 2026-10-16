@@ -162,6 +162,13 @@ export function createMemoryTools(opts: CreateMemoryToolsOptions): ToolDefinitio
 // start ("What I remember"), capped at ~500 tokens.
 // ===========================================================================
 
+/**
+ * MEDIUM fix: cap on retained L0 raw events per bot. Raw events are the
+ * firehose (one row per turn); distillation into L2 atoms is the durable
+ * record, so old raw rows are expendable.
+ */
+const MAX_L0_EVENTS_PER_BOT = 5000;
+
 /** L0: a raw turn event. */
 export interface MemoryEvent {
   id: string;
@@ -642,7 +649,33 @@ export class TieredMemoryStore {
     this.db
       .prepare('INSERT INTO memory_events (id, ts, bot_id, session_id, role, text, tool_calls_json, tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
       .run(ev.id, ev.ts, ev.botId, ev.sessionId, ev.role, ev.text, JSON.stringify(ev.toolCalls), ev.tier);
+    // MEDIUM fix: L0 events grew without bound (one row per turn per bot,
+    // forever). Keep only the most recent N per bot; older raw events are
+    // already distilled into L2 atoms by the keeper.
+    try {
+      this.db
+        .prepare(
+          `DELETE FROM memory_events WHERE bot_id = ? AND id NOT IN (
+             SELECT id FROM memory_events WHERE bot_id = ? ORDER BY ts DESC, rowid DESC LIMIT ?
+           )`,
+        )
+        .run(botId, botId, MAX_L0_EVENTS_PER_BOT);
+    } catch {
+      // Pruning must never break recording.
+    }
     return ev;
+  }
+
+  /** Count retained L0 raw events for a bot (diagnostics; the store caps this). */
+  countEvents(botId: string): number {
+    try {
+      const row = this.db
+        .prepare('SELECT COUNT(*) AS n FROM memory_events WHERE bot_id = ?')
+        .get(botId) as { n: number };
+      return row.n;
+    } catch {
+      return 0;
+    }
   }
 
   // ---- Turn ingestion (async, non-blocking) --------------------------------
@@ -853,8 +886,7 @@ export class TieredMemoryStore {
    * List a bot's atoms. Inactive (superseded) atoms are excluded unless
    * includeInactive is set — recall and search must never see them.
    */
-  getAtoms(botId: string, limit = 200, opts: { includeInactive?: boolean } = {}): AtomCard[] {
-    const where = opts.includeInactive ? 'bot_id = ?' : 'bot_id = ? AND active = 1';
+  getAtoms(botId: string, limit = 200, opts: { includeInactive?: boolean } = {}): AtomCard[] {    const where = opts.includeInactive ? 'bot_id = ?' : 'bot_id = ? AND active = 1';
     const rows = this.db
       .prepare(`SELECT * FROM memory_atoms WHERE ${where} ORDER BY pinned DESC, created_at DESC LIMIT ?`)
       .all(botId, limit) as Array<{

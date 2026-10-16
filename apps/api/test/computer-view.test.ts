@@ -131,7 +131,7 @@ describe('computer-view input API', () => {
     expect(r.status).toBe(200);
     expect(r.json).toMatchObject({ ok: true, action: 'click', x: 123, y: 456 });
     expect(layers).toHaveLength(1); // one session per bot
-    expect(layers[0]!.callsOf('click')).toEqual([{ x: 123, y: 456 }]);
+    expect(layers[0]!.callsOf('click')).toEqual([{ x: 123, y: 456, button: 'left', clicks: 1 }]);
     // Second input reuses the same per-bot session (no new layer).
     await post('/api/computer/input', { botId: 'bot-1', action: 'click', x: 10, y: 10 });
     expect(layers).toHaveLength(1);
@@ -292,6 +292,51 @@ describe('computer-view websocket', () => {
     await sleep(120);
     expect(v.sent.length).toBe(countAfterLeave);
     h.view.hub.stop();
+  });
+
+  it('never stacks overlapping screenshot captures (re-entrancy guard)', async () => {
+    // A layer whose screenshot() stays in flight: without the guard, every
+    // 5ms tick would start another capture.
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const slowLayer = new MockOSScreenLayer();
+    const realScreenshot = slowLayer.screenshot.bind(slowLayer);
+    slowLayer.screenshot = async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      try {
+        await gate;
+        return await realScreenshot();
+      } finally {
+        inFlight -= 1;
+      }
+    };
+    const view = createComputerView({
+      audit: () => {},
+      listAudit: () => [],
+      createLayer: () => slowLayer,
+      fps: 200, // 5ms ticks
+      loopbackToken: 'test-loopback-token',
+    });
+    try {
+      const v = fakeViewer();
+      view.hub.acceptSocket(v.sock, 'bot-1');
+      v.emit(JSON.stringify({ t: 'watch', botId: 'bot-1' }));
+      await sleep(80); // ~16 ticks while the first capture is gated
+      expect(maxInFlight).toBe(1);
+      release();
+      await sleep(50);
+      // After release, ticks resume and frames flow again.
+      const frames = v.sent.map((s) => JSON.parse(s) as Record<string, unknown>);
+      expect(frames.some((m) => m.t === 'frame')).toBe(true);
+    } finally {
+      release();
+      view.hub.stop();
+    }
   });
 });
 

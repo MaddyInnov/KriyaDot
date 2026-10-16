@@ -149,6 +149,20 @@ describe('EvalRunner', () => {
     expect(report.caseResults[0].rubricResults[0].detail).toContain('read_file');
   });
 
+  it('enforces the per-case timeout even when runTurn never settles', async () => {
+    // A non-cooperative runTurn that ignores the abort signal entirely.
+    const hanging = () => new Promise<EvalTurnOutput>(() => {});
+    const runner = new EvalRunner(depsWith({ runTurn: hanging }));
+    const c: EvalCase = { id: 'ct', name: 'Timeout', input: 'hang', rubrics: [{ type: 'contains', keywords: ['x'] }], timeoutMs: 50 };
+    const start = Date.now();
+    const report = await runner.run(simpleSuite([c]), BOT);
+    const elapsed = Date.now() - start;
+    expect(report.caseResults[0].passed).toBe(false);
+    expect(report.caseResults[0].error).toMatch(/timed out after 50ms/);
+    // Bounded: well under a generous ceiling (the hang would run forever).
+    expect(elapsed).toBeLessThan(5000);
+  });
+
   it('scores llm_judge with an injected judge', async () => {
     const judge = vi.fn(async () => 0.9);
     const c: EvalCase = {

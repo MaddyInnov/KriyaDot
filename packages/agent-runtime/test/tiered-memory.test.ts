@@ -133,4 +133,15 @@ describe('TieredMemoryStore', () => {
     const entities = s2.getEntities('helper');
     expect(entities.some((e) => e.entity === 'TestCo')).toBe(true);
   });
+
+  it('caps retained L0 events per bot (no unbounded growth)', () => {
+    for (let i = 0; i < 5100; i++) {
+      store.recordEvent('helper', 's', 'user', `turn ${i}`);
+    }
+    expect(store.countEvents('helper')).toBeLessThanOrEqual(5000);
+    expect(store.countEvents('helper')).toBeGreaterThan(4900);
+    // Other bots are unaffected by the cap.
+    store.recordEvent('coder', 's', 'user', 'hello');
+    expect(store.countEvents('coder')).toBe(1);
+  });
 });

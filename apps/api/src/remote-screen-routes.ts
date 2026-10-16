@@ -17,6 +17,7 @@
 
 import type { Request, Response, Router, NextFunction } from 'express';
 import express from 'express';
+import crypto from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
 import type { CompanionDevice } from './companion.js';
@@ -35,6 +36,16 @@ export interface RemoteScreenRouteDeps {
   store: RemoteScreenDeviceStore;
   service: RemoteScreenService;
   audit: (action: string, fields: Record<string, unknown>) => void;
+  /**
+   * Per-boot loopback bearer <redacted> (the PC owner's own console auth).
+   * MEDIUM fix: the local web-UI routes (/status, /stop-local) previously
+   * relied on the global requireLoopbackAuth middleware ordering — fragile
+   * if this router is ever mounted elsewhere. They now enforce the token
+   * explicitly, consistent with the device-token auth on session routes.
+   * When absent, the routes fall back to the global middleware (unchanged
+   * behavior in the standard index.ts wiring).
+   */
+  loopbackToken?: string;
 }
 
 interface AuthedRequest extends Request {
@@ -97,6 +108,35 @@ export function createRemoteScreenRouter(deps: RemoteScreenRouteDeps): Router {
     next();
   };
 
+  /**
+   * Local-console auth: the per-boot loopback bearer <redacted> (same credential
+   * the browser UI uses). Constant-time comparison; no device token needed —
+   * the console IS the PC owner.
+   */
+  const requireLocal = (req: Request, res: Response, next: NextFunction): void => {
+    const expected = deps.loopbackToken;
+    if (!expected) {
+      // Not wired — the global requireLoopbackAuth middleware still applies
+      // in the standard index.ts mounting.
+      next();
+      return;
+    }
+    const got = bearerToken(req) ?? '';
+    const a = Buffer.from(got);
+    const b = Buffer.from(expected);
+    const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
+    if (!ok) {
+      audit('remote-screen.auth_failed', {
+        actor: 'api',
+        toolName: REMOTE_SCREEN_TOOL,
+        detail: { path: req.path, kind: 'loopback' },
+      });
+      err(res, 401, 'unauthorized', 'A valid loopback token is required.');
+      return;
+    }
+    next();
+  };
+
   // -- session lifecycle ----------------------------------------------------
 
   router.post('/start', requireAuth, (req: AuthedRequest, res: Response) => {
@@ -153,10 +193,10 @@ export function createRemoteScreenRouter(deps: RemoteScreenRouteDeps): Router {
     res.json({ ok: true });
   });
 
-  // -- web UI surface (no device token; the console is the PC owner's own) ----
+  // -- web UI surface (loopback-authenticated; the console is the PC owner's own) ----
 
   /** Active sessions for the "screen sharing" banner. Terminal states excluded. */
-  router.get('/status', (_req: Request, res: Response) => {
+  router.get('/status', requireLocal, (_req: Request, res: Response) => {
     const active = service.activeSessions().map((s) => ({
       sessionId: s.id,
       deviceId: s.deviceId,
@@ -170,7 +210,7 @@ export function createRemoteScreenRouter(deps: RemoteScreenRouteDeps): Router {
   });
 
   /** Local console can stop a session (the banner's Stop button). */
-  router.post('/stop-local', (req: Request, res: Response) => {
+  router.post('/stop-local', requireLocal, (req: Request, res: Response) => {
     const body = (req.body ?? {}) as { sessionId?: unknown };
     if (typeof body.sessionId !== 'string' || !body.sessionId) {
       err(res, 400, 'bad_request', 'sessionId is required.');

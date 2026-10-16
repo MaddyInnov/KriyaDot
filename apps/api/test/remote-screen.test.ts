@@ -473,4 +473,49 @@ describe('remote-screen routes', () => {
     });
     expect(typeof upgrade.handleUpgrade).toBe('function');
   });
+
+  it('local routes enforce the loopback token explicitly when wired', async () => {
+    const app = express();
+    app.use(express.json());
+    app.use(
+      '/api/remote-screen',
+      createRemoteScreenRouter({
+        store: {
+          findDeviceByToken: () => undefined,
+          touchDevice: () => {},
+        } as never,
+        service,
+        audit: () => {},
+        loopbackToken: 'loopback-secret',
+      }),
+    );
+    const server = app.listen(0, '127.0.0.1');
+    await new Promise<void>((resolve) => server.on('listening', resolve));
+    const addr = server.address() as AddressInfo;
+    const url = `http://127.0.0.1:${addr.port}/api/remote-screen`;
+    try {
+      // No token → 401 on both local routes.
+      expect((await fetch(`${url}/status`)).status).toBe(401);
+      expect(
+        (
+          await fetch(`${url}/stop-local`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId: 'x' }),
+          })
+        ).status,
+      ).toBe(401);
+      // Wrong token → 401.
+      expect(
+        (await fetch(`${url}/status`, { headers: { Authorization: 'Bearer wrong' } })).status,
+      ).toBe(401);
+      // Right token → through (200 on status).
+      expect(
+        (await fetch(`${url}/status`, { headers: { Authorization: 'Bearer loopback-secret' } }))
+          .status,
+      ).toBe(200);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
 });

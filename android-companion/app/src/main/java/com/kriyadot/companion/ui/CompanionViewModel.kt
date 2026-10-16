@@ -363,11 +363,21 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
 
     private var screenPollJob: Job? = null
 
+    /** Recycle the current frame bitmap (if any) before dropping the reference. */
+    private fun recycleScreenBitmap() {
+        _screenBitmap.value?.let { old ->
+            if (!old.isRecycled) {
+                try { old.recycle() } catch (_: Exception) { /* best effort */ }
+            }
+        }
+        _screenBitmap.value = null
+    }
+
     /** Ask the PC to share its screen. The owner must approve in the web UI. */
     fun startScreenShare() {
         if (_screenSession.value != null) return
         _screenNote.value = null
-        _screenBitmap.value = null
+        recycleScreenBitmap()
         viewModelScope.launch {
             try {
                 val s = api.startRemoteScreen()
@@ -423,7 +433,17 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             override fun onFrame(bitmap: Bitmap, w: Int, h: Int, frameNo: Long) {
-                mainHandler.post { _screenBitmap.value = bitmap }
+                mainHandler.post {
+                    // HIGH fix: recycle the previous frame before replacing it
+                    // (OOM safety). Posted on the main thread — the same
+                    // thread Compose draws on — so no draw can be in flight
+                    // with the old bitmap at this point.
+                    val old = _screenBitmap.value
+                    _screenBitmap.value = bitmap
+                    if (old != null && !old.isRecycled) {
+                        try { old.recycle() } catch (_: Exception) { /* best effort */ }
+                    }
+                }
             }
 
             override fun onServerError(detail: String) {
@@ -444,7 +464,7 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
                         else -> "Screen sharing ended."
                     }
                     _screenSession.value = null
-                    _screenBitmap.value = null
+                    recycleScreenBitmap()
                 }
             }
 
@@ -452,7 +472,7 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
                 mainHandler.post {
                     _screenNote.value = "Connection to the PC lost."
                     _screenSession.value = null
-                    _screenBitmap.value = null
+                    recycleScreenBitmap()
                 }
             }
         })
@@ -465,7 +485,7 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
         screenSocket.stop()
         val id = _screenSession.value?.sessionId
         _screenSession.value = null
-        _screenBitmap.value = null
+        recycleScreenBitmap()
         _screenNote.value = null
         if (id != null) {
             viewModelScope.launch {

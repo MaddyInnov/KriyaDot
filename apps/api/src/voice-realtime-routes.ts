@@ -174,7 +174,12 @@ export function createRealtimeVoiceUpgrade(deps: RealtimeUpgradeDeps): {
           // client gone
         }
       };
-      live.attach(send);
+      // MEDIUM fix: reject a second client on the same call (call_busy)
+      // instead of letting it hijack the frame sender.
+      if (!live.attach(send)) {
+        reject('call_busy');
+        return;
+      }
 
       sock.onMessage((text: string) => {
         let msg: { t?: unknown; data?: unknown };
@@ -205,6 +210,7 @@ export function createRealtimeVoiceUpgrade(deps: RealtimeUpgradeDeps): {
         send({ t: 'error', detail: `unknown frame type "${String(msg.t)}"` });
       });
       sock.onClose(() => {
+        live.detach();
         live.end('socket_close');
       });
     },

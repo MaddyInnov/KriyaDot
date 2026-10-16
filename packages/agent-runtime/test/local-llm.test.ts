@@ -286,6 +286,64 @@ describe('LocalLlmManager', () => {
     expect(manifest?.sha256).toHaveLength(64);
   });
 
+  it('verifyInstalledBinary() passes right after a TOFU install', async () => {
+    const m2 = new LocalLlmManager(ctx.dataDir, {
+      platform: 'linux',
+      arch: 'x64',
+      spawn: ctx.spawn,
+      download: async (url: string, dest: string) => {
+        fs.writeFileSync(dest, 'fake-payload-bytes');
+      },
+      exec: async (cmd, args) => {
+        if (cmd === 'nvidia-smi') return { stdout: 'NVIDIA Fake 9000\n', stderr: '' };
+        if (cmd === 'tar' && args[0] === 'tzf') return { stdout: 'llama-server\n', stderr: '' };
+        if (cmd === 'tar' && args[0] === '-xzf') {
+          const dest = args[args.indexOf('-C') + 1];
+          const nested = path.join(dest, 'llama-b11683');
+          fs.mkdirSync(nested, { recursive: true });
+          fs.writeFileSync(path.join(nested, 'llama-server'), 'fake');
+          return { stdout: '', stderr: '' };
+        }
+        throw new Error('unexpected ' + cmd);
+      },
+    });
+    await m2.downloadBinary();
+    await expect(m2.verifyInstalledBinary()).resolves.toMatch(/llama-server$/);
+  });
+
+  it('refuses to start a tampered binary (TOFU re-verified before every start)', async () => {
+    const m2 = new LocalLlmManager(ctx.dataDir, {
+      platform: 'linux',
+      arch: 'x64',
+      spawn: ctx.spawn,
+      download: async (url: string, dest: string) => {
+        fs.writeFileSync(dest, 'fake-payload-bytes');
+      },
+      exec: async (cmd, args) => {
+        if (cmd === 'nvidia-smi') return { stdout: 'NVIDIA Fake 9000\n', stderr: '' };
+        if (cmd === 'tar' && args[0] === 'tzf') return { stdout: 'llama-server\n', stderr: '' };
+        if (cmd === 'tar' && args[0] === '-xzf') {
+          const dest = args[args.indexOf('-C') + 1];
+          const nested = path.join(dest, 'llama-b11683');
+          fs.mkdirSync(nested, { recursive: true });
+          fs.writeFileSync(path.join(nested, 'llama-server'), 'fake');
+          return { stdout: '', stderr: '' };
+        }
+        throw new Error('unexpected ' + cmd);
+      },
+    });
+    await m2.downloadBinary();
+    // Tamper with the installed binary after download.
+    const binDir = path.join(ctx.dataDir, 'local-llm', 'bin');
+    const bin = fs
+      .readdirSync(binDir, { recursive: true })
+      .map(String)
+      .find((f) => f.endsWith('llama-server'));
+    expect(bin).toBeTruthy();
+    fs.writeFileSync(path.join(binDir, bin!), 'TAMPERED-payload');
+    await expect(m2.verifyInstalledBinary()).rejects.toThrow(/integrity verification/i);
+    await expect(m2.start()).rejects.toThrow(/integrity verification/i);
+  });
   it('rejects unknown model ids (curated list only)', async () => {
     await expect(ctx.manager.downloadModel('https://evil.example/x.gguf')).rejects.toThrow(
       /only curated models/i,

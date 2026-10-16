@@ -201,6 +201,25 @@ describe('loadImportPayload', () => {
     const payload = loadImportPayload('claude-code', HOME, ['skill:claude-code:nope'], claudeFs);
     expect(payload.skills).toHaveLength(0);
   });
+  it('redacts secrets inside imported session transcript messages', () => {
+    const fs = makeFs({
+      [`${HOME}/.claude/projects/proj/leaky.jsonl`]:
+        '{"type":"user","message":{"role":"user","content":"my key is sk-abcdefghij1234567890 and password=hunter2"},"timestamp":1}\n' +
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"noted"}]},"timestamp":2}\n',
+    });
+    const payload = loadImportPayload(
+      'claude-code',
+      HOME,
+      ['session:claude-code:.claude/projects/proj/leaky.jsonl'],
+      fs,
+    );
+    expect(payload.sessions).toHaveLength(1);
+    const userMsg = payload.sessions[0].messages[0];
+    expect(userMsg.role).toBe('user');
+    expect(userMsg.content).not.toContain('sk-abcdefghij1234567890');
+    expect(userMsg.content).not.toContain('hunter2');
+    expect(userMsg.content).toContain('[REDACTED]');
+  });
   it('parses generic session files best-effort', () => {
     const fs = makeFs({
       [`${HOME}/.codex/sessions/s1.jsonl`]:

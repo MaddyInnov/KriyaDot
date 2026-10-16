@@ -350,8 +350,14 @@ export interface LocalLlmStatus {
 interface Manifest {
   release: string;
   asset: string;
-  /** sha256 recorded at download time (TOFU) or the pre-verified pin. */
+  /** sha256 of the downloaded archive (TOFU) or the pre-verified pin. */
   sha256: string;
+  /**
+   * sha256 of the EXTRACTED llama-server binary, recorded at install time.
+   * This is what verifyInstalledBinary() re-checks before every start —
+   * the archive hash alone cannot detect a binary swapped after extraction.
+   */
+  binarySha256: string;
   installedAt: number;
 }
 
@@ -490,6 +496,39 @@ export class LocalLlmManager {
   }
 
   /**
+   * Re-verify the installed llama-server binary against the binary hash
+   * recorded at install time (TOFU manifest). A swapped or tampered binary
+   * refuses to start — the manifest alone is not trusted. Throws on mismatch
+   * or when no manifest/binary hash exists (old installs must re-download).
+   */
+  async verifyInstalledBinary(): Promise<string> {
+    const bin = await findBinary(this.binDir, serverBinaryName(this.platform));
+    if (!bin) {
+      throw new Error('llama.cpp is not installed. Download it first from Settings → Local LLM.');
+    }
+    const manifest = await this.readManifest();
+    const expected = manifest?.binarySha256?.toLowerCase();
+    if (!expected) {
+      throw new Error(
+        'No integrity record for the installed llama.cpp binary — refusing to start. ' +
+          'Re-download it from Settings → Local LLM.',
+      );
+    }
+    const actual = await sha256File(bin);
+    if (actual !== expected) {
+      const msg =
+        `llama-server binary failed integrity verification: expected sha256 ` +
+        `${expected.slice(0, 16)}…, got ${actual.slice(0, 16)}…. ` +
+        `The binary may have been replaced or tampered with — refusing to start. ` +
+        `Re-download it from Settings → Local LLM.`;
+      this.log(`SECURITY: ${msg}`);
+      this.lastError = msg;
+      throw new Error(msg);
+    }
+    return bin;
+  }
+
+  /**
    * Download and install the llama.cpp server binary.
    * Verifies sha256 (pinned pin, user env pin, or TOFU-recorded) and archive
    * integrity before extraction.
@@ -517,10 +556,19 @@ export class LocalLlmManager {
       const bin = await findBinary(this.binDir, serverBinaryName(this.platform));
       if (!bin) throw new Error(`archive did not contain ${serverBinaryName(this.platform)}`);
       if (this.platform !== 'win32') await chmod(bin, 0o755).catch(() => undefined);
+      // Record the EXTRACTED binary's hash too — verifyInstalledBinary()
+      // re-checks it before every start so a post-install swap is caught.
+      const binarySha256 = await sha256File(bin);
       await writeFile(
         this.manifestPath,
         JSON.stringify(
-          { release: llamacppRelease(), asset: asset.file, sha256: actual, installedAt: Date.now() } satisfies Manifest,
+          {
+            release: llamacppRelease(),
+            asset: asset.file,
+            sha256: actual,
+            binarySha256,
+            installedAt: Date.now(),
+          } satisfies Manifest,
           null,
           2,
         ),
@@ -618,10 +666,9 @@ export class LocalLlmManager {
    */
   async start(modelId?: string): Promise<void> {
     if (this.isRunning()) return;
-    const bin = await findBinary(this.binDir, serverBinaryName(this.platform));
-    if (!bin) {
-      throw new Error('llama.cpp is not installed. Download it first from Settings → Local LLM.');
-    }
+    // HIGH fix: re-verify the binary hash against the TOFU manifest on every
+    // start — a binary swapped after download must never be executed.
+    const bin = await this.verifyInstalledBinary();
     const models = await this.listModels();
     let chosen: ModelEntry | undefined;
     if (modelId) {

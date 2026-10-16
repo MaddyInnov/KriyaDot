@@ -563,12 +563,36 @@ export class EvalRunner {
 
     let turn: EvalTurnOutput;
     try {
-      turn = await this.deps.runTurn(bot, {
-        caseId: c.id,
-        input: c.input,
-        timeoutMs,
-        signal,
+      // MEDIUM fix: enforce the timeout HERE with a race, not just via the
+      // injected runTurn's signal handling — a non-cooperative runTurn must
+      // not be able to exceed the case budget. The per-case AbortController
+      // is still aborted on timeout so cooperative runners clean up.
+      const caseController = new AbortController();
+      const onOuterAbort = (): void => caseController.abort(signal.reason);
+      if (signal.aborted) caseController.abort(signal.reason);
+      else signal.addEventListener('abort', onOuterAbort, { once: true });
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => {
+          caseController.abort(new Error(`eval case "${c.id}" timed out after ${timeoutMs}ms`));
+          reject(new Error(`eval case "${c.id}" timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+        timeout.unref?.();
       });
+      try {
+        turn = await Promise.race([
+          this.deps.runTurn(bot, {
+            caseId: c.id,
+            input: c.input,
+            timeoutMs,
+            signal: caseController.signal,
+          }),
+          timeoutPromise,
+        ]);
+      } finally {
+        if (timeout) clearTimeout(timeout);
+        signal.removeEventListener('abort', onOuterAbort);
+      }
     } catch (err) {
       return {
         caseId: c.id,

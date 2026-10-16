@@ -49,9 +49,17 @@ fun ScreenShareScreen(vm: CompanionViewModel, nav: NavController) {
     val bitmap by vm.screenBitmap.collectAsState()
     val note by vm.screenNote.collectAsState()
 
-    // Stop the session if the user navigates away mid-stream.
+    // Stop the session when the user actually navigates away — NOT on
+    // rotation. A config change disposes this composable but leaves the nav
+    // back stack untouched, so the route check below distinguishes the two:
+    // rotate → still on "screen" → keep the session alive; navigate away →
+    // route changed → stop.
     DisposableEffect(Unit) {
-        onDispose { vm.stopScreenShare() }
+        onDispose {
+            if (nav.currentDestination?.route != "screen") {
+                vm.stopScreenShare()
+            }
+        }
     }
 
     ScreenScaffold(vm = vm, title = "Remote screen", nav = nav) {

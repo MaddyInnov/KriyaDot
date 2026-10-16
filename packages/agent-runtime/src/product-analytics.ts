@@ -173,6 +173,12 @@ export class ProductAnalytics {
   private sink: AnalyticsSink = new LocalOnlySink();
   private readonly sessionId = newSessionId();
   private flushTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * MEDIUM fix: consecutive flush failures. The batch is re-queued (never
+   * dropped) and flushes back off exponentially so a dead endpoint doesn't
+   * get hammered every 60s.
+   */
+  private consecutiveFlushFailures = 0;
 
   constructor(settings?: Partial<AnalyticsSettings>, sink?: AnalyticsSink) {
     if (settings) this.updateSettings(settings);
@@ -243,11 +249,43 @@ export class ProductAnalytics {
     this.queue = [];
   }
 
-  /** Flush queued events to the sink. No-op when disabled. */
+  /**
+   * Flush queued events to the sink. No-op when disabled. MEDIUM fix: on
+   * sink failure the batch is re-queued at the FRONT (bounded by MAX_QUEUE)
+   * instead of being dropped, and the next scheduled flush is delayed with
+   * exponential backoff (60s → 5min cap).
+   */
   async flush(): Promise<void> {
     if (!this.settings.enabled || this.queue.length === 0) return;
     const batch = this.queue.splice(0, this.queue.length);
-    await this.sink.send(batch);
+    try {
+      await this.sink.send(batch);
+      this.consecutiveFlushFailures = 0;
+    } catch {
+      // Never drop events on a failed flush: re-queue at the front,
+      // respecting the queue cap (oldest beyond the cap are shed first —
+      // the cap already existed for the live queue).
+      this.queue.unshift(...batch.slice(-MAX_QUEUE));
+      if (this.queue.length > MAX_QUEUE) {
+        this.queue.splice(0, this.queue.length - MAX_QUEUE);
+      }
+      this.consecutiveFlushFailures += 1;
+      this.rescheduleFlushWithBackoff();
+    }
+  }
+
+  /** Delay the next scheduled flush after a failure (exponential backoff). */
+  private rescheduleFlushWithBackoff(): void {
+    this.stopFlushTimer();
+    const delayMs = Math.min(60_000 * 2 ** (this.consecutiveFlushFailures - 1), 300_000);
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      this.startFlushTimer();
+      void this.flush();
+    }, delayMs);
+    if (typeof this.flushTimer === 'object' && this.flushTimer !== null) {
+      (this.flushTimer as unknown as { unref?: () => void }).unref?.();
+    }
   }
 
   /**

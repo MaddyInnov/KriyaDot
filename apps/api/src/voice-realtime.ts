@@ -397,8 +397,14 @@ export class RealtimeCall {
     return this.call;
   }
 
-  /** Attach the client frame sender (called once by the WS route). */
-  attach(send: (frame: Record<string, unknown>) => void): void {
+  /**
+   * Attach the client frame sender (called once by the WS route).
+   * MEDIUM fix: returns false when a client is already attached — a second
+   * client must never hijack the call's frame sender or feed audio into the
+   * same VAD state machine concurrently.
+   */
+  attach(send: (frame: Record<string, unknown>) => void): boolean {
+    if (this.attached) return false;
     this.send = send;
     this.attached = true;
     this.send({
@@ -412,6 +418,12 @@ export class RealtimeCall {
       maxCallMs: this.svc.maxCallMs,
     });
     this.armTimers();
+    return true;
+  }
+
+  /** Release the client slot (socket closed without ending the call). */
+  detach(): void {
+    this.attached = false;
   }
 
   private armTimers(): void {

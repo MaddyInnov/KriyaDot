@@ -180,6 +180,13 @@ export function createVoiceCallUpgrade(deps: VoiceCallUpgradeDeps): {
         reject('call_ended');
         return;
       }
+      // MEDIUM fix: one driving client per call. A second client attaching
+      // to the same callId is rejected instead of driving the turn loop
+      // concurrently with the first.
+      if (!service.attachClient(call.id)) {
+        reject('call_busy');
+        return;
+      }
       const sock = acceptRawWsSocket(req, socket);
       if (!sock) return;
       const send = (frame: Record<string, unknown>): void => {
@@ -242,14 +249,20 @@ export function createVoiceCallUpgrade(deps: VoiceCallUpgradeDeps): {
           }
           busy = true;
           const mimeType = typeof msg.mimeType === 'string' && msg.mimeType ? msg.mimeType : 'audio/webm';
-          void handleVoiceUtterance(service, call.id, bytes, mimeType, send).finally(() => {
-            busy = false;
-          });
+          void handleVoiceUtterance(service, call.id, bytes, mimeType, send)
+            .finally(() => {
+              busy = false;
+            })
+            // MEDIUM fix: unhandled-rejection guard — handleVoiceUtterance
+            // reports errors to the client itself; this just prevents a
+            // fire-and-forget rejection from crashing the process.
+            .catch(() => {});
           return;
         }
         send({ t: 'error', detail: `unknown frame type "${String(msg.t)}"` });
       });
       sock.onClose(() => {
+        service.detachClient(call.id);
         service.endCall(call.id);
       });
     },

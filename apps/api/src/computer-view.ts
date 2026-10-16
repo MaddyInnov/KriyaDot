@@ -401,6 +401,13 @@ interface BotViewState {
   timer: ReturnType<typeof setInterval> | null;
   frames: number;
   lastError: string | null;
+  /**
+   * MEDIUM fix: re-entrancy guard. screenshot() is async; when it takes
+   * longer than the tick interval, a second capture must not start on top
+   * of the first (frame pile-up + unbounded memory). Skipped ticks are
+   * simply dropped — the next tick picks up the latest screen.
+   */
+  capturing: boolean;
 }
 
 interface WatchMessage {
@@ -470,6 +477,7 @@ export class ComputerViewHub {
         timer: null,
         frames: 0,
         lastError: null,
+        capturing: false,
       };
       this.states.set(botId, state);
     }
@@ -726,6 +734,10 @@ export class ComputerViewHub {
         }
         return;
       }
+      // MEDIUM fix: skip this tick when the previous capture is still in
+      // flight — never stack overlapping screenshot() promises.
+      if (state.capturing) return;
+      state.capturing = true;
       void state.layer
         .screenshot()
         .then((shot) => {
@@ -758,6 +770,9 @@ export class ComputerViewHub {
               state.viewers.delete(viewer);
             }
           }
+        })
+        .finally(() => {
+          state.capturing = false;
         });
     };
     state.timer = setInterval(tick, intervalMs);

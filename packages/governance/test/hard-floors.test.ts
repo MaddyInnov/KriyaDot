@@ -33,8 +33,13 @@ describe('hard floors', () => {
     // Tier 1: unconditional denial, never approvable.
     for (const command of [
       'rm -rf /',
+      'rm -rf ~',
+      'rm -rf $HOME',
+      'rm -rf ${HOME}/',
       'mkfs.ext4 /dev/sda1',
       'dd if=/dev/zero of=/dev/sda bs=1M',
+      'cat backup.iso > /dev/sdb',
+      'find / -delete',
       'shred -u secret.txt',
       'wipefs -a /dev/sdb',
       'fdisk /dev/sda',

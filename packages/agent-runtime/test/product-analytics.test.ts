@@ -138,6 +138,28 @@ describe('ProductAnalytics — enabled', () => {
     expect(pa.queueSize).toBe(0);
     pa.dispose();
   });
+
+  it('flush() re-queues the batch instead of dropping it on sink failure', async () => {
+    let calls = 0;
+    const pa = new ProductAnalytics({ enabled: true }, {
+      name: 'flaky',
+      send: async () => {
+        calls += 1;
+        throw new Error('endpoint down');
+      },
+    });
+    pa.track('bot_created', { botId: 'a' });
+    pa.track('bot_created', { botId: 'b' });
+    await pa.flush();
+    expect(calls).toBe(1);
+    // Nothing lost: both events are back in the queue, in order.
+    expect(pa.queueSize).toBe(2);
+    expect(pa.getQueuedEvents().map((e) => (e.properties as Record<string, unknown>)['botId'])).toEqual([
+      'a',
+      'b',
+    ]);
+    pa.dispose();
+  });
 });
 
 describe('HttpSink', () => {
