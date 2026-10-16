@@ -792,6 +792,38 @@ async function boot(): Promise<void> {
   });
   threadScheduler.start();
 
+  // Routine schedules (OpenMausBot parity): timezone-aware once/daily/
+  // cron/interval schedules on bot routines. Each scheduled fire runs the
+  // routine's bot turn; overlap policy ('skip' | 'queue') is per schedule.
+  const { RoutineScheduler } = await import('./routine-schedules.js');
+  const { renderRoutinePrompt } = await import('./webhooks.js');
+  const routineScheduler = new RoutineScheduler({
+    routineStore,
+    agentRuntime,
+    getBots: () => seed.bots,
+    renderPrompt: renderRoutinePrompt,
+    onFire: ({ routine, at, ok, error, skipped }) => {
+      try {
+        createTask({
+          title: skipped
+            ? `Routine skipped (overlap): ${routine.name}`
+            : ok
+              ? `Routine fired on schedule: ${routine.name}`
+              : `Routine schedule failed: ${routine.name}`,
+          notes: skipped
+            ? `Schedule for routine ${routine.id} fired at ${new Date(at).toISOString()} but the previous run was still in flight (overlap: skip).`
+            : ok
+              ? `Schedule for routine ${routine.id} fired at ${new Date(at).toISOString()}.`
+              : `Schedule for routine ${routine.id} failed at ${new Date(at).toISOString()}: ${error ?? 'unknown error'}`,
+          dueAt: null,
+        });
+      } catch (err) {
+        console.error('[tasks] failed to record routine fire:', err instanceof Error ? err.message : err);
+      }
+    },
+  });
+  routineScheduler.start();
+
   // Omni rolling summary (Omni panel backend): the collector feeds the
   // store from the governance audit log, pending approvals, and workflow
   // runs; the scheduler refreshes the live layers hourly and runs the
@@ -1294,6 +1326,11 @@ async function boot(): Promise<void> {
     }
     try {
       updater.stopAutoCheck();
+    } catch {
+      // ignore
+    }
+    try {
+      routineScheduler.stop();
     } catch {
       // ignore
     }

@@ -1,0 +1,845 @@
+// SPDX-License-Identifier: Apache-2.0
+// Routine scheduling — OpenMausBot parity P0 #6.
+//
+// BotRoutine previously had no schedule field (webhook-only). This module
+// adds timezone-aware schedules to routines:
+//
+//   - 'once':     run once at a specific datetime
+//   - 'daily':    time + weekdays, e.g. Mon/Wed/Fri at 09:00
+//   - 'cron':    5-field cron expression (Vixie semantics)
+//   - 'interval': every N minutes, with optional anchor time, weekday
+//                 filter, wall-clock window, and endsAt
+//
+// Every schedule carries an explicit IANA timezone (e.g. 'Asia/Kolkata').
+// All wall-clock interpretation happens in that timezone — the server's
+// local zone is never consulted. Timezone math is done with the platform
+// Intl APIs (no new dependencies):
+//
+//   - zonedParts(): UTC instant  -> wall-clock parts in a zone
+//   - wallToUtcMs(): wall-clock parts -> UTC instant (null when the local
+//     time does not exist, e.g. the spring-forward gap; ambiguous
+//     fall-back times resolve deterministically to the first occurrence)
+//
+// The RoutineScheduler at the bottom ticks on an interval, computes the
+// occurrences that fell inside (lastTick, now] for each routine with an
+// enabled schedule, and fires the routine's bot turn. Overlap policy per
+// schedule: 'skip' (don't fire while a previous scheduled run is still
+// in flight) or 'queue' (fire regardless).
+
+import type { AgentRuntime, BotConfig } from '@mvp/agent-runtime';
+import type { BotRoutine, RoutineStore } from './bot-routines.js';
+
+// ---------------------------------------------------------------------------
+// Timezone helpers (Intl-based, no dependencies)
+// ---------------------------------------------------------------------------
+
+export interface ZonedParts {
+  year: number;
+  month: number; // 1-12
+  day: number; // 1-31
+  hour: number; // 0-23
+  minute: number; // 0-59
+  second: number; // 0-59
+  /** 0=Sunday .. 6=Saturday (matches Date#getDay). */
+  weekday: number;
+}
+
+const WEEKDAY_SHORT: Record<string, number> = {
+  Sun: 0,
+  Mon: 1,
+  Tue: 2,
+  Wed: 3,
+  Thu: 4,
+  Fri: 5,
+  Sat: 6,
+};
+
+/** Cached formatters per timezone — Intl construction is not free. */
+const formatterCache = new Map<string, Intl.DateTimeFormat>();
+
+function formatterFor(timeZone: string): Intl.DateTimeFormat {
+  let f = formatterCache.get(timeZone);
+  if (!f) {
+    // Throws RangeError on unknown zones — callers rely on this for
+    // validation.
+    f = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      weekday: 'short',
+      hourCycle: 'h23',
+    });
+    formatterCache.set(timeZone, f);
+  }
+  return f;
+}
+
+/** Throw a descriptive Error when the timezone is not a valid IANA zone. */
+export function assertValidTimeZone(timeZone: string): void {
+  if (typeof timeZone !== 'string' || !timeZone) {
+    throw new Error('timezone is required (IANA name, e.g. "Asia/Kolkata")');
+  }
+  try {
+    formatterFor(timeZone);
+  } catch (err) {
+    throw new Error(`unknown timezone "${timeZone}"`);
+  }
+}
+
+/** Wall-clock parts of a UTC instant in the given zone. */
+export function zonedParts(timeZone: string, utcMs: number): ZonedParts {
+  const parts = formatterFor(timeZone).formatToParts(new Date(utcMs));
+  const get = (type: string): string => parts.find((p) => p.type === type)?.value ?? '';
+  const weekday = WEEKDAY_SHORT[get('weekday')];
+  return {
+    year: Number(get('year')),
+    month: Number(get('month')),
+    day: Number(get('day')),
+    hour: Number(get('hour')),
+    minute: Number(get('minute')),
+    second: Number(get('second')),
+    weekday: weekday === undefined ? new Date(utcMs).getUTCDay() : weekday,
+  };
+}
+
+/**
+ * The zone's UTC offset in milliseconds at a given UTC instant
+ * (positive east of UTC).
+ */
+function offsetAtMs(timeZone: string, utcMs: number): number {
+  const p = zonedParts(timeZone, utcMs);
+  const wallAsUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+  return wallAsUtc - utcMs;
+}
+
+/**
+ * Convert wall-clock components in a zone to a UTC instant.
+ * Returns null when the local time does not exist (spring-forward gap).
+ * Ambiguous times (fall-back overlap) resolve to the first occurrence.
+ */
+export function wallToUtcMs(
+  timeZone: string,
+  comps: { year: number; month: number; day: number; hour: number; minute: number; second?: number },
+): number | null {
+  const second = comps.second ?? 0;
+  const wallAsUtc = Date.UTC(comps.year, comps.month - 1, comps.day, comps.hour, comps.minute, second);
+  // Fixed-point iteration: utc = wall - offset(utc). Converges in <= 2
+  // iterations for real zones; 4 iterations for safety.
+  let utc = wallAsUtc;
+  for (let i = 0; i < 4; i++) {
+    utc = wallAsUtc - offsetAtMs(timeZone, utc);
+  }
+  // Round-trip check: nonexistent local times land on a different
+  // wall-clock reading (the post-gap time), so they fail this test.
+  const check = zonedParts(timeZone, utc);
+  if (
+    check.year !== comps.year ||
+    check.month !== comps.month ||
+    check.day !== comps.day ||
+    check.hour !== comps.hour ||
+    check.minute !== comps.minute
+  ) {
+    return null;
+  }
+  return utc;
+}
+
+/** Shift a wall-clock date by n days (calendar arithmetic, zone-naive). */
+function shiftDate(comps: { year: number; month: number; day: number }, days: number): { year: number; month: number; day: number } {
+  const d = new Date(Date.UTC(comps.year, comps.month - 1, comps.day) + days * 86_400_000);
+  return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() };
+}
+
+// ---------------------------------------------------------------------------
+// Cron parsing (Vixie/standard semantics)
+// ---------------------------------------------------------------------------
+
+const MONTH_NAMES: Record<string, number> = {
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+  jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+};
+const DOW_NAMES: Record<string, number> = {
+  sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6,
+};
+
+interface CronField {
+  /** Sorted allowed values, or null for '*'. */
+  values: number[] | null;
+  /** True when the field was a bare '*' (matters for dom/dow OR semantics). */
+  star: boolean;
+}
+
+export interface ParsedCron {
+  minute: CronField;
+  hour: CronField;
+  dom: CronField;
+  month: CronField;
+  dow: CronField;
+}
+
+const CRON_RE = /^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)$/;
+const DAYS_IN_MONTH = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]; // Feb=29: leap years exist
+
+function parseCronField(
+  raw: string,
+  min: number,
+  max: number,
+  names: Record<string, number> | null,
+  fieldName: string,
+): CronField {
+  const field = raw.trim().toLowerCase();
+  if (field === '*') return { values: null, star: true };
+  const out = new Set<number>();
+  const resolveName = (tok: string): number => {
+    if (names && names[tok] !== undefined) return names[tok];
+    if (!/^-?\d+$/.test(tok)) throw new Error(`invalid ${fieldName} value "${tok}"`);
+    return Number(tok);
+  };
+  for (const part of field.split(',')) {
+    if (!part) throw new Error(`empty ${fieldName} list element`);
+    const slash = part.split('/');
+    if (slash.length > 2) throw new Error(`invalid ${fieldName} step "${part}"`);
+    const step = slash.length === 2 ? Number(slash[1]) : 1;
+    if (!Number.isInteger(step) || step < 1) throw new Error(`invalid ${fieldName} step "${part}"`);
+    const range = slash[0];
+    let lo: number;
+    let hi: number;
+    if (range === '*') {
+      lo = min;
+      hi = max;
+    } else if (range.includes('-')) {
+      const [a, b] = range.split('-');
+      lo = resolveName(a);
+      hi = resolveName(b);
+      if (lo > hi) throw new Error(`invalid ${fieldName} range "${part}"`);
+    } else {
+      lo = resolveName(range);
+      hi = range === '*' ? max : lo;
+    }
+    if (lo < min || hi > max) {
+      throw new Error(`${fieldName} value out of range ${min}-${max}: "${part}"`);
+    }
+    for (let v = lo; v <= hi; v += step) out.add(v);
+  }
+  if (out.size === 0) throw new Error(`empty ${fieldName} field`);
+  return { values: [...out].sort((a, b) => a - b), star: false };
+}
+
+/**
+ * Parse and validate a 5-field cron expression. Throws on any problem,
+ * including impossible calendar dates (e.g. "30 9 30 2 *" — Feb 30).
+ * Feb 29 is allowed (leap years exist).
+ */
+export function parseCron(expr: string): ParsedCron {
+  const m = CRON_RE.exec(expr.trim());
+  if (!m) throw new Error('cron must be a 5-field expression: "minute hour dom month dow"');
+  const [, minute, hour, dom, month, dow] = m;
+  const parsed: ParsedCron = {
+    minute: parseCronField(minute, 0, 59, null, 'minute'),
+    hour: parseCronField(hour, 0, 23, null, 'hour'),
+    dom: parseCronField(dom, 1, 31, null, 'day-of-month'),
+    month: parseCronField(month, 1, 12, MONTH_NAMES, 'month'),
+    dow: parseCronField(dow, 0, 7, DOW_NAMES, 'day-of-week'),
+  };
+  // Normalize Sunday=7 to 0.
+  if (parsed.dow.values) {
+    parsed.dow.values = [...new Set(parsed.dow.values.map((v) => (v === 7 ? 0 : v)))].sort((a, b) => a - b);
+  }
+  // Impossible-date check: every restricted dom must be valid in at
+  // least one allowed month (Feb allows 29 for leap years).
+  if (!parsed.dom.star && parsed.dom.values && !parsed.month.star && parsed.month.values) {
+    for (const d of parsed.dom.values) {
+      const okInSomeMonth = parsed.month.values.some((mo) => d <= DAYS_IN_MONTH[mo - 1]);
+      if (!okInSomeMonth) {
+        throw new Error(`impossible date: day-of-month ${d} never occurs in the allowed months`);
+      }
+    }
+  }
+  return parsed;
+}
+
+function fieldMatches(field: CronField, value: number): boolean {
+  if (field.values === null) return true;
+  return field.values.includes(value);
+}
+
+/**
+ * Standard cron day semantics: dom and dow are OR-ed when both are
+ * restricted; when one is '*', the other decides.
+ */
+export function cronMatchesZone(parsed: ParsedCron, p: ZonedParts): boolean {
+  if (!fieldMatches(parsed.minute, p.minute)) return false;
+  if (!fieldMatches(parsed.hour, p.hour)) return false;
+  if (!fieldMatches(parsed.month, p.month)) return false;
+  const domOk = fieldMatches(parsed.dom, p.day);
+  const dowOk = fieldMatches(parsed.dow, p.weekday);
+  if (parsed.dom.star && parsed.dow.star) return true;
+  if (parsed.dom.star) return dowOk;
+  if (parsed.dow.star) return domOk;
+  return domOk || dowOk;
+}
+
+// ---------------------------------------------------------------------------
+// Schedule model
+// ---------------------------------------------------------------------------
+
+export type RoutineScheduleKind = 'once' | 'daily' | 'cron' | 'interval';
+
+/** When a scheduled run fires while the previous run is still in flight. */
+export type OverlapPolicy = 'skip' | 'queue';
+
+interface ScheduleBase {
+  kind: RoutineScheduleKind;
+  /** Explicit IANA timezone; all wall-clock fields are read in this zone. */
+  timezone: string;
+  enabled: boolean;
+  overlap: OverlapPolicy;
+}
+
+/** Run once at a specific datetime. */
+export interface OnceSchedule extends ScheduleBase {
+  kind: 'once';
+  /**
+   * ISO 8601 datetime. Two accepted forms:
+   *  - with offset: "2026-10-17T09:00:00+05:30" (offset wins)
+   *  - wall-clock:  "2026-10-17T09:00" (interpreted in `timezone`)
+   */
+  runAt: string;
+}
+
+/** Run at a wall-clock time on selected weekdays. */
+export interface DailySchedule extends ScheduleBase {
+  kind: 'daily';
+  /** "HH:mm" 24h wall-clock time in `timezone`. */
+  time: string;
+  /** Weekdays 0=Sunday..6=Saturday. Default: every day. */
+  weekdays: number[];
+}
+
+/** 5-field cron expression, matched in `timezone`. */
+export interface CronSchedule extends ScheduleBase {
+  kind: 'cron';
+  expression: string;
+}
+
+/** Every N minutes, anchored to a wall-clock grid in `timezone`. */
+export interface IntervalSchedule extends ScheduleBase {
+  kind: 'interval';
+  /** 1..10080 (one week). */
+  everyMinutes: number;
+  /** "HH:mm" wall-clock anchor; the occurrence grid is anchored to this
+   *  time on 1970-01-01 in `timezone`, so it is stable across restarts. */
+  anchorTime?: string;
+  /** Optional weekday filter 0=Sunday..6=Saturday. */
+  weekdays?: number[];
+  /** Optional wall-clock window "HH:mm" — occurrences must fall inside. */
+  windowStart?: string;
+  windowEnd?: string;
+  /** Optional absolute cutoff: ISO 8601 datetime with offset. */
+  endsAt?: string;
+}
+
+export type RoutineSchedule = OnceSchedule | DailySchedule | CronSchedule | IntervalSchedule;
+
+const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const ONCE_WALL_RE = /^(\d{4})-(\d{2})-(\d{2})T([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?$/;
+const ONCE_OFFSET_RE =
+  /^(\d{4})-(\d{2})-(\d{2})T([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?(Z|[+-]([01]\d|2[0-3]):?([0-5]\d))$/;
+
+function validWeekdays(v: unknown): v is number[] {
+  return (
+    Array.isArray(v) &&
+    v.length > 0 &&
+    v.every((d) => Number.isInteger(d) && d >= 0 && d <= 6)
+  );
+}
+
+/** Parse an ISO datetime with explicit offset to UTC ms. Throws on garbage. */
+export function parseIsoWithOffset(s: string): number {
+  const m = ONCE_OFFSET_RE.exec(s.trim());
+  if (!m) throw new Error(`invalid datetime "${s}" (expected ISO 8601 with offset, e.g. 2026-10-17T09:00:00+05:30)`);
+  const [, yy, mo, dd, hh, mi, ss, zone, zh, zm] = m;
+  const base = Date.UTC(Number(yy), Number(mo) - 1, Number(dd), Number(hh), Number(mi), Number(ss ?? 0));
+  if (Number.isNaN(base)) throw new Error(`invalid datetime "${s}"`);
+  // Sanity: reject impossible calendar dates (Date.UTC normalizes).
+  const check = new Date(base);
+  if (
+    check.getUTCFullYear() !== Number(yy) ||
+    check.getUTCMonth() + 1 !== Number(mo) ||
+    check.getUTCDate() !== Number(dd)
+  ) {
+    throw new Error(`impossible date "${s}"`);
+  }
+  if (zone === 'Z') return base;
+  const sign = zone.startsWith('+') ? 1 : -1;
+  const offMs = (Number(zh) * 60 + Number(zm)) * 60_000;
+  return sign === 1 ? base - offMs : base + offMs;
+}
+
+function parseWallClock(s: string, what: string): { hour: number; minute: number } {
+  const m = TIME_RE.exec(s.trim());
+  if (!m) throw new Error(`${what} must be "HH:mm" (24h), got "${s}"`);
+  return { hour: Number(m[1]), minute: Number(m[2]) };
+}
+
+/**
+ * Parse an absolute datetime: ISO 8601 with offset ("...+05:30"/"Z") or
+ * wall-clock "YYYY-MM-DDTHH:mm" interpreted in `timezone`. Returns UTC ms.
+ */
+export function parseScheduleInstant(s: string, timezone: string, what: string): number {
+  const t = s.trim();
+  if (ONCE_OFFSET_RE.test(t)) return parseIsoWithOffset(t);
+  const m = ONCE_WALL_RE.exec(t);
+  if (m) {
+    const utc = wallToUtcMs(timezone, {
+      year: Number(m[1]), month: Number(m[2]), day: Number(m[3]),
+      hour: Number(m[4]), minute: Number(m[5]), second: Number(m[6] ?? 0),
+    });
+    if (utc === null) throw new Error(`${what} "${t}" does not exist in timezone "${timezone}" (DST gap)`);
+    return utc;
+  }
+  throw new Error(`${what} must be ISO 8601 with offset ("...+05:30"/"Z") or wall-clock "YYYY-MM-DDTHH:mm"`);
+}
+
+/**
+ * Validate a schedule object (from JSON input). Returns a normalized copy
+ * with defaults applied. Throws a descriptive Error on any problem.
+ */
+export function validateRoutineSchedule(input: unknown): RoutineSchedule {
+  if (typeof input !== 'object' || input === null) {
+    throw new Error('schedule must be an object');
+  }
+  const s = input as Record<string, unknown>;
+  const kind = s.kind;
+  if (kind !== 'once' && kind !== 'daily' && kind !== 'cron' && kind !== 'interval') {
+    throw new Error('schedule.kind must be one of: once, daily, cron, interval');
+  }
+  const timezone = s.timezone;
+  assertValidTimeZone(typeof timezone === 'string' ? timezone : '');
+  const overlap: OverlapPolicy = s.overlap === 'queue' ? 'queue' : s.overlap === 'skip' || s.overlap === undefined ? 'skip' : (() => { throw new Error('schedule.overlap must be "skip" or "queue"'); })();
+  const enabled = s.enabled === undefined ? true : s.enabled === true;
+  if (s.enabled !== undefined && typeof s.enabled !== 'boolean') {
+    throw new Error('schedule.enabled must be a boolean');
+  }
+
+  if (kind === 'once') {
+    const runAt = s.runAt;
+    if (typeof runAt !== 'string' || !runAt.trim()) throw new Error('once schedule requires runAt');
+    parseScheduleInstant(runAt, timezone as string, 'once runAt'); // validates
+    return { kind, timezone: timezone as string, enabled, overlap, runAt: runAt.trim() };
+  }
+
+  if (kind === 'daily') {
+    const { hour, minute } = parseWallClock(typeof s.time === 'string' ? s.time : '', 'daily time');
+    const weekdays = s.weekdays === undefined ? [0, 1, 2, 3, 4, 5, 6] : s.weekdays;
+    if (!validWeekdays(weekdays)) throw new Error('daily weekdays must be a non-empty array of 0..6 (0=Sunday)');
+    const time = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+    return { kind, timezone: timezone as string, enabled, overlap, time, weekdays: [...weekdays].sort((a, b) => a - b) };
+  }
+
+  if (kind === 'cron') {
+    if (typeof s.expression !== 'string' || !s.expression.trim()) {
+      throw new Error('cron schedule requires expression');
+    }
+    parseCron(s.expression); // throws with details
+    return { kind, timezone: timezone as string, enabled, overlap, expression: s.expression.trim() };
+  }
+
+  // interval
+  const everyMinutes = s.everyMinutes;
+  if (!Number.isInteger(everyMinutes) || (everyMinutes as number) < 1 || (everyMinutes as number) > 10080) {
+    throw new Error('interval everyMinutes must be an integer 1..10080');
+  }
+  const out: IntervalSchedule = {
+    kind, timezone: timezone as string, enabled, overlap, everyMinutes: everyMinutes as number,
+  };
+  if (s.anchorTime !== undefined) {
+    const { hour, minute } = parseWallClock(String(s.anchorTime), 'interval anchorTime');
+    out.anchorTime = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+  }
+  if (s.weekdays !== undefined) {
+    if (!validWeekdays(s.weekdays)) throw new Error('interval weekdays must be a non-empty array of 0..6 (0=Sunday)');
+    out.weekdays = [...(s.weekdays as number[])].sort((a, b) => a - b);
+  }
+  if (s.windowStart !== undefined || s.windowEnd !== undefined) {
+    if (s.windowStart === undefined || s.windowEnd === undefined) {
+      throw new Error('interval window requires both windowStart and windowEnd');
+    }
+    const ws = parseWallClock(String(s.windowStart), 'interval windowStart');
+    const we = parseWallClock(String(s.windowEnd), 'interval windowEnd');
+    out.windowStart = `${String(ws.hour).padStart(2, '0')}:${String(ws.minute).padStart(2, '0')}`;
+    out.windowEnd = `${String(we.hour).padStart(2, '0')}:${String(we.minute).padStart(2, '0')}`;
+    if (out.windowStart === out.windowEnd) throw new Error('interval windowStart and windowEnd must differ');
+  }
+  if (s.endsAt !== undefined) {
+    if (typeof s.endsAt !== 'string') throw new Error('interval endsAt must be a datetime string');
+    parseScheduleInstant(s.endsAt, timezone as string, 'interval endsAt'); // validates
+    out.endsAt = s.endsAt.trim();
+  }
+  return out;
+}
+
+/** Human-readable one-line summary of a schedule (UI + logs). */
+export function describeSchedule(s: RoutineSchedule): string {
+  const tz = s.timezone;
+  switch (s.kind) {
+    case 'once':
+      return `once at ${s.runAt} (${tz})`;
+    case 'daily': {
+      const names = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+      const days = s.weekdays.length === 7 ? 'daily' : s.weekdays.map((d) => names[d]).join('/');
+      return `${days} at ${s.time} (${tz})`;
+    }
+    case 'cron':
+      return `cron "${s.expression}" (${tz})`;
+    case 'interval': {
+      let d = `every ${s.everyMinutes}m`;
+      if (s.anchorTime) d += ` from ${s.anchorTime}`;
+      if (s.windowStart) d += ` ${s.windowStart}–${s.windowEnd}`;
+      if (s.weekdays) d += ` on ${s.weekdays.join(',')}`;
+      if (s.endsAt) d += ` until ${s.endsAt}`;
+      return `${d} (${tz})`;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Next-run computation
+// ---------------------------------------------------------------------------
+
+export interface NextRun {
+  /** UTC epoch ms of the occurrence. */
+  at: number;
+  /** ISO 8601 string in UTC. */
+  atIso: string;
+  /** Wall-clock label in the schedule's timezone, e.g. "2026-10-17 09:00 (Asia/Kolkata)". */
+  label: string;
+}
+
+const MAX_NEXT_RUNS = 100;
+/** Hard cap on forward scanning so a pathological schedule can't spin. */
+const MAX_SCAN_DAYS = 400;
+
+function makeNextRun(timeZone: string, at: number): NextRun {
+  const p = zonedParts(timeZone, at);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return {
+    at,
+    atIso: new Date(at).toISOString(),
+    label: `${p.year}-${pad(p.month)}-${pad(p.day)} ${pad(p.hour)}:${pad(p.minute)} (${timeZone})`,
+  };
+}
+
+function onceInstant(s: OnceSchedule): number {
+  return parseScheduleInstant(s.runAt, s.timezone, 'runAt');
+}
+
+function nextRunsOnce(s: OnceSchedule, n: number, fromMs: number): NextRun[] {
+  const at = onceInstant(s);
+  return at > fromMs ? [makeNextRun(s.timezone, at)].slice(0, n) : [];
+}
+
+function nextRunsDaily(s: DailySchedule, n: number, fromMs: number): NextRun[] {
+  const { hour, minute } = parseWallClock(s.time, 'daily time');
+  const out: NextRun[] = [];
+  let cursor = zonedParts(s.timezone, fromMs);
+  for (let d = 0; d < MAX_SCAN_DAYS && out.length < n; d++) {
+    const date = shiftDate(cursor, d);
+    const at = wallToUtcMs(s.timezone, { ...date, hour, minute });
+    // null = nonexistent wall time (DST spring-forward gap): skip the day.
+    if (at === null) continue;
+    if (at <= fromMs) continue;
+    const wd = zonedParts(s.timezone, at).weekday;
+    if (!s.weekdays.includes(wd)) continue;
+    out.push(makeNextRun(s.timezone, at));
+  }
+  return out;
+}
+
+function nextRunsCron(s: CronSchedule, n: number, fromMs: number): NextRun[] {
+  const parsed = parseCron(s.expression);
+  const out: NextRun[] = [];
+  // Start at the next whole minute strictly after `fromMs`.
+  const cursorMin = Math.floor(fromMs / 60_000) * 60_000 + 60_000;
+  const startWall = zonedParts(s.timezone, cursorMin);
+  const startMinuteOfDay = startWall.hour * 60 + startWall.minute;
+
+  const dayMatches = (date: { year: number; month: number; day: number }): boolean => {
+    if (!fieldMatches(parsed.month, date.month)) return false;
+    const wd = new Date(Date.UTC(date.year, date.month - 1, date.day)).getUTCDay();
+    const domOk = fieldMatches(parsed.dom, date.day);
+    const dowOk = fieldMatches(parsed.dow, wd);
+    // Standard cron day semantics: dom/dow are OR-ed when both restricted.
+    if (parsed.dom.star && parsed.dow.star) return true;
+    if (parsed.dom.star) return dowOk;
+    if (parsed.dow.star) return domOk;
+    return domOk || dowOk;
+  };
+
+  for (let d = 0; d < MAX_SCAN_DAYS && out.length < n; d++) {
+    const date = shiftDate(startWall, d);
+    if (!dayMatches(date)) continue;
+    const firstMinute = d === 0 ? startMinuteOfDay : 0;
+    for (let mi = firstMinute; mi < 1440 && out.length < n; mi++) {
+      const hour = Math.floor(mi / 60);
+      const minute = mi % 60;
+      if (!fieldMatches(parsed.hour, hour) || !fieldMatches(parsed.minute, minute)) continue;
+      const at = wallToUtcMs(s.timezone, { ...date, hour, minute });
+      // null = spring-forward gap minute: can never occur, skip.
+      // Enumerating wall minutes means a fall-back overlap yields exactly
+      // one occurrence (wallToUtcMs picks the first deterministically).
+      if (at === null || at <= fromMs) continue;
+      out.push(makeNextRun(s.timezone, at));
+    }
+  }
+  return out;
+}
+
+/**
+ * Interval grid anchor: the anchor wall-clock on 1970-01-01 in the
+ * schedule's timezone, as a UTC instant. Anchoring to the epoch (not to
+ * "now" or boot time) keeps the occurrence grid stable across restarts,
+ * so a restart can never double-fire or skip an occurrence.
+ */
+function intervalAnchorMs(s: IntervalSchedule): number {
+  const { hour, minute } = parseWallClock(s.anchorTime ?? '00:00', 'interval anchorTime');
+  const at = wallToUtcMs(s.timezone, { year: 1970, month: 1, day: 1, hour, minute });
+  if (at === null) {
+    // 00:0x on 1970-01-01 essentially always exists; a zone with a
+    // transition exactly then is pathological — fall back to UTC midnight.
+    return 0;
+  }
+  return at;
+}
+
+function intervalWindowAllows(s: IntervalSchedule, at: number): boolean {
+  if (!s.windowStart || !s.windowEnd) return true;
+  const p = zonedParts(s.timezone, at);
+  const t = p.hour * 60 + p.minute;
+  const ws = parseWallClock(s.windowStart, 'windowStart');
+  const we = parseWallClock(s.windowEnd, 'windowEnd');
+  const start = ws.hour * 60 + ws.minute;
+  const end = we.hour * 60 + we.minute;
+  // Overnight windows (e.g. 22:00–06:00) wrap around midnight.
+  return start < end ? t >= start && t < end : t >= start || t < end;
+}
+
+function nextRunsInterval(s: IntervalSchedule, n: number, fromMs: number): NextRun[] {
+  const step = s.everyMinutes * 60_000;
+  const anchor = intervalAnchorMs(s);
+  const endsAt = s.endsAt ? parseScheduleInstant(s.endsAt, s.timezone, 'endsAt') : Infinity;
+  const out: NextRun[] = [];
+  // First k with anchor + k*step > fromMs.
+  let k = Math.max(0, Math.floor((fromMs - anchor) / step) + 1);
+  // Safety: k must stay non-negative (fromMs < anchor → k=0).
+  if (anchor + k * step <= fromMs) k += 1;
+  const maxK = k + Math.ceil((MAX_SCAN_DAYS * 86_400_000) / step) + 2;
+  for (; k <= maxK && out.length < n; k++) {
+    const at = anchor + k * step;
+    if (at > endsAt) break;
+    const p = zonedParts(s.timezone, at);
+    if (s.weekdays && !s.weekdays.includes(p.weekday)) continue;
+    if (!intervalWindowAllows(s, at)) continue;
+    out.push(makeNextRun(s.timezone, at));
+  }
+  return out;
+}
+
+/**
+ * The next N run times strictly after `fromMs` (default: now).
+ * Returns at most 100 runs. Throws on invalid schedules.
+ */
+export function nextRuns(schedule: RoutineSchedule, n = 5, fromMs: number = Date.now()): NextRun[] {
+  const count = Math.max(1, Math.min(MAX_NEXT_RUNS, Math.floor(n) || 5));
+  switch (schedule.kind) {
+    case 'once':
+      return nextRunsOnce(schedule, count, fromMs);
+    case 'daily':
+      return nextRunsDaily(schedule, count, fromMs);
+    case 'cron':
+      return nextRunsCron(schedule, count, fromMs);
+    case 'interval':
+      return nextRunsInterval(schedule, count, fromMs);
+  }
+}
+
+/**
+ * Occurrences with fromMs < at <= toMs. Used by the scheduler tick.
+ * Bounded: at most 500 occurrences are enumerated.
+ */
+export function occurrencesBetween(schedule: RoutineSchedule, fromMs: number, toMs: number): NextRun[] {
+  if (toMs <= fromMs) return [];
+  return nextRuns(schedule, 500, fromMs).filter((r) => r.at <= toMs);
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler engine
+// ---------------------------------------------------------------------------
+
+export interface RoutineFireInfo {
+  routine: BotRoutine;
+  /** The scheduled occurrence time (UTC ms). */
+  at: number;
+  ok: boolean;
+  error?: string;
+  /** True when the run was skipped by the 'skip' overlap policy. */
+  skipped?: boolean;
+}
+
+export interface RoutineSchedulerDeps {
+  routineStore: RoutineStore;
+  agentRuntime: AgentRuntime;
+  getBots: () => BotConfig[];
+  /** Render the routine prompt template (default: {{payload}} substitution). */
+  renderPrompt?: (template: string, body: unknown) => string;
+  /** Called after every scheduled fire attempt (and every skip). */
+  onFire?: (info: RoutineFireInfo) => void;
+  /** Clock override for tests. */
+  now?: () => number;
+}
+
+/**
+ * Ticks on an interval; for each routine with an enabled schedule, fires
+ * the occurrences that fell inside (lastTick, now].
+ *
+ * Restart behavior: a routine's last-fired watermark is persisted in the
+ * store. On boot, routines with no watermark get watermarked at the boot
+ * time — missed occurrences during downtime do NOT backfill (no
+ * missed-run execution; that's the run-lifecycle item). The epoch-anchored
+ * interval grid and minute-granular cron matching mean a restart can
+ * neither double-fire nor skip an occurrence that falls after boot.
+ */
+export class RoutineScheduler {
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private ticking = false;
+  private readonly inFlight = new Set<string>();
+  private booted = false;
+
+  constructor(private readonly deps: RoutineSchedulerDeps) {}
+
+  start(intervalMs = 30_000): void {
+    if (this.timer) return;
+    this.timer = setInterval(() => void this.tick().catch((err) => {
+      console.error('[routine-scheduler] tick failed:', err instanceof Error ? err.message : err);
+    }), intervalMs);
+    if (typeof this.timer === 'object' && 'unref' in this.timer) this.timer.unref();
+    // First tick shortly after boot so schedules due at startup fire
+    // promptly; boot watermarking (see tick) prevents backfill.
+    setTimeout(() => void this.tick().catch(() => {}), 2_000);
+  }
+
+  stop(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+  }
+
+  /** For tests: is a scheduled run currently in flight for this routine? */
+  inFlightCount(): number {
+    return this.inFlight.size;
+  }
+
+  async tick(nowMs?: number): Promise<void> {
+    if (this.ticking) return;
+    this.ticking = true;
+    try {
+      const now = nowMs ?? this.deps.now?.() ?? Date.now();
+      for (const routine of this.deps.routineStore.list()) {
+        await this.tickRoutine(routine, now);
+      }
+      this.booted = true;
+    } finally {
+      this.ticking = false;
+    }
+  }
+
+  private async tickRoutine(routine: BotRoutine, now: number): Promise<void> {
+    const schedule = routine.schedule;
+    if (!routine.enabled || !schedule || !schedule.enabled) return;
+
+    let watermark = this.deps.routineStore.getLastFiredAt(routine.id);
+    if (watermark === undefined) {
+      // First sight (fresh schedule or pre-schedule routine): watermark
+      // at now so downtime occurrences don't backfill on boot.
+      this.deps.routineStore.setLastFiredAt(routine.id, now);
+      return;
+    }
+    if (watermark > now) {
+      // Clock moved backwards — re-anchor rather than firing a huge
+      // backfill window.
+      this.deps.routineStore.setLastFiredAt(routine.id, now);
+      return;
+    }
+
+    const due = occurrencesBetween(schedule, watermark, now);
+    if (due.length === 0) return;
+    // Advance the watermark past this tick even if firing fails, so a
+    // failing routine can't wedge the scheduler into a retry storm.
+    // (Failure reporting goes through onFire.)
+    this.deps.routineStore.setLastFiredAt(routine.id, now);
+
+    for (const occ of due) {
+      if (schedule.overlap === 'skip' && this.inFlight.has(routine.id)) {
+        this.emit({ routine, at: occ.at, ok: true, skipped: true });
+        continue;
+      }
+      // Fire without awaiting: a long-running turn must not block the
+      // scheduler (or other routines). The 'skip' overlap policy is
+      // enforced via the inFlight set, which fire() maintains.
+      void this.fire(routine, occ.at);
+    }
+  }
+
+  /** Invoke onFire without letting a throwing listener break the scheduler. */
+  private emit(info: RoutineFireInfo): void {
+    try {
+      this.deps.onFire?.(info);
+    } catch (err) {
+      console.error('[routine-scheduler] onFire listener threw:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  private async fire(routine: BotRoutine, at: number): Promise<void> {
+    const { agentRuntime, getBots } = this.deps;
+    const bot = getBots().find((b) => b.id === routine.botId);
+    if (!bot) {
+      this.emit({ routine, at, ok: false, error: `Unknown bot "${routine.botId}"` });
+      return;
+    }
+    const render = this.deps.renderPrompt ?? defaultRenderPrompt;
+    this.inFlight.add(routine.id);
+    try {
+      const message = render(routine.promptTemplate, {
+        source: 'schedule',
+        routineId: routine.id,
+        routineName: routine.name,
+        scheduledAt: new Date(at).toISOString(),
+      });
+      await agentRuntime.runTurn({
+        bot,
+        message,
+        sessionId: routine.sessionId ?? `routine_${routine.id}`,
+        taskType: 'chat',
+        onEvent: () => {},
+      });
+      this.emit({ routine, at, ok: true });
+    } catch (err) {
+      this.emit({
+        routine,
+        at,
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      this.inFlight.delete(routine.id);
+    }
+  }
+}
+
+function defaultRenderPrompt(template: string, body: unknown): string {
+  const payload = typeof body === 'string' ? body : JSON.stringify(body ?? {});
+  return template.split('{{payload}}').join(payload).split('{{body}}').join(payload);
+}

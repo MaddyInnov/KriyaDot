@@ -17,11 +17,87 @@
 import { useCallback, useEffect, useState } from 'react';
 import { kriyadotFetch } from '../../lib/kriyadot-api';
 
+interface RoutineSchedule {
+  kind: 'once' | 'daily' | 'cron' | 'interval';
+  timezone: string;
+  enabled: boolean;
+  overlap: 'skip' | 'queue';
+  runAt?: string;
+  time?: string;
+  weekdays?: number[];
+  expression?: string;
+  everyMinutes?: number;
+  anchorTime?: string;
+  windowStart?: string;
+  windowEnd?: string;
+  endsAt?: string;
+}
+
 interface Routine {
   id: string;
   name: string;
   botId: string;
   enabled: boolean;
+  schedule?: RoutineSchedule | null;
+  nextRunAt?: number | null;
+}
+
+interface NextRun {
+  at: number;
+  atIso: string;
+  label: string;
+}
+
+const COMMON_TIMEZONES = [
+  'UTC',
+  'Asia/Kolkata',
+  'Asia/Dubai',
+  'Asia/Karachi',
+  'Asia/Dhaka',
+  'Asia/Singapore',
+  'Asia/Jakarta',
+  'Asia/Manila',
+  'Asia/Shanghai',
+  'Asia/Tokyo',
+  'Asia/Seoul',
+  'Australia/Sydney',
+  'Pacific/Auckland',
+  'Europe/London',
+  'Europe/Berlin',
+  'Europe/Paris',
+  'Europe/Moscow',
+  'Africa/Cairo',
+  'Africa/Lagos',
+  'America/Sao_Paulo',
+  'America/New_York',
+  'America/Chicago',
+  'America/Denver',
+  'America/Los_Angeles',
+  'America/Toronto',
+  'Pacific/Honolulu',
+];
+
+const WEEKDAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+function describeScheduleClient(s: RoutineSchedule): string {
+  switch (s.kind) {
+    case 'once':
+      return `Once at ${s.runAt}`;
+    case 'daily': {
+      const days = s.weekdays && s.weekdays.length < 7
+        ? s.weekdays.map((d) => WEEKDAY_LABELS[d]).join('/')
+        : 'daily';
+      return `${days} at ${s.time}`;
+    }
+    case 'cron':
+      return `Cron \`${s.expression}\``;
+    case 'interval': {
+      let d = `Every ${s.everyMinutes} min`;
+      if (s.anchorTime) d += ` from ${s.anchorTime}`;
+      if (s.windowStart) d += `, ${s.windowStart}–${s.windowEnd}`;
+      return d;
+    }
+  }
 }
 
 interface HookInfo {
@@ -82,7 +158,374 @@ function fallbackCopy(text: string, done: () => void) {
   document.body.removeChild(ta);
 }
 
-function RoutineRow({ routine, botId }: { routine: Routine; botId: string }) {
+function WeekdayPicker({ value, onChange }: { value: number[]; onChange: (v: number[]) => void }) {
+  const toggle = (d: number) => {
+    onChange(value.includes(d) ? value.filter((x) => x !== d) : [...value, d].sort((a, b) => a - b));
+  };
+  return (
+    <div className="weekday-picker">
+      {WEEKDAY_LABELS.map((label, d) => (
+        <button
+          key={label}
+          type="button"
+          className={`weekday-chip${value.includes(d) ? ' on' : ''}`}
+          onClick={() => toggle(d)}
+          aria-pressed={value.includes(d)}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function TimezoneField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  return (
+    <>
+      <input
+        className="text-input"
+        list="kriyadot-timezones"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="Asia/Kolkata"
+        spellCheck={false}
+      />
+      <datalist id="kriyadot-timezones">
+        {COMMON_TIMEZONES.map((tz) => (
+          <option key={tz} value={tz} />
+        ))}
+      </datalist>
+      <p className="muted small">IANA timezone — all times below are read in this zone, not server-local.</p>
+    </>
+  );
+}
+
+function ScheduleBuilder({
+  routineId,
+  initial,
+  onSaved,
+  onCancel,
+}: {
+  routineId: string;
+  initial: RoutineSchedule | null;
+  onSaved: (routine: Routine) => void;
+  onCancel: () => void;
+}) {
+  const [kind, setKind] = useState<RoutineSchedule['kind']>(initial?.kind ?? 'daily');
+  const [timezone, setTimezone] = useState(initial?.timezone ?? 'Asia/Kolkata');
+  const [overlap, setOverlap] = useState<'skip' | 'queue'>(initial?.overlap ?? 'skip');
+  const [onceRunAt, setOnceRunAt] = useState(initial?.runAt?.slice(0, 16) ?? '');
+  const [dailyTime, setDailyTime] = useState(initial?.time ?? '09:00');
+  const [dailyWeekdays, setDailyWeekdays] = useState<number[]>(initial?.weekdays ?? [1, 2, 3, 4, 5]);
+  const [cronExpr, setCronExpr] = useState(initial?.expression ?? '0 9 * * *');
+  const [everyMinutes, setEveryMinutes] = useState(String(initial?.everyMinutes ?? 30));
+  const [anchorTime, setAnchorTime] = useState(initial?.anchorTime ?? '');
+  const [useWindow, setUseWindow] = useState(Boolean(initial?.windowStart));
+  const [windowStart, setWindowStart] = useState(initial?.windowStart ?? '09:00');
+  const [windowEnd, setWindowEnd] = useState(initial?.windowEnd ?? '18:00');
+  const [useWeekdays, setUseWeekdays] = useState(Boolean(initial?.weekdays));
+  const [intervalWeekdays, setIntervalWeekdays] = useState<number[]>(initial?.weekdays ?? [1, 2, 3, 4, 5]);
+  const [endsAt, setEndsAt] = useState(initial?.endsAt?.slice(0, 16) ?? '');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const build = (): RoutineSchedule => {
+    const base = { timezone: timezone.trim(), enabled: initial?.enabled ?? true, overlap };
+    switch (kind) {
+      case 'once':
+        if (!onceRunAt) throw new Error('Pick a date and time');
+        return { ...base, kind, runAt: onceRunAt };
+      case 'daily':
+        if (dailyWeekdays.length === 0) throw new Error('Pick at least one weekday');
+        return { ...base, kind, time: dailyTime, weekdays: dailyWeekdays };
+      case 'cron':
+        if (!cronExpr.trim()) throw new Error('Enter a cron expression');
+        return { ...base, kind, expression: cronExpr.trim() };
+      case 'interval': {
+        const mins = Number(everyMinutes);
+        if (!Number.isInteger(mins) || mins < 1 || mins > 10080) {
+          throw new Error('Every N minutes must be an integer 1..10080');
+        }
+        const s: RoutineSchedule = { ...base, kind, everyMinutes: mins };
+        if (anchorTime) s.anchorTime = anchorTime;
+        if (useWindow) {
+          s.windowStart = windowStart;
+          s.windowEnd = windowEnd;
+        }
+        if (useWeekdays) {
+          if (intervalWeekdays.length === 0) throw new Error('Pick at least one weekday');
+          s.weekdays = intervalWeekdays;
+        }
+        if (endsAt) s.endsAt = endsAt;
+        return s;
+      }
+    }
+  };
+
+  const onSave = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const schedule = build();
+      const res = await api<{ routine: Routine }>(`/api/routines/${encodeURIComponent(routineId)}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ schedule }),
+      });
+      onSaved(res.routine);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Save failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="schedule-builder">
+      <div className="sched-row">
+        <label className="field-label">
+          Type
+          <select className="text-input" value={kind} onChange={(e) => setKind(e.target.value as RoutineSchedule['kind'])}>
+            <option value="once">Once — a specific date &amp; time</option>
+            <option value="daily">Daily — time + weekdays</option>
+            <option value="cron">Cron — 5-field expression</option>
+            <option value="interval">Interval — every N minutes</option>
+          </select>
+        </label>
+        <label className="field-label">
+          Timezone
+          <TimezoneField value={timezone} onChange={setTimezone} />
+        </label>
+      </div>
+
+      {kind === 'once' && (
+        <label className="field-label">
+          Run at <span className="muted">(in {timezone || '…'})</span>
+          <input type="datetime-local" className="text-input" value={onceRunAt} onChange={(e) => setOnceRunAt(e.target.value)} />
+        </label>
+      )}
+
+      {kind === 'daily' && (
+        <>
+          <label className="field-label">
+            Time <span className="muted">(in {timezone || '…'})</span>
+            <input type="time" className="text-input" value={dailyTime} onChange={(e) => setDailyTime(e.target.value)} />
+          </label>
+          <label className="field-label">Weekdays</label>
+          <WeekdayPicker value={dailyWeekdays} onChange={setDailyWeekdays} />
+        </>
+      )}
+
+      {kind === 'cron' && (
+        <label className="field-label">
+          Expression <span className="muted">— minute hour day-of-month month day-of-week</span>
+          <input
+            className="text-input mono"
+            value={cronExpr}
+            onChange={(e) => setCronExpr(e.target.value)}
+            placeholder="0 9 * * 1-5"
+            spellCheck={false}
+          />
+        </label>
+      )}
+
+      {kind === 'interval' && (
+        <>
+          <div className="sched-row">
+            <label className="field-label">
+              Every N minutes
+              <input
+                type="number"
+                className="text-input"
+                min={1}
+                max={10080}
+                value={everyMinutes}
+                onChange={(e) => setEveryMinutes(e.target.value)}
+              />
+            </label>
+            <label className="field-label">
+              Anchor time <span className="muted">(optional)</span>
+              <input type="time" className="text-input" value={anchorTime} onChange={(e) => setAnchorTime(e.target.value)} />
+            </label>
+          </div>
+          <label className="check-row">
+            <input type="checkbox" checked={useWindow} onChange={(e) => setUseWindow(e.target.checked)} />
+            Only within a wall-clock window
+          </label>
+          {useWindow && (
+            <div className="sched-row">
+              <label className="field-label">
+                Window start
+                <input type="time" className="text-input" value={windowStart} onChange={(e) => setWindowStart(e.target.value)} />
+              </label>
+              <label className="field-label">
+                Window end
+                <input type="time" className="text-input" value={windowEnd} onChange={(e) => setWindowEnd(e.target.value)} />
+              </label>
+            </div>
+          )}
+          <label className="check-row">
+            <input type="checkbox" checked={useWeekdays} onChange={(e) => setUseWeekdays(e.target.checked)} />
+            Only on selected weekdays
+          </label>
+          {useWeekdays && <WeekdayPicker value={intervalWeekdays} onChange={setIntervalWeekdays} />}
+          <label className="field-label">
+            Ends at <span className="muted">(optional, in {timezone || '…'})</span>
+            <input type="datetime-local" className="text-input" value={endsAt} onChange={(e) => setEndsAt(e.target.value)} />
+          </label>
+        </>
+      )}
+
+      <label className="field-label">
+        If a run is still going when the next one is due
+        <select className="text-input" value={overlap} onChange={(e) => setOverlap(e.target.value as 'skip' | 'queue')}>
+          <option value="skip">Skip the new run</option>
+          <option value="queue">Run it anyway (queue)</option>
+        </select>
+      </label>
+
+      {error && <p className="error">{error}</p>}
+      <div className="sched-actions">
+        <button type="button" className="btn-primary" onClick={() => void onSave()} disabled={busy}>
+          {busy ? 'Saving…' : initial ? 'Update schedule' : 'Save schedule'}
+        </button>
+        <button type="button" className="btn-ghost" onClick={onCancel} disabled={busy}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ScheduleSection({ routine, onChanged }: { routine: Routine; onChanged: (r: Routine) => void }) {
+  const [editing, setEditing] = useState(false);
+  const [runs, setRuns] = useState<NextRun[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const loadRuns = useCallback(async () => {
+    if (!routine.schedule) {
+      setRuns(null);
+      return;
+    }
+    try {
+      const res = await api<{ runs: NextRun[] }>(
+        `/api/routines/${encodeURIComponent(routine.id)}/next-runs?n=5`,
+      );
+      setRuns(res.runs);
+    } catch {
+      setRuns(null);
+    }
+  }, [routine.id, routine.schedule]);
+
+  useEffect(() => {
+    void loadRuns();
+  }, [loadRuns, routine.schedule]);
+
+  const toggleEnabled = async () => {
+    if (!routine.schedule) return;
+    setBusy(true);
+    setError('');
+    try {
+      const action = routine.schedule.enabled ? 'disable' : 'enable';
+      const res = await api<{ routine: Routine }>(
+        `/api/routines/${encodeURIComponent(routine.id)}/schedule/${action}`,
+        { method: 'POST' },
+      );
+      onChanged(res.routine);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Toggle failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const res = await api<{ routine: Routine }>(`/api/routines/${encodeURIComponent(routine.id)}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ schedule: null }),
+      });
+      onChanged(res.routine);
+      setEditing(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Remove failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (editing) {
+    return (
+      <ScheduleBuilder
+        routineId={routine.id}
+        initial={routine.schedule ?? null}
+        onSaved={(r) => {
+          onChanged(r);
+          setEditing(false);
+        }}
+        onCancel={() => setEditing(false)}
+      />
+    );
+  }
+
+  if (!routine.schedule) {
+    return (
+      <div className="schedule-empty">
+        <p className="muted small">No schedule — this routine only fires via webhook or manually.</p>
+        <button type="button" className="btn-ghost small" onClick={() => setEditing(true)}>
+          ＋ Add schedule
+        </button>
+      </div>
+    );
+  }
+
+  const s = routine.schedule;
+  return (
+    <div className="schedule-summary">
+      <div className="sched-head">
+        <span className={`routine-badge${s.enabled ? '' : ' paused'}`}>{s.enabled ? 'scheduled' : 'paused'}</span>
+        <code className="mono small">{describeScheduleClient(s)}</code>
+      </div>
+      <p className="muted small">
+        Timezone <code>{s.timezone}</code>
+        {' · '}overlap: <code>{s.overlap}</code>
+      </p>
+      {runs && runs.length > 0 && (
+        <div className="next-runs">
+          <label className="field-label">Next runs</label>
+          <ul>
+            {runs.map((r) => (
+              <li key={r.at}>
+                <code className="mono small">{r.label}</code>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {runs && runs.length === 0 && (
+        <p className="muted small">No upcoming runs (a one-shot schedule in the past, or past its end).</p>
+      )}
+      {error && <p className="error">{error}</p>}
+      <div className="sched-actions">
+        <button type="button" className="btn-ghost small" onClick={() => void toggleEnabled()} disabled={busy}>
+          {s.enabled ? 'Pause schedule' : 'Resume schedule'}
+        </button>
+        <button type="button" className="btn-ghost small" onClick={() => setEditing(true)} disabled={busy}>
+          Edit
+        </button>
+        <button type="button" className="btn-ghost small danger" onClick={() => void remove()} disabled={busy}>
+          Remove
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function RoutineRow({ routine, botId, onChanged }: { routine: Routine; botId: string; onChanged: (r: Routine) => void }) {
   const [open, setOpen] = useState(false);
   const [hook, setHook] = useState<HookInfo | null>(null);
   const [deliveries, setDeliveries] = useState<Delivery[]>([]);
@@ -174,6 +617,16 @@ function RoutineRow({ routine, botId }: { routine: Routine; botId: string }) {
         <span className={`routine-badge${routine.enabled ? '' : ' paused'}`}>
           {routine.enabled ? 'on' : 'paused'}
         </span>
+        {routine.schedule && (
+          <span className={`routine-badge${routine.schedule.enabled ? '' : ' paused'}`} title={routine.schedule ? describeScheduleClient(routine.schedule) : ''}>
+            ⏰ {routine.schedule.enabled ? 'scheduled' : 'sched. paused'}
+          </span>
+        )}
+        {routine.nextRunAt && (
+          <span className="muted small" title={new Date(routine.nextRunAt).toString()}>
+            next {new Date(routine.nextRunAt).toLocaleString()}
+          </span>
+        )}
         {hook?.connected && <span className="routine-badge connected">connected</span>}
         <span className="routine-chev">{open ? '▾' : '▸'}</span>
       </button>
@@ -181,6 +634,8 @@ function RoutineRow({ routine, botId }: { routine: Routine; botId: string }) {
         <div className="routine-detail">
           {busy && !hook && <p className="muted">Loading…</p>}
           {error && <p className="error">{error}</p>}
+          <ScheduleSection routine={routine} onChanged={onChanged} />
+          <hr className="section-sep" />
           {hook && (
             <>
               <label className="field-label">
@@ -305,6 +760,10 @@ export function RoutinesPanel({ botId }: { botId: string }) {
     void refresh();
   }, [refresh]);
 
+  const onRoutineChanged = useCallback((updated: Routine) => {
+    setRoutines((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+  }, []);
+
   return (
     <section className="panel routines-panel" aria-label="Routines and webhooks">
       <div className="panel-head">
@@ -322,7 +781,7 @@ export function RoutinesPanel({ botId }: { botId: string }) {
         </p>
       )}
       {routines.map((r) => (
-        <RoutineRow key={r.id} routine={r} botId={botId} />
+        <RoutineRow key={r.id} routine={r} botId={botId} onChanged={onRoutineChanged} />
       ))}
     </section>
   );

@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
-// Bot routines — named, bot-bound tasks that can be fired on demand.
+// Bot routines — named, bot-bound tasks that can be fired on demand,
+// on a timezone-aware schedule (once/daily/cron/interval, see
+// routine-schedules.ts), or via webhook.
 //
 // A routine is a bot + prompt template (+ optional fixed session). Unlike
 // thread schedules (cron) and workflows (multi-step graphs), a routine is
 // one agent turn triggered externally — the workstream-C ingress for that
-// is a signed webhook (see webhooks.ts createRoutineWebhookRouter).
+// is a signed webhook (see webhooks.ts createRoutineWebhookRouter), while
+// scheduled firing is handled by RoutineScheduler (routine-schedules.ts).
 //
 // HTTP (mounted at /api/routines by the host):
-//   POST   /                        → { name, botId, promptTemplate, sessionId? }
-//   GET    /                        → list routines
-//   GET    /:id                     → one routine
-//   PATCH  /:id                     → { name?, botId?, promptTemplate?, sessionId?, enabled? }
+//   POST   /                        → { name, botId, promptTemplate, sessionId?, schedule? }
+//   GET    /                        → list routines (each with nextRunAt)
+//   GET    /:id                     → one routine (+ nextRunAt)
+//   PATCH  /:id                     → { name?, botId?, promptTemplate?, sessionId?, schedule?|null, enabled? }
 //   DELETE /:id                     → delete routine (+ its webhook triggers)
+//   GET    /:id/next-runs?n=5       → upcoming scheduled run times
+//   POST   /:id/schedule/enable     → enable the schedule
+//   POST   /:id/schedule/disable    → disable the schedule
 //   POST   /:id/triggers            → create webhook trigger → { trigger incl. secret (shown once) }
 //   GET    /:id/triggers            → list triggers (secrets redacted)
 //   DELETE /:id/triggers/:triggerId → revoke trigger
@@ -23,6 +29,11 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import express, { type Request, type Response, type Router } from 'express';
 import type { BotConfig } from '@mvp/agent-runtime';
+import {
+  nextRuns,
+  validateRoutineSchedule,
+  type RoutineSchedule,
+} from './routine-schedules.js';
 
 const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
 
@@ -37,6 +48,13 @@ export interface BotRoutine {
   promptTemplate: string;
   /** Fixed session id; defaults to `routine_<id>` when unset. */
   sessionId?: string;
+  /**
+   * Optional timezone-aware schedule (OpenMausBot parity). Null/undefined
+   * means webhook/manual firing only.
+   */
+  schedule?: RoutineSchedule | null;
+  /** Last scheduled-fire watermark (UTC ms), maintained by RoutineScheduler. */
+  lastFiredAt?: number;
   enabled: boolean;
   createdAt: number;
 }
@@ -59,6 +77,8 @@ interface RoutineRow {
   bot_id: string;
   prompt_template: string;
   session_id: string | null;
+  schedule: string | null;
+  last_fired_at: number | null;
   enabled: number;
   created_at: number;
 }
@@ -72,12 +92,24 @@ interface TriggerRow {
 }
 
 function rowToRoutine(r: RoutineRow): BotRoutine {
+  let schedule: RoutineSchedule | null = null;
+  if (r.schedule) {
+    try {
+      schedule = validateRoutineSchedule(JSON.parse(r.schedule));
+    } catch {
+      // A schedule that no longer validates (e.g. edited by hand) is
+      // treated as absent rather than breaking the whole row.
+      schedule = null;
+    }
+  }
   return {
     id: r.id,
     name: r.name,
     botId: r.bot_id,
     promptTemplate: r.prompt_template,
     sessionId: r.session_id ?? undefined,
+    schedule,
+    lastFiredAt: r.last_fired_at ?? undefined,
     enabled: r.enabled === 1,
     createdAt: r.created_at,
   };
@@ -131,6 +163,14 @@ function openDb(dataDir: string): DatabaseSync {
   if (!cols.some((c) => c.name === 'webhook_secret')) {
     db.exec('ALTER TABLE bot_routines ADD COLUMN webhook_secret TEXT');
   }
+  // Migration: timezone-aware schedules (OpenMausBot parity) + the
+  // scheduler's last-fired watermark.
+  if (!cols.some((c) => c.name === 'schedule')) {
+    db.exec('ALTER TABLE bot_routines ADD COLUMN schedule TEXT');
+  }
+  if (!cols.some((c) => c.name === 'last_fired_at')) {
+    db.exec('ALTER TABLE bot_routines ADD COLUMN last_fired_at INTEGER');
+  }
   return db;
 }
 
@@ -145,7 +185,13 @@ export class RoutineStore {
     this.db = openDb(dataDir);
   }
 
-  create(input: { name: string; botId: string; promptTemplate: string; sessionId?: string }): BotRoutine {
+  create(input: {
+    name: string;
+    botId: string;
+    promptTemplate: string;
+    sessionId?: string;
+    schedule?: RoutineSchedule | null;
+  }): BotRoutine {
     const name = input.name.trim().slice(0, 120);
     if (!name) throw new Error('name is required');
     const promptTemplate = input.promptTemplate.trim();
@@ -155,18 +201,23 @@ export class RoutineStore {
     if (input.sessionId !== undefined && !validSessionId(input.sessionId)) {
       throw new Error('sessionId must match /^[a-zA-Z0-9_-]{1,128}$/');
     }
+    const schedule =
+      input.schedule === undefined || input.schedule === null
+        ? null
+        : validateRoutineSchedule(input.schedule);
     const routine: BotRoutine = {
       id: randomUUID(),
       name,
       botId: input.botId,
       promptTemplate,
       sessionId: input.sessionId,
+      schedule,
       enabled: true,
       createdAt: Date.now(),
     };
     this.db
       .prepare(
-        'INSERT INTO bot_routines (id, name, bot_id, prompt_template, session_id, enabled, created_at, webhook_secret) VALUES (?, ?, ?, ?, ?, 1, ?, ?)',
+        'INSERT INTO bot_routines (id, name, bot_id, prompt_template, session_id, schedule, enabled, created_at, webhook_secret) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)',
       )
       .run(
         routine.id,
@@ -174,6 +225,7 @@ export class RoutineStore {
         routine.botId,
         routine.promptTemplate,
         routine.sessionId ?? null,
+        schedule ? JSON.stringify(schedule) : null,
         routine.createdAt,
         randomBytes(32).toString('hex'),
       );
@@ -192,7 +244,14 @@ export class RoutineStore {
 
   update(
     id: string,
-    patch: { name?: string; botId?: string; promptTemplate?: string; sessionId?: string | null; enabled?: boolean },
+    patch: {
+      name?: string;
+      botId?: string;
+      promptTemplate?: string;
+      sessionId?: string | null;
+      schedule?: RoutineSchedule | null;
+      enabled?: boolean;
+    },
   ): BotRoutine | undefined {
     const cur = this.get(id);
     if (!cur) return undefined;
@@ -214,10 +273,27 @@ export class RoutineStore {
       }
       next.sessionId = patch.sessionId ?? undefined;
     }
+    if (patch.schedule !== undefined) {
+      next.schedule = patch.schedule === null ? null : validateRoutineSchedule(patch.schedule);
+      // A (re-)set schedule starts its watermark now: no backfill of
+      // occurrences that "would have" fired before the schedule existed.
+      next.lastFiredAt = Date.now();
+    }
     if (patch.enabled !== undefined) next.enabled = patch.enabled;
     this.db
-      .prepare('UPDATE bot_routines SET name = ?, bot_id = ?, prompt_template = ?, session_id = ?, enabled = ? WHERE id = ?')
-      .run(next.name, next.botId, next.promptTemplate, next.sessionId ?? null, next.enabled ? 1 : 0, id);
+      .prepare(
+        'UPDATE bot_routines SET name = ?, bot_id = ?, prompt_template = ?, session_id = ?, schedule = ?, last_fired_at = ?, enabled = ? WHERE id = ?',
+      )
+      .run(
+        next.name,
+        next.botId,
+        next.promptTemplate,
+        next.sessionId ?? null,
+        next.schedule ? JSON.stringify(next.schedule) : null,
+        next.lastFiredAt ?? null,
+        next.enabled ? 1 : 0,
+        id,
+      );
     return this.get(id);
   }
 
@@ -256,6 +332,34 @@ export class RoutineStore {
     const secret = randomBytes(32).toString('hex');
     this.setWebhookSecret(id, secret);
     return secret;
+  }
+
+  // --- Scheduling -----------------------------------------------------------
+
+  /** Replace (or clear, with null) the routine's schedule. Watermark resets to now. */
+  setSchedule(id: string, schedule: RoutineSchedule | null): BotRoutine | undefined {
+    return this.update(id, { schedule });
+  }
+
+  /** Toggle just the schedule's enabled flag without touching the schedule itself. */
+  setScheduleEnabled(id: string, enabled: boolean): BotRoutine | undefined {
+    const cur = this.get(id);
+    if (!cur || !cur.schedule) return cur ?? undefined;
+    const schedule: RoutineSchedule = { ...cur.schedule, enabled };
+    this.db.prepare('UPDATE bot_routines SET schedule = ? WHERE id = ?').run(JSON.stringify(schedule), id);
+    return this.get(id);
+  }
+
+  /** Scheduler watermark: last UTC ms the scheduler scanned up to. */
+  getLastFiredAt(id: string): number | undefined {
+    const row = this.db.prepare('SELECT last_fired_at FROM bot_routines WHERE id = ?').get(id) as unknown as
+      | { last_fired_at: number | null }
+      | undefined;
+    return row?.last_fired_at ?? undefined;
+  }
+
+  setLastFiredAt(id: string, ms: number): void {
+    this.db.prepare('UPDATE bot_routines SET last_fired_at = ? WHERE id = ?').run(ms, id);
   }
 }
 
@@ -322,6 +426,24 @@ function validId(id: string): boolean {
 }
 
 /**
+ * Attach `nextRunAt` (UTC ms of the next scheduled occurrence, or null)
+ * for routines with an enabled schedule. Never throws — a schedule that
+ * fails to compute (shouldn't happen post-validation) yields null.
+ */
+function withNextRun(routine: BotRoutine): BotRoutine & { nextRunAt: number | null } {
+  let nextRunAt: number | null = null;
+  if (routine.enabled && routine.schedule?.enabled) {
+    try {
+      const runs = nextRuns(routine.schedule, 1);
+      nextRunAt = runs.length > 0 ? runs[0].at : null;
+    } catch {
+      nextRunAt = null;
+    }
+  }
+  return { ...routine, nextRunAt };
+}
+
+/**
  * Register bot-routine management routes. Mount the returned router at
  * `/api/routines`, e.g.:
  *
@@ -359,6 +481,7 @@ export function registerRoutineRoutes(
       botId?: unknown;
       promptTemplate?: unknown;
       sessionId?: unknown;
+      schedule?: unknown;
     };
     const botId = typeof body.botId === 'string' ? body.botId : '';
     if (!deps.getBots().some((b) => b.id === botId)) {
@@ -371,21 +494,25 @@ export function registerRoutineRoutes(
         botId,
         promptTemplate: typeof body.promptTemplate === 'string' ? body.promptTemplate : '',
         sessionId: typeof body.sessionId === 'string' && body.sessionId ? body.sessionId : undefined,
+        schedule:
+          body.schedule === null || body.schedule === undefined
+            ? null
+            : (body.schedule as RoutineSchedule),
       });
-      res.status(201).json({ ok: true, routine });
+      res.status(201).json({ ok: true, routine: withNextRun(routine) });
     } catch (err) {
       res.status(400).json(errorBody(err instanceof Error ? err.message : 'Failed to create routine'));
     }
   });
 
   router.get('/', (_req: Request, res: Response) => {
-    res.json({ ok: true, routines: routineStore.list() });
+    res.json({ ok: true, routines: routineStore.list().map(withNextRun) });
   });
 
   router.get('/:id', (req: Request, res: Response) => {
     const routine = requireRoutine(res, req.params.id);
     if (!routine) return;
-    res.json({ ok: true, routine });
+    res.json({ ok: true, routine: withNextRun(routine) });
   });
 
   router.patch('/:id', (req: Request, res: Response) => {
@@ -396,6 +523,7 @@ export function registerRoutineRoutes(
       botId?: unknown;
       promptTemplate?: unknown;
       sessionId?: unknown;
+      schedule?: unknown;
       enabled?: unknown;
     };
     if (body.botId !== undefined && !deps.getBots().some((b) => b.id === body.botId)) {
@@ -413,9 +541,15 @@ export function registerRoutineRoutes(
             : typeof body.sessionId === 'string' && body.sessionId
               ? body.sessionId
               : undefined,
+        schedule:
+          body.schedule === null
+            ? null
+            : body.schedule === undefined
+              ? undefined
+              : (body.schedule as RoutineSchedule),
         enabled: typeof body.enabled === 'boolean' ? body.enabled : undefined,
       });
-      res.json({ ok: true, routine: updated });
+      res.json({ ok: true, routine: updated ? withNextRun(updated) : updated });
     } catch (err) {
       res.status(400).json(errorBody(err instanceof Error ? err.message : 'Failed to update routine'));
     }
@@ -432,6 +566,47 @@ export function registerRoutineRoutes(
       return;
     }
     res.json({ ok: true, deleted: id });
+  });
+
+  // --- Scheduling (OpenMausBot parity) ------------------------------------
+  // Timezone-aware schedules on routines: once / daily / cron / interval.
+
+  router.get('/:id/next-runs', (req: Request, res: Response) => {
+    const routine = requireRoutine(res, req.params.id);
+    if (!routine) return;
+    if (!routine.schedule) {
+      res.status(400).json(errorBody('Routine has no schedule'));
+      return;
+    }
+    const n = Math.max(1, Math.min(100, Number(req.query.n) || 5));
+    try {
+      const runs = nextRuns(routine.schedule, n);
+      res.json({ ok: true, routineId: routine.id, schedule: routine.schedule, runs });
+    } catch (err) {
+      res.status(400).json(errorBody(err instanceof Error ? err.message : 'Failed to compute next runs'));
+    }
+  });
+
+  router.post('/:id/schedule/enable', (req: Request, res: Response) => {
+    const routine = requireRoutine(res, req.params.id);
+    if (!routine) return;
+    if (!routine.schedule) {
+      res.status(400).json(errorBody('Routine has no schedule'));
+      return;
+    }
+    const updated = routineStore.setScheduleEnabled(routine.id, true);
+    res.json({ ok: true, routine: updated ? withNextRun(updated) : updated });
+  });
+
+  router.post('/:id/schedule/disable', (req: Request, res: Response) => {
+    const routine = requireRoutine(res, req.params.id);
+    if (!routine) return;
+    if (!routine.schedule) {
+      res.status(400).json(errorBody('Routine has no schedule'));
+      return;
+    }
+    const updated = routineStore.setScheduleEnabled(routine.id, false);
+    res.json({ ok: true, routine: updated ? withNextRun(updated) : updated });
   });
 
   router.post('/:id/triggers', (req: Request, res: Response) => {

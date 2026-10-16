@@ -4429,3 +4429,20 @@ html[data-ux='simple'] .mic-btn.recording {
 .eval-case { margin: 0.4rem 0; padding: 0.4rem 0.6rem; border: 1px solid var(--border, #e5e7eb); border-radius: 6px; }
 .eval-case summary { cursor: pointer; }
 .eval-response { white-space: pre-wrap; font-size: 0.8rem; max-height: 300px; overflow: auto; background: rgba(0,0,0,0.04); padding: 0.5rem; border-radius: 6px; }
+
+/* Routine schedules (OpenMausBot parity) */
+.schedule-builder { margin: 0.6rem 0; padding: 0.8rem; border: 1px solid var(--border, #e5e7eb); border-radius: 8px; background: rgba(0,0,0,0.02); }
+.sched-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
+@media (max-width: 560px) { .sched-row { grid-template-columns: 1fr; } }
+.sched-actions { display: flex; gap: 0.5rem; margin-top: 0.7rem; }
+.weekday-picker { display: flex; gap: 0.3rem; flex-wrap: wrap; margin: 0.3rem 0 0.6rem; }
+.weekday-chip { font-size: 0.75rem; padding: 0.25rem 0.55rem; border-radius: 16px; border: 1px solid var(--border, #d1d5db); background: transparent; cursor: pointer; }
+.weekday-chip.on { background: rgba(110, 231, 183, 0.2); border-color: #6ee7b7; color: inherit; font-weight: 600; }
+.check-row { display: flex; align-items: center; gap: 0.45rem; font-size: 0.85rem; margin: 0.5rem 0; cursor: pointer; }
+.schedule-summary { margin: 0.6rem 0; padding: 0.7rem 0.8rem; border: 1px solid var(--border, #e5e7eb); border-radius: 8px; }
+.sched-head { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.3rem; }
+.next-runs ul { margin: 0.3rem 0; padding-left: 1.1rem; }
+.next-runs li { font-size: 0.85rem; margin: 0.15rem 0; }
+.schedule-empty { margin: 0.6rem 0; }
+.section-sep { border: none; border-top: 1px solid var(--border, #e5e7eb); margin: 0.9rem 0; }
+.btn-ghost.danger { color: #f87171; }
