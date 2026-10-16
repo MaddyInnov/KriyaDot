@@ -21,11 +21,20 @@ import {
   replyInMessageThread,
   saveSlashCommand,
   streamChat,
+  startFusionRun,
+  streamFusionRun,
   uploadFile,
   deleteUploadedFile,
   fileTypeIcon,
+  type FusionStreamEvent,
   type MessageReaction,
 } from '../lib/api';
+import {
+  FusionProgressView,
+  applyFusionEvent,
+  emptyFusionState,
+  type FusionLiveState,
+} from '../components/fusion/fusion-progress';
 import type {
   BotConfig,
   MessageThreadSummary,
@@ -70,6 +79,7 @@ type ChatBlock =
   | { kind: 'widget'; id: string; widget: Widget }
   | { kind: 'error'; id: string; text: string }
   | { kind: 'interrupted'; id: string; text: string }
+  | { kind: 'fusion'; id: string; runId: string; state: FusionLiveState; ts: number }
   | {
       kind: 'voice-note';
       id: string;
@@ -419,6 +429,15 @@ function ChatPageInner() {
   const [convSheetPeer, setConvSheetPeer] = useState<string | null>(null);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
+  // Fusion mode (Atomic Agent parity): when on, the composer sends the
+  // message as a fusion run (planner + parallel workers + fused synthesis).
+  const [fusionMode, setFusionMode] = useState(false);
+  const fusionModeRef = useRef(false);
+  useEffect(() => {
+    fusionModeRef.current = fusionMode;
+  }, [fusionMode]);
+  // Active fusion SSE subscriptions, keyed by block id (cleaned up on stop).
+  const fusionStreamsRef = useRef(new Map<string, () => void>());
   const [loadError, setLoadError] = useState('');
   const [attachedFiles, setAttachedFiles] = useState<UploadedFile[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -1065,6 +1084,15 @@ function ChatPageInner() {
       c.abort();
       abortRef.current = null;
     }
+    // Also drop any live fusion SSE subscriptions.
+    for (const unsub of fusionStreamsRef.current.values()) {
+      try {
+        unsub();
+      } catch {
+        // ignore
+      }
+    }
+    fusionStreamsRef.current.clear();
   }, []);
 
   /**
@@ -1165,7 +1193,72 @@ function ChatPageInner() {
     const fileIds = attachedFiles.map((f) => f.id);
     setInput('');
     setAttachedFiles([]);
+    if (fusionModeRef.current && selectedBotRef.current) {
+      void sendFusion(text);
+      return;
+    }
     void sendImpl(text, undefined, fileIds);
+  };
+
+  /**
+   * Fusion-mode send: the message becomes a fusion run (planner + parallel
+   * workers + fused synthesis). Progress streams in over SSE into a live
+   * fusion block.
+   */
+  const sendFusion = async (text: string) => {
+    const bot = selectedBotRef.current;
+    if (!bot) return;
+    stopTurn();
+    const seq = ++turnSeq.current;
+    setSending(true);
+    const userBlock: ChatBlock = { kind: 'user', id: nextId(), text, ts: Date.now() };
+    const blockId = nextId();
+    const fusionBlock: ChatBlock = {
+      kind: 'fusion',
+      id: blockId,
+      runId: '',
+      state: emptyFusionState(),
+      ts: Date.now(),
+    };
+    setBlocks((prev) => [...prev, userBlock, fusionBlock]);
+    const patchState = (fn: (s: FusionLiveState) => FusionLiveState) => {
+      if (turnSeq.current !== seq) return;
+      setBlocks((prev) =>
+        prev.map((b) => (b.kind === 'fusion' && b.id === blockId ? { ...b, state: fn(b.state) } : b)),
+      );
+    };
+    try {
+      const { runId } = await startFusionRun({ botId: bot.id, task: text });
+      if (turnSeq.current !== seq) return;
+      setBlocks((prev) =>
+        prev.map((b) => (b.kind === 'fusion' && b.id === blockId ? { ...b, runId } : b)),
+      );
+      const unsubscribe = streamFusionRun(
+        runId,
+        (event: FusionStreamEvent) => {
+          patchState((s) => applyFusionEvent(s, event));
+          if (event.type === 'done' || event.type === 'error') {
+            fusionStreamsRef.current.delete(blockId);
+            if (turnSeq.current === seq) setSending(false);
+          }
+        },
+        () => {
+          patchState((s) => ({ ...s, status: 'failed', error: 'Lost connection to the fusion stream.' }));
+          fusionStreamsRef.current.delete(blockId);
+          if (turnSeq.current === seq) setSending(false);
+        },
+      );
+      fusionStreamsRef.current.set(blockId, unsubscribe);
+    } catch (err) {
+      fusionStreamsRef.current.delete(blockId);
+      if (turnSeq.current === seq) {
+        setBlocks((prev) => [
+          ...prev.filter((b) => b.id !== blockId),
+          { kind: 'error', id: nextId(), text: err instanceof Error ? err.message : String(err) },
+        ]);
+        setSending(false);
+      }
+    }
   };
 
   /** Voice-note send: the audio bubble leads, its transcript drives the turn. */
@@ -1881,6 +1974,12 @@ function ChatPageInner() {
                     onAction={(a, w) => void handleWidgetAction(a, w)}
                   />
                 );
+              case 'fusion':
+                return (
+                  <div key={b.id} className="msg-row assistant">
+                    <FusionProgressView state={b.state} />
+                  </div>
+                );
               case 'tool': {
                 const notice =
                   (b.call.name === 'ask_bot' || b.call.name === 'message_bot') &&
@@ -2123,6 +2222,18 @@ function ChatPageInner() {
             <span className="kbd-hint" title="Enter sends · Shift+Enter for a new line">
               <kbd>↵</kbd> send · <kbd>⇧↵</kbd> newline
             </span>
+            <button
+              type="button"
+              className={`fusion-toggle${fusionMode ? ' on' : ''}`}
+              title="Fusion mode: decompose the task, run workers in parallel, fuse the results"
+              aria-pressed={fusionMode}
+              onClick={() => setFusionMode((v) => !v)}
+            >
+              ⚡ Fusion{fusionMode ? ' on' : ''}
+            </button>
+            <a className="fusion-history-link" href="/fusion" title="Past fusion runs">
+              history
+            </a>
             {botSessionUsage ? (
               <span
                 className="mono"

@@ -2859,6 +2859,143 @@ html[data-theme='midnight'] .tk-fn { color: #67e8f9; }
   margin-left: auto;
 }
 
+/* --- Fusion mode (planner + parallel workers + fused synthesis) --- */
+.fusion-toggle {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-3);
+  cursor: pointer;
+}
+.fusion-toggle:hover {
+  border-color: var(--accent, #7c6cf0);
+  color: var(--text-1);
+}
+.fusion-toggle.on {
+  background: var(--accent, #7c6cf0);
+  border-color: var(--accent, #7c6cf0);
+  color: #fff;
+}
+.fusion-history-link {
+  font-size: 11px;
+  color: var(--text-3);
+  text-decoration: underline;
+}
+.fusion-run {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-1);
+}
+.fusion-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.fusion-note {
+  font-size: 12px;
+  color: var(--text-3);
+  background: var(--surface-2);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.fusion-plan .label,
+.fusion-result .label,
+.fusion-worker-detail .label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-3);
+  margin-bottom: 6px;
+}
+.fusion-workers {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.fusion-worker-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 6px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--text-1);
+  font-size: 13px;
+}
+.fusion-worker-toggle:hover {
+  background: var(--surface-2);
+}
+.fusion-icon {
+  width: 18px;
+  text-align: center;
+}
+.fusion-worker.running .fusion-icon {
+  animation: caretPulse 1s ease-in-out infinite;
+}
+.fusion-worker-detail {
+  margin: 0 8px 8px 34px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--border);
+  font-size: 13px;
+}
+.fusion-error {
+  color: var(--danger, #e5484d);
+  font-size: 13px;
+}
+.fusion-result .msg-text {
+  font-size: 14px;
+}
+.pre-wrap {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* --- Fusion history page --- */
+.fusion-history {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 24px 16px 64px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.fusion-history h1 {
+  font-size: 20px;
+  margin: 0;
+}
+.fusion-history-item {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-1);
+  padding: 12px 14px;
+}
+.fusion-history-item summary {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+}
+.fusion-history-task {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Streaming caret always pulses (was pro-mode only). */
 .stream-caret {
   animation: caretPulse 1s ease-in-out infinite;

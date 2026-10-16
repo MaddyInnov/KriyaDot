@@ -48,3 +48,4 @@ export * from './tools/bot-team.js';
 export * from './teams.js';
 export * from './hooks.js';
 export * from './worktrees.js';
+export * from './fusion.js';

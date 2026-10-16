@@ -1182,3 +1182,148 @@ export async function rescanAgents(): Promise<{ agents: DetectedAgentDto[]; scan
   if (!res.ok) throw new Error(`Rescan failed (${res.status})`);
   return res.json();
 }
+
+/* ------------------------------------------------------------------ */
+/* Fusion mode (planner + parallel workers + fused synthesis)           */
+/* ------------------------------------------------------------------ */
+
+export interface FusionSubtaskDto {
+  id: string;
+  title: string;
+  description: string;
+  dependencies: string[];
+}
+
+export interface FusionPlanDto {
+  subtasks: FusionSubtaskDto[];
+  rationale?: string;
+}
+
+export interface FusionWorkerResultDto {
+  subtaskId: string;
+  title: string;
+  output: string;
+  usage: { promptTokens: number; completionTokens: number; totalTokens: number };
+  error?: string;
+}
+
+export type FusionRunStatus = 'running' | 'completed' | 'aborted_budget' | 'failed';
+
+export interface FusionRunDto {
+  runId: string;
+  botId: string;
+  botName: string;
+  task: string;
+  status: FusionRunStatus;
+  plan: FusionPlanDto | null;
+  workerResults: FusionWorkerResultDto[];
+  fused: string | null;
+  fallbackSingleAgent: boolean;
+  usage: { promptTokens: number; completionTokens: number; totalTokens: number } | null;
+  costUsd: number | null;
+  error: string | null;
+  createdAt: string;
+  completedAt: string | null;
+}
+
+export type FusionStreamEvent =
+  | { type: 'snapshot'; run: FusionRunDto }
+  | { type: 'plan_created'; plan: FusionPlanDto }
+  | { type: 'plan_failed'; reason: string }
+  | { type: 'worker_started'; subtaskId: string; title: string }
+  | { type: 'worker_done'; subtaskId: string; title: string; ok: boolean }
+  | { type: 'fusion_started'; workerCount: number }
+  | { type: 'done'; result: {
+      task: string;
+      status: FusionRunStatus;
+      plan: FusionPlanDto | null;
+      workerResults: FusionWorkerResultDto[];
+      fused: string;
+      fallbackSingleAgent: boolean;
+      usage: { promptTokens: number; completionTokens: number; totalTokens: number };
+      costUsd?: number;
+      error?: string;
+    } }
+  | { type: 'error'; message: string };
+
+export async function startFusionRun(input: {
+  botId: string;
+  task: string;
+  maxSubtasks?: number;
+  maxConcurrency?: number;
+  maxBudgetUsd?: number;
+}): Promise<{ ok: boolean; runId: string }> {
+  const res = await apiFetch('/api/fusion/runs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    let detail = '';
+    try {
+      detail = ((await res.json()) as { error?: string }).error ?? '';
+    } catch {
+      // ignore
+    }
+    throw new Error(`Fusion run failed to start (${res.status}): ${detail || res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function getFusionRun(runId: string): Promise<{ ok: boolean; run: FusionRunDto }> {
+  return apiJson(`/api/fusion/runs/${encodeURIComponent(runId)}`);
+}
+
+export async function listFusionRuns(limit = 50): Promise<{ ok: boolean; runs: FusionRunDto[] }> {
+  return apiJson(`/api/fusion/runs?limit=${limit}`);
+}
+
+/**
+ * Subscribe to a fusion run's SSE progress stream. Returns an unsubscribe
+ * function. Uses fetch + reader (EventSource can't send headers, and the
+ * fetch pattern matches the chat stream implementation).
+ */
+export function streamFusionRun(
+  runId: string,
+  onEvent: (e: FusionStreamEvent) => void,
+  onError?: (err: Error) => void,
+): () => void {
+  const controller = new AbortController();
+  let buffer = '';
+  const dispatch = (chunk: string): void => {
+    buffer += chunk;
+    let idx: number;
+    while ((idx = buffer.indexOf('\n\n')) >= 0) {
+      const frame = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      for (const line of frame.split('\n')) {
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload) continue;
+        try {
+          onEvent(JSON.parse(payload) as FusionStreamEvent);
+        } catch {
+          // ignore malformed frame
+        }
+      }
+    }
+  };
+  (async () => {
+    try {
+      const res = await fetch(`${getApiBase()}/api/fusion/runs/${encodeURIComponent(runId)}/stream`, {
+        signal: controller.signal,
+      });
+      if (!res.ok || !res.body) throw new Error(`Fusion stream failed (${res.status})`);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        dispatch(decoder.decode(value, { stream: true }));
+      }
+    } catch (err) {
+      if (!controller.signal.aborted) onError?.(err instanceof Error ? err : new Error(String(err)));
+    }
+  })();
+  return () => controller.abort();
+}

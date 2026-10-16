@@ -36,6 +36,8 @@ import { createAgentDetectRouter } from './agent-detect-routes.js';
 import { createAnalyticsRouter } from './analytics-routes.js';
 import { createLocalLlmRouter } from './local-llm-routes.js';
 import { LocalLlmManager } from '@mvp/agent-runtime';
+import { createFusionRouter, shutdownFusionRuns } from './fusion-routes.js';
+import { FusionRunStore } from './fusion.js';
 import { createSummarizer } from './summarizer.js';
 import { createRouter } from './routes.js';
 import { renderKriyaDotMeter } from './kriyadot-meter.js';
@@ -933,6 +935,17 @@ async function boot(): Promise<void> {
   // the shutdown path below.
   const localLlm = new LocalLlmManager(config.dataDir);
   app.use('/api/local-llm', createLocalLlmRouter(localLlm));
+  // Fusion mode (Atomic Agent parity): planner + parallel workers + fused
+  // synthesis. Store created once; background runs are tracked in-memory.
+  const fusionStore = new FusionRunStore(config.dataDir);
+  app.use(
+    '/api/fusion',
+    createFusionRouter({
+      store: fusionStore,
+      getBot: (id) => seed.bots.find((b) => b.id === id),
+      agentRuntime,
+    }),
+  );
 
   app.use('/api/routines', routinesRouter);
   app.use('/webhooks/routines', routineWebhookRouter);
@@ -1039,6 +1052,11 @@ async function boot(): Promise<void> {
     }
     try {
       remoteScreenService.close();
+    } catch {
+      // ignore
+    }
+    try {
+      shutdownFusionRuns();
     } catch {
       // ignore
     }
