@@ -4,6 +4,8 @@ export * from './types.js';
 export * from './governance.js';
 export * from './providers/catalog.js';
 export * from './providers/cli-bridge.js';
+export * from './providers/cli-driver.js';
+export * from './providers/cli-auth.js';
 export * from './providers/factory.js';
 export * from './providers/openai-compatible.js';
 export * from './providers/anthropic.js';

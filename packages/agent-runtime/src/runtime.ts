@@ -669,6 +669,42 @@ export class AgentRuntime {
             // Per-bot model options (Codync parity): bot.modelOptions wins over
             // the call-site override.
             reasoningEffort: opts.bot.modelOptions?.reasoningEffort ?? opts.reasoningEffort,
+            // Native CLI drivers (OpenMausBot parity): session resume key,
+            // approval-mode mapping, and observation of the CLI's own tool
+            // executions (surfaced as stream events + audit; never re-executed).
+            sessionKey: sessionId,
+            approvalMode,
+            onCliToolEvent: (e) => {
+              if (e.kind === 'tool_call') {
+                this.audit({
+                  type: 'cli.tool_observed',
+                  sessionId,
+                  botId: ctx.botId,
+                  call: e.call,
+                  detail: { cliId: e.cliId },
+                });
+                void emit({ type: 'tool_call', call: e.call, approvalRequired: false });
+              } else if (e.kind === 'tool_result') {
+                void emit({ type: 'tool_result', call: e.call, result: e.result, denied: e.denied });
+              } else {
+                // tool_denied: the driver's kill-switch fired on a
+                // catastrophic command. Loud audit; the turn aborts.
+                this.audit({
+                  type: 'cli.tool_blocked',
+                  sessionId,
+                  botId: ctx.botId,
+                  call: e.call,
+                  detail: { cliId: e.cliId, reason: 'catastrophic-command policy' },
+                  provenance: 'hard-floor-escalated',
+                });
+                void emit({
+                  type: 'tool_result',
+                  call: e.call,
+                  result: { denied: true, reason: 'Blocked by KriyaDot catastrophic-command policy.' },
+                  denied: true,
+                });
+              }
+            },
           });
           llmStep?.end({ ok: true });
         } catch (err) {

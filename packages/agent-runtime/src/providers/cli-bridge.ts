@@ -225,6 +225,95 @@ export function loadBridgeToken(id: CliBridgeId, homeDir?: string): string | und
 }
 
 /**
+ * Consent-free probe: does the CLI's credential file exist AND parse to a
+ * usable token shape? Returns a boolean only — never the token. Used by the
+ * in-app sign-in flow (login completion polling) and sign-in status checks,
+ * which must not require (or grant) bridge consent.
+ */
+export function bridgeHasUsableToken(id: CliBridgeId, homeDir?: string): boolean {
+  const home = homeDir ?? defaultHomeDir();
+  const parsed = readJsonFile(join(home, BRIDGE_PATHS[id].credentialsRel));
+  if (parsed === undefined) return false;
+  if (id === 'claude') return claudeTokenFromFile(parsed) !== undefined;
+  if (id === 'opencode') return opencodeTokenFromFile(parsed) !== undefined;
+  return codexTokenFromFile(parsed) !== undefined;
+}
+
+function numberField(obj: unknown, path: string[]): number | undefined {
+  let cur: unknown = obj;
+  for (const key of path) {
+    if (typeof cur !== 'object' || cur === null) return undefined;
+    cur = (cur as Record<string, unknown>)[key];
+  }
+  return typeof cur === 'number' && Number.isFinite(cur) ? cur : undefined;
+}
+
+/**
+ * Consent-free probe: when the credential file carries an expiry timestamp,
+ * return it as ms-since-epoch. Undefined when unknown (no expiry field, or
+ * no credential file). Never returns token bytes.
+ */
+export function bridgeTokenExpiry(id: CliBridgeId, homeDir?: string): number | undefined {
+  const home = homeDir ?? defaultHomeDir();
+  const parsed = readJsonFile(join(home, BRIDGE_PATHS[id].credentialsRel));
+  if (parsed === undefined || typeof parsed !== 'object' || parsed === null) return undefined;
+  const raw =
+    numberField(parsed, ['claudeAiOauth', 'expiresAt']) ??
+    numberField(parsed, ['claudeAiOauth', 'expires_at']) ??
+    numberField(parsed, ['tokens', 'expires_at']) ??
+    numberField(parsed, ['expiresAt']) ??
+    numberField(parsed, ['expires_at']);
+  if (raw === undefined) return undefined;
+  // Heuristic: values below 1e12 are seconds, not milliseconds.
+  return raw < 1e12 ? raw * 1000 : raw;
+}
+
+/** Fields that look like secrets — never surfaced as an account hint. */
+const SECRETISH_KEY_RE = /token|secret|api[-_]?key|password|credential|bearer/i;
+/** Values that look like tokens — never surfaced as an account hint. */
+const TOKENISH_VALUE_RE = /^(sk-ant-|sk-|xox|ghp_|gho_|Bearer\s|eyJ[A-Za-z0-9_-]{10,})/;
+
+function safeAccountHint(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const v = value.trim();
+  if (v.length === 0 || v.length > 120) return undefined;
+  if (TOKENISH_VALUE_RE.test(v)) return undefined;
+  return v;
+}
+
+/**
+ * Consent-free probe: best-effort non-secret account identity ("signed in as
+ * X") for the sign-in status UI. Reads only clearly-labeled identity fields
+ * (email/username/login); anything secret-shaped is refused. Undefined when
+ * the CLI doesn't expose an identity (common — most CLI credential files
+ * carry only tokens).
+ */
+export function bridgeAccountHint(id: CliBridgeId, homeDir?: string): string | undefined {
+  const home = homeDir ?? defaultHomeDir();
+  if (id === 'claude') {
+    // ~/.claude.json sometimes carries profile-ish fields next to the real
+    // credentials in ~/.claude/.credentials.json (which we do NOT mine for
+    // identity — it is token-shaped throughout).
+    const cfg = readJsonFile(join(home, '.claude.json'));
+    if (cfg && typeof cfg === 'object') {
+      const obj = cfg as Record<string, unknown>;
+      for (const key of ['email', 'userEmail', 'username', 'user', 'login', 'accountEmail']) {
+        if (SECRETISH_KEY_RE.test(key)) continue;
+        const hint = safeAccountHint(obj[key]);
+        if (hint) return hint;
+      }
+    }
+    return undefined;
+  }
+  if (id === 'codex') {
+    // Codex identity comes from `codex login status` (handled by cli-auth);
+    // auth.json is token-shaped throughout — do not mine it.
+    return undefined;
+  }
+  return undefined;
+}
+
+/**
  * Validate that a bridge can actually be connected right now: detected and a
  * token is readable from its credential file. Used by the Connect endpoint so
  * a stale detection (CLI uninstalled since boot) fails with a clear message.

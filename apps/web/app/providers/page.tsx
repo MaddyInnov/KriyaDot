@@ -3,13 +3,17 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import {
+  cancelCliLogin,
   connectBridge,
   disconnectBridge,
+  getCliAuthStatus,
   getProviders,
+  pollCliLogin,
   removeProviderKey,
   saveProviderKey,
+  startCliLogin,
 } from '../../lib/api';
-import type { ProviderInfo, RateLimitSnapshot } from '../../lib/api';
+import type { CliLoginStatus, ProviderInfo, RateLimitSnapshot } from '../../lib/api';
 import { formatResetIn, formatTokens } from '../../lib/usage';
 
 /**
@@ -57,18 +61,24 @@ function BridgeCard({
   models,
   freeOnly,
   saving,
+  authStatus,
   onConnect,
   onDisconnect,
+  onSignIn,
 }: {
   p: ProviderInfo;
   /** Model ids to display (already filtered by the "Free only" toggle). */
   models: { id: string; free?: boolean }[];
   freeOnly: boolean;
   saving: string;
+  /** In-app CLI sign-in status (undefined while loading). */
+  authStatus?: CliLoginStatus;
   onConnect: (p: ProviderInfo) => void;
   onDisconnect: (p: ProviderInfo) => void;
+  onSignIn: (p: ProviderInfo) => void;
 }) {
   const cliLabel = p.bridge === 'claude' ? 'Claude Code' : 'Codex CLI';
+  const signedIn = authStatus?.signedIn === true;
   return (
     <div className="card">
       <div className="row-between">
@@ -76,7 +86,12 @@ function BridgeCard({
           <strong>{p.name}</strong>{' '}
           <span className={`chip ${p.connected ? 'green' : 'gray'}`}>
             {p.connected ? 'connected' : 'not connected'}
-          </span>
+          </span>{' '}
+          {authStatus && (
+            <span className={`chip ${signedIn ? 'green' : 'amber'}`} title={authStatus.accountHint ?? (signedIn ? 'Signed in' : 'Not signed in')}>
+              {signedIn ? `signed in${authStatus.accountHint ? ` as ${authStatus.accountHint}` : ''}` : 'not signed in'}
+            </span>
+          )}
         </div>
         <span className="small muted mono">{p.id}</span>
       </div>
@@ -114,6 +129,146 @@ function BridgeCard({
             {saving === p.id ? 'Disconnecting…' : 'Disconnect'}
           </button>
         )}
+        {authStatus && !signedIn && authStatus.cliPresent && (
+          <button className="btn btn-sm" onClick={() => onSignIn(p)} title="Start the CLI's login in your browser — no tokens to paste">
+            Sign in to {cliLabel}
+          </button>
+        )}
+      </div>
+      {authStatus && !signedIn && (
+        <p className="small muted" style={{ marginTop: 8 }}>
+          {authStatus.cliPresent
+            ? 'Not signed in. Sign in here (browser OAuth — nothing to paste) or once in your terminal.'
+            : `${cliLabel} was detected via a credential file but the executable is not on PATH.`}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** In-app CLI sign-in modal: shows the OAuth URL, polls for completion. */
+function CliSignInModal({
+  cliLabel,
+  cliId,
+  onClose,
+  onDone,
+}: {
+  cliLabel: string;
+  cliId: string;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const [phase, setPhase] = useState<'starting' | 'waiting' | 'done' | 'failed'>('starting');
+  const [url, setUrl] = useState('');
+  const [reason, setReason] = useState('');
+  const [loginId, setLoginId] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    (async () => {
+      try {
+        const started = await startCliLogin(cliId);
+        if (cancelled) {
+          void cancelCliLogin(cliId, started.loginId).catch(() => undefined);
+          return;
+        }
+        setLoginId(started.loginId);
+        setUrl(started.url);
+        setPhase('waiting');
+        timer = setInterval(async () => {
+          try {
+            const st = await pollCliLogin(cliId, started.loginId);
+            if (st.status === 'done') {
+              if (timer) clearInterval(timer);
+              setPhase('done');
+              onDone();
+            } else if (st.status === 'failed' || st.status === 'cancelled') {
+              if (timer) clearInterval(timer);
+              setReason(st.reason ?? 'Login did not complete.');
+              setPhase('failed');
+            }
+          } catch (err) {
+            if (timer) clearInterval(timer);
+            setReason(err instanceof Error ? err.message : String(err));
+            setPhase('failed');
+          }
+        }, 3000);
+      } catch (err) {
+        if (!cancelled) {
+          setReason(err instanceof Error ? err.message : String(err));
+          setPhase('failed');
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (timer) clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cliId]);
+
+  const cancel = async () => {
+    if (loginId) {
+      try {
+        await cancelCliLogin(cliId, loginId);
+      } catch {
+        // best-effort
+      }
+    }
+    onClose();
+  };
+
+  return (
+    <div className="modal-overlay" onClick={cancel}>
+      <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 520 }}>
+        <h3>Sign in to {cliLabel}</h3>
+        {phase === 'starting' && <p className="small muted">Starting the {cliLabel} login…</p>}
+        {phase === 'failed' && (
+          <>
+            <div className="error-box">{reason}</div>
+            <p className="small muted">
+              Fallback: sign in once in your terminal (<span className="mono">{cliId === 'claude' ? 'claude' : 'codex'}</span>),
+              then use “Connect” above.
+            </p>
+          </>
+        )}
+        {(phase === 'waiting' || phase === 'done') && (
+          <>
+            <p className="small">
+              Complete the sign-in in your browser. Nothing to paste — this page detects
+              when the login finishes.
+            </p>
+            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={() => window.open(url, '_blank', 'noopener')}
+              >
+                Open login page
+              </button>
+              <button className="btn btn-sm" onClick={() => navigator.clipboard?.writeText(url).catch(() => undefined)}>
+                Copy URL
+              </button>
+            </div>
+            <p className="small muted mono" style={{ marginTop: 8, wordBreak: 'break-all' }}>{url}</p>
+            {phase === 'waiting' ? (
+              <p className="small muted" style={{ marginTop: 8 }}>
+                <span className="spinner" /> Waiting for you to finish signing in…
+              </p>
+            ) : (
+              <div className="card" style={{ borderColor: '#bbf7d0', background: '#f0fdf4', marginTop: 8 }}>
+                Signed in. You can now Connect {cliLabel} above.
+              </div>
+            )}
+          </>
+        )}
+        <div style={{ display: 'flex', gap: 8, marginTop: 12, justifyContent: 'flex-end' }}>
+          {phase === 'done' ? (
+            <button className="btn btn-primary btn-sm" onClick={onClose}>Done</button>
+          ) : (
+            <button className="btn btn-sm" onClick={cancel}>Cancel</button>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -142,6 +297,9 @@ export default function ProvidersPage() {
   const [keys, setKeys] = useState<Record<string, string>>({});
   const [baseUrls, setBaseUrls] = useState<Record<string, string>>({});
   const [headers, setHeaders] = useState<Record<string, string>>({});
+  // In-app CLI sign-in status (OpenMausBot parity).
+  const [cliAuth, setCliAuth] = useState<CliLoginStatus[]>([]);
+  const [signInFor, setSignInFor] = useState<ProviderInfo | null>(null);
 
   const toggleFreeOnly = (on: boolean) => {
     setFreeOnly(on);
@@ -162,6 +320,12 @@ export default function ProvidersPage() {
       setError('');
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    }
+    try {
+      const auth = await getCliAuthStatus();
+      setCliAuth(auth.clis);
+    } catch {
+      // sign-in status is best-effort; the page works without it
     }
   }, []);
 
@@ -304,11 +468,23 @@ export default function ProvidersPage() {
               models={shownModels(p)}
               freeOnly={freeOnly}
               saving={saving}
+              authStatus={p.bridge ? cliAuth.find((c) => c.cliId === p.bridge) : undefined}
               onConnect={connect}
               onDisconnect={disconnect}
+              onSignIn={(bp) => setSignInFor(bp)}
             />
           ))}
         </>
+      )}
+      {signInFor?.bridge && (
+        <CliSignInModal
+          cliLabel={signInFor.bridge === 'claude' ? 'Claude Code' : 'Codex CLI'}
+          cliId={signInFor.bridge}
+          onClose={() => setSignInFor(null)}
+          onDone={() => {
+            void refresh();
+          }}
+        />
       )}
 
       <h2 className="page-sub" style={{ marginTop: 24 }}>

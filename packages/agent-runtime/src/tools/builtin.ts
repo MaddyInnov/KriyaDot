@@ -38,6 +38,16 @@ function truncate(s: string, maxBytes: number): string {
 }
 
 /**
+ * True when `text` (a shell command, or JSON containing one) matches the
+ * catastrophic-command denylist. Exported for the native CLI driver's
+ * kill-switch: the same hard floor applies to CLI-observed tool calls, and
+ * a human approval can never lift it.
+ */
+export function isCatastrophicCommand(text: string): boolean {
+  return COMMAND_DENYLIST.some((pattern) => pattern.test(text));
+}
+
+/**
  * Resolve `p` inside `workspaceDir`. Throws if the resolved path escapes the
  * workspace (directory traversal).
  */
@@ -112,10 +122,8 @@ function runCommandTool(workspaceDir: WorkspaceSource): ToolDefinition {
     },
     handler: async (args, ctx) => {
       const command = String(args.command);
-      for (const pattern of COMMAND_DENYLIST) {
-        if (pattern.test(command)) {
-          throw new Error(`Refused by command denylist (${pattern.source}): "${command.slice(0, 120)}"`);
-        }
+      if (isCatastrophicCommand(command)) {
+        throw new Error(`Refused by command denylist: "${command.slice(0, 120)}"`);
       }
       const timeoutMs =
         typeof args.timeoutMs === 'number' && args.timeoutMs > 0

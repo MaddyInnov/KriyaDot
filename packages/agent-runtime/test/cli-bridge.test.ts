@@ -49,7 +49,8 @@ function plantCli(binDir: string, name: string): void {
 /** Fake CLI executable that prints canned stdout (tests the real spawn path). */
 function plantCliOutput(binDir: string, name: string, stdout: string): void {
   const p = join(binDir, name);
-  writeFileSync(p, `#!/bin/sh\nprintf '%s' ${JSON.stringify(stdout)}\n`);
+  // printf %b interprets backslash escapes, so embedded \n become real newlines.
+  writeFileSync(p, `#!/bin/sh\nprintf '%b' ${JSON.stringify(stdout)}\n`);
   chmodSync(p, 0o755);
 }
 
@@ -223,10 +224,19 @@ describe('bridged chat turn', () => {
   it.runIf(process.platform !== 'win32')('codex-subscription shells out to the codex CLI (ChatGPT OAuth is CLI-only)', async () => {
     // The ChatGPT OAuth token is not valid against api.openai.com, so the
     // bridge spawns the user's own `codex` CLI. Fake the binary on the
-    // faked PATH and exercise the real spawn path end to end.
+    // faked PATH and exercise the real spawn path end to end. The native
+    // driver speaks the CLI's `--json` JSONL event stream.
     plantCodexCredentials(fakeHome, 'sk-codex-chat');
     grantBridgeConsent('codex');
-    plantCliOutput(fakeBin, 'codex', 'yo');
+    plantCliOutput(
+      fakeBin,
+      'codex',
+      [
+        JSON.stringify({ type: 'thread.started', thread_id: 'thread-test-1' }),
+        JSON.stringify({ type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: 'yo' } }),
+        JSON.stringify({ type: 'turn.completed' }),
+      ].join('\n'),
+    );
 
     const provider = createProvider('codex-subscription');
     const result = await provider.chat([{ role: 'user', content: 'hi' }], [], { model: 'gpt-5' });

@@ -42,6 +42,7 @@ import { applyChiefOverlays, registerChiefToolsWiring } from './chief-wiring.js'
 import { createChiefRouter } from './chief-routes.js';
 import { createBotConversationsRouter } from './bot-conversations-routes.js';
 import { createAgentDetectRouter } from './agent-detect-routes.js';
+import { createCliAuthRouter } from './cli-auth-routes.js';
 import { createAgentImportRouter } from './agent-import-routes.js';
 import { createAnalyticsRouter } from './analytics-routes.js';
 import { createLocalLlmRouter } from './local-llm-routes.js';
@@ -1167,6 +1168,9 @@ async function boot(): Promise<void> {
   // (Stores are created once above and shared by both routers.)
   // Agent auto-detection (Codync parity: detected coding CLIs + install hints).
   app.use('/api/agents', createAgentDetectRouter());
+  // In-app subscription sign-in for native CLI drivers (OpenMausBot parity):
+  // start the CLI's OAuth login, capture the authorize URL, poll for completion.
+  app.use('/api/cli-auth', createCliAuthRouter());
   // Opt-in product analytics (off by default; local-first privacy posture).
   app.use('/api/analytics', createAnalyticsRouter({ dataDir: config.dataDir }));
   // Managed local LLM (Atomic Agent parity): zero-config llama.cpp binary +

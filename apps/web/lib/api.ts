@@ -1029,6 +1029,49 @@ export function disconnectBridge(bridgeId: string): Promise<{ ok: boolean }> {
   });
 }
 
+// ---- Native CLI in-app sign-in (OpenMausBot parity) ------------------------
+
+export interface CliLoginStatus {
+  cliId: string;
+  cliPresent: boolean;
+  credentialsPresent: boolean;
+  signedIn: boolean;
+  accountHint?: string;
+  expired?: boolean;
+}
+
+export interface CliSessionInfo {
+  id: string;
+  title: string;
+  updatedAt: number;
+  cliId: string;
+}
+
+export function getCliAuthStatus(): Promise<{ ok: boolean; clis: CliLoginStatus[] }> {
+  return apiJson('/api/cli-auth/status');
+}
+
+export function startCliLogin(cliId: string): Promise<{ ok: boolean; loginId: string; url: string }> {
+  return apiJson(`/api/cli-auth/${encodeURIComponent(cliId)}/login`, { method: 'POST' });
+}
+
+export function pollCliLogin(
+  cliId: string,
+  loginId: string,
+): Promise<{ ok: boolean; status: 'waiting' | 'done' | 'failed' | 'cancelled'; url?: string; reason?: string }> {
+  return apiJson(`/api/cli-auth/${encodeURIComponent(cliId)}/login/${encodeURIComponent(loginId)}`);
+}
+
+export function cancelCliLogin(cliId: string, loginId: string): Promise<{ ok: boolean }> {
+  return apiJson(`/api/cli-auth/${encodeURIComponent(cliId)}/login/${encodeURIComponent(loginId)}/cancel`, {
+    method: 'POST',
+  });
+}
+
+export function listCliSessions(cliId: string): Promise<{ ok: boolean; sessions: CliSessionInfo[] }> {
+  return apiJson(`/api/cli-auth/${encodeURIComponent(cliId)}/sessions`);
+}
+
 export const getWorkflows = (): Promise<WorkflowDefinition[]> => apiJson('/api/workflows');
 
 export function runWorkflow(

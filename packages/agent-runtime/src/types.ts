@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { ApprovalMode } from './approval-modes.js';
+export type { ApprovalMode };
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -270,10 +271,38 @@ export interface LLMProvider {
       onRetry?: (attempt: number, error: Error) => void;
       /** Reasoning effort for models that support it (OpenAI reasoning_effort). */
       reasoningEffort?: 'low' | 'medium' | 'high';
+      /**
+       * Native CLI drivers (OpenMausBot parity): stable key for CLI session
+       * resume (the runtime passes its sessionId). Absent = one-shot turn.
+       */
+      sessionKey?: string;
+      /**
+       * Native CLI drivers: KriyaDot approval mode, mapped onto the CLI's
+       * own permission flags before spawn. Defaults to 'auto'.
+       */
+      approvalMode?: ApprovalMode;
+      /**
+       * Native CLI drivers: tool executions the CLI performed itself,
+       * surfaced as stream events (observation only — the runtime must NOT
+       * re-execute them). Absent = events are dropped.
+       */
+      onCliToolEvent?: (e: CliToolStreamEvent) => void;
     },
   ): Promise<{ content: string; toolCalls: ToolCall[]; usage: TokenUsage }>;
   listModels(): Promise<ModelInfo[]>;
 }
+
+/**
+ * Tool activity observed from a native CLI driver (OpenMausBot parity).
+ * These describe tools the CLI executed ITSELF inside its own process —
+ * they are already done (or blocked by the kill-switch) and must never be
+ * re-executed by the runtime. `tool_denied` is emitted when the
+ * catastrophic-command kill-switch fires.
+ */
+export type CliToolStreamEvent =
+  | { kind: 'tool_call'; call: ToolCall; cliId: string }
+  | { kind: 'tool_result'; call: ToolCall; cliId: string; result: unknown; denied?: boolean }
+  | { kind: 'tool_denied'; call: ToolCall; cliId: string; denied: true };
 
 export interface ModelInfo {
   id: string;

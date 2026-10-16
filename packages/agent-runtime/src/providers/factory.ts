@@ -15,6 +15,7 @@ import { OllamaProvider } from './ollama.js';
 import { LlamaCppProvider } from './llamacpp.js';
 import { OpenAICompatibleProvider } from './openai-compatible.js';
 import { createAgentCliProvider, parseAgentProviderId } from './agent-cli.js';
+import { createNativeCliDriver } from './cli-driver.js';
 
 /**
  * Build an LLMProvider from a catalog preset — or from a `custom-*` provider
@@ -61,8 +62,11 @@ export function createProvider(providerId: string, opts?: { apiKey?: string }): 
   // the user's own subscription login — zero marginal cost, zero API keys
   // handled by KriyaDot. Auth is the CLI's own; the child is spawned without
   // a shell and its output is marked untrusted (see agent-cli.ts).
+  // CLIs with a native driver (claude-code, codex) get streaming, tool
+  // observation, permission brokering, and session resume (cli-driver.ts);
+  // the rest stay on the one-shot provider.
   if (parseAgentProviderId(providerId)) {
-    return createAgentCliProvider(providerId);
+    return createNativeCliDriver(providerId) ?? createAgentCliProvider(providerId);
   }
 
   const preset = getProviderPreset(providerId) ?? getCustomProviderPreset(providerId);
@@ -83,9 +87,11 @@ export function createProvider(providerId: string, opts?: { apiKey?: string }): 
   // Codex bridge: the ChatGPT OAuth token does not work with api.openai.com
   // (it needs the Codex backend or CLI). Shell out to the `codex` CLI directly,
   // which uses the user's own login. The model is selected per-request via the UI.
+  // The native driver (streaming JSONL, tool observation, session resume)
+  // is preferred; falls back to the one-shot provider.
   if (preset.bridge === 'codex') {
     const defaultModel = getDefaultModel(preset.id) || 'gpt-5';
-    return createAgentCliProvider(`agent/codex/${defaultModel}`);
+    return createNativeCliDriver(`agent/codex/${defaultModel}`) ?? createAgentCliProvider(`agent/codex/${defaultModel}`);
   }
 
   const apiKey = opts?.apiKey ?? resolveApiKey(providerId);
