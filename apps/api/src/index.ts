@@ -73,6 +73,11 @@ import type { McpConnectionClass } from './mcp-annotations.js';
 // imported directly (not re-exported from the agent-runtime index — index
 // untouched), following the pricing.ts precedent in routes.ts.
 import { computerUsePolicyRules, registerComputerUseTool } from '@mvp/agent-runtime/dist/tools/computer.js';
+// Password-safe login typing (type_login): resolves the vault password
+// server-side inside the handler; the model plane never sees values.
+// Same direct-dist-subpath import pattern as computer.js above.
+import { registerTypeLoginTool } from '@mvp/agent-runtime/dist/tools/type-login.js';
+import { SecureVault } from '@mvp/vault';
 // Real foreground OS layer (opt-in via COMPUTER_USE_REAL=1; mock by default).
 // Same direct-dist-subpath import pattern as computer.js above.
 // (Kept for reference; the live path now goes through selectComputerSandbox.)
@@ -317,6 +322,21 @@ async function boot(): Promise<void> {
   await computerSandbox.launch(); // no-op for local; starts the container for docker
   registerComputerUseTool(toolRegistry, {
     os: computerSandbox,
+  });
+  // type_login (Codync parity): the handler resolves the vault password
+  // server-side — the model plane only ever sees the loginId. Vault is
+  // per x-user-id; tool turns run as the local single user, so the
+  // 'default-user' namespace matches what the Settings UI writes.
+  // No verifySite is injected here: the bot must assert expectedSite, which
+  // must match the login's stored site; the human approval gate is the
+  // real protection (the approval card names the login and site).
+  registerTypeLoginTool(toolRegistry, {
+    os: computerSandbox,
+    getLogin: (loginId: string) => {
+      const vault = new SecureVault(config.dataDir, 'default-user', 'type-login-tool');
+      const rec = vault.getLogin(loginId);
+      return rec ? { name: rec.name, site: rec.site, username: rec.username, password: rec.password } : undefined;
+    },
   });
   // OpenCode parity: git worktree tools (per-session isolated checkouts).
   // Workspace resolves per-session: a session with an attached worktree

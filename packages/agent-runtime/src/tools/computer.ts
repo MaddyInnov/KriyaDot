@@ -156,6 +156,12 @@ export function computerUsePolicyRules(): BotPolicyRule[] {
       reason: 'Computer-use mutating actions (click/type/key/open_app) always need human approval',
     },
     {
+      id: 'type-login-require-approval',
+      toolPattern: '^type_login$',
+      effect: 'require-approval',
+      reason: 'type_login types saved credentials and always needs human approval',
+    },
+    {
       id: 'computer-use-screenshot-allow',
       toolPattern: '^computer_screenshot$',
       effect: 'allow',

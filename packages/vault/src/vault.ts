@@ -21,6 +21,8 @@ import { readEncryptedJson, writeEncryptedJson } from './crypto.js';
 import type { PrivacyTier } from '@mvp/governance';
 import { isPrivacyTier, resolveTier } from '@mvp/governance';
 
+export type SecretKind = 'secret' | 'login';
+
 export interface SecretMeta {
   name: string;
   description?: string;
@@ -32,10 +34,37 @@ export interface SecretMeta {
    * Overridable per secret via create/update opts.
    */
   tier: PrivacyTier;
+  /**
+   * Record kind. 'secret' for plain secrets; 'login' for saved site logins
+   * (used by the type_login tool). Absent on records written before kinds
+   * existed — treated as 'secret'.
+   */
+  kind: SecretKind;
 }
 
 export interface Secret extends SecretMeta {
   value: string;
+}
+
+/**
+ * A saved site login. The password is encrypted at rest inside the vault
+ * envelope (same AES-256-GCM as secrets) and is only ever returned by
+ * getLogin() — a server-side call. It must NEVER enter LLM context; the
+ * type_login tool resolves it inside its handler.
+ */
+export interface LoginMeta {
+  name: string;
+  /** Domain (example.com) or app name the login belongs to. */
+  site: string;
+  username: string;
+  createdAt: number;
+  updatedAt: number;
+  tier: PrivacyTier;
+  kind: 'login';
+}
+
+export interface LoginRecord extends LoginMeta {
+  password: string;
 }
 
 export interface VaultAuditEntry {
@@ -48,9 +77,38 @@ export interface VaultAuditEntry {
 
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const MAX_VALUE_BYTES = 64 * 1024;
+/** Site: domain-ish or app name, 1-128 chars, no control chars. */
+const SITE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._\- ]{0,127}$/;
+const MAX_USERNAME_BYTES = 1024;
 
 interface StoredSecret extends SecretMeta {
   value: string;
+}
+
+/** Wire format of a login record stored as a secret value (encrypted). */
+interface StoredLoginValue {
+  site: string;
+  username: string;
+  password: string;
+}
+
+function requireSite(site: unknown): string {
+  if (typeof site !== 'string' || !SITE_PATTERN.test(site.trim())) {
+    throw vaultError(
+      'login "site" must be 1-128 chars: a domain (example.com) or app name (letters, digits, space, ., _, -)',
+    );
+  }
+  return site.trim();
+}
+
+function requireUsername(username: unknown): string {
+  if (typeof username !== 'string' || username.length === 0) {
+    throw vaultError('login "username" must be a non-empty string');
+  }
+  if (Buffer.byteLength(username, 'utf8') > MAX_USERNAME_BYTES) {
+    throw vaultError('login "username" exceeds the 1 KiB limit');
+  }
+  return username;
 }
 
 interface VaultPayload {
@@ -120,10 +178,14 @@ export class SecureVault {
     }
     // Backward compatibility: secrets written before tiers existed have no
     // tier field — fail closed to `local-only` (secrets never silently
-    // become egressable).
+    // become egressable). Same for `kind` (pre-kind records are 'secret').
     for (const s of payload.secrets) {
       if (!isPrivacyTier((s as { tier?: unknown }).tier)) {
         (s as { tier: PrivacyTier }).tier = 'local-only';
+      }
+      const k = (s as { kind?: unknown }).kind;
+      if (k !== 'secret' && k !== 'login') {
+        (s as { kind: SecretKind }).kind = 'secret';
       }
     }
     return payload;
@@ -139,8 +201,36 @@ export class SecureVault {
   list(): SecretMeta[] {
     const payload = this.load();
     return payload.secrets
-      .map(({ name, description, createdAt, updatedAt, tier }) => ({ name, description, createdAt, updatedAt, tier }))
+      .map(({ name, description, createdAt, updatedAt, tier, kind }) => ({
+        name,
+        description,
+        createdAt,
+        updatedAt,
+        tier,
+        kind,
+      }))
       .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /** Login metadata only — sites and usernames are listed; passwords never. */
+  listLogins(): LoginMeta[] {
+    const payload = this.load();
+    const out: LoginMeta[] = [];
+    for (const s of payload.secrets) {
+      if (s.kind !== 'login') continue;
+      const parsed = parseLoginValue(s.name, s.value);
+      if (!parsed) continue; // corrupt entry: skip, don't leak
+      out.push({
+        name: s.name,
+        site: parsed.site,
+        username: parsed.username,
+        createdAt: s.createdAt,
+        updatedAt: s.updatedAt,
+        tier: s.tier,
+        kind: 'login',
+      });
+    }
+    return out.sort((a, b) => a.name.localeCompare(b.name));
   }
 
   /**
@@ -162,6 +252,7 @@ export class SecureVault {
       createdAt: now,
       updatedAt: now,
       tier,
+      kind: 'secret',
     };
     this.save(
       { ...payload, secrets: [...payload.secrets, { ...meta, value: v }] },
@@ -180,7 +271,76 @@ export class SecureVault {
       return undefined;
     }
     this.save(payload, { ts: Date.now(), actor: this.actor, action: 'read', name: n });
-    return { name: found.name, description: found.description, value: found.value, createdAt: found.createdAt, updatedAt: found.updatedAt, tier: found.tier };
+    return { name: found.name, description: found.description, value: found.value, createdAt: found.createdAt, updatedAt: found.updatedAt, tier: found.tier, kind: found.kind };
+  }
+
+  /**
+   * Create a saved site login. Stored as a 'login'-kind secret whose
+   * encrypted value is { site, username, password } JSON. The password is
+   * only ever returned by getLogin() (server-side); list()/listLogins()
+   * never expose it.
+   */
+  createLogin(
+    name: unknown,
+    site: unknown,
+    username: unknown,
+    password: unknown,
+    opts: { tier?: PrivacyTier } = {},
+  ): LoginMeta {
+    const n = requireName(name);
+    const s = requireSite(site);
+    const u = requireUsername(username);
+    const p = requireValue(password);
+    const tier = resolveTier('vault', opts.tier);
+    const payload = this.load();
+    if (payload.secrets.some((x) => x.name === n)) {
+      throw vaultError(`secret "${n}" already exists`);
+    }
+    const now = Date.now();
+    const stored: StoredSecret = {
+      name: n,
+      createdAt: now,
+      updatedAt: now,
+      tier,
+      kind: 'login',
+      value: JSON.stringify({ site: s, username: u, password: p } satisfies StoredLoginValue),
+    };
+    this.save(
+      { ...payload, secrets: [...payload.secrets, stored] },
+      { ts: now, actor: this.actor, action: 'create', name: n },
+    );
+    return { name: n, site: s, username: u, createdAt: now, updatedAt: now, tier, kind: 'login' };
+  }
+
+  /**
+   * Full login read — the only method that returns a password. Server-side
+   * only (used by the type_login tool handler); never expose to the model
+   * plane. Success is audited name-only.
+   */
+  getLogin(name: unknown): LoginRecord | undefined {
+    const n = requireName(name);
+    const payload = this.load();
+    const found = payload.secrets.find((s) => s.name === n);
+    if (!found || found.kind !== 'login') {
+      this.save(payload, { ts: Date.now(), actor: this.actor, action: 'read-denied', name: n });
+      return undefined;
+    }
+    const parsed = parseLoginValue(n, found.value);
+    if (!parsed) {
+      this.save(payload, { ts: Date.now(), actor: this.actor, action: 'read-denied', name: n });
+      return undefined;
+    }
+    this.save(payload, { ts: Date.now(), actor: this.actor, action: 'read', name: n });
+    return {
+      name: found.name,
+      site: parsed.site,
+      username: parsed.username,
+      password: parsed.password,
+      createdAt: found.createdAt,
+      updatedAt: found.updatedAt,
+      tier: found.tier,
+      kind: 'login',
+    };
   }
 
   /** Update a secret; `opts.tier` re-tags it (explicit override only). */
@@ -217,6 +377,27 @@ export class SecureVault {
   auditLog(): VaultAuditEntry[] {
     return this.load().audit.slice();
   }
+}
+
+/**
+ * Parse a stored login value. Returns undefined (never throws, never leaks
+ * the raw value) when the envelope is corrupt.
+ */
+function parseLoginValue(name: string, value: string): StoredLoginValue | undefined {
+  try {
+    const parsed = JSON.parse(value) as Partial<StoredLoginValue>;
+    if (
+      typeof parsed.site === 'string' &&
+      typeof parsed.username === 'string' &&
+      typeof parsed.password === 'string' &&
+      parsed.password.length > 0
+    ) {
+      return { site: parsed.site, username: parsed.username, password: parsed.password };
+    }
+  } catch {
+    // fall through to undefined
+  }
+  return undefined;
 }
 
 function sanitizeNamespace(namespace: string): string {

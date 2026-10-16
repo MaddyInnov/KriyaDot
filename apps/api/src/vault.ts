@@ -123,6 +123,13 @@ export function registerVaultRoutes(router: express.Router, deps: VaultDeps): vo
         res.status(404).json(errorBody(`unknown secret: ${req.params.name}`));
         return;
       }
+      // Login-kind records must never be read as raw secrets: their value
+      // is {site,username,password} JSON. Passwords are only resolved
+      // server-side by the type_login tool handler.
+      if (secret.kind === 'login') {
+        res.status(404).json(errorBody(`unknown secret: ${req.params.name}`));
+        return;
+      }
       governance.audit('vault.secret_read', {
         actor: callerOf(req),
         toolName: 'vault',
@@ -184,6 +191,48 @@ export function registerVaultRoutes(router: express.Router, deps: VaultDeps): vo
         .json(errorBody('Failed to delete secret', err instanceof Error ? err.message : String(err)));
     }
   });
+
+  // -- saved logins (for the type_login tool) --------------------------
+  //
+  //   GET    /vault/logins       → LoginMeta[] (sites + usernames; NEVER passwords)
+  //   POST   /vault/logins       → { name, site, username, password } → LoginMeta (201)
+  //
+  // Deletion reuses DELETE /vault/:name. Passwords are never returned by
+  // any login endpoint — the type_login tool resolves them server-side.
+  //
+  // NOTE: registered BEFORE router.use('/vault', ...) below — otherwise
+  // vaultRouter's GET /:name would swallow /vault/logins.
+
+  const loginsRouter = express.Router();
+
+  loginsRouter.get('/', (req: Request, res: Response) => {
+    try {
+      res.json(vaultOf(req).listLogins());
+    } catch (err) {
+      res
+        .status(vaultStatus(err))
+        .json(errorBody('Failed to list logins', err instanceof Error ? err.message : String(err)));
+    }
+  });
+
+  loginsRouter.post('/', (req: Request, res: Response) => {
+    try {
+      const body = (req.body ?? {}) as { name?: unknown; site?: unknown; username?: unknown; password?: unknown };
+      const meta = vaultOf(req).createLogin(body.name, body.site, body.username, body.password);
+      governance.audit('vault.login_created', {
+        actor: callerOf(req),
+        toolName: 'vault',
+        detail: { name: meta.name, site: meta.site },
+      });
+      res.status(201).json(meta);
+    } catch (err) {
+      res
+        .status(vaultStatus(err))
+        .json(errorBody('Failed to store login', err instanceof Error ? err.message : String(err)));
+    }
+  });
+
+  router.use('/vault/logins', loginsRouter);
 
   router.use('/vault', vaultRouter);
 

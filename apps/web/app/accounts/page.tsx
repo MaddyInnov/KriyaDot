@@ -40,10 +40,20 @@ interface SecretMeta {
   description?: string;
   createdAt: number;
   updatedAt: number;
+  kind?: 'secret' | 'login';
 }
 
 interface Secret extends SecretMeta {
   value: string;
+}
+
+interface LoginMeta {
+  name: string;
+  site: string;
+  username: string;
+  createdAt: number;
+  updatedAt: number;
+  kind: 'login';
 }
 
 interface PaymentMethod {
@@ -458,7 +468,11 @@ function VaultPanel() {
   const refresh = useCallback(async () => {
     try {
       setError(null);
-      setSecrets((await api<SecretMeta[]>('GET', '/api/vault')) ?? []);
+      // Login-kind records live in the Saved logins panel, not here —
+      // their values are {site,username,password} JSON and must never be
+      // revealed as plain secrets.
+      const all = (await api<SecretMeta[]>('GET', '/api/vault')) ?? [];
+      setSecrets(all.filter((s) => s.kind !== 'login'));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -574,6 +588,119 @@ function VaultPanel() {
         </div>
       ))}
       {secrets.length === 0 && <p className="small muted">No secrets stored.</p>}
+    </Section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Saved logins (for the type_login tool)
+// ---------------------------------------------------------------------------
+
+function LoginsPanel() {
+  const [logins, setLogins] = useState<LoginMeta[]>([]);
+  const [name, setName] = useState('');
+  const [site, setSite] = useState('');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState('');
+
+  const refresh = useCallback(async () => {
+    try {
+      setError(null);
+      setLogins((await api<LoginMeta[]>('GET', '/api/vault/logins')) ?? []);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const add = async () => {
+    setBusy('add');
+    try {
+      await api('POST', '/api/vault/logins', { name, site, username, password });
+      setName('');
+      setSite('');
+      setUsername('');
+      setPassword('');
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const remove = async (loginName: string) => {
+    if (!window.confirm(`Delete login "${loginName}"?`)) return;
+    setBusy(loginName);
+    try {
+      await api('DELETE', `/api/vault/${encodeURIComponent(loginName)}`);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy('');
+    }
+  };
+
+  return (
+    <Section
+      title="Saved logins"
+      hint="Site logins for the type_login tool. Passwords are encrypted at rest and never displayed — bots type them without ever seeing the value."
+    >
+      <ErrorLine error={error} />
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
+        <input
+          className="input"
+          placeholder="name (e.g. github-personal)"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+        />
+        <input
+          className="input"
+          placeholder="site (e.g. github.com)"
+          value={site}
+          onChange={(e) => setSite(e.target.value)}
+        />
+        <input
+          className="input"
+          placeholder="username"
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+        />
+        <input
+          className="input"
+          type="password"
+          placeholder="password (never shown again)"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+        />
+        <button
+          className="btn btn-primary"
+          disabled={busy === 'add' || !name || !site || !username || !password}
+          onClick={() => void add()}
+        >
+          Add login
+        </button>
+      </div>
+      {logins.map((l) => (
+        <div key={l.name} className="row-between" style={{ padding: '8px 0' }}>
+          <div>
+            <strong>{l.name}</strong>
+            <span className="small muted"> — {l.site} · {l.username} · password ••••</span>
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="btn btn-sm btn-danger" disabled={busy === l.name} onClick={() => void remove(l.name)}>
+              Delete
+            </button>
+          </div>
+        </div>
+      ))}
+      {logins.length === 0 && <p className="small muted">No logins saved.</p>}
     </Section>
   );
 }
@@ -701,6 +828,7 @@ export default function AccountsPage() {
       <ConnectedAccounts />
       <ComposioPanel />
       <VaultPanel />
+      <LoginsPanel />
       <WalletPanel />
     </div>
   );
