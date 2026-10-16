@@ -67,6 +67,7 @@ import { mountWebAssets } from './web-assets.js';
 import { createComputerView } from './computer-view.js';
 import { createChatThreadsRouter, ThreadTitleStore } from './chat-threads-routes.js';
 import { createMessageSearchRouter } from './message-search-routes.js';
+import { createWorkspaceBackupRouter } from './workspace-backup-routes.js';
 import { createMessageThreadsRouter } from './message-threads-routes.js';
 import { createMessageReactionsRouter } from './message-reactions-routes.js';
 import { MessageReactionStore } from './message-reactions.js';
@@ -1230,6 +1231,18 @@ async function boot(): Promise<void> {
       searchMessages: (q, opts) => agentRuntime.sessionStore.searchMessages(q, opts),
       rebuildSearchIndex: () => agentRuntime.sessionStore.rebuildSearchIndex(),
       getThreadTitle: (id) => threadTitles.getTitle(id),
+      audit: (action, fields) => governance.audit(action, fields),
+    }),
+  );
+  // Workspace backup / restore / rollback (OpenMausBot parity P1 #19).
+  // Secrets are never in a backup — the engine blocklists the vault,
+  // wallet, provider keys, machine key, OAuth caches and any
+  // token/secret/credential-looking filename.
+  app.use(
+    '/api/workspace',
+    createWorkspaceBackupRouter({
+      dataDir: config.dataDir,
+      workspaceDir: config.workspaceDir,
       audit: (action, fields) => governance.audit(action, fields),
     }),
   );

@@ -29,12 +29,17 @@ import { join } from 'node:path';
 import {
   DEFAULT_DELEGATION_POLICY,
   DELEGATION_POLICIES,
+  TEAM_MANIFEST_FORMAT,
   TeamDirectoryStore,
   TeamStore,
   buildCoordinatorPrompt,
+  buildTeamManifest,
+  describeTeamImport,
   enrichActor,
   isDelegationPolicy,
   resolveDelegationPolicy,
+  teamManifestFilename,
+  validateTeamManifest,
   withEnrichedRunActors,
   type AgentRuntime,
   type BotConfig,
@@ -42,6 +47,7 @@ import {
   type DelegationPolicy,
   type StreamEvent,
   type Team,
+  type TeamManifest,
   type TeamRun,
   type TeamStep,
 } from '@mvp/agent-runtime';
@@ -62,6 +68,12 @@ export interface TeamRouteDeps {
    * requestPeerDelegationApproval + awaitDecision).
    */
   delegationBroker?: DelegationApprovalBroker;
+  /**
+   * Audit sink (optional). Used for manifest export/import events.
+   *
+   * HOST WIRING: pass `(action, fields) => deps.governance.audit(action, fields)`.
+   */
+  audit?: (action: string, fields: { actor?: string; detail?: unknown }) => void;
 }
 
 /**
@@ -153,6 +165,11 @@ export function createDelegationGate(
 
 function errorBody(message: string, detail?: string): Record<string, unknown> {
   return { ok: false, error: message, ...(detail ? { detail } : {}) };
+}
+
+/** Heuristic: does the body look like a raw team manifest (not wrapped)? */
+function isManifestLike(body: Record<string, unknown>): boolean {
+  return body.format === TEAM_MANIFEST_FORMAT && typeof body.team === 'object' && body.team !== null;
 }
 
 function validId(id: string): boolean {
@@ -391,6 +408,178 @@ export function registerTeamRoutes(router: Router, deps: TeamRouteDeps): TeamSto
       return;
     }
     res.json({ ok: true, deleted: memberId });
+  });
+
+  // -- Team-sharing manifest (OpenMausBot parity P1 #18) -------------------
+  //   POST /export { teamId } → downloadable `kriyadot.team.json` manifest:
+  //                             team identity, embedded full bot configs,
+  //                             roster-prompt snapshot, coordination rules,
+  //                             referenced workflows, SHA-256 checksum.
+  //   POST /import { manifest, confirm?, importBots? } → validates schema +
+  //                             checksum, dedupes by team name (409 on
+  //                             collision unless confirm: true), imports any
+  //                             embedded bots that don't exist yet, and
+  //                             creates the team with a fresh id.
+  //
+  // The manifest is a plain readable JSON spec: users can hand-edit,
+  // version-control, or share it. Import NEVER overwrites existing teams
+  // or bots — collisions are reported, not merged.
+
+  const appVersion = (() => {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { readFileSync } = require('node:fs') as typeof import('node:fs');
+      const pkg = JSON.parse(
+        readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+      ) as { version?: string };
+      return `kriyadot-api/${pkg.version ?? '0.1.0'}`;
+    } catch {
+      return 'kriyadot-api/0.1.0';
+    }
+  })();
+
+  router.post('/export', (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as { teamId?: unknown };
+    const teamId = typeof body.teamId === 'string' ? body.teamId : '';
+    if (!teamId || !validId(teamId)) {
+      res.status(400).json(errorBody('"teamId" is required'));
+      return;
+    }
+    const team = store.getTeam(teamId);
+    if (!team) {
+      res.status(404).json(errorBody(`Unknown team "${teamId}"`));
+      return;
+    }
+    const bots = new Map(deps.getBots().map((b) => [b.id, b]));
+    const coordinator = bots.get(team.coordinatorBotId);
+    if (!coordinator) {
+      res
+        .status(410)
+        .json(errorBody(`Coordinator bot "${team.coordinatorBotId}" no longer exists — cannot export a portable manifest`));
+      return;
+    }
+    const members: BotConfig[] = [];
+    for (const id of team.memberBotIds) {
+      const b = bots.get(id);
+      if (!b) {
+        res
+          .status(410)
+          .json(errorBody(`Member bot "${id}" no longer exists — cannot export a portable manifest`));
+        return;
+      }
+      members.push(b);
+    }
+    const manifest = buildTeamManifest({
+      team,
+      coordinator,
+      members,
+      appVersion,
+    });
+    deps.audit?.('teams.manifest_export', {
+      actor: 'api',
+      detail: { teamId: team.id, name: team.name, members: members.length },
+    });
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${teamManifestFilename(team.name, manifest.exportedAt)}"`,
+    );
+    res.json(manifest);
+  });
+
+  router.post('/import', async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as {
+      manifest?: unknown;
+      confirm?: unknown;
+      importBots?: unknown;
+    };
+    // Accept { manifest } or the raw manifest object as the body.
+    const raw = body.manifest ?? (isManifestLike(body) ? body : undefined);
+    if (raw === undefined) {
+      res.status(400).json(errorBody('body.manifest (a team manifest object) is required'));
+      return;
+    }
+    const validation = validateTeamManifest(raw);
+    if (!validation.ok) {
+      res.status(400).json(errorBody('Invalid team manifest', validation.errors.join('; ')));
+      return;
+    }
+    const manifest = validation.manifest;
+    const bots = deps.getBots();
+    const botIds = new Set(bots.map((b) => b.id));
+    const plan = describeTeamImport(
+      manifest,
+      store.listTeams().map((t) => ({ id: t.id, name: t.name })),
+      botIds,
+    );
+    if (plan.nameCollision && body.confirm !== true) {
+      res.status(409).json({
+        ok: false,
+        error: `A team named "${plan.nameCollision.name}" already exists — import never overwrites. Re-send with { confirm: true } to create it anyway.`,
+        conflict: plan.nameCollision,
+        missingBotIds: plan.missingBotIds,
+      });
+      return;
+    }
+
+    // Import embedded bots that don't exist yet (self-contained manifest).
+    const importBots = body.importBots !== false;
+    const importedBots: string[] = [];
+    if (importBots && plan.missingBotIds.length > 0) {
+      const { appendRosterImport } = await import('./bot-roster-routes.js');
+      const { allocateBotWorkspace } = await import('./bot-workspace-alloc.js');
+      const embedded = new Map(
+        [manifest.team.coordinator, ...manifest.team.members].map((b) => [b.id, b]),
+      );
+      for (const id of plan.missingBotIds) {
+        const cfg = embedded.get(id);
+        if (!cfg) continue;
+        try {
+          allocateBotWorkspace(cfg, deps.dataDir);
+        } catch {
+          // Invalid bot id — workspace allocation is best-effort on import.
+        }
+        bots.push(cfg);
+        botIds.add(id);
+        appendRosterImport(cfg, deps.dataDir);
+        importedBots.push(id);
+      }
+    } else if (!importBots && plan.missingBotIds.length > 0) {
+      res.status(400).json(
+        errorBody(
+          `Manifest references unknown bots (${plan.missingBotIds.join(', ')}) and importBots is false`,
+        ),
+      );
+      return;
+    }
+
+    const team = store.createTeam(
+      manifest.team.name,
+      manifest.team.coordinator.id,
+      manifest.team.members.map((m) => m.id),
+    );
+    store.setDelegationPolicy(
+      team.id,
+      manifest.team.coordinationRules.delegationPolicy,
+      manifest.team.coordinationRules.delegationPolicyOverrides,
+    );
+    deps.audit?.('teams.manifest_import', {
+      actor: 'api',
+      detail: {
+        teamId: team.id,
+        name: team.name,
+        confirmed: plan.nameCollision !== null,
+        importedBots,
+        workflows: manifest.team.workflows,
+      },
+    });
+    res.status(201).json({
+      ok: true,
+      team,
+      importedBots,
+      workflows: manifest.team.workflows,
+      note: 'Coordination rules restored from the manifest. Run history is not part of the manifest.',
+    });
   });
 
   router.delete('/:id', (req: Request, res: Response) => {

@@ -58,6 +58,7 @@ export * from './widgets.js';
 export * from './chief.js';
 export * from './tools/chief.js';
 export * from './teams.js';
+export * from './team-manifest.js';
 export * from './group-goals.js';
 export * from './hooks.js';
 export * from './worktrees.js';

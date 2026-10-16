@@ -2544,6 +2544,7 @@ export function createRouter(deps: RouteDeps): express.Router {
     // Peer-delegation approval broker (workstream C): the teams API gates
     // bot→bot delegation on user approval through the approvals inbox.
     delegationBroker: deps.governanceAdapter,
+    audit: (action, fields) => deps.governance.audit(action, fields),
   });
   router.use('/teams', teamsRouter);
 

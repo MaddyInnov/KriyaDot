@@ -61,7 +61,9 @@ export default function TeamsPage() {
   const [runs, setRuns] = useState<TeamRun[]>([]);
   const [liveRun, setLiveRun] = useState<TeamRun | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const esRef = useRef<AbortController | null>(null);
+  const importFileRef = useRef<HTMLInputElement>(null);
   // Group goals tab (OpenMausBot parity P1 #11): bounded multi-turn
   // coordinator/worker goal runs. No new top-level nav — lives under Teams.
   const [tab, setTab] = useState<'teams' | 'goals'>('teams');
@@ -135,6 +137,79 @@ export default function TeamsPage() {
       await api(`/api/teams/${id}`, { method: 'DELETE' });
       setLiveRun(null);
       await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  // Team-sharing manifest (OpenMausBot parity P1 #18): export a portable
+  // `kriyadot.team.json` (team + embedded bot configs + coordination rules
+  // + checksum) and import one back. Import never overwrites: a name
+  // collision asks for confirmation first.
+  const exportTeam = async (id: string) => {
+    setError(null);
+    try {
+      const res = await authedFetch('/api/teams/export', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ teamId: id }),
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`${res.status}: ${text || res.statusText}`);
+      }
+      const blob = await res.blob();
+      const cd = res.headers.get('content-disposition') || '';
+      const m = cd.match(/filename="([^"]+)"/);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = m?.[1] ?? `kriyadot.team.${id}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setNotice('Team manifest downloaded — share it, version-control it, or hand-edit it.');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const importTeamManifest = async (file: File, confirmCollision = false): Promise<void> => {
+    setError(null);
+    try {
+      const manifest = JSON.parse(await file.text());
+      const res = await authedFetch('/api/teams/import', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ manifest, confirm: confirmCollision }),
+      });
+      const json = (await res.json()) as {
+        ok: boolean;
+        error?: string;
+        conflict?: { name: string };
+        team?: Team;
+        importedBots?: string[];
+      };
+      if (res.status === 409 && json.conflict && !confirmCollision) {
+        if (
+          confirm(
+            `A team named "${json.conflict.name}" already exists. Import anyway as a separate team?`,
+          )
+        ) {
+          await importTeamManifest(file, true);
+        }
+        return;
+      }
+      if (!res.ok || !json.team) throw new Error(json.error || `Import failed (${res.status})`);
+      setNotice(
+        `Imported team "${json.team.name}"` +
+          (json.importedBots && json.importedBots.length > 0
+            ? ` (+${json.importedBots.length} bot${json.importedBots.length === 1 ? '' : 's'}: ${json.importedBots.join(', ')})`
+            : ''),
+      );
+      await load();
+      setActiveId(json.team.id);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -227,6 +302,7 @@ export default function TeamsPage() {
         </div>
       </div>
       {error && <div className="error">{error}</div>}
+      {notice && <div className="notice">{notice}</div>}
 
       <div className="tabs">
         <button className={tab === 'teams' ? 'tab active' : 'tab'} onClick={() => setTab('teams')}>
@@ -254,9 +330,28 @@ export default function TeamsPage() {
                   {botName(t.coordinatorBotId)} leads · {t.memberBotIds.map(botName).join(', ')}
                 </div>
                 <button className="btn btn-sm btn-danger" onClick={() => deleteTeam(t.id)}>Delete</button>
+                <button className="btn btn-sm" onClick={() => exportTeam(t.id)}>Export</button>
               </li>
             ))}
           </ul>
+
+          <div className="row" style={{ marginTop: 8 }}>
+            <button className="btn btn-sm" onClick={() => importFileRef.current?.click()}>
+              Import team manifest…
+            </button>
+            <input
+              ref={importFileRef}
+              type="file"
+              accept=".json,application/json"
+              hidden
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                e.target.value = '';
+                if (f) void importTeamManifest(f);
+              }}
+            />
+          </div>
+          <p className="muted small">Import a <code>kriyadot.team.json</code> manifest — validated by checksum, never overwrites.</p>
 
           <h3>New team</h3>
           <input className="input" placeholder="Team name" value={name} onChange={(e) => setName(e.target.value)} />

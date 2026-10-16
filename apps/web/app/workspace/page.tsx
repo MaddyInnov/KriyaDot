@@ -7,6 +7,7 @@ import { TasksPanel } from '../../components/panels/tasks-panel';
 import { FilesPanel } from '../../components/panels/files-panel';
 import PhonePanel from '../../components/panels/phone-panel';
 import DevicesPanel from '../../components/panels/devices-panel';
+import BackupPanel from '../../components/panels/backup-panel';
 
 const TABS = [
   { id: 'notes', label: 'Notes' },
@@ -14,6 +15,7 @@ const TABS = [
   { id: 'files', label: 'Files' },
   { id: 'phone', label: 'Phone', title: 'Control your phone' },
   { id: 'devices', label: 'Devices', title: 'Control KriyaDot from your phone' },
+  { id: 'backup', label: 'Backup', title: 'Back up and restore your workspace' },
 ] as const;
 
 type TabId = (typeof TABS)[number]['id'];
@@ -47,6 +49,8 @@ export default function WorkspacePage() {
           <PhonePanel />
         ) : tab === 'devices' ? (
           <DevicesPanel />
+        ) : tab === 'backup' ? (
+          <BackupPanel />
         ) : (
           <FilesPanel />
         )}
