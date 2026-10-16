@@ -202,7 +202,7 @@ export interface SessionChangeTracker {
   getToolCalls(sessionId: string): Array<Pick<ToolCall, 'name' | 'args'>>;
 }
 
-const WRITE_TOOL_NAMES = new Set(['write_file', 'edit_file', 'create_file', 'patch', 'delete_file', 'remove_file']);
+const WRITE_TOOL_NAMES = new Set(['write_file', 'edit', 'patch']);
 
 export interface DiffFileEntry {
   path: string;
@@ -313,6 +313,7 @@ function verifyChangesTool(
 ): ToolDefinition {
   return {
     name: 'verify_changes',
+    mutating: true,
     description:
       'Run this project\'s own checks (tests, lint, build) BEFORE telling the user the work is done. ' +
       'Detects the project type (npm/go/cargo/python/maven/gradle) and runs its standard verification. ' +

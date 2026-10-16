@@ -18,7 +18,9 @@ afterEach(() => {
 
 function stubFetch(handler: (url: string, init?: RequestInit) => unknown): void {
   globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
-    const body = handler(String(url), init);
+    const u = String(url);
+    // Auth bootstrap: every authed request awaits this first.
+    const body = u.includes('/api/auth/bootstrap') ? { token: 'test-token' } : handler(u, init);
     return new Response(JSON.stringify(body), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },

@@ -2,10 +2,14 @@
 // Zero-network tests: fetch is stubbed, so no API server is needed.
 import { describe, expect, it, beforeEach, vi } from 'vitest';
 import { HttpSTTProvider, HttpTTSProvider, bytesToBase64, base64ToBytes } from './voice-http';
+import { resetApiBootstrap } from './api';
 
 function stubFetch(handler: (url: string, init: RequestInit) => unknown) {
+  // Fresh bootstrap per test so fetch call counts stay deterministic.
+  resetApiBootstrap();
   (globalThis as unknown as { fetch: unknown }).fetch = vi.fn(async (url: string, init: RequestInit) => {
-    const payload = handler(url, init);
+    // Auth bootstrap: every authed request awaits this first.
+    const payload = String(url).includes('/api/auth/bootstrap') ? { token: 'test-token' } : handler(url, init);
     return {
       ok: true,
       status: 200,
@@ -37,7 +41,7 @@ describe('HttpSTTProvider', () => {
     const res = await stt.transcribe(new Uint8Array([9, 8, 7]), { language: 'en' });
     expect(res.text).toBe('hello world');
     expect(res.confidence).toBe(0.9);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2); // bootstrap + API call
   });
 
   it('rejects empty audio without touching the network', async () => {
@@ -49,12 +53,18 @@ describe('HttpSTTProvider', () => {
   });
 
   it('surfaces API errors', async () => {
-    (globalThis as unknown as { fetch: unknown }).fetch = vi.fn(async () => ({
-      ok: false,
-      status: 500,
-      statusText: 'boom',
-      json: async () => ({ error: 'stt exploded' }),
-    }));
+    resetApiBootstrap();
+    (globalThis as unknown as { fetch: unknown }).fetch = vi.fn(async (url: string) => {
+      if (String(url).includes('/api/auth/bootstrap')) {
+        return { ok: true, status: 200, statusText: 'OK', json: async () => ({ token: 'test-token' }) };
+      }
+      return {
+        ok: false,
+        status: 500,
+        statusText: 'boom',
+        json: async () => ({ error: 'stt exploded' }),
+      };
+    });
     await expect(new HttpSTTProvider().transcribe(new Uint8Array([1]))).rejects.toThrow(
       /stt exploded/,
     );
@@ -76,7 +86,7 @@ describe('HttpTTSProvider', () => {
     const res = await tts.synthesize('  say this  ');
     expect(res.audio).toEqual(wav);
     expect(res.mimeType).toBe('audio/wav');
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2); // bootstrap + API call
   });
 
   it('rejects blank text without touching the network', async () => {

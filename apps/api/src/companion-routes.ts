@@ -26,6 +26,8 @@
 
 import os from 'node:os';
 import type { Request, Response, Router, NextFunction } from 'express';
+import type { BotConfig } from '@mvp/agent-runtime';
+import { botWorkspacePath } from './bot-workspace-alloc.js';
 import { BriefingStore } from './briefing.js';
 import { CompanionHub, CompanionStore, type CompanionAudit } from './companion.js';
 import type { DecideApprovalBody } from './types.js';
@@ -138,6 +140,8 @@ export interface CompanionRouteDeps {
   /** dataDir for the BriefingStore (same DB the briefing routes use). */
   dataDir: string;
   runControls: CompanionRunControls;
+  /** Live bot roster accessor — the same source the web UI's GET /api/bots reads. */
+  getBots: () => BotConfig[];
   mcpServer?: { decideApproval(approvalId: string, decision: 'approved' | 'denied'): void };
   recordPreference?: (botId: string, toolName: string, decision: 'approved' | 'denied') => void;
 }
@@ -762,6 +766,23 @@ export function registerCompanionRoutes(router: Router, deps: CompanionRouteDeps
     } finally {
       res.end();
     }
+  });
+
+  // ---- Bots -------------------------------------------------------------------------
+  //
+  // Bot roster for the companion app's chat picker. Same shape as the web UI's
+  // GET /api/bots: the live bot configs (seed/bots.json + roster imports) with
+  // the resolved workspacePath per bot. The app persists its selection and
+  // sends it as botId in the chat request; an empty array means the roster is
+  // unavailable (the app shows "No bots available").
+
+  router.get('/bots', requireAuth, (_req: Request, res: Response) => {
+    res.json(
+      deps.getBots().map((bot) => ({
+        ...bot,
+        workspacePath: botWorkspacePath(bot, deps.dataDir),
+      })),
+    );
   });
 
   // ---- Activity --------------------------------------------------------------------

@@ -16,6 +16,79 @@ export function getApiBase(): string {
   return '';
 }
 
+// ---- Auth (bearer bootstrap) --------------------------------------------------
+// Every API call must send `Authorization: Bearer <token>`. The token comes
+// from GET /api/auth/bootstrap (no auth header needed; the server only serves
+// it to allowlisted/absent Origin) and is stored IN MEMORY ONLY — a
+// module-level variable, never localStorage.
+//
+// All requests funnel through authedFetch() below, which awaits the single
+// shared bootstrap promise so concurrent early calls each wait for the token
+// exactly once. If bootstrap fails, callers surface the blocking
+// "Cannot reach the KriyaDot API" state.
+
+let authToken: string | null = null;
+let bootstrapPromise: Promise<string> | null = null;
+
+/** The in-memory bootstrap token (null until bootstrap completes). */
+export function getAuthToken(): string | null {
+  return authToken;
+}
+
+/**
+ * Bootstrap the API token. The first call fires the request; every later or
+ * concurrent call awaits the same promise — the token is fetched exactly
+ * once. Rejects when the API is unreachable.
+ */
+export function ensureApiReady(): Promise<string> {
+  if (!bootstrapPromise) {
+    bootstrapPromise = (async () => {
+      let res: Response;
+      try {
+        res = await fetch(`${getApiBase()}/api/auth/bootstrap`);
+      } catch (err) {
+        throw new Error(
+          `Cannot reach the KriyaDot API (${err instanceof Error ? err.message : String(err)})`,
+        );
+      }
+      if (!res.ok) {
+        throw new Error(`Cannot reach the KriyaDot API (HTTP ${res.status} ${res.statusText})`);
+      }
+      const data = (await res.json().catch(() => ({}))) as { token?: unknown };
+      if (typeof data.token !== 'string' || data.token.length === 0) {
+        throw new Error('Cannot reach the KriyaDot API (bootstrap returned no token)');
+      }
+      authToken = data.token;
+      return authToken;
+    })();
+  }
+  return bootstrapPromise;
+}
+
+/** Forget the cached token/promise (retry button on the unreachable-API screen). */
+export function resetApiBootstrap(): void {
+  bootstrapPromise = null;
+  authToken = null;
+}
+
+/** Merge `Authorization: Bearer <token>` into init headers (any HeadersInit shape). */
+function withAuthHeader(init: RequestInit | undefined, token: string): RequestInit {
+  const headers = new Headers(init?.headers);
+  headers.set('Authorization', `Bearer ${token}`);
+  return { ...init, headers };
+}
+
+/**
+ * Central fetch for every API call in the web app: waits for the bootstrap
+ * token, then sends the request with the Authorization header attached.
+ * SSE streams also go through here — fetch-based streaming carries headers;
+ * EventSource cannot, so EventSource must not be used for API streams.
+ */
+export async function authedFetch(path: string, init?: RequestInit): Promise<Response> {
+  const token = await ensureApiReady();
+  return fetch(`${getApiBase()}${path}`, withAuthHeader(init, token));
+}
+
 // ---- Shared types (mirror the API wire shapes) ----------------------------
 
 export type BotPolicyEffect = 'allow' | 'deny' | 'require-approval';
@@ -50,6 +123,10 @@ export interface BotConfig {
   voice?: VoiceSettings;
   /** Approval mode (Atomic parity): 'plan' | 'auto' | 'bypass'. Default 'auto'. */
   approvalMode?: 'plan' | 'auto' | 'bypass';
+  /** Chief of Staff: prompt injection + chief-only tools enabled. */
+  chiefOfStaff?: boolean;
+  /** Sections the chief is the primary contact for. */
+  managedSections?: string[];
 }
 
 export interface VoiceSettings {
@@ -145,6 +222,11 @@ export type StreamEvent =
   | { type: 'error'; message: string }
   | { type: 'interrupted'; reason: string }
   | { type: 'approval_required'; approvalId: string; call: ToolCall }
+  /**
+   * Non-fatal informational notice from the server (e.g. "queued behind an
+   * in-flight turn"). Rendered inline; never aborts the turn.
+   */
+  | { type: 'notice'; message: string }
   /** A queued message started its turn on this stream (queue-at-boundary). */
   | { type: 'queued_turn_start'; queueId?: string }
   /**
@@ -360,8 +442,7 @@ export interface PreviewResult {
 // ---- Fetch helpers ----------------------------------------------------------
 
 async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
-  const res = await fetch(`${getApiBase()}${path}`, init);
-  return res;
+  return authedFetch(path, init);
 }
 
 async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -1328,7 +1409,9 @@ export function streamFusionRun(
   };
   (async () => {
     try {
-      const res = await fetch(`${getApiBase()}/api/fusion/runs/${encodeURIComponent(runId)}/stream`, {
+      // Fetch-based streaming: EventSource cannot send the Authorization
+      // header, so the token is attached here via authedFetch.
+      const res = await authedFetch(`/api/fusion/runs/${encodeURIComponent(runId)}/stream`, {
         signal: controller.signal,
       });
       if (!res.ok || !res.body) throw new Error(`Fusion stream failed (${res.status})`);
@@ -1513,7 +1596,9 @@ export function streamEvalRun(
   };
   (async () => {
     try {
-      const res = await fetch(`${getApiBase()}/api/evals/runs/${encodeURIComponent(runId)}/stream`, {
+      // Fetch-based streaming: EventSource cannot send the Authorization
+      // header, so the token is attached here via authedFetch.
+      const res = await authedFetch(`/api/evals/runs/${encodeURIComponent(runId)}/stream`, {
         signal: controller.signal,
       });
       if (!res.ok || !res.body) throw new Error(`Eval stream failed (${res.status})`);
@@ -1530,3 +1615,96 @@ export function streamEvalRun(
   })();
   return () => controller.abort();
 }
+
+// ---- Chief of Staff (/api/teams/chief, /sections, /proposals, /incidents) --
+
+export interface ChiefInfo {
+  ok: boolean;
+  chiefBotId: string | null;
+  managedSections: string[];
+}
+
+export interface ChiefProposalOpDto {
+  action: 'create' | 'update' | 'delete';
+  key?: string;
+  botId?: string;
+  fields?: Record<string, unknown>;
+}
+
+export interface ChiefProposalDto {
+  id: string;
+  kind: 'team-setup' | 'create-bot' | 'delete-bot';
+  createdByBotId: string;
+  reason: string;
+  operations: ChiefProposalOpDto[];
+  status: 'pending' | 'approved' | 'rejected';
+  suggestion?: boolean;
+  newTeams?: string[];
+  createdAt: string;
+  decidedAt?: string;
+}
+
+export interface ChiefIncidentDto {
+  id: string;
+  kind: 'incident' | 'escalation';
+  chiefBotId: string;
+  targetBotId?: string;
+  targetBotName?: string;
+  threadId?: string;
+  summary: string;
+  detail?: string;
+  attempts: number;
+  status: 'open' | 'triaged' | 'resolved';
+  createdAt: string;
+  updatedAt: string;
+}
+
+export const getChief = (): Promise<ChiefInfo> => apiJson('/api/teams/chief');
+
+export const setChief = (botId: string | null): Promise<ChiefInfo> =>
+  apiJson('/api/teams/chief', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ botId }),
+  });
+
+export const getChiefSections = (): Promise<{ ok: boolean; sections: string[] }> =>
+  apiJson('/api/teams/sections');
+
+export const setChiefSections = (sections: string[]): Promise<{ ok: boolean; sections: string[] }> =>
+  apiJson('/api/teams/sections', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sections }),
+  });
+
+export const listChiefProposals = (status?: string): Promise<{ ok: boolean; proposals: ChiefProposalDto[] }> =>
+  apiJson(`/api/teams/proposals${status ? `?status=${encodeURIComponent(status)}` : ''}`);
+
+export const approveChiefProposal = (id: string): Promise<{ ok: boolean; proposal: ChiefProposalDto; applied: string[] }> =>
+  apiJson(`/api/teams/proposals/${encodeURIComponent(id)}/approve`, { method: 'POST' });
+
+export const rejectChiefProposal = (id: string, note?: string): Promise<{ ok: boolean; proposal: ChiefProposalDto }> =>
+  apiJson(`/api/teams/proposals/${encodeURIComponent(id)}/reject`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ note }),
+  });
+
+export const listChiefIncidents = (status?: string, kind?: string): Promise<{ ok: boolean; incidents: ChiefIncidentDto[] }> => {
+  const q = new URLSearchParams();
+  if (status) q.set('status', status);
+  if (kind) q.set('kind', kind);
+  const suffix = q.toString() ? `?${q.toString()}` : '';
+  return apiJson(`/api/teams/incidents${suffix}`);
+};
+
+export const resolveChiefIncident = (id: string, note?: string): Promise<{ ok: boolean; incident: ChiefIncidentDto }> =>
+  apiJson(`/api/teams/incidents/${encodeURIComponent(id)}/resolve`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ note }),
+  });
+
+export const retryChiefIncident = (id: string): Promise<{ ok: boolean; incidentId: string; attempts: number; incident: ChiefIncidentDto }> =>
+  apiJson(`/api/teams/incidents/${encodeURIComponent(id)}/retry`, { method: 'POST' });

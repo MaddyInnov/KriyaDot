@@ -21,6 +21,7 @@ function makeHarness(opts: {
   auditEntries?: ComputerViewAuditEntry[];
   fps?: number;
   drivingWindowMs?: number;
+  loopbackToken?: string;
 } = {}): {
   view: ComputerView;
   audits: AuditCall[];
@@ -43,6 +44,7 @@ function makeHarness(opts: {
     createLayer,
     fps: opts.fps ?? 200,
     drivingWindowMs: opts.drivingWindowMs ?? 10_000,
+    loopbackToken: opts.loopbackToken ?? 'test-loopback-token',
   });
   return { view, audits, layers, setAuditEntries: (e) => (entries = e) };
 }
@@ -290,5 +292,226 @@ describe('computer-view websocket', () => {
     await sleep(120);
     expect(v.sent.length).toBe(countAfterLeave);
     h.view.hub.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// H3: MiniWsSocket inbound frame-buffer cap (via acceptRawWsSocket)
+// ---------------------------------------------------------------------------
+
+import { Duplex } from 'node:stream';
+import type { IncomingMessage } from 'node:http';
+import { acceptRawWsSocket, MAX_WS_BUFFER_BYTES } from '../src/computer-view.js';
+
+/** Fake socket: writes go nowhere (like a real net.Socket), reads are pushed by the test. */
+class FakeSocket extends Duplex {
+  written: Buffer[] = [];
+  _write(chunk: Buffer, _enc: BufferEncoding, cb: () => void): void {
+    this.written.push(Buffer.from(chunk));
+    cb();
+  }
+  _read(): void {
+    // push-driven
+  }
+  pushInbound(d: Buffer): void {
+    this.push(d);
+  }
+}
+
+function fakeWsRequest(): IncomingMessage {
+  return {
+    headers: {
+      'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==',
+      upgrade: 'websocket',
+      'sec-websocket-version': '13',
+    },
+  } as unknown as IncomingMessage;
+}
+
+/** Build one masked client→server text frame (mask 0x09). */
+function maskedFrame(text: string): Buffer {
+  const payload = Buffer.from(text, 'utf8');
+  const mask = Buffer.from([9, 9, 9, 9]);
+  const masked = Buffer.from(payload.map((b) => b ^ 9));
+  return Buffer.concat([Buffer.from([0x81, 0x80 | payload.length]), mask, masked]);
+}
+
+describe('MiniWsSocket inbound buffer cap', () => {
+  it('passes small valid frames through without destroying the socket', async () => {
+    const duplex = new FakeSocket();
+    const sock = acceptRawWsSocket(fakeWsRequest(), duplex);
+    expect(sock).not.toBeNull();
+    const seen: string[] = [];
+    sock!.onMessage((t) => seen.push(t));
+    duplex.pushInbound(maskedFrame('hi'));
+    await sleep(20);
+    expect(seen).toEqual(['hi']);
+    expect(duplex.destroyed).toBe(false);
+  });
+
+  it('destroys the socket when accumulated inbound bytes exceed 16MB', async () => {
+    const duplex = new FakeSocket();
+    const sock = acceptRawWsSocket(fakeWsRequest(), duplex);
+    expect(sock).not.toBeNull();
+    const seen: string[] = [];
+    sock!.onMessage((t) => seen.push(t));
+
+    // A peer that declares a huge frame and trickles the payload: the
+    // header + mask alone must not trip the cap (incomplete frame).
+    // (127-length frames have a 10-byte header: 2 + 8-byte length.)
+    const declared = MAX_WS_BUFFER_BYTES + 1;
+    const header = Buffer.alloc(10);
+    header[0] = 0x81;
+    header[1] = 0xff; // masked + 127 (8-byte length follows)
+    header.writeBigUInt64BE(BigInt(declared), 2);
+    duplex.pushInbound(Buffer.concat([header, Buffer.from([1, 2, 3, 4])]));
+    await sleep(20);
+    expect(duplex.destroyed).toBe(false);
+
+    // Now the payload arrives and pushes the buffer past the cap.
+    duplex.pushInbound(Buffer.alloc(declared, 0));
+    await sleep(50);
+    expect(duplex.destroyed).toBe(true);
+    expect(seen).toEqual([]); // oversize frame never delivered
+  });
+
+  it('destroys the socket when fragmented messages accumulate past 16MB', async () => {
+    const duplex = new FakeSocket();
+    const sock = acceptRawWsSocket(fakeWsRequest(), duplex);
+    expect(sock).not.toBeNull();
+    const seen: string[] = [];
+    sock!.onMessage((t) => seen.push(t));
+
+    // 6MB non-final fragments (opcode 0x1 then 0x0 continuations, FIN=0,
+    // masked, len 127). Note the parser holds the in-flight frame in the
+    // buffer while earlier fragments sit in the fragment list, so a third
+    // 6MB fragment pushes the accumulated total past 16MB.
+    // (127-length frames have a 10-byte header: 2 + 8-byte length.)
+    const fragLen = 6 * 1024 * 1024;
+    const mkFrag = (fin: boolean, opcode: number): Buffer => {
+      const header = Buffer.alloc(10);
+      header[0] = (fin ? 0x80 : 0x00) | opcode;
+      header[1] = 0xff;
+      header.writeBigUInt64BE(BigInt(fragLen), 2);
+      return Buffer.concat([header, Buffer.from([5, 6, 7, 8]), Buffer.alloc(fragLen, 0x41)]);
+    };
+    duplex.pushInbound(mkFrag(false, 0x1)); // first fragment: ~6MB
+    await sleep(30);
+    expect(duplex.destroyed).toBe(false);
+    duplex.pushInbound(mkFrag(false, 0x0)); // continuation 1: ~12MB total
+    await sleep(30);
+    expect(duplex.destroyed).toBe(false);
+    duplex.pushInbound(mkFrag(false, 0x0)); // continuation 2: ~18MB > cap
+    await sleep(50);
+    expect(duplex.destroyed).toBe(true);
+    expect(seen).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WS upgrade auth: ?token= (loopback bootstrap token) / ?ticket=
+// ---------------------------------------------------------------------------
+
+describe('computer-view WS upgrade auth', () => {
+  const TOKEN = 'cv-upgrade-token';
+
+  function upgradeWith(qs: string): { duplex: FakeSocket; view: ComputerView } {
+    const h = makeHarness({ loopbackToken: TOKEN, fps: 200 });
+    const duplex = new FakeSocket();
+    const req = {
+      ...fakeWsRequest(),
+      url: `/api/computer/ws?botId=bot-1${qs}`,
+    } as unknown as IncomingMessage;
+    h.view.handleUpgrade(req, duplex, Buffer.alloc(0));
+    return { duplex, view: h.view };
+  }
+
+  /** Decode server→client text frames captured in FakeSocket.written. */
+  function serverTexts(duplex: FakeSocket): string[] {
+    const out: string[] = [];
+    for (const w of duplex.written) {
+      if (w[0] !== 0x81) continue;
+      let len = w[1]! & 0x7f;
+      let off = 2;
+      if (len === 126) {
+        len = w.readUInt16BE(2);
+        off = 4;
+      } else if (len === 127) {
+        len = Number(w.readBigUInt64BE(2));
+        off = 10;
+      }
+      out.push(w.subarray(off, off + len).toString('utf8'));
+    }
+    return out;
+  }
+
+  /** Find the close frame's status code in the written chunks (if any). */
+  function closeCode(duplex: FakeSocket): number | null {
+    for (const w of duplex.written) {
+      if (w[0] === 0x88 && w.length >= 4) return w.readUInt16BE(2);
+    }
+    return null;
+  }
+
+  async function waitForText(duplex: FakeSocket, pred: (t: string) => boolean, timeoutMs = 2000): Promise<string> {
+    const start = Date.now();
+    for (;;) {
+      const hit = serverTexts(duplex).find(pred);
+      if (hit !== undefined) return hit;
+      if (Date.now() - start > timeoutMs) throw new Error('timed out waiting for server text frame');
+      await sleep(20);
+    }
+  }
+
+  it('accepts a valid ?token= and completes the watch handshake', async () => {
+    const { duplex, view } = upgradeWith(`&token=${encodeURIComponent(TOKEN)}`);
+    try {
+      duplex.pushInbound(maskedFrame(JSON.stringify({ t: 'watch', botId: 'bot-1' })));
+      const ok = await waitForText(duplex, (t) => {
+        try {
+          return (JSON.parse(t) as { t?: string }).t === 'ok';
+        } catch {
+          return false;
+        }
+      });
+      expect(JSON.parse(ok) as { botId?: string }).toMatchObject({ t: 'ok', botId: 'bot-1' });
+      expect(duplex.destroyed).toBe(false);
+    } finally {
+      view.hub.stop();
+    }
+  });
+
+  it('accepts a one-time ?ticket=', async () => {
+    const { issueWsTicket } = await import('../src/loopback-auth.js');
+    const { duplex, view } = upgradeWith(`&ticket=${encodeURIComponent(issueWsTicket())}`);
+    try {
+      duplex.pushInbound(maskedFrame(JSON.stringify({ t: 'watch', botId: 'bot-1' })));
+      const ok = await waitForText(duplex, (t) => {
+        try {
+          return (JSON.parse(t) as { t?: string }).t === 'ok';
+        } catch {
+          return false;
+        }
+      });
+      expect(JSON.parse(ok) as { t?: string }).toMatchObject({ t: 'ok' });
+    } finally {
+      view.hub.stop();
+    }
+  });
+
+  it('rejects a missing or wrong ?token= with unauthorized + close 4401', async () => {
+    for (const qs of ['', '&token=wrong-token']) {
+      const { duplex, view } = upgradeWith(qs);
+      try {
+        await sleep(50);
+        expect(duplex.destroyed).toBe(true);
+        expect(closeCode(duplex)).toBe(4401);
+        const err = serverTexts(duplex).find((t) => t.includes('unauthorized'));
+        expect(err).toBeDefined();
+        expect(JSON.parse(err!) as { detail?: string }).toMatchObject({ t: 'error', detail: 'unauthorized' });
+      } finally {
+        view.hub.stop();
+      }
+    }
   });
 });

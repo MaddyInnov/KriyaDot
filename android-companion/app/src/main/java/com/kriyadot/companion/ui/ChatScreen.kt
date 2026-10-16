@@ -8,6 +8,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -16,6 +18,12 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenu
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -34,20 +42,25 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.kriyadot.companion.core.Bot
 import com.kriyadot.companion.core.ChatMessage
 
 /**
  * Chat with the KriyaDot instance. Mirrors the web app's POST /chat turn API:
  * the assistant reply streams token-by-token into the last bubble.
  *
- * NOTE: the bot id is currently the TODO placeholder in KriyaDotApi; see the
- * README for what to wire up once the server exposes a default bot.
+ * The bot the message is addressed to is picked from the roster
+ * (GET /api/companion/bots) with the picker above the conversation; the
+ * selection persists in PairingStore and is sent as botId in the request.
  */
 @Composable
 fun ChatScreen(vm: CompanionViewModel) {
     val messages by vm.messages.collectAsState()
     val busy by vm.chatBusy.collectAsState()
     val error by vm.error.collectAsState()
+    val bots by vm.bots.collectAsState()
+    val selectedBotId by vm.selectedBotId.collectAsState()
+    val botsLoading by vm.botsLoading.collectAsState()
     var input by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     val snackbar = remember { SnackbarHostState() }
@@ -55,6 +68,7 @@ fun ChatScreen(vm: CompanionViewModel) {
     LaunchedEffect(error) {
         error?.let { snackbar.showSnackbar(it); vm.clearError() }
     }
+    LaunchedEffect(Unit) { vm.ensureBots() }
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
     }
@@ -75,7 +89,7 @@ fun ChatScreen(vm: CompanionViewModel) {
                 )
                 IconButton(
                     onClick = { vm.sendChat(input); input = "" },
-                    enabled = input.isNotBlank() && !busy,
+                    enabled = input.isNotBlank() && !busy && selectedBotId != null,
                 ) {
                     Icon(Icons.Filled.Send, contentDescription = "Send")
                 }
@@ -85,44 +99,117 @@ fun ChatScreen(vm: CompanionViewModel) {
             }
         },
     ) { inner ->
-        if (messages.isEmpty()) {
-            Column(
-                modifier = Modifier.fillMaxSize().padding(inner).padding(24.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                Spacer(Modifier.height(48.dp))
+        Column(modifier = Modifier.fillMaxSize().padding(inner)) {
+            BotPickerRow(
+                bots = bots,
+                selectedBotId = selectedBotId,
+                loading = botsLoading,
+                onSelect = vm::selectBot,
+            )
+            if (messages.isEmpty()) {
+                Column(
+                    modifier = Modifier.fillMaxSize().padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Spacer(Modifier.height(48.dp))
+                    Text(
+                        "Ask KriyaDot anything.",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
+                ) {
+                    items(messages, key = { it.id }) { msg ->
+                        val isUser = msg.role == "user"
+                        Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                            if (isUser) Spacer(Modifier.weight(1f))
+                            Card(
+                                modifier = Modifier.fillMaxWidth(if (isUser) 0.85f else 1f),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = if (isUser) MaterialTheme.colorScheme.primaryContainer
+                                    else MaterialTheme.colorScheme.surfaceVariant,
+                                ),
+                            ) {
+                                Text(
+                                    msg.text.ifEmpty { "…" },
+                                    modifier = Modifier.padding(12.dp),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                )
+                            }
+                            if (!isUser) Spacer(Modifier.weight(0.001f))
+                        }
+                    }
+                    item { Spacer(Modifier.height(8.dp)) }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Chat bot picker backed by GET /api/companion/bots: a dropdown of the roster
+ * (defaults to the first bot), "Loading bots…" while fetching, and
+ * "No bots available" when the roster comes back empty.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun BotPickerRow(
+    bots: List<Bot>,
+    selectedBotId: String?,
+    loading: Boolean,
+    onSelect: (String) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val selected = bots.find { it.id == selectedBotId }
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        when {
+            loading && bots.isEmpty() -> {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+                Text("Loading bots…", style = MaterialTheme.typography.bodyMedium)
+            }
+            bots.isEmpty() -> {
                 Text(
-                    "Ask KriyaDot anything.",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    "No bots available",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
                 )
             }
-        } else {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.fillMaxSize().padding(inner).padding(horizontal = 12.dp),
-            ) {
-                items(messages, key = { it.id }) { msg ->
-                    val isUser = msg.role == "user"
-                    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                        if (isUser) Spacer(Modifier.weight(1f))
-                        Card(
-                            modifier = Modifier.fillMaxWidth(if (isUser) 0.85f else 1f),
-                            colors = CardDefaults.cardColors(
-                                containerColor = if (isUser) MaterialTheme.colorScheme.primaryContainer
-                                else MaterialTheme.colorScheme.surfaceVariant,
-                            ),
-                        ) {
-                            Text(
-                                msg.text.ifEmpty { "…" },
-                                modifier = Modifier.padding(12.dp),
-                                style = MaterialTheme.typography.bodyMedium,
+            else -> {
+                ExposedDropdownMenuBox(
+                    expanded = expanded,
+                    onExpandedChange = { expanded = !expanded },
+                ) {
+                    OutlinedTextField(
+                        value = selected?.name ?: "",
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text("Bot") },
+                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+                        modifier = Modifier.menuAnchor().fillMaxWidth(),
+                    )
+                    ExposedDropdownMenu(
+                        expanded = expanded,
+                        onDismissRequest = { expanded = false },
+                    ) {
+                        bots.forEach { bot ->
+                            DropdownMenuItem(
+                                text = { Text(bot.name) },
+                                onClick = {
+                                    onSelect(bot.id)
+                                    expanded = false
+                                },
                             )
                         }
-                        if (!isUser) Spacer(Modifier.weight(0.001f))
                     }
                 }
-                item { Spacer(Modifier.height(8.dp)) }
             }
         }
     }

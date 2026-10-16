@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import express from 'express';
 import type { AddressInfo } from 'node:net';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   PhoneSessionHub,
   PhoneStore,
@@ -13,6 +13,7 @@ import {
   type PhoneSocket,
 } from '../src/phone.js';
 import { registerPhoneRoutes } from '../src/phone-routes.js';
+import { consumeWsTicket, issueWsTicket } from '../src/loopback-auth.js';
 import { AdbPhoneProvider, parseAdbDevices, parsePngDims } from '../src/phone-adb.js';
 
 // ---------------------------------------------------------------------------
@@ -255,7 +256,7 @@ describe('PhoneSessionHub', () => {
 
     const viewer = new MockSocket();
     hub.acceptSocket(viewer, '127.0.0.1');
-    viewer.clientSend({ t: 'watch', deviceId });
+    viewer.clientSend({ t: 'watch', deviceId, ticket: issueWsTicket() });
     expect(viewer.lastJson().t).toBe('ok');
     expect(viewer.lastJson().online).toBe(true);
 
@@ -290,10 +291,38 @@ describe('PhoneSessionHub', () => {
   it('does not route input when the device is offline', () => {
     const viewer = new MockSocket();
     hub.acceptSocket(viewer, '127.0.0.1');
-    viewer.clientSend({ t: 'watch', deviceId });
+    viewer.clientSend({ t: 'watch', deviceId, ticket: issueWsTicket() });
     expect(viewer.lastJson().online).toBe(false);
     viewer.clientSend({ t: 'tap', x: 0.5, y: 0.5 });
     expect(viewer.lastJson()).toEqual({ t: 'error', detail: 'device_offline' });
+  });
+
+  it('rejects a watch message without a valid one-time ticket', () => {
+    const viewer = new MockSocket();
+    hub.acceptSocket(viewer, '127.0.0.1');
+    // No ticket at all → validation still passes (ticket optional), auth fails.
+    viewer.clientSend({ t: 'watch', deviceId });
+    expect(viewer.lastJson().t).toBe('error');
+    expect(viewer.lastJson().detail).toBe('auth_failed');
+    expect(viewer.closedWith).toBe(4401);
+    expect(audits.some((a) => a.action === 'phone.auth_failed')).toBe(true);
+
+    // Bogus ticket → same rejection.
+    const viewer2 = new MockSocket();
+    hub.acceptSocket(viewer2, '127.0.0.1');
+    viewer2.clientSend({ t: 'watch', deviceId, ticket: 'nope' });
+    expect(viewer2.closedWith).toBe(4401);
+
+    // A ticket is single-use: reuse fails even though it was valid once.
+    const ticket = issueWsTicket();
+    const viewer3 = new MockSocket();
+    hub.acceptSocket(viewer3, '127.0.0.1');
+    viewer3.clientSend({ t: 'watch', deviceId, ticket });
+    expect(viewer3.lastJson().t).toBe('ok');
+    const viewer4 = new MockSocket();
+    hub.acceptSocket(viewer4, '127.0.0.1');
+    viewer4.clientSend({ t: 'watch', deviceId, ticket });
+    expect(viewer4.closedWith).toBe(4401);
   });
 
   it('kickDevice force-disconnects a live phone', () => {
@@ -394,6 +423,65 @@ describe('phone REST routes', () => {
   it('lists sessions (empty at first)', async () => {
     const r = (await (await get('/api/phone/sessions')).json()) as { sessions: unknown[] };
     expect(r.sessions).toEqual([]);
+  });
+});
+
+describe('phone watch-ticket route', () => {
+  let base = '';
+  let server: { close(cb?: () => void): void } | null = null;
+
+  /** Build the phone router with/without the loopback-auth flag set (index.ts sets it via requireLoopbackAuth). */
+  async function boot(authed: boolean) {
+    const store = makeStore();
+    const adb = new AdbPhoneProvider(
+      async () => ({ stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), code: 1 }),
+      () => false, // adb absent
+    );
+    const hub = new PhoneSessionHub(store, () => {});
+    const app = express();
+    app.use(express.json());
+    if (authed) {
+      app.use((req, _res, next) => {
+        req.loopbackAuthed = true;
+        next();
+      });
+    }
+    const router = express.Router();
+    registerPhoneRoutes(router, { store, hub, adb, audit: () => {} });
+    app.use('/api/phone', router);
+    await new Promise<void>((resolve) => {
+      server = app.listen(0, '127.0.0.1', () => resolve());
+    });
+    const addr = (server as unknown as { address(): AddressInfo }).address();
+    base = `http://127.0.0.1:${addr.port}`;
+  }
+
+  afterEach(() => {
+    server?.close();
+    server = null;
+  });
+
+  it('401s without the loopback-auth flag (defense in depth behind the global middleware)', async () => {
+    await boot(false);
+    const r = await fetch(`${base}/api/phone/watch-ticket`, { method: 'POST' });
+    expect(r.status).toBe(401);
+    expect(await r.json()).toEqual({ ok: false, error: 'unauthorized' });
+  });
+
+  it('issues a unique single-use ticket for authed callers', async () => {
+    await boot(true);
+    const r1 = await fetch(`${base}/api/phone/watch-ticket`, { method: 'POST' });
+    expect(r1.status).toBe(200);
+    const b1 = (await r1.json()) as { ok: boolean; ticket: string };
+    expect(b1.ok).toBe(true);
+    expect(typeof b1.ticket).toBe('string');
+    expect(b1.ticket.length).toBeGreaterThan(0);
+    const r2 = await fetch(`${base}/api/phone/watch-ticket`, { method: 'POST' });
+    const b2 = (await r2.json()) as { ticket: string };
+    expect(b2.ticket).not.toBe(b1.ticket);
+    // The issued ticket is accepted exactly once by the hub.
+    expect(consumeWsTicket(b1.ticket)).toBe(true);
+    expect(consumeWsTicket(b1.ticket)).toBe(false);
   });
 });
 

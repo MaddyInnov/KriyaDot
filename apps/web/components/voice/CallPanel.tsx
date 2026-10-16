@@ -45,6 +45,43 @@ function fmtDuration(ms: number): string {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
+/**
+ * Resolve with the recorded utterance blob once the recorder stops.
+ *
+ * Reads the shared chunk array at onstop-time (MediaRecorder fires the
+ * final ondataavailable AFTER stop() is called) and resets it afterwards.
+ * Resetting chunksRef BEFORE stop() drops that final data event — with
+ * start() and no timeslice, ALL audio arrives in it, yielding an empty blob.
+ * Exported for unit tests.
+ */
+export function finalizeRecording(
+  recorder: {
+    stop(): void;
+    readonly mimeType: string;
+    onstop: ((ev: Event) => unknown) | null;
+    onerror: ((ev: ErrorEvent) => unknown) | null;
+  },
+  chunksRef: { current: Blob[] },
+): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    recorder.onstop = () => {
+      const chunks = chunksRef.current;
+      chunksRef.current = [];
+      resolve(new Blob(chunks, { type: recorder.mimeType || 'audio/webm' }));
+    };
+    recorder.onerror = () => {
+      chunksRef.current = [];
+      reject(new Error('recording failed'));
+    };
+    try {
+      recorder.stop();
+    } catch (err) {
+      chunksRef.current = [];
+      reject(err instanceof Error ? err : new Error(String(err)));
+    }
+  });
+}
+
 function fmtTime(ts: number): string {
   try {
     return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -91,6 +128,7 @@ export default function CallPanel({ botId, botName, language, captureDeps, clien
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
   const vadRef = useRef<VadDetector | null>(null);
   const vadTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const audioQueueRef = useRef<Array<{ data: string; mimeType: string }>>([]);
@@ -136,9 +174,15 @@ export default function CallPanel({ botId, botName, language, captureDeps, clien
     } catch {
       // ignore
     }
+    try {
+      await audioCtxRef.current?.close();
+    } catch {
+      // ignore
+    }
     recorderRef.current = null;
     streamRef.current = null;
     analyserRef.current = null;
+    audioCtxRef.current = null;
     vadRef.current = null;
     audioQueueRef.current = [];
     playingRef.current = false;
@@ -211,37 +255,30 @@ export default function CallPanel({ botId, botName, language, captureDeps, clien
           break;
         case 'error':
           setError(e.detail);
+          void teardown();
           break;
         case 'ended':
           setPhase('idle');
           setMic('quiet');
+          void teardown();
           break;
       }
     },
-    [pumpAudioQueue],
+    [pumpAudioQueue, teardown],
   );
 
   /** Stop the current recorder and send the utterance to the server. */
   const stopAndSend = useCallback(async () => {
     const recorder = recorderRef.current;
-    const chunks = chunksRef.current;
     recorderRef.current = null;
-    chunksRef.current = [];
     if (!recorder) {
       setMic('quiet');
       return;
     }
     setMic('thinking');
     try {
-      const blob: Blob = await new Promise((resolve, reject) => {
-        recorder.onstop = () => resolve(new Blob(chunks, { type: recorder.mimeType || 'audio/webm' }));
-        recorder.onerror = () => reject(new Error('recording failed'));
-        try {
-          recorder.stop();
-        } catch (err) {
-          reject(err instanceof Error ? err : new Error(String(err)));
-        }
-      });
+      // finalizeRecording reads the chunk array at onstop-time; see its doc.
+      const blob: Blob = await finalizeRecording(recorder, chunksRef);
       const bytes = new Uint8Array(await blob.arrayBuffer());
       if (bytes.length === 0) {
         setMic('quiet');
@@ -319,6 +356,7 @@ export default function CallPanel({ botId, botName, language, captureDeps, clien
         const AC = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
         if (AC) {
           const ctx = new AC();
+          audioCtxRef.current = ctx;
           const src = ctx.createMediaStreamSource(stream);
           const analyser = ctx.createAnalyser();
           analyser.fftSize = 2048;

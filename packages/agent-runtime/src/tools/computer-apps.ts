@@ -215,6 +215,7 @@ export function createOpenAppTool(opts: OpenAppToolOptions = {}): ToolDefinition
 
   return {
     name: OPEN_APP_TOOL_NAME,
+    mutating: true,
     description:
       'Launch a desktop application by name (e.g. "whatsapp", "notepad", "chrome"). ' +
       'Use when the user asks to open an app. MUTATING: requires human approval via governance.',

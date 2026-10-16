@@ -20,11 +20,7 @@ import type {
   TTSResult,
   TTSSynthesizeOptions,
 } from '@mvp/voice';
-import { getApiBase } from './api';
-
-function api(path: string): string {
-  return `${getApiBase()}${path}`;
-}
+import { authedFetch } from './api';
 
 /** Uint8Array → base64 (chunked to avoid call-stack blowups on large audio). */
 export function bytesToBase64(bytes: Uint8Array): string {
@@ -45,7 +41,7 @@ export function base64ToBytes(b64: string): Uint8Array {
 }
 
 async function postJson<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(api(path), {
+  const res = await authedFetch(path, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),

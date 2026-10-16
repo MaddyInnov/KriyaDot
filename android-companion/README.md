@@ -81,10 +81,12 @@ Because the server workstream is being built in parallel, all JSON parsing is
 **lenient** (`opt*` accessors with fallbacks): unknown or missing fields degrade
 gracefully instead of crashing. Tighten the models once the server contract is frozen.
 
-**Chat TODO:** the bot id sent to `POST /chat` is currently the placeholder
-`KriyaDotApi.DEFAULT_BOT_ID = "default"` (marked `TODO(chat)` in code). No
-default bot id was discoverable in the web app sources; wire it to a bot
-picker (`GET /api/bots`) or a settings field once the server exposes one.
+**Chat:** the chat screen loads the bot roster from `GET /api/companion/bots`
+(same shape as the web UI's `GET /api/bots`) into a bot picker above the
+conversation. The selection is persisted in `PairingStore` (`selected_bot_id`),
+defaults to the first bot, and is sent as `botId` in the `POST /chat` body. An
+empty roster shows "No bots available" and blocks sending — the placeholder
+`botId: "default"` is gone.
 
 ## Security notes (MVP)
 

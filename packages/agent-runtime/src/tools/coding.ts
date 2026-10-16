@@ -183,6 +183,7 @@ interface PatchFileResult {
 function patchTool(workspaceDir: WorkspaceSource): ToolDefinition {
   return {
     name: 'patch',
+    mutating: true,
     description:
       'Apply a unified diff to files inside the workspace. Context lines are verified ' +
       'before applying; the whole file fails if any hunk mismatches. Set dryRun=true ' +
@@ -262,6 +263,7 @@ function patchTool(workspaceDir: WorkspaceSource): ToolDefinition {
 function editTool(workspaceDir: WorkspaceSource): ToolDefinition {
   return {
     name: 'edit',
+    mutating: true,
     description:
       'Surgically replace text in a workspace file. Fails if oldText is not found, ' +
       'or if the number of occurrences does not match expectedCount (when given).',

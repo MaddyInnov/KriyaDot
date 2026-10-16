@@ -12,7 +12,7 @@
 
 'use client';
 
-import { getApiBase } from './api';
+import { ensureApiReady, getApiBase } from './api';
 
 export const SPACE_STORAGE_KEY = 'kriyadot:space';
 export const SPACE_HEADER = 'X-KriyaDot-Space';
@@ -63,9 +63,12 @@ function withSpaceHeader(init?: RequestInit): RequestInit {
   return { ...init, headers };
 }
 
-/** fetch that always carries the active-space header (when a space is set). */
+/** fetch that always carries the auth token + the active-space header (when a space is set). */
 export async function kriyadotFetch(path: string, init?: RequestInit): Promise<Response> {
-  return fetch(`${getApiBase()}${path}`, withSpaceHeader(init));
+  const token = await ensureApiReady();
+  const headers = new Headers(withSpaceHeader(init).headers);
+  headers.set('Authorization', `Bearer ${token}`);
+  return fetch(`${getApiBase()}${path}`, { ...withSpaceHeader(init), headers });
 }
 
 async function kriyadotJson<T>(path: string, init?: RequestInit): Promise<T> {

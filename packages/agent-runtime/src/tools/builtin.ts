@@ -70,6 +70,7 @@ function readFileTool(workspaceDir: WorkspaceSource): ToolDefinition {
 function writeFileTool(workspaceDir: WorkspaceSource): ToolDefinition {
   return {
     name: 'write_file',
+    mutating: true,
     description: 'Write (or overwrite) a UTF-8 text file inside the workspace. Parent directories are created.',
     parameters: {
       type: 'object',
@@ -92,6 +93,7 @@ function writeFileTool(workspaceDir: WorkspaceSource): ToolDefinition {
 function runCommandTool(workspaceDir: WorkspaceSource): ToolDefinition {
   return {
     name: 'run_command',
+    mutating: true,
     description:
       'Run a shell command (sh -c). Destructive patterns are refused. ' +
       'Executes inside an E2B cloud sandbox when E2B_API_KEY is set, else a local Docker container ' +

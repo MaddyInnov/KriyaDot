@@ -4,6 +4,8 @@
 // multi-step work. Create a team, run a task, watch each step land live.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { authedFetch } from '../../lib/api';
+import { normalizeBots } from '../../lib/teams';
 
 interface Bot {
   id: string;
@@ -39,7 +41,7 @@ interface TeamRun {
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } });
+  const res = await authedFetch(path, { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new Error(`${res.status}: ${text || res.statusText}`);
@@ -58,20 +60,21 @@ export default function TeamsPage() {
   const [runs, setRuns] = useState<TeamRun[]>([]);
   const [liveRun, setLiveRun] = useState<TeamRun | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const esRef = useRef<EventSource | null>(null);
+  const esRef = useRef<AbortController | null>(null);
 
   const active = teams.find((t) => t.id === activeId) ?? null;
   const botName = (id: string) => bots.find((b) => b.id === id)?.name ?? id;
 
   const load = useCallback(async () => {
     try {
-      const [b, t] = await Promise.all([
-        api<{ ok: boolean; bots: Bot[] }>('/api/bots'),
+      const [bRaw, t] = await Promise.all([
+        api<Bot[] | { bots: Bot[] }>('/api/bots'),
         api<{ ok: boolean; teams: Team[] }>('/api/teams'),
       ]);
-      setBots(b.bots);
+      const b = normalizeBots(bRaw);
+      setBots(b);
       setTeams(t.teams);
-      setCoordinator((c) => c || b.bots[0]?.id || '');
+      setCoordinator((c) => c || b[0]?.id || '');
       setActiveId((prev) => (prev && t.teams.some((x) => x.id === prev) ? prev : t.teams[0]?.id ?? null));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -97,7 +100,7 @@ export default function TeamsPage() {
   useEffect(() => {
     if (activeId) loadRuns(activeId);
     return () => {
-      esRef.current?.close();
+      esRef.current?.abort();
       esRef.current = null;
     };
   }, [activeId, loadRuns]);
@@ -137,7 +140,7 @@ export default function TeamsPage() {
     if (!active || !task.trim()) return;
     setError(null);
     setLiveRun(null);
-    esRef.current?.close();
+    esRef.current?.abort();
     try {
       const res = await api<{ ok: boolean; run: TeamRun }>(`/api/teams/${active.id}/run`, {
         method: 'POST',
@@ -146,40 +149,66 @@ export default function TeamsPage() {
       const run = res.run;
       setLiveRun(run);
       setTask('');
-      const es = new EventSource(`/api/teams/${active.id}/runs/${run.id}/stream`);
-      esRef.current = es;
-      es.onmessage = (ev) => {
-        try {
-          const evt = JSON.parse(ev.data) as
-            | { kind: 'step_start'; index: number; step: TeamStep }
-            | { kind: 'step_done'; index: number; step: TeamStep }
-            | { kind: 'done'; result: string }
-            | { kind: 'failed'; error: string };
-          setLiveRun((prev) => {
-            if (!prev) return prev;
-            if (evt.kind === 'step_start') {
-              return { ...prev, steps: [...prev.steps, evt.step] };
-            }
-            if (evt.kind === 'step_done') {
-              const steps = prev.steps.map((s, i) => (i === evt.index ? evt.step : s));
-              return { ...prev, steps };
-            }
-            if (evt.kind === 'done') {
-              es.close();
-              loadRuns(active.id);
-              return { ...prev, status: 'done', result: evt.result };
-            }
-            es.close();
+      // Fetch-based SSE: EventSource cannot send the Authorization header,
+      // so the stream is read with authedFetch + a manual reader loop.
+      const controller = new AbortController();
+      esRef.current = controller;
+      const handleTeamEvent = (
+        evt:
+          | { kind: 'step_start'; index: number; step: TeamStep }
+          | { kind: 'step_done'; index: number; step: TeamStep }
+          | { kind: 'done'; result: string }
+          | { kind: 'failed'; error: string },
+      ) => {
+        setLiveRun((prev) => {
+          if (!prev) return prev;
+          if (evt.kind === 'step_start') {
+            return { ...prev, steps: [...prev.steps, evt.step] };
+          }
+          if (evt.kind === 'step_done') {
+            const steps = prev.steps.map((s, i) => (i === evt.index ? evt.step : s));
+            return { ...prev, steps };
+          }
+          if (evt.kind === 'done') {
+            controller.abort();
             loadRuns(active.id);
-            return { ...prev, status: 'failed', error: evt.error };
-          });
-        } catch {
-          // ignore malformed frames
+            return { ...prev, status: 'done', result: evt.result };
+          }
+          controller.abort();
+          loadRuns(active.id);
+          return { ...prev, status: 'failed', error: evt.error };
+        });
+      };
+      try {
+        const streamRes = await authedFetch(`/api/teams/${active.id}/runs/${run.id}/stream`, {
+          signal: controller.signal,
+        });
+        if (!streamRes.ok || !streamRes.body) throw new Error(`Run stream failed (${streamRes.status})`);
+        const reader = streamRes.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const chunks = buf.split('\n\n');
+          buf = chunks.pop() ?? '';
+          for (const chunk of chunks) {
+            for (const line of chunk.split('\n')) {
+              if (line.startsWith('data:')) {
+                try {
+                  handleTeamEvent(JSON.parse(line.slice(5).trim()));
+                } catch {
+                  // ignore malformed frames
+                }
+              }
+            }
+          }
         }
-      };
-      es.onerror = () => {
-        // stream ends on done/failed; abnormal drops just stop updates
-      };
+      } catch (e) {
+        // Stream ends on done/failed; abnormal drops just stop updates.
+        if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e));
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }

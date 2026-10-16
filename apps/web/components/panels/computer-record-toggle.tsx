@@ -18,7 +18,7 @@
 // Workflows destination.
 
 import { useCallback, useState } from 'react';
-import { getApiBase } from '../../lib/api';
+import { authedFetch } from '../../lib/api';
 
 interface RecordingPayload {
   id: string;
@@ -28,7 +28,7 @@ interface RecordingPayload {
 }
 
 const api = (path: string, init?: RequestInit): Promise<any> =>
-  fetch(`${getApiBase()}${path}`, {
+  authedFetch(path, {
     ...init,
     headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
   }).then(async (res) => {

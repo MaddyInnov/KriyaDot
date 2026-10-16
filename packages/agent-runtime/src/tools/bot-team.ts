@@ -150,6 +150,7 @@ export function createBotTeamTools(opts: CreateBotTeamToolsOptions): ToolDefinit
 
   const askBotTool: ToolDefinition = {
     name: BOT_TEAM_TOOL_NAMES.askBot,
+    mutating: true,
     description: [
       'Ask another bot a question and wait for its reply (synchronous).',
       'The recipient runs in its own session with its own folder, tools,',
@@ -239,6 +240,7 @@ export function createBotTeamTools(opts: CreateBotTeamToolsOptions): ToolDefinit
 
   const messageBotTool: ToolDefinition = {
     name: BOT_TEAM_TOOL_NAMES.messageBot,
+    mutating: true,
     description: [
       'Send another bot a message without waiting (fire-and-forget).',
       'The recipient processes it in its own session and reports in its own',

@@ -62,6 +62,7 @@ export function createDelegateTools(opts: CreateDelegateToolsOptions): ToolDefin
 
   const delegateTool: ToolDefinition = {
     name: 'delegate',
+    mutating: true,
     description: [
       'Spawn a subagent to handle a subtask independently, then return its result.',
       'Use it to parallelize research, run a bounded investigation, or isolate a',

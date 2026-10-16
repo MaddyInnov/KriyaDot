@@ -6,7 +6,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
-import { getApiBase } from '../../lib/api';
+import { authedFetch } from '../../lib/api';
 
 // Mount point the integrator uses for registerMuseModuleRoutes().
 const MODULES_BASE = '/api/modules';
@@ -119,7 +119,7 @@ const MODULES: ModuleDef[] = [
 ];
 
 const api = (path: string): Promise<unknown> =>
-  fetch(`${getApiBase()}${path}`).then(async (res) => {
+  authedFetch(path).then(async (res) => {
     if (!res.ok) {
       const detail = await res.text().catch(() => res.statusText);
       throw new Error(`API ${res.status}: ${detail || res.statusText}`);

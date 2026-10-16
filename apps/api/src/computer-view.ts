@@ -43,6 +43,7 @@
 //   const computerView = createComputerView({
 //     audit: (action, fields) => governance.audit(action, fields),
 //     listAudit: (limit) => governance.listAudit(limit),
+//     loopbackToken, // per-boot token from loopback-auth.ts (browser WS ?token=)
 //   });
 //   app.use('/api/computer', computerView.router);
 //   // ... in the existing server 'upgrade' handler, add:
@@ -79,6 +80,7 @@ import express, { type Request, type Response, type Router } from 'express';
 import { createHash } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
+import { validateWsQueryToken } from './loopback-auth.js';
 import { isRealOSLayerActive, selectOSLayer } from '@mvp/agent-runtime/dist/tools/computer-real.js';
 import {
   COMPUTER_KEY_ALLOWLIST,
@@ -149,6 +151,13 @@ export interface ComputerViewDeps {
   fps?: number;
   /** Driving-indicator window in ms. Default 10_000. */
   drivingWindowMs?: number;
+  /**
+   * Per-boot loopback bearer token (index.ts). Browsers can't set
+   * Authorization headers on WS handshakes, so the web UI appends it as
+   * `?token=` on the computer-view WS URL (a single-use `?ticket=` from
+   * issueWsTicket is also accepted).
+   */
+  loopbackToken: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +168,9 @@ export interface ComputerViewDeps {
 // Binary frames from the client are rejected.
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+
+/** Max accumulated inbound bytes (frame buffer + pending fragments) per socket. */
+export const MAX_WS_BUFFER_BYTES = 16 * 1024 * 1024;
 
 export interface ViewerSocket {
   sendText(text: string): void;
@@ -173,6 +185,7 @@ class MiniWsSocket implements ViewerSocket {
   private closed = false;
   private buf = Buffer.alloc(0);
   private frag: Buffer[] = [];
+  private fragBytes = 0;
 
   constructor(private readonly socket: Duplex) {
     socket.on('data', (d: Buffer) => this.onData(d));
@@ -246,8 +259,35 @@ class MiniWsSocket implements ViewerSocket {
     }
   }
 
+  /**
+   * Destroy the underlying socket immediately without writing a close frame.
+   * Used for abusive peers (e.g. unbounded inbound buffering) where we don't
+   * want to spend any more effort on the connection.
+   */
+  private hardDestroy(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.buf = Buffer.alloc(0);
+    this.frag = [];
+    this.fragBytes = 0;
+    try {
+      this.socket.destroy();
+    } catch {
+      // ignore
+    }
+    this.emitClose();
+  }
+
   private onData(d: Buffer): void {
+    if (this.closed) return;
     this.buf = Buffer.concat([this.buf, d]);
+    // H3: cap the accumulated inbound bytes. A peer that never finishes a
+    // frame (or declares a huge frame and trickles payload) would otherwise
+    // grow this buffer without bound.
+    if (this.buf.length + this.fragBytes > MAX_WS_BUFFER_BYTES) {
+      this.hardDestroy();
+      return;
+    }
     while (this.buf.length >= 2) {
       const b0 = this.buf[0]!;
       const b1 = this.buf[1]!;
@@ -295,9 +335,11 @@ class MiniWsSocket implements ViewerSocket {
       if (opcode === 0x0) {
         // continuation
         this.frag.push(payload);
+        this.fragBytes += payload.length;
         if (fin) {
           const text = Buffer.concat(this.frag).toString('utf8');
           this.frag = [];
+          this.fragBytes = 0;
           this.msgCb?.(text);
         }
         continue;
@@ -305,6 +347,7 @@ class MiniWsSocket implements ViewerSocket {
       if (opcode === 0x1) {
         if (!fin) {
           this.frag = [payload];
+          this.fragBytes = payload.length;
           continue;
         }
         this.msgCb?.(payload.toString('utf8'));
@@ -378,7 +421,7 @@ function validBotId(botId: unknown): botId is string {
 // ---------------------------------------------------------------------------
 
 export class ComputerViewHub {
-  private readonly deps: Required<Pick<ComputerViewDeps, 'audit' | 'listAudit'>> &
+  private readonly deps: Required<Pick<ComputerViewDeps, 'audit' | 'listAudit' | 'loopbackToken'>> &
     Pick<ComputerViewDeps, 'createLayer'> & { fps: number; drivingWindowMs: number };
   private readonly states = new Map<string, BotViewState>();
 
@@ -389,6 +432,7 @@ export class ComputerViewHub {
       createLayer: deps.createLayer,
       fps: deps.fps ?? envFps(),
       drivingWindowMs: deps.drivingWindowMs ?? DEFAULT_DRIVING_WINDOW_MS,
+      loopbackToken: deps.loopbackToken,
     };
   }
 
@@ -571,9 +615,24 @@ export class ComputerViewHub {
 
   /** HTTP upgrade entry point — wired into the server's 'upgrade' event by the integrator. */
   handleUpgrade(req: IncomingMessage, socket: Duplex, _head: Buffer): void {
+    // NOTE: req.url carries the credential (?token= / ?ticket=) — never log it.
+    const url = new URL(req.url ?? COMPUTER_VIEW_WS_PATH, 'http://localhost');
+    if (!validateWsQueryToken(url.searchParams, this.deps.loopbackToken)) {
+      // Reject like the voice-call upgrade: complete the handshake so we can
+      // send a machine-readable error, then close with 4401.
+      const sock = acceptRawWsSocket(req, socket);
+      if (sock) {
+        try {
+          sock.sendText(JSON.stringify({ t: 'error', detail: 'unauthorized' }));
+          sock.close(4401);
+        } catch {
+          // ignore
+        }
+      }
+      return;
+    }
     const sock = acceptRawWsSocket(req, socket);
     if (!sock) return;
-    const url = new URL(req.url ?? COMPUTER_VIEW_WS_PATH, 'http://localhost');
     const queryBotId = url.searchParams.get('botId');
     this.acceptSocket(sock, queryBotId);
   }

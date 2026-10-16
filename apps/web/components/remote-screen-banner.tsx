@@ -2,6 +2,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { kriyadotFetch } from '../lib/kriyadot-api';
 
 interface ActiveSession {
   sessionId: string;
@@ -27,7 +28,7 @@ export default function RemoteScreenBanner() {
     let cancelled = false;
     const poll = async () => {
       try {
-        const res = await fetch('/api/remote-screen/status', { cache: 'no-store' });
+        const res = await kriyadotFetch('/api/remote-screen/status', { cache: 'no-store' });
         if (!res.ok) return;
         const json = (await res.json()) as { active?: ActiveSession[] };
         if (!cancelled) setActive(Array.isArray(json.active) ? json.active : []);
@@ -48,7 +49,7 @@ export default function RemoteScreenBanner() {
   const stop = async (sessionId: string) => {
     setStopping(sessionId);
     try {
-      await fetch('/api/remote-screen/stop-local', {
+      await kriyadotFetch('/api/remote-screen/stop-local', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionId }),

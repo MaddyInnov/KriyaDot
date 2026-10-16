@@ -227,6 +227,7 @@ export function createWorktreeTools(opts: CreateWorktreeToolsOptions): ToolDefin
 
   const createTool: ToolDefinition = {
     name: 'worktree_create',
+    mutating: true,
     description:
       'Create a git worktree (isolated checkout) for a coding session. Returns the ' +
       'absolute path of the new worktree. The worktree is created under the ' +
@@ -274,6 +275,7 @@ export function createWorktreeTools(opts: CreateWorktreeToolsOptions): ToolDefin
 
   const removeTool: ToolDefinition = {
     name: 'worktree_remove',
+    mutating: true,
     description:
       'Remove a git worktree created under the worktree root. Refuses dirty ' +
       'worktrees unless force=true. Refuses paths outside the worktree root ' +

@@ -8,7 +8,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
-import { getApiBase } from '../../lib/api';
+import { authedFetch } from '../../lib/api';
 
 interface MarketplaceEntry {
   id: string;
@@ -32,7 +32,7 @@ interface CreatorSummary {
 }
 
 const api = (path: string, init?: RequestInit): Promise<unknown> =>
-  fetch(`${getApiBase()}${path}`, init).then(async (res) => {
+  authedFetch(path, init).then(async (res) => {
     if (!res.ok) {
       const detail = await res.text().catch(() => res.statusText);
       throw new Error(`API ${res.status}: ${detail || res.statusText}`);

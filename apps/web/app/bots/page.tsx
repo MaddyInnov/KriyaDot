@@ -11,6 +11,7 @@ import VoiceSettingsPanel from '../../components/panels/voice-settings-panel';
 import { ApprovalModeSelector } from '../../components/panels/approval-mode-selector';
 import { MemoryPanel } from '../../components/panels/memory-panel';
 import { RoutinesPanel } from '../../components/panels/routines-panel';
+import TeamsPanel from '../../components/panels/teams-panel';
 
 const EFFECTS: BotPolicyEffect[] = ['allow', 'deny', 'require-approval'];
 
@@ -711,6 +712,7 @@ function BotsPageInner() {
   const [selectedBotId, setSelectedBotId] = useState('');
   const [error, setError] = useState('');
   const [tab, setTab] = useState<'policy' | 'model' | 'robustness' | 'computer' | 'memory' | 'routines'>('policy');
+  const [pageTab, setPageTab] = useState<'bots' | 'teams'>('bots');
   const [mode] = useUxMode();
   const [rosterBusy, setRosterBusy] = useState(false);
   const [rosterError, setRosterError] = useState('');
@@ -825,6 +827,29 @@ function BotsPageInner() {
         </a>
       </p>
       {error && <div className="error-box">{error}</div>}
+      <div className="tabs" role="tablist" aria-label="Bots sections" style={{ marginBottom: 12 }}>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={pageTab === 'bots'}
+          className={`tab${pageTab === 'bots' ? ' active' : ''}`}
+          onClick={() => setPageTab('bots')}
+        >
+          🤖 Bots
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={pageTab === 'teams'}
+          className={`tab${pageTab === 'teams' ? ' active' : ''}`}
+          onClick={() => setPageTab('teams')}
+        >
+          👑 Chief of Staff
+        </button>
+      </div>
+      {pageTab === 'teams' ? (
+        <TeamsPanel bots={bots} onRosterChanged={refresh} />
+      ) : (
       <div className="chat-layout">
         <aside className="bot-roster">
           <h3>{t('bots.roster')}</h3>
@@ -959,6 +984,7 @@ function BotsPageInner() {
           )}
         </div>
       </div>
+      )}
     </div>
   );
 }

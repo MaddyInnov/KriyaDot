@@ -2,7 +2,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { getApiBase } from '../../lib/api';
+import { authedFetch } from '../../lib/api';
 import { GraphView, type GraphNode, type GraphEdge } from '../../components/knowledge/graph-view';
 import { QuickSwitcher } from '../../components/knowledge/quick-switcher';
 import { EntityTrace } from '../../components/knowledge/entity-trace';
@@ -16,7 +16,7 @@ interface Note {
 }
 
 const api = (path: string, init?: RequestInit): Promise<any> =>
-  fetch(`${getApiBase()}${path}`, init).then(async (res) => {
+  authedFetch(path, init).then(async (res) => {
     if (!res.ok) {
       const detail = await res.text().catch(() => res.statusText);
       throw new Error(`API ${res.status}: ${detail || res.statusText}`);

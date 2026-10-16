@@ -74,6 +74,14 @@ export interface ToolDefinition {
   description: string;
   parameters: Record<string, unknown>; // JSON Schema
   handler: (args: Record<string, unknown>, ctx: ToolContext) => Promise<unknown>;
+  /**
+   * True when the tool writes files, executes shell/commands, commits or
+   * pushes, sends messages externally, spawns subagents/delegates, or
+   * otherwise changes state outside the process. Authoritative for the
+   * plan-mode gate and the sandbox read-only enforcement in runtime.ts.
+   * Read-only tools (read_file, glob, web_search, ...) leave this unset.
+   */
+  mutating?: boolean;
 }
 
 /**
@@ -217,6 +225,20 @@ export interface BotConfig {
    *   opt-in only; the catastrophic-command denylist still applies.
    */
   approvalMode?: ApprovalMode;
+  /**
+   * Chief of Staff (chief-of-staff.ts): when true, the bot gets the chief
+   * section (roster + delegation doctrine + incidents/escalations +
+   * team-setup rules) injected into its system prompt on every turn, and
+   * may use the chief-only tools (coordinate_bots, propose_team_setup,
+   * create_bot, propose_bot_deletion, raise_escalation, retry_thread).
+   * The host enforces at most one chief per team.
+   */
+  chiefOfStaff?: boolean;
+  /**
+   * Sections the chief is the primary contact for (e.g. ['support']).
+   * Rendered in the chief prompt header; empty/absent = 'general'.
+   */
+  managedSections?: string[];
 }
 
 export interface LLMProvider {

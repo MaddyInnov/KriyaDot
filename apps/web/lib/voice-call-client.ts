@@ -6,7 +6,7 @@
 // MediaRecorder here, so it unit-tests with a fake socket. The CallPanel
 // component owns mic capture + audio playback and calls into this.
 
-import { getApiBase } from './api';
+import { authedFetch, ensureApiReady, getApiBase } from './api';
 
 export interface VoiceCallProviderInfo {
   id: 'mock' | 'groq' | 'openai';
@@ -54,7 +54,7 @@ function wsBase(): string {
 }
 
 async function postJson<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${getApiBase()}${path}`, {
+  const res = await authedFetch(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -72,7 +72,7 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
 }
 
 export async function getVoiceCallProviders(): Promise<VoiceCallProviderInfo[]> {
-  const res = await fetch(`${getApiBase()}/api/voice/call-providers`);
+  const res = await authedFetch('/api/voice/call-providers');
   if (!res.ok) throw new Error(`voice call providers: HTTP ${res.status}`);
   const body = (await res.json()) as { providers: VoiceCallProviderInfo[] };
   return body.providers;
@@ -134,7 +134,11 @@ export class VoiceCallClient {
       tts: string;
     }>('/api/voice/calls', { botId, ...opts });
     this.callId = session.callId;
-    await this.connect(`${wsBase()}${session.wsPath}`, session);
+    // Browsers cannot send headers on a WebSocket upgrade, so the bootstrap
+    // token rides as a `token` query param (the server must accept it there).
+    const token = await ensureApiReady();
+    const sep = session.wsPath.includes('?') ? '&' : '?';
+    await this.connect(`${wsBase()}${session.wsPath}${sep}token=${encodeURIComponent(token)}`, session);
   }
 
   private connect(url: string, session: { stt: string; tts: string }): Promise<void> {

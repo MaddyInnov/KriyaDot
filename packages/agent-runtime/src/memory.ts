@@ -123,6 +123,7 @@ export function createMemoryTools(opts: CreateMemoryToolsOptions): ToolDefinitio
 
   const storeTool: ToolDefinition = {
     name: 'memory_store',
+    mutating: true,
     description:
       'Save a durable fact to your persistent memory (survives sessions). ' +
       'Use for user preferences, project decisions, and anything you will ' +

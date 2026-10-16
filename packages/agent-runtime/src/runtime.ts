@@ -754,8 +754,11 @@ export class AgentRuntime {
           // Plan mode: block all mutating tools (write/execute/network).
           // The model can read, search, and explore freely, but any attempt
           // to change state is denied with an explanation.
+          // Authoritative signal is the tool's `mutating` flag (set on every
+          // ToolDefinition); third-party `mcp:` tools are fail-closed since
+          // their effects are unknown.
           if (opts.planMode && decision !== 'deny') {
-            const mutating = /^(write_file|edit_file|create_file|delete_file|remove_file|run_command|exec|shell|http|mcp:)/.test(call.name);
+            const mutating = def.mutating === true || call.name.startsWith('mcp:');
             if (mutating) {
               decision = 'deny';
               reason = 'Plan mode: read-only exploration. Turn off plan mode to make changes.';
@@ -769,7 +772,7 @@ export class AgentRuntime {
           const sandboxMode = opts.sandboxMode ?? opts.bot.sandboxMode ?? 'workspace-write';
           if (decision !== 'deny') {
             if (sandboxMode === 'read-only') {
-              const mutating = /^(write_file|edit_file|create_file|delete_file|remove_file|run_command|exec|shell|patch|http|mcp:)/.test(call.name);
+              const mutating = def.mutating === true || call.name.startsWith('mcp:');
               if (mutating) {
                 decision = 'deny';
                 reason = 'Sandbox mode is read-only: this bot cannot modify files or execute commands.';
@@ -1250,8 +1253,10 @@ export class AgentRuntime {
       }
     }
     // Checkpoint hook: snapshot the file BEFORE a mutating tool runs, so
-    // the user can rewind (Claude Code Esc+Esc style).
-    if (this.onBeforeFileMutate && /^(write_file|edit_file|create_file|delete_file|remove_file)$/.test(def.name)) {
+    // the user can rewind (Claude Code Esc+Esc style). Uses the
+    // authoritative `mutating` flag; the filePath null-guard below keeps it
+    // scoped to file-taking tools.
+    if (this.onBeforeFileMutate && def.mutating === true) {
       if (filePath) {
         // write_file already read it above; other tools read here.
         if (def.name !== 'write_file') {

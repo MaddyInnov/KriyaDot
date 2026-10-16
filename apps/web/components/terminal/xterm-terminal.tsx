@@ -2,10 +2,12 @@
 
 // xterm.js terminal bound to a backend Terminal AI+ session.
 // - keystrokes → POST /api/terminal/sessions/:id/input
-// - output    ← EventSource /api/terminal/sessions/:id/stream
+// - output    ← fetch-based SSE /api/terminal/sessions/:id/stream
+//   (EventSource cannot send the Authorization header)
 // Dynamically imported (no SSR) by the terminal page.
 
 import { useEffect, useRef } from 'react';
+import { authedFetch } from '../../lib/api';
 import 'xterm/css/xterm.css';
 
 interface Props {
@@ -21,7 +23,7 @@ export default function XTermTerminal({ sessionId }: Props) {
   useEffect(() => {
     let disposed = false;
     let term: { dispose: () => void } | null = null;
-    let es: EventSource | null = null;
+    let controller: AbortController | null = null;
     let fit: { fit: () => void } | null = null;
 
     (async () => {
@@ -60,7 +62,7 @@ export default function XTermTerminal({ sessionId }: Props) {
 
       // Keystrokes → backend.
       t.onData((data: string) => {
-        fetch(`/api/terminal/sessions/${sessionRef.current}/input`, {
+        authedFetch(`/api/terminal/sessions/${sessionRef.current}/input`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ data }),
@@ -69,27 +71,46 @@ export default function XTermTerminal({ sessionId }: Props) {
         });
       });
 
-      // Backend output → terminal.
-      const source = new EventSource(`/api/terminal/sessions/${sessionRef.current}/stream`);
-      es = source;
-      source.onmessage = (ev: MessageEvent) => {
-        try {
-          const { chunk } = JSON.parse(ev.data) as { chunk: string };
-          t.write(chunk);
-        } catch {
-          // ignore malformed frames
+      // Backend output → terminal. Fetch-based SSE: EventSource cannot send
+      // the Authorization header, so the stream is read with a manual loop.
+      const ac = new AbortController();
+      controller = ac;
+      try {
+        const streamRes = await authedFetch(`/api/terminal/sessions/${sessionRef.current}/stream`, {
+          signal: ac.signal,
+        });
+        if (!streamRes.ok || !streamRes.body) throw new Error(`terminal stream failed (${streamRes.status})`);
+        const reader = streamRes.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const frames = buf.split('\n\n');
+          buf = frames.pop() ?? '';
+          for (const frame of frames) {
+            for (const line of frame.split('\n')) {
+              if (!line.startsWith('data:')) continue;
+              try {
+                const { chunk } = JSON.parse(line.slice(5).trim()) as { chunk: string };
+                if (!disposed) t.write(chunk);
+              } catch {
+                // ignore malformed frames
+              }
+            }
+          }
         }
-      };
-      source.onerror = () => {
+      } catch {
         // Keep the terminal open; the session-close message arrives as data.
-      };
+      }
 
       const onResize = () => {
         try {
           fitAddon.fit();
           const dims = fitAddon.proposeDimensions();
           if (dims) {
-            fetch(`/api/terminal/sessions/${sessionRef.current}/resize`, {
+            authedFetch(`/api/terminal/sessions/${sessionRef.current}/resize`, {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
               body: JSON.stringify({ cols: dims.cols, rows: dims.rows }),
@@ -111,7 +132,7 @@ export default function XTermTerminal({ sessionId }: Props) {
         // ignore
       }
       try {
-        es?.close();
+        controller?.abort();
       } catch {
         // ignore
       }

@@ -12,12 +12,12 @@
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import { getApiBase } from '../../lib/api';
+import { authedFetch, getApiBase } from '../../lib/api';
 
 const base = () => getApiBase();
 
 async function api<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${base()}${path}`, {
+  const res = await authedFetch(path, {
     method,
     headers: { 'content-type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -192,7 +192,7 @@ interface WebBot {
 }
 
 async function fetchBots(): Promise<WebBot[]> {
-  const res = await fetch(`${base()}/api/bots`);
+  const res = await authedFetch('/api/bots');
   if (!res.ok) throw new Error(`Failed to load bots (${res.status})`);
   return (await res.json()) as WebBot[];
 }

@@ -13,6 +13,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
@@ -29,6 +30,7 @@ import kotlin.coroutines.resumeWithException
  *   POST /api/companion/runs/:id/pause | /resume | /cancel
  *   GET  /api/companion/activity      -> activity feed
  *   GET  /api/companion/briefing      -> latest digest
+ *   GET  /api/companion/bots          -> bot roster for the chat picker
  *   POST /api/companion/chat/send | /api/chat     -> chat turn (SSE stream; mirrored from apps/api)
  *
  * All calls except the pairing exchange carry
@@ -158,6 +160,28 @@ class KriyaDotApi(
     suspend fun getBriefing(): Briefing =
         Briefing.fromJson(awaitJson(authed("/api/companion/briefing").get().build()))
 
+    /**
+     * Bot roster for the chat picker (same shape as the web UI's GET /api/bots:
+     * a bare JSON array of bot configs). Lenient: a {"bots":[...]} envelope is
+     * accepted too, and bots without an id are skipped.
+     */
+    suspend fun getBots(): List<Bot> {
+        val res = await(authed("/api/companion/bots").get().build())
+        res.use {
+            val text = it.body?.string().orEmpty()
+            if (!it.isSuccessful) {
+                val detail = runCatching { JSONObject(text).optString("error") }.getOrNull().orEmpty()
+                throw IOException("HTTP ${it.code}${if (detail.isNotEmpty()) ": $detail" else ""}")
+            }
+            val arr = runCatching {
+                val t = text.trimStart()
+                if (t.startsWith("[")) JSONArray(t)
+                else JSONObject(t).optJSONArray("bots") ?: JSONArray()
+            }.getOrDefault(JSONArray())
+            return Bot.listFromArray(arr)
+        }
+    }
+
     // ---- Remote screen (phone -> PC live screen view) -----------------------
     // Approval-gated: start() returns a pending session; the PC owner approves
     // in the web UI, then the app opens the frame WebSocket.
@@ -198,14 +222,20 @@ class KriyaDotApi(
      * heartbeats are skipped. A non-SSE JSON reply (queueMode=queue while a
      * turn is in flight) surfaces as [ChatEvent.Queued].
      *
-     * TODO(chat): DEFAULT_BOT_ID is a placeholder. The web UI picks the bot
-     * per workspace but no default bot id was discoverable in the web app
-     * sources; wire this to a bot picker (GET /api/bots) or a settings field
-     * once the server exposes a default.
+     * The bot id comes from the chat picker selection persisted in
+     * [PairingStore.selectedBotId] (roster loaded from GET /api/companion/bots).
+     * When no bot is selected — e.g. the roster is empty — the flow emits
+     * [ChatEvent.Error] instead of sending, so the server never sees a
+     * placeholder id.
      */
     fun streamChat(message: String): Flow<ChatEvent> = flow {
+        val botId = store.selectedBotId
+        if (botId.isNullOrEmpty()) {
+            emit(ChatEvent.Error("No bot selected — pick one from the chat screen."))
+            return@flow
+        }
         val body = JSONObject()
-            .put("botId", DEFAULT_BOT_ID)
+            .put("botId", botId)
             .put("message", message)
             .put("sessionId", store.deviceId.ifEmpty { "companion" })
             .put("queueMode", "queue")
@@ -267,8 +297,5 @@ class KriyaDotApi(
 
     companion object {
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
-
-        // TODO(chat): replace with a real default bot id (see streamChat docs).
-        const val DEFAULT_BOT_ID = "default"
     }
 }

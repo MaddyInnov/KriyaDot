@@ -20,7 +20,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { getApiBase } from '../../lib/api';
+import { authedFetch } from '../../lib/api';
 
 type ColumnType = 'text' | 'number' | 'select' | 'date' | 'checkbox';
 type CellValue = string | number | boolean | null;
@@ -51,7 +51,7 @@ interface DatabaseRow {
 }
 
 const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
-  const res = await fetch(`${getApiBase()}${path}`, init);
+  const res = await authedFetch(path, init);
   if (!res.ok) {
     const detail = await res.text().catch(() => res.statusText);
     throw new Error(`API ${res.status}: ${detail || res.statusText}`);

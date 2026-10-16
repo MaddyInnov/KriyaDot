@@ -2533,6 +2533,7 @@ export function createRouter(deps: RouteDeps): express.Router {
       chatQueueStore,
       omniStore,
       dataDir: config.dataDir,
+      getBots: () => bots,
       runControls: {
         activeTurns: () =>
           [...activeTurns.entries()].map(([sessionId, t]) => ({

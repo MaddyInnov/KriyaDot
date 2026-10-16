@@ -21,7 +21,7 @@
 //   in the tab panel. Destinations stay at exactly six.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { getApiBase } from '../../lib/api';
+import { authedFetch, getApiBase } from '../../lib/api';
 import { useUxMode } from '../../lib/ux-mode';
 
 const KEYS: Array<{ label: string; key: string }> = [
@@ -33,7 +33,7 @@ const KEYS: Array<{ label: string; key: string }> = [
 ];
 
 const api = (path: string, init?: RequestInit): Promise<unknown> =>
-  fetch(`${getApiBase()}${path}`, init).then(async (res) => {
+  authedFetch(path, init).then(async (res) => {
     if (!res.ok) {
       const detail = await res.text().catch(() => res.statusText);
       throw new Error(`API ${res.status}: ${detail || res.statusText}`);

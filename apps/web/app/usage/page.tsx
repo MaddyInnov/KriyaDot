@@ -5,7 +5,7 @@
 // backed by GET /api/usage/breakdown.
 
 import { useCallback, useEffect, useState } from 'react';
-import { getApiBase } from '../../lib/api';
+import { authedFetch } from '../../lib/api';
 
 interface BreakdownTotals {
   inputTokens: number;
@@ -53,7 +53,7 @@ export default function UsagePage() {
     setLoading(true);
     setError('');
     try {
-      const res = await fetch(`${getApiBase()}/api/usage/breakdown?period=${period}`);
+      const res = await authedFetch(`/api/usage/breakdown?period=${period}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = (await res.json()) as BreakdownResponse;
       setData(json);

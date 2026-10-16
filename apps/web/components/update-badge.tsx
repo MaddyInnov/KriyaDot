@@ -6,6 +6,7 @@
 // a failed check must never break navigation.
 
 import { useEffect, useState } from 'react';
+import { kriyadotFetch } from '../lib/kriyadot-api';
 
 export function UpdateBadge() {
   const [available, setAvailable] = useState(false);
@@ -14,7 +15,7 @@ export function UpdateBadge() {
     let alive = true;
     const check = async () => {
       try {
-        const res = await fetch('/api/updates/status');
+        const res = await kriyadotFetch('/api/updates/status');
         if (!res.ok) return;
         const body = (await res.json()) as { status?: { state?: string } };
         if (alive) setAvailable(body.status?.state === 'available' || body.status?.state === 'ready');

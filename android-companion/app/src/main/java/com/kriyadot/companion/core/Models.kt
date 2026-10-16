@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.kriyadot.companion.core
 
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -143,6 +144,25 @@ data class Briefing(
             body = o.optString("body", o.optString("text", o.optString("summary", ""))),
             generatedAt = o.optString("generatedAt", o.optString("ts", "")),
         )
+    }
+}
+
+/**
+ * A chat bot from GET /api/companion/bots (same shape as the web UI's
+ * GET /api/bots: bot config fields plus workspacePath).
+ */
+data class Bot(
+    val id: String,
+    val name: String,
+) {
+    companion object {
+        fun listFromArray(arr: JSONArray): List<Bot> =
+            (0 until arr.length()).mapNotNull { i ->
+                val b = arr.optJSONObject(i) ?: return@mapNotNull null
+                val id = b.optString("id")
+                if (id.isEmpty()) return@mapNotNull null
+                Bot(id = id, name = b.optString("name", id))
+            }
     }
 }
 

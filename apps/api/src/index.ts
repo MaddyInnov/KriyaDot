@@ -23,6 +23,13 @@ import { TelemetryCollector } from '@mvp/agent-runtime';
 import { Scheduler, TriggerStore, WorkflowRunner } from '@mvp/workflows';
 import type { WorkflowRun } from '@mvp/workflows';
 import { loadConfig } from './config.js';
+import {
+  corsOriginFn,
+  createBootstrapHandler,
+  ensureLoopbackToken,
+  isOriginAllowed,
+  requireLoopbackAuth,
+} from './loopback-auth.js';
 import { GovernanceAdapter } from './governance-adapter.js';
 import { SEED_FILES } from './generated/seed.js';
 import { loadSeed } from './seed.js';
@@ -31,6 +38,8 @@ import { applyBotPolicies } from './bot-policies.js';
 import { buildToolRegistry } from './tool-registry.js';
 import { registerDelegateTools } from './delegate-wiring.js';
 import { registerBotTeamToolsWiring } from './bot-team-wiring.js';
+import { applyChiefOverlays, registerChiefToolsWiring } from './chief-wiring.js';
+import { createChiefRouter } from './chief-routes.js';
 import { createBotConversationsRouter } from './bot-conversations-routes.js';
 import { createAgentDetectRouter } from './agent-detect-routes.js';
 import { createAgentImportRouter } from './agent-import-routes.js';
@@ -200,6 +209,10 @@ function buildPlatformMcpServer(opts: {
 
 async function boot(): Promise<void> {
   const config = loadConfig();
+  // Per-boot loopback bearer token (C1): minted once at startup, persisted
+  // to <dataDir>/.api-token for local clients (TUI/scripts), served to
+  // browser clients via GET /api/auth/bootstrap (Origin-gated).
+  const loopbackToken = ensureLoopbackToken(config.dataDir);
   fs.mkdirSync(config.dataDir, { recursive: true });
   fs.mkdirSync(config.workspaceDir, { recursive: true });
 
@@ -245,6 +258,9 @@ async function boot(): Promise<void> {
   applyBotMemorySettings(seed.bots, config.dataDir);
   // Chat branching / roster import: overlay previously imported bots.
   applyImportedBots(seed.bots, config.dataDir);
+  // Chief of Staff: restore chief flag + sections, approved field overrides,
+  // and deleted ids from chief-teams.db.
+  applyChiefOverlays(seed.bots, config.dataDir);
   // Auto-allocated per-bot workspaces (Codync parity): every bot gets
   // <dataDir>/bots/<botId>/workspace unless it already has an explicit
   // workspace configured.
@@ -290,6 +306,7 @@ async function boot(): Promise<void> {
   const computerView = createComputerView({
     audit: (action, fields) => governance.audit(action, fields),
     listAudit: (limit) => governance.listAudit(limit),
+    loopbackToken,
   });
 
   const governanceAdapter = new GovernanceAdapter(governance, {
@@ -459,6 +476,17 @@ async function boot(): Promise<void> {
     audit: (action, fields) => governance.audit(action, fields),
   });
 
+  // Chief of Staff (OpenMausBot parity): chief-only coordination tools,
+  // incidents/escalations inbox, team-setup proposals, and the per-turn
+  // chief prompt section. State persists in chief-teams.db.
+  const chiefWiring = registerChiefToolsWiring({
+    registry: toolRegistry,
+    agentRuntime,
+    dataDir: config.dataDir,
+    getBotConfig: (id) => botsById.get(id),
+    getBots: () => seed.bots,
+    audit: (action, fields) => governance.audit(action, fields),
+  });
   const workflowRunner = new WorkflowRunner({
     dbPath: `${config.dataDir}/workflows.db`,
     agentRuntime,
@@ -761,10 +789,19 @@ async function boot(): Promise<void> {
   // external senders (GitHub etc.) need a tunnel (Tailscale/cloudflared/ngrok)
   // plus KRIYADOT_PUBLIC_URL; LAN senders use the local URL.
   app.use('/api/hooks', express.raw({ type: '*/*', limit: '64kb' }), routinePublicHookRouter);
-  // MVP: allow any origin — the Tauri webview calls the sidecar API
-  // cross-origin (http://127.0.0.1:4567). Revisit with an allowlist when
-  // auth/multi-user ships.
-  app.use(cors({ origin: '*' }));
+  // Loopback auth (C1): the API binds to 127.0.0.1, which any website in the
+  // user's browser can reach. Enforce a per-boot bearer token on every route
+  // except the exempt prefixes (companion/remote-screen have device-token
+  // auth, /api/hooks is HMAC-verified, /api/health and /.well-known are
+  // public, /api/auth/bootstrap issues the token itself under Origin gating).
+  // CORS allowlist keeps evil origins from reading responses; the bearer
+  // token is the actual auth (CORS is never auth).
+  app.use(cors({ origin: corsOriginFn }));
+  app.use(requireLoopbackAuth(loopbackToken));
+  // Token bootstrap for the browser UI (and other browser clients): returns
+  // the token only when the Origin header is absent or allowlisted, so an
+  // evil cross-origin page can never read it.
+  app.get('/api/auth/bootstrap', createBootstrapHandler(loopbackToken));
   app.use(express.json({ limit: '150mb' })); // 100MB file uploads (base64 +33%)
   // Phase 4: A2A agent-card discovery (spec-correct location).
   app.get('/.well-known/agent-card.json', (_req, res) => {
@@ -826,7 +863,7 @@ async function boot(): Promise<void> {
     },
     audit: (action, fields) => governance.audit(action, fields),
   });
-  const voiceCallUpgrade = createVoiceCallUpgrade({ service: voiceCallService });
+  const voiceCallUpgrade = createVoiceCallUpgrade({ service: voiceCallService, loopbackToken });
   // Phase 2: workflow webhook triggers (shared-secret authenticated).
   app.use('/webhooks', createWebhookRouter({ runner: workflowRunner, triggerStore }));
   app.use(
@@ -989,6 +1026,20 @@ async function boot(): Promise<void> {
   });
   app.use('/api/updates', createSelfUpdateRouter(updater));
 
+  // Chief of Staff (OpenMausBot parity): chief assignment, managed
+  // sections, team-setup proposals, incidents/escalations inbox. The store
+  // instance comes from registerChiefToolsWiring above.
+  app.use(
+    '/api/teams',
+    createChiefRouter({
+      dataDir: config.dataDir,
+      getBots: () => seed.bots,
+      store: chiefWiring.store,
+      retryDelegation: chiefWiring.retryDelegation,
+      audit: (action, fields) => governance.audit(action, fields),
+    }),
+  );
+
   app.use('/api/routines', routinesRouter);
   app.use('/webhooks/routines', routineWebhookRouter);
   // n8n workflow import/export.
@@ -1066,6 +1117,15 @@ async function boot(): Promise<void> {
   // /api/companion). Unknown upgrade paths are destroyed so nothing else
   // hijacks upgrades.
   server.on('upgrade', (req, socket, head) => {
+    // Origin validation on every WS upgrade: browsers on evil origins always
+    // send Origin; a non-allowlisted one destroys the socket before any
+    // handshake. Non-browser clients (phones, TUI, curl) send no Origin and
+    // proceed to the in-protocol auth of each endpoint.
+    const origin = req.headers.origin;
+    if (typeof origin === 'string' && origin.length > 0 && !isOriginAllowed(origin)) {
+      socket.destroy();
+      return;
+    }
     const path = req.url?.split('?')[0];
     if (path === '/api/phone/ws') {
       phoneHub.handleUpgrade(req, socket, head);

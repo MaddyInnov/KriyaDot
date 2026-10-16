@@ -33,6 +33,25 @@
 
 import { EventEmitter } from 'node:events';
 import express, { type Request, type Response, type Router } from 'express';
+
+/**
+ * Requested-limit caps for POST /api/fusion/runs (H2). Clamping is silent
+ * (friendlier than 400): unbounded values would spawn unbounded parallel
+ * worker turns.
+ */
+export const MAX_SUBTASKS = 32;
+export const MAX_CONCURRENCY = 8;
+export function clampFusionLimits(
+  maxSubtasks: number | undefined,
+  maxConcurrency: number | undefined,
+): { maxSubtasks: number | undefined; maxConcurrency: number | undefined } {
+  const clamp = (v: number | undefined, lo: number, hi: number): number | undefined =>
+    v === undefined ? undefined : Math.min(hi, Math.max(lo, Math.floor(v)));
+  return {
+    maxSubtasks: clamp(maxSubtasks, 1, MAX_SUBTASKS),
+    maxConcurrency: clamp(maxConcurrency, 1, MAX_CONCURRENCY),
+  };
+}
 import {
   FusionOrchestrator,
   buildWorkerMessage,
@@ -138,8 +157,9 @@ export function createFusionRouter(deps: FusionRouteDeps): Router {
     const fusionBot: BotConfig = bot;
     const num = (v: unknown): number | undefined =>
       typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : undefined;
-    const maxSubtasks = num(body.maxSubtasks);
-    const maxConcurrency = num(body.maxConcurrency);
+    // Clamp silently (see clampFusionLimits): unbounded values would spawn
+    // unbounded parallel worker turns.
+    const { maxSubtasks, maxConcurrency } = clampFusionLimits(num(body.maxSubtasks), num(body.maxConcurrency));
     const maxBudgetUsd = num(body.maxBudgetUsd);
     const providerId =
       typeof body.providerId === 'string' && body.providerId ? body.providerId : (bot.provider ?? 'groq');

@@ -28,12 +28,32 @@ import type { Duplex } from 'node:stream';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { acceptRawWsSocket } from './computer-view.js';
-import { VoiceCallService } from './voice-call.js';
+import { validateWsQueryToken } from './loopback-auth.js';
+import { VoiceCallService, MAX_UTTERANCE_BYTES } from './voice-call.js';
 
 export const VOICE_CALL_WS_PATH = '/api/voice/calls/ws';
 
+/**
+ * H4: pre-decode cap on the utterance base64 STRING. Decoded bytes are ~3/4
+ * of the string length, so capping the string at 4/3 of MAX_UTTERANCE_BYTES
+ * rejects oversized audio before Buffer.from() allocates the decoded buffer.
+ * (The post-decode 10MB check in VoiceCallService.processUtterance stays as
+ * defense in depth.)
+ */
+export const MAX_UTTERANCE_B64 = Math.ceil((MAX_UTTERANCE_BYTES * 4) / 3);
+
 export interface VoiceCallRouteDeps {
   service: VoiceCallService;
+}
+
+/** Deps for the WS upgrade handler: REST deps plus the loopback token. */
+export interface VoiceCallUpgradeDeps extends VoiceCallRouteDeps {
+  /**
+   * Per-boot loopback bearer token (index.ts). Browsers can't set
+   * Authorization headers on WS handshakes, so the web UI appends it as
+   * `?token=` (a single-use `?ticket=` from issueWsTicket is also accepted).
+   */
+  loopbackToken: string;
 }
 
 function errMessage(err: unknown, fallback: string): string {
@@ -123,15 +143,15 @@ export async function handleVoiceUtterance(
   send({ t: 'turn_done' });
 }
 
-export function createVoiceCallUpgrade(deps: VoiceCallRouteDeps): {
+export function createVoiceCallUpgrade(deps: VoiceCallUpgradeDeps): {
   handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void;
 } {
-  const { service } = deps;
+  const { service, loopbackToken } = deps;
   return {
     handleUpgrade(req: IncomingMessage, socket: Duplex, _head: Buffer): void {
+      // NOTE: req.url carries the credential (?token= / ?ticket=) — never log it.
       const url = new URL(req.url ?? VOICE_CALL_WS_PATH, 'http://localhost');
       const callId = url.searchParams.get('callId') ?? '';
-      const call = callId ? service.getCall(callId) : undefined;
 
       const reject = (detail: string): void => {
         const sock = acceptRawWsSocket(req, socket);
@@ -145,6 +165,13 @@ export function createVoiceCallUpgrade(deps: VoiceCallRouteDeps): {
         }
       };
 
+      // Auth first: don't leak call-id existence to unauthenticated probers.
+      if (!validateWsQueryToken(url.searchParams, loopbackToken)) {
+        reject('unauthorized');
+        return;
+      }
+
+      const call = callId ? service.getCall(callId) : undefined;
       if (!call) {
         reject('unknown_call');
         return;
@@ -192,6 +219,14 @@ export function createVoiceCallUpgrade(deps: VoiceCallRouteDeps): {
           }
           if (typeof msg.audio !== 'string' || msg.audio.length === 0) {
             send({ t: 'error', detail: '"audio" must be a non-empty base64 string' });
+            return;
+          }
+          // H4: reject by base64 STRING length before decoding — the decoded
+          // bytes are ~3/4 of the string, so a huge string allocates a huge
+          // buffer. (Post-decode zero-length check below stays as defense in
+          // depth.)
+          if (msg.audio.length > MAX_UTTERANCE_B64) {
+            send({ t: 'error', detail: `audio too large (max ${MAX_UTTERANCE_BYTES} bytes decoded)` });
             return;
           }
           let bytes: Uint8Array;

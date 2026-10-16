@@ -6,6 +6,7 @@
 
 import type { Request, Response, Router } from 'express';
 import { PhoneSessionHub, PhoneStore, validateMessage } from './phone.js';
+import { issueWsTicket } from './loopback-auth.js';
 import { AdbPhoneProvider, isValidSerial } from './phone-adb.js';
 import type { PhoneAudit } from './phone.js';
 
@@ -123,6 +124,21 @@ export function registerPhoneRoutes(router: Router, deps: PhoneRouteDeps): void 
   });
 
   // ---- Sessions (audit trail) ---------------------------------------------
+
+  /**
+   * Issue a one-time WS ticket for the phone watch socket. NOT exempt from
+   * the loopback bearer token — the caller proves its auth here, then the
+   * browser passes the ticket in its first `watch` message (browsers can't
+   * send Authorization headers on WS handshakes). Tickets are single-use and
+   * expire after 60s.
+   */
+  router.post('/watch-ticket', (req: Request, res: Response) => {
+    if (!req.loopbackAuthed) {
+      res.status(401).json({ ok: false, error: 'unauthorized' });
+      return;
+    }
+    res.json({ ok: true, ticket: issueWsTicket() });
+  });
 
   router.get('/sessions', (req: Request, res: Response) => {
     const limit = Number(req.query.limit ?? 50);

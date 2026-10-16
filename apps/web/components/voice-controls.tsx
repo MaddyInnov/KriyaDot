@@ -15,7 +15,7 @@
 // is wired via VOICE_TTS_PROVIDER).
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { getApiBase } from '../lib/api';
+import { authedFetch } from '../lib/api';
 
 export interface VoiceControlsProps {
   /** Called with each finalized transcript. */
@@ -28,9 +28,6 @@ export interface VoiceControlsProps {
 
 type MicState = 'idle' | 'listening' | 'working' | 'error';
 
-function api(path: string): string {
-  return `${getApiBase()}${path}`;
-}
 
 export default function VoiceControls({ onTranscript, speakText, language = 'en' }: VoiceControlsProps) {
   const [micState, setMicState] = useState<MicState>('idle');
@@ -63,7 +60,7 @@ export default function VoiceControls({ onTranscript, speakText, language = 'en'
 
   const postStt = useCallback(
     async (audioBase64: string, mimeType?: string) => {
-      const res = await fetch(api('/api/voice/stt'), {
+      const res = await authedFetch('/api/voice/stt', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ audioBase64, mimeType, language }),
@@ -178,7 +175,7 @@ export default function VoiceControls({ onTranscript, speakText, language = 'en'
     setSpeaking(true);
     setError(null);
     try {
-      const res = await fetch(api('/api/voice/tts'), {
+      const res = await authedFetch('/api/voice/tts', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ text, format: 'wav' }),

@@ -3,7 +3,7 @@
 // kriyadot-tui — terminal client for KriyaDot.
 import React from 'react';
 import { render } from 'ink';
-import { KriyaDotApi } from './api.js';
+import { KriyaDotApi, readLoopbackToken } from './api.js';
 import { App } from './components/App.js';
 import { loadConfig, normalizeApiUrl, parseCliArgs, printHelp, saveConfig } from './config.js';
 import { isThemeName } from './themes.js';
@@ -34,7 +34,17 @@ try {
   // best-effort
 }
 
-const api = new KriyaDotApi(config.apiUrl);
+// The API requires a per-boot loopback bearer token (written to
+// <dataDir>/.api-token on startup). Without it every call 401s.
+let apiToken: string;
+try {
+  apiToken = readLoopbackToken();
+} catch (err) {
+  console.error(`kriyadot-tui: ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
+}
+
+const api = new KriyaDotApi(config.apiUrl, apiToken);
 const { waitUntilExit } = render(<App api={api} config={config} />);
 void waitUntilExit().then(() => {
   process.exit(0);

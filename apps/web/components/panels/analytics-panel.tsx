@@ -7,6 +7,7 @@
 // exactly what would be sent before enabling anything.
 
 import { useEffect, useState } from 'react';
+import { kriyadotFetch } from '../../lib/kriyadot-api';
 
 interface AnalyticsSettings {
   enabled: boolean;
@@ -28,7 +29,7 @@ interface CrashRecord {
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } });
+  const res = await kriyadotFetch(path, { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json() as Promise<T>;
 }

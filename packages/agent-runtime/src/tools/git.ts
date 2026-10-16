@@ -138,6 +138,7 @@ function gitDiffTool(workspaceDir: WorkspaceSource): ToolDefinition {
 function gitCommitTool(workspaceDir: WorkspaceSource): ToolDefinition {
   return {
     name: 'git_commit',
+    mutating: true,
     description:
       'Stage all changes and commit with a message. REQUIRES HUMAN APPROVAL. ' +
       'Part of the Codex-style loop: write code → review (git_status/git_diff) → ' +
@@ -170,6 +171,7 @@ function gitCommitTool(workspaceDir: WorkspaceSource): ToolDefinition {
 function gitBranchTool(workspaceDir: WorkspaceSource): ToolDefinition {
   return {
     name: 'git_branch',
+    mutating: true,
     description:
       'Create and/or switch branches. REQUIRES HUMAN APPROVAL. ' +
       'Actions: "create" (new branch), "switch" (checkout existing), "list". ' +
@@ -209,6 +211,7 @@ function gitBranchTool(workspaceDir: WorkspaceSource): ToolDefinition {
 function gitPushTool(workspaceDir: WorkspaceSource): ToolDefinition {
   return {
     name: 'git_push',
+    mutating: true,
     description:
       'Push the current branch to the remote. REQUIRES HUMAN APPROVAL ' +
       '(network + mutates the remote). After pushing, open a PR via ' +

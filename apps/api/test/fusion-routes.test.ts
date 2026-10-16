@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { AgentRuntime, BotConfig, ChatMessage, TokenUsage } from '@mvp/agent-runtime';
 import { FusionRunStore } from '../src/fusion.js';
-import { createFusionRouter } from '../src/fusion-routes.js';
+import { MAX_CONCURRENCY, MAX_SUBTASKS, clampFusionLimits, createFusionRouter } from '../src/fusion-routes.js';
 
 const U: TokenUsage = { promptTokens: 1, completionTokens: 1, totalTokens: 2 };
 
@@ -30,7 +30,21 @@ function makeAgentRuntime(): AgentRuntime {
   } as unknown as AgentRuntime;
 }
 
-function makeApp(dataDir: string, runtime?: AgentRuntime) {
+type CallLlm = (providerId: string, model: string, messages: ChatMessage[]) => Promise<{ content: string; usage: TokenUsage }>;
+
+const defaultCallLlm: CallLlm = async (_providerId: string, _model: string, messages: ChatMessage[]) => {
+  const text = messages.map((m) => m.content).join('\n');
+  if (text.includes('task planner')) {
+    return {
+      content:
+        '{"subtasks": [{"id": "s1", "title": "Part A", "description": "do A", "dependencies": []}], "rationale": "simple"}',
+      usage: U,
+    };
+  }
+  return { content: 'FUSED: all done', usage: U };
+};
+
+function makeApp(dataDir: string, runtime?: AgentRuntime, callLlm: CallLlm = defaultCallLlm) {
   const store = new FusionRunStore(dataDir);
   const app = express();
   app.use(express.json());
@@ -40,17 +54,7 @@ function makeApp(dataDir: string, runtime?: AgentRuntime) {
       store,
       getBot: (id) => (id === BOT.id ? BOT : undefined),
       agentRuntime: runtime ?? makeAgentRuntime(),
-      callLlm: async (_providerId: string, _model: string, messages: ChatMessage[]) => {
-        const text = messages.map((m) => m.content).join('\n');
-        if (text.includes('task planner')) {
-          return {
-            content:
-              '{"subtasks": [{"id": "s1", "title": "Part A", "description": "do A", "dependencies": []}], "rationale": "simple"}',
-            usage: U,
-          };
-        }
-        return { content: 'FUSED: all done', usage: U };
-      },
+      callLlm,
     }),
   );
   return { app, store };
@@ -117,6 +121,47 @@ describe('fusion routes', () => {
         body: JSON.stringify({ botId: 'nope', task: 'hi' }),
       });
       expect(r.status).toBe(404);
+    } finally {
+      server.close();
+    }
+  });
+
+  it('clampFusionLimits caps the requested limits and floors them at 1 (silent clamp)', () => {
+    expect(MAX_SUBTASKS).toBe(32);
+    expect(MAX_CONCURRENCY).toBe(8);
+    expect(clampFusionLimits(undefined, undefined)).toEqual({ maxSubtasks: undefined, maxConcurrency: undefined });
+    expect(clampFusionLimits(5, 3)).toEqual({ maxSubtasks: 5, maxConcurrency: 3 });
+    expect(clampFusionLimits(1000, 64)).toEqual({ maxSubtasks: 32, maxConcurrency: 8 });
+    expect(clampFusionLimits(32, 8)).toEqual({ maxSubtasks: 32, maxConcurrency: 8 });
+    expect(clampFusionLimits(0.4, 0.9)).toEqual({ maxSubtasks: 1, maxConcurrency: 1 }); // floors at 1
+    expect(clampFusionLimits(7.9, 2.5)).toEqual({ maxSubtasks: 7, maxConcurrency: 2 }); // floors to int
+  });
+
+  it('POST /runs clamps an unbounded maxSubtasks before the planner runs', async () => {
+    let plannerPrompt = '';
+    const capture: CallLlm = async (p, m, messages) => {
+      const text = messages.map((x) => x.content).join('\n');
+      if (text.includes('task planner')) plannerPrompt = text;
+      return defaultCallLlm(p, m, messages);
+    };
+    const { app, store } = makeApp(dataDir, undefined, capture);
+    const { server, base } = await listen(app);
+    try {
+      const r = await fetch(`${base}/api/fusion/runs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ botId: 'bot1', task: 'do the thing', maxSubtasks: 100000, maxConcurrency: 1000 }),
+      });
+      expect(r.status).toBe(202); // clamped silently, not rejected
+      const body = (await r.json()) as { ok: boolean; runId: string };
+      await waitFor(() => {
+        const rec = store.getRun(body.runId);
+        return rec?.status === 'completed';
+      });
+      // The planner prompt carries "At most N subtasks" — the clamp must have
+      // applied before it was built.
+      expect(plannerPrompt).toContain('At most 32 subtasks');
+      expect(plannerPrompt).not.toContain('At most 100000 subtasks');
     } finally {
       server.close();
     }

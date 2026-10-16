@@ -10,6 +10,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.kriyadot.companion.core.Approval
+import com.kriyadot.companion.core.Bot
 import com.kriyadot.companion.core.Briefing
 import com.kriyadot.companion.core.ChatEvent
 import com.kriyadot.companion.core.ChatMessage
@@ -88,6 +89,15 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
     private var chatJob: Job? = null
     private var msgId = 0L
 
+    private val _bots = MutableStateFlow<List<Bot>>(emptyList())
+    val bots: StateFlow<List<Bot>> = _bots.asStateFlow()
+
+    private val _selectedBotId = MutableStateFlow(store.selectedBotId)
+    val selectedBotId: StateFlow<String?> = _selectedBotId.asStateFlow()
+
+    private val _botsLoading = MutableStateFlow(false)
+    val botsLoading: StateFlow<Boolean> = _botsLoading.asStateFlow()
+
     init {
         if (store.isPaired) startLive()
     }
@@ -133,6 +143,8 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
         _activity.value = emptyList()
         _briefing.value = null
         _messages.value = emptyList()
+        _bots.value = emptyList()
+        _selectedBotId.value = null
     }
 
     // ---- Live data ------------------------------------------------------
@@ -182,6 +194,7 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
         refreshRuns()
         refreshActivity()
         refreshBriefing()
+        refreshBots()
     }
 
     fun refreshStatus() = viewModelScope.launch { load { _status.value = api.getStatus() } }
@@ -189,6 +202,45 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
     fun refreshRuns() = viewModelScope.launch { load { _runs.value = api.getRuns() } }
     fun refreshActivity() = viewModelScope.launch { load { _activity.value = api.getActivity() } }
     fun refreshBriefing() = viewModelScope.launch { load { _briefing.value = api.getBriefing() } }
+
+    /**
+     * Loads the bot roster for the chat picker (called after pairing via
+     * refreshAll, and when the chat screen opens via ensureBots). Keeps the
+     * persisted selection when it is still on the roster; otherwise falls back
+     * to the first bot. An empty roster clears the selection.
+     */
+    fun refreshBots() = viewModelScope.launch {
+        _botsLoading.value = true
+        try {
+            val list = api.getBots()
+            _bots.value = list
+            val current = store.selectedBotId
+            val resolved = if (list.any { it.id == current }) current else list.firstOrNull()?.id
+            _selectedBotId.value = resolved
+            store.saveSelectedBotId(resolved)
+            _error.value = null
+        } catch (e: Exception) {
+            _error.value = e.message ?: "Failed to load bots"
+        } finally {
+            _botsLoading.value = false
+        }
+    }
+
+    /**
+     * Ensures the roster is loaded once; later calls are no-ops while the
+     * cached list is non-empty. Safe to call on every chat-screen open.
+     */
+    fun ensureBots() {
+        if (_bots.value.isNotEmpty() || _botsLoading.value) return
+        refreshBots()
+    }
+
+    /** Persists an explicit chat bot-picker selection. */
+    fun selectBot(id: String) {
+        if (_bots.value.none { it.id == id }) return
+        _selectedBotId.value = id
+        store.saveSelectedBotId(id)
+    }
 
     private suspend fun load(block: suspend () -> Unit) {
         _loading.value = true
@@ -247,6 +299,10 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
     fun sendChat(text: String) {
         val trimmed = text.trim()
         if (trimmed.isEmpty() || _chatBusy.value) return
+        if (_selectedBotId.value.isNullOrEmpty()) {
+            _error.value = if (_bots.value.isEmpty()) "No bots available." else "Pick a bot before sending."
+            return
+        }
         chatJob?.cancel()
         _messages.value = _messages.value +
             ChatMessage(++msgId, "user", trimmed) +

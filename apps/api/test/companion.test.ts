@@ -8,6 +8,7 @@ import express from 'express';
 import type { AddressInfo } from 'node:net';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CompanionHub, CompanionStore, type CompanionSocket } from '../src/companion.js';
+import type { BotConfig } from '@mvp/agent-runtime';
 import {
   buildHostedQrPayload,
   buildPairingPayload,
@@ -435,6 +436,7 @@ async function makeRouteCtx(overrides: Partial<CompanionRouteDeps> = {}): Promis
     omniStore: { listItems: () => omniItems },
     dataDir,
     runControls,
+    getBots: () => [],
     ...overrides,
   } as CompanionRouteDeps;
 
@@ -608,6 +610,44 @@ describe('companion REST routes', () => {
     expect(body.activeRuns).toBe(1);
     expect(body.pendingApprovals).toBe(2);
     expect(body.runs[0]).toEqual(expect.objectContaining({ id: 'sess-1', kind: 'chat-turn', state: 'running' }));
+  });
+
+  it('bots: roster requires auth, mirrors GET /api/bots shape', async () => {
+    const unauth = await get('/api/companion/bots');
+    expect(unauth.status).toBe(401);
+
+    const botsCtx = await makeRouteCtx({
+      getBots: () =>
+        [
+          { id: 'scout', name: 'Scout' },
+          { id: 'helper', name: 'Helper' },
+        ] as unknown as BotConfig[],
+    });
+    try {
+      const rec = botsCtx.store.requestPairingOTT();
+      const ex = botsCtx.store.exchangePairing({ ott: rec.ott, deviceName: 'Test', platform: 'android' });
+      if (!ex.ok) throw new Error('pairing failed');
+      const headers = botsCtx.authHeader(ex.token);
+
+      const r = await fetch(`${botsCtx.base}/api/companion/bots`, { headers });
+      expect(r.status).toBe(200);
+      const body = (await r.json()) as Array<{ id: string; name: string; workspacePath: string }>;
+      expect(body).toHaveLength(2);
+      expect(body[0].id).toBe('scout');
+      expect(body[0].name).toBe('Scout');
+      // Same shape as the web UI's GET /api/bots: bot config + resolved workspacePath.
+      expect(typeof body[0].workspacePath).toBe('string');
+      expect(body[0].workspacePath).toContain('scout');
+    } finally {
+      await botsCtx.close();
+    }
+  });
+
+  it('bots: empty roster is returned as an empty array', async () => {
+    const headers = await authed();
+    const r = await get('/api/companion/bots', headers);
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual([]);
   });
 
   it('approvals: list, approve, deny, 404, 409', async () => {

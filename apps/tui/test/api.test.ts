@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, KriyaDotApi, parseChatEvent, pumpSse } from '../src/api.js';
 
 function sseStream(frames: string[]): ReadableStream<Uint8Array> {
@@ -139,5 +139,92 @@ describe('KriyaDotApi', () => {
       throw new Error('ECONNREFUSED');
     }));
     await expect(new KriyaDotApi('http://x:4000').listBots()).rejects.toThrow('Cannot reach KriyaDot API');
+  });
+});
+
+describe('loopback token file', () => {
+  const prevEnv: Record<string, string | undefined> = {};
+  beforeEach(() => {
+    for (const k of ['KRIYADOT_DATA_DIR', 'DATA_DIR'] as const) {
+      prevEnv[k] = process.env[k];
+      delete process.env[k];
+    }
+  });
+  afterEach(() => {
+    for (const k of ['KRIYADOT_DATA_DIR', 'DATA_DIR'] as const) {
+      if (prevEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = prevEnv[k];
+    }
+  });
+
+  it('resolveApiDataDir prefers KRIYADOT_DATA_DIR, then DATA_DIR, then ./data', async () => {
+    const { resolveApiDataDir } = await import('../src/api.js');
+    const { resolve } = await import('node:path');
+    process.env.KRIYADOT_DATA_DIR = '/tmp/kdd';
+    process.env.DATA_DIR = '/tmp/dd';
+    expect(resolveApiDataDir()).toBe(resolve('/tmp/kdd'));
+    delete process.env.KRIYADOT_DATA_DIR;
+    expect(resolveApiDataDir()).toBe(resolve('/tmp/dd'));
+    delete process.env.DATA_DIR;
+    expect(resolveApiDataDir()).toBe(resolve(process.cwd(), 'data'));
+  });
+
+  it('readLoopbackToken reads and trims a fake token file', async () => {
+    const { mkdtempSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { readLoopbackToken } = await import('../src/api.js');
+    const dir = mkdtempSync(join(tmpdir(), 'tui-token-'));
+    writeFileSync(join(dir, '.api-token'), '  fake-token-123\n', 'utf8');
+    expect(readLoopbackToken(dir)).toBe('fake-token-123');
+  });
+
+  it('readLoopbackToken throws a clear error when the file is missing', async () => {
+    const { readLoopbackToken, LoopbackTokenError } = await import('../src/api.js');
+    expect(() => readLoopbackToken('/nonexistent-dir-xyz')).toThrow(LoopbackTokenError);
+    expect(() => readLoopbackToken('/nonexistent-dir-xyz')).toThrow(
+      'API token not found — is the KriyaDot API running?',
+    );
+  });
+});
+
+describe('KriyaDotApi bearer token', () => {
+  it('sends Authorization: Bearer on API calls when a token is given', async () => {
+    let seen: Record<string, string> = {};
+    mockFetch((url, init) => {
+      seen = { ...((init?.headers ?? {}) as Record<string, string>) };
+      return jsonResponse([{ id: 'b1', name: 'Helper' }]);
+    });
+    await new KriyaDotApi('http://x:4000', 'tok123').listBots();
+    expect(seen['Authorization']).toBe('Bearer tok123');
+  });
+
+  it('omits the Authorization header when no token is given', async () => {
+    let seen: Record<string, string> = {};
+    mockFetch((url, init) => {
+      seen = { ...((init?.headers ?? {}) as Record<string, string>) };
+      return jsonResponse([{ id: 'b1', name: 'Helper' }]);
+    });
+    await new KriyaDotApi('http://x:4000').listBots();
+    expect(seen['Authorization']).toBeUndefined();
+  });
+
+  it('sendChat (SSE) also carries the bearer token', async () => {
+    let seen: Record<string, string> = {};
+    mockFetch((url, init) => {
+      seen = { ...((init?.headers ?? {}) as Record<string, string>) };
+      return new Response(sseStream(['data: {"type":"done"}\n\n']), {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      });
+    });
+    const api = new KriyaDotApi('http://x:4000', 'tok123');
+    await new Promise<void>((resolve, reject) => {
+      void api.sendChat(
+        { botId: 'b1', message: 'hi' },
+        { onEvent: () => {}, onDone: () => resolve(), onError: (e) => reject(e) },
+      );
+    });
+    expect(seen['Authorization']).toBe('Bearer tok123');
   });
 });

@@ -2,13 +2,13 @@
 'use client';
 
 // Shared helpers for the per-module pages under app/modules/.
-import { useCallback, useEffect, useState } from 'react';
-import { getApiBase } from '../../lib/api';
+import React, { useCallback, useEffect, useState } from 'react';
+import { authedFetch } from '../../lib/api';
 
 export const MODULES_BASE = '/api/modules';
 
 export const api = (path: string, init?: RequestInit): Promise<unknown> =>
-  fetch(`${getApiBase()}${path}`, init).then(async (res) => {
+  authedFetch(path, init).then(async (res) => {
     if (!res.ok) {
       const detail = await res.text().catch(() => res.statusText);
       throw new Error(`API ${res.status}: ${detail || res.statusText}`);
@@ -32,7 +32,11 @@ export function fmtMoney(cents: number, currency: string): string {
 /** Tiny markdown renderer (headings, lists, code, bold, italic, links). */
 export function Markdown({ src }: { src: string }): React.ReactElement {
   const esc = (s: string): string =>
-    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    s
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
   const inline = (s: string): string =>
     esc(s)
       .replace(/`([^`]+)`/g, '<code class="mono">$1</code>')

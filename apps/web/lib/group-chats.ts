@@ -13,7 +13,7 @@
 
 'use client';
 
-import { getApiBase } from './api';
+import { authedFetch } from './api';
 
 export interface GroupChat {
   id: string;
@@ -41,7 +41,7 @@ export interface RoomTurnReply {
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${getApiBase()}${path}`, {
+  const res = await authedFetch(path, {
     ...init,
     headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
   });

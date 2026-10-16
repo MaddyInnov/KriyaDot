@@ -1,6 +1,47 @@
 // SPDX-License-Identifier: Apache-2.0
 // HTTP + SSE client for the KriyaDot API (apps/api). Mirrors what the web
 // client uses: POST /chat with `data: {...}\n\n` SSE events.
+import { readFileSync } from 'node:fs';
+import { join as joinPath, resolve as resolvePath } from 'node:path';
+
+/** Filename the API writes its per-boot loopback bearer token to (apps/api/src/loopback-auth.ts). */
+export const LOOPBACK_TOKEN_FILENAME = '.api-token';
+
+/**
+ * Resolve the API's data dir the same way apps/api's loadConfig() does:
+ * DATA_DIR env (KRIYADOT_DATA_DIR accepted as an alias), else ./data under
+ * the current working directory.
+ */
+export function resolveApiDataDir(): string {
+  const fromEnv = process.env.KRIYADOT_DATA_DIR ?? process.env.DATA_DIR;
+  return fromEnv ? resolvePath(fromEnv) : resolvePath(process.cwd(), 'data');
+}
+
+/** Thrown when the loopback API token file can't be read. */
+export class LoopbackTokenError extends Error {
+  constructor(dataDir: string) {
+    super(
+      `API token not found — is the KriyaDot API running? (looked for ${joinPath(dataDir, LOOPBACK_TOKEN_FILENAME)})`,
+    );
+    this.name = 'LoopbackTokenError';
+  }
+}
+
+/**
+ * Read the per-boot bearer token the API writes to <dataDir>/.api-token.
+ * Throws LoopbackTokenError when the file is missing or unreadable.
+ */
+export function readLoopbackToken(dataDir: string = resolveApiDataDir()): string {
+  let raw: string;
+  try {
+    raw = readFileSync(joinPath(dataDir, LOOPBACK_TOKEN_FILENAME), 'utf8');
+  } catch {
+    throw new LoopbackTokenError(dataDir);
+  }
+  const token = raw.trim();
+  if (!token) throw new LoopbackTokenError(dataDir);
+  return token;
+}
 export interface BotSummary {
   id: string;
   name: string;
@@ -124,16 +165,27 @@ export interface ChatCallbacks {
 }
 
 export class KriyaDotApi {
-  constructor(private readonly baseUrl: string) {}
+  constructor(
+    private readonly baseUrl: string,
+    private readonly token?: string,
+  ) {}
 
   private url(path: string): string {
     return `${this.baseUrl.replace(/\/+$/, '')}/api${path.startsWith('/') ? path : `/${path}`}`;
   }
 
+  /** Authorization header for the loopback bearer token (empty when no token — e.g. /health probe). */
+  private authHeaders(): Record<string, string> {
+    return this.token ? { Authorization: `Bearer ${this.token}` } : {};
+  }
+
   private async request<T>(path: string, init?: RequestInit): Promise<T> {
     let res: Response;
     try {
-      res = await fetch(this.url(path), init);
+      res = await fetch(this.url(path), {
+        ...init,
+        headers: { ...this.authHeaders(), ...init?.headers },
+      });
     } catch (err) {
       throw new Error(`Cannot reach KriyaDot API at ${this.baseUrl}: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -215,7 +267,7 @@ export class KriyaDotApi {
       try {
         res = await fetch(this.url('/chat'), {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+          headers: { ...this.authHeaders(), 'Content-Type': 'application/json', Accept: 'text/event-stream' },
           body: JSON.stringify({
             botId: opts.botId,
             message: opts.message,

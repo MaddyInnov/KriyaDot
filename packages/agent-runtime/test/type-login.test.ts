@@ -163,3 +163,36 @@ describe('site normalization', () => {
     expect(sitesMatch('', 'github.com')).toBe(false);
   });
 });
+
+describe('sitesMatch dot-boundary matching (H1 fix)', () => {
+  it('rejects lookalike suffix domains: evilgithub.com does NOT match github.com', () => {
+    expect(sitesMatch('evilgithub.com', 'github.com')).toBe(false);
+    expect(sitesMatch('github.com.evil.com', 'github.com')).toBe(false);
+    expect(sitesMatch('mygithub.com', 'github.com')).toBe(false);
+  });
+
+  it('accepts true subdomains: sub.github.com matches github.com', () => {
+    expect(sitesMatch('sub.github.com', 'github.com')).toBe(true);
+    expect(sitesMatch('a.b.github.com', 'github.com')).toBe(true);
+  });
+
+  it('accepts exact domains and is case-insensitive', () => {
+    expect(sitesMatch('github.com', 'github.com')).toBe(true);
+    expect(sitesMatch('GITHUB.COM', 'github.com')).toBe(true);
+    expect(sitesMatch('https://Sub.GitHub.com/login', 'github.com')).toBe(true);
+  });
+
+  it('keeps app-name alias matching for non-domain values', () => {
+    expect(sitesMatch('whatsapp', 'WhatsApp Desktop')).toBe(true);
+    expect(sitesMatch('slack', 'Slack')).toBe(true);
+  });
+
+  it('refuses credential typing when the bot asserts a lookalike site', async () => {
+    const os = new MockOSScreenLayer();
+    const tool = createTypeLoginTool({ os, getLogin: () => login() });
+    await expect(
+      tool.handler({ loginId: 'github-personal', expectedSite: 'evilgithub.com' }, ctx),
+    ).rejects.toThrow(/does not match login site/);
+    expect(os.calls).toHaveLength(0); // nothing typed
+  });
+});

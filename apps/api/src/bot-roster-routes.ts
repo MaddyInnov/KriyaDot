@@ -120,6 +120,46 @@ export function applyImportedBots(bots: BotConfig[], dataDir: string): void {
   }
 }
 
+/**
+ * Append one bot to the roster imports file (used when an approved
+ * chief-of-staff create proposal adds a bot). The entry survives restarts
+ * via applyImportedBots.
+ */
+export function appendRosterImport(bot: BotConfig, dataDir: string): void {
+  const bots = readImportedBots(dataDir);
+  bots.push(bot);
+  writeImportedBots(dataDir, bots);
+}
+
+/** True when the bot id lives in the roster imports file. */
+export function isRosterImport(botId: string, dataDir: string): boolean {
+  return readImportedBots(dataDir).some((b) => b.id === botId);
+}
+
+/**
+ * Replace one bot entry in the roster imports file. Returns true when the
+ * entry existed and was replaced.
+ */
+export function updateRosterImport(bot: BotConfig, dataDir: string): boolean {
+  const bots = readImportedBots(dataDir);
+  const idx = bots.findIndex((b) => b.id === bot.id);
+  if (idx === -1) return false;
+  bots[idx] = bot;
+  writeImportedBots(dataDir, bots);
+  return true;
+}
+
+/**
+ * Remove one bot from the roster imports file. Returns true when removed.
+ */
+export function removeRosterImport(botId: string, dataDir: string): boolean {
+  const bots = readImportedBots(dataDir);
+  const kept = bots.filter((b) => b.id !== botId);
+  if (kept.length === bots.length) return false;
+  writeImportedBots(dataDir, kept);
+  return true;
+}
+
 // ---- Manifest validation -----------------------------------------------------
 
 function isRecord(v: unknown): v is Record<string, unknown> {

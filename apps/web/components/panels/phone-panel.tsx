@@ -11,7 +11,7 @@
 // authenticated device; pairing requires explicit on-phone acceptance.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { getApiBase } from '../../lib/api';
+import { authedFetch, getApiBase } from '../../lib/api';
 import { useUxMode } from '../../lib/ux-mode';
 
 interface PhoneDevice {
@@ -25,7 +25,7 @@ interface PhoneDevice {
 }
 
 const api = (path: string, init?: RequestInit): Promise<unknown> =>
-  fetch(`${getApiBase()}${path}`, init).then(async (res) => {
+  authedFetch(path, init).then(async (res) => {
     if (!res.ok) {
       const detail = await res.text().catch(() => res.statusText);
       throw new Error(`API ${res.status}: ${detail || res.statusText}`);

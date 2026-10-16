@@ -6,6 +6,7 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { CodeBlock } from '../code/CodeBlock';
+import { authedFetch } from '../../lib/api';
 
 export interface FileNode {
   name: string;
@@ -90,7 +91,7 @@ export function FilesPanel() {
       : `/api/files/content?path=${encodeURIComponent(path)}`;
 
   useEffect(() => {
-    fetch('/api/bots')
+    authedFetch('/api/bots')
       .then((r) => r.json())
       .then((j) => {
         if (Array.isArray(j)) setBots(j.map((b: { id: string; name: string; workspace?: string }) => ({ id: b.id, name: b.name, workspace: b.workspace })));
@@ -105,7 +106,7 @@ export function FilesPanel() {
     setSelected(null);
     setContent(null);
     setExpanded(new Set());
-    fetch(listUrl)
+    authedFetch(listUrl)
       .then((r) => r.json())
       .then((j) => {
         if (cancelled) return;
@@ -125,7 +126,7 @@ export function FilesPanel() {
     setContent(null);
     setTruncated(false);
     setLoading(true);
-    fetch(contentUrl(node.path))
+    authedFetch(contentUrl(node.path))
       .then((r) => r.json())
       .then((j) => {
         setLoading(false);

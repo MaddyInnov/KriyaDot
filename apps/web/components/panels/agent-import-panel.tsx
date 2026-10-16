@@ -10,6 +10,7 @@
 // KriyaDot skills/bots are never overwritten (collisions are skipped).
 
 import { useEffect, useState } from 'react';
+import { kriyadotFetch } from '../../lib/kriyadot-api';
 
 interface SourceCounts {
   skills: number;
@@ -48,7 +49,7 @@ interface ImportReport {
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } });
+  const res = await kriyadotFetch(path, { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } });
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new Error(`${res.status} ${body || res.statusText}`.slice(0, 300));

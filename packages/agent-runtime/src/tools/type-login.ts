@@ -82,15 +82,25 @@ export function normalizeSite(site: string): string {
 }
 
 /**
- * Two sites match when their normalized forms are equal or one contains
- * the other (covers "mail.google.com" vs "google.com" and app-name
- * aliases like "whatsapp" vs "whatsapp desktop").
+ * Two sites match when their normalized forms are equal, or when one is a
+ * DNS subdomain of the other ("sub.github.com" vs "github.com"). Subdomain
+ * matching requires a dot boundary: "evilgithub.com" does NOT match
+ * "github.com" (substring matching would have let it through — H1).
+ * Non-domain values (no dots), such as app-name aliases like "whatsapp" vs
+ * "whatsapp desktop", still match when one contains the other.
  */
 export function sitesMatch(a: string, b: string): boolean {
   const na = normalizeSite(a);
   const nb = normalizeSite(b);
   if (!na || !nb) return false;
-  return na === nb || na.includes(nb) || nb.includes(na);
+  if (na === nb) return true;
+  const aIsDomain = na.includes('.');
+  const bIsDomain = nb.includes('.');
+  if (aIsDomain || bIsDomain) {
+    // Domain comparison: exact equality or dot-boundary suffix.
+    return na.endsWith('.' + nb) || nb.endsWith('.' + na);
+  }
+  return na.includes(nb) || nb.includes(na);
 }
 
 function loginIdArg(args: Record<string, unknown>): string {
@@ -105,6 +115,7 @@ export function createTypeLoginTool(opts: TypeLoginToolOptions): ToolDefinition 
   const { os, getLogin, verifySite } = opts;
   return {
     name: TYPE_LOGIN_TOOL_NAME,
+    mutating: true,
     description:
       'Type a saved vault login (username, Tab, password) into the currently focused field. ' +
       'The password is resolved server-side and never revealed to you — pass only the loginId. ' +

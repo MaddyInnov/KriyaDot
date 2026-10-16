@@ -3,6 +3,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { MODULES_BASE, api, fmtTs, PageHeader, ErrorBox, EmptyState, Markdown } from '../lib';
+import { authedFetch } from '../../../lib/api';
 
 interface KbDocument {
   id: string;
@@ -77,7 +78,7 @@ export default function KbPage() {
         mimeType: file.type || 'application/octet-stream',
         ...(corpusFilter ? { corpusId: corpusFilter } : {}),
       });
-      const res = await fetch(`${MODULES_BASE}/kb/documents?${qs}`, {
+      const res = await authedFetch(`${MODULES_BASE}/kb/documents?${qs}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: file,

@@ -42,6 +42,12 @@ class PairingStore(context: Context) {
      */
     val pushKey: String? get() = prefs.getString(KEY_PUSH_KEY, null)?.ifEmpty { null }
 
+    /**
+     * Bot id chosen in the chat picker (persisted after each roster load or
+     * explicit selection). Null until the roster has been loaded once.
+     */
+    val selectedBotId: String? get() = prefs.getString(KEY_SELECTED_BOT_ID, null)?.ifEmpty { null }
+
     /** Hosted-mode public base URL (https://…), or null for LAN pairing. */
     val serverUrl: String? get() = prefs.getString(KEY_SERVER_URL, null)?.ifEmpty { null }
 
@@ -76,6 +82,13 @@ class PairingStore(context: Context) {
         e.apply()
     }
 
+    /** Persists the chat bot-picker selection (null clears it). */
+    fun saveSelectedBotId(id: String?) {
+        val e = prefs.edit()
+        if (id.isNullOrEmpty()) e.remove(KEY_SELECTED_BOT_ID) else e.putString(KEY_SELECTED_BOT_ID, id)
+        e.apply()
+    }
+
     fun clear() {
         prefs.edit().clear().apply()
     }
@@ -89,5 +102,6 @@ class PairingStore(context: Context) {
         private const val KEY_DEVICE_TOKEN = "device_token"
         private const val KEY_DEVICE_ID = "device_id"
         private const val KEY_PUSH_KEY = "push_key"
+        private const val KEY_SELECTED_BOT_ID = "selected_bot_id"
     }
 }

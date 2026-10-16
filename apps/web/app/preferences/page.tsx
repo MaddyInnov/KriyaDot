@@ -11,6 +11,7 @@ import { LocalLlmPanel } from '../../components/panels/local-llm-panel';
 import { UpdatesPanel } from '../../components/panels/updates-panel';
 import { AgentImportPanel } from '../../components/panels/agent-import-panel';
 import { useUxMode } from '../../lib/ux-mode';
+import { authedFetch } from '../../lib/api';
 
 interface LearnedPreference {
   id: string;
@@ -30,7 +31,7 @@ interface Recording {
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } });
+  const res = await authedFetch(path, { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json() as Promise<T>;
 }

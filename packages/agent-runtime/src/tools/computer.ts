@@ -202,6 +202,7 @@ function screenshotTool(os: OSScreenLayer): ToolDefinition {
 function clickTool(os: OSScreenLayer): ToolDefinition {
   return {
     name: COMPUTER_TOOL_NAMES.click,
+    mutating: true,
     description:
       'Click at display coordinates (x, y) in physical pixels. MUTATING: requires human approval via governance.',
     parameters: {
@@ -229,6 +230,7 @@ function clickTool(os: OSScreenLayer): ToolDefinition {
 function typeTool(os: OSScreenLayer): ToolDefinition {
   return {
     name: COMPUTER_TOOL_NAMES.type,
+    mutating: true,
     description:
       'Type text into the focused element of the sandboxed display (max 2000 chars). MUTATING: requires human approval via governance.',
     parameters: {
@@ -254,6 +256,7 @@ function typeTool(os: OSScreenLayer): ToolDefinition {
 function keyTool(os: OSScreenLayer): ToolDefinition {
   return {
     name: COMPUTER_TOOL_NAMES.key,
+    mutating: true,
     description:
       `Press a named key (${[...COMPUTER_KEY_ALLOWLIST].join(', ')}). MUTATING: requires human approval via governance.`,
     parameters: {

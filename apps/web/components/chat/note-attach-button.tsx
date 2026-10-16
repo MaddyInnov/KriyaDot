@@ -7,7 +7,7 @@
 // the system prompt via an AgentRuntime context provider.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { getApiBase } from '../../lib/api';
+import { authedFetch } from '../../lib/api';
 import {
   attachNote,
   detachNote,
@@ -22,7 +22,7 @@ interface DocItem {
 }
 
 async function fetchDocs(kind: 'notes' | 'pages'): Promise<DocItem[]> {
-  const res = await fetch(`${getApiBase()}/api/${kind}`);
+  const res = await authedFetch(`/api/${kind}`);
   if (!res.ok) return [];
   const data = (await res.json()) as unknown;
   if (!Array.isArray(data)) return [];

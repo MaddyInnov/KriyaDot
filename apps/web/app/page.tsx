@@ -4,11 +4,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   allowTool,
+  authedFetch,
   branchChatThread,
   createMessageThread,
   decideApproval,
   deleteSlashCommand,
-  getApiBase,
+  ensureApiReady,
   getBots,
   getChatThreadMessages,
   getMessageReactions,
@@ -19,6 +20,7 @@ import {
   getSlashCommands,
   markMessageThreadRead,
   replyInMessageThread,
+  resetApiBootstrap,
   saveSlashCommand,
   streamChat,
   startFusionRun,
@@ -79,6 +81,7 @@ type ChatBlock =
   | { kind: 'widget'; id: string; widget: Widget }
   | { kind: 'error'; id: string; text: string }
   | { kind: 'interrupted'; id: string; text: string }
+  | { kind: 'notice'; id: string; text: string }
   | { kind: 'fusion'; id: string; runId: string; state: FusionLiveState; ts: number }
   | {
       kind: 'voice-note';
@@ -548,26 +551,29 @@ function ChatPageInner() {
   }, [anyStreaming]);
   const petMood: PetMood = celebrate ? 'happy' : waitingForFirstToken ? 'thinking' : anyStreaming ? 'working' : 'idle';
 
+  // Boot: wait for the API bootstrap token first (single shared promise —
+  // concurrent early calls all wait for it exactly once), then load the
+  // initial data. A bootstrap failure lands on the blocking
+  // unreachable-API screen below.
+  const boot = useCallback(async () => {
+    setLoadError('');
+    try {
+      await ensureApiReady();
+      const [b, p, m, sc] = await Promise.all([getBots(), getProviders(), getModels(), getSlashCommands()]);
+      setBots(b);
+      setProviders(p);
+      setModelPrices(m);
+      setSlashCommands(sc.commands ?? {});
+      if (b.length > 0) setSelectedBotId(b[0].id);
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : String(err));
+    }
+  }, []);
+
   // Initial load.
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const [b, p, m, sc] = await Promise.all([getBots(), getProviders(), getModels(), getSlashCommands()]);
-        if (cancelled) return;
-        setBots(b);
-        setProviders(p);
-        setModelPrices(m);
-        setSlashCommands(sc.commands ?? {});
-        if (b.length > 0) setSelectedBotId(b[0].id);
-      } catch (err) {
-        if (!cancelled) setLoadError(err instanceof Error ? err.message : String(err));
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    void boot();
+  }, [boot]);
 
   // Restore run-control prefs.
   useEffect(() => {
@@ -1056,6 +1062,11 @@ function ChatPageInner() {
           next.push({ kind: 'interrupted', id: nextId(), text: event.reason || 'Turn interrupted.' });
           break;
         }
+        case 'notice': {
+          // Non-fatal server notice — surfaced inline, never aborts the turn.
+          next.push({ kind: 'notice', id: nextId(), text: event.message });
+          break;
+        }
         case 'error': {
           next.push({ kind: 'error', id: nextId(), text: event.message });
           break;
@@ -1282,6 +1293,10 @@ function ChatPageInner() {
     try {
       await decideApproval(approvalId, decision);
     } catch (err) {
+      // The POST failed — revert the card to pending so the user can retry.
+      setBlocks((prev) =>
+        prev.map((b) => (b.kind === 'approval' && b.id === blockId ? { ...b, status: 'pending' } : b)),
+      );
       setBlocks((prev) => [
         ...prev,
         { kind: 'error', id: nextId(), text: err instanceof Error ? err.message : String(err) },
@@ -1321,7 +1336,7 @@ function ChatPageInner() {
   const handleWidgetAction = async (action: WidgetAction, widget: Widget) => {
     const endpoint = action.endpoint ?? '/api/widget-action';
     try {
-      const res = await fetch(`${getApiBase()}${endpoint}`, {
+      const res = await authedFetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1480,6 +1495,17 @@ function ChatPageInner() {
         <div className="error-box">
           Could not reach the API: {loadError}. Is it running? (see api: label in the top bar)
         </div>
+        <button
+          type="button"
+          className="btn"
+          style={{ marginTop: 8 }}
+          onClick={() => {
+            resetApiBootstrap();
+            void boot();
+          }}
+        >
+          Retry
+        </button>
       </div>
     );
   }
@@ -2084,6 +2110,12 @@ function ChatPageInner() {
                 return (
                   <div key={b.id} className="msg interrupted">
                     ⏹ {b.text}
+                  </div>
+                );
+              case 'notice':
+                return (
+                  <div key={b.id} className="msg notice">
+                    ℹ️ {b.text}
                   </div>
                 );
               case 'error':

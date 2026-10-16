@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
 import type { DatabaseSync } from 'node:sqlite';
+import { consumeWsTicket } from './loopback-auth.js';
 
 const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
 
@@ -285,7 +286,9 @@ export class PhoneStore {
 //   { t:'hello', deviceId, token }        authenticate the phone end
 //   { t:'frame', jpg: base64, w, h, ts }  MJPEG frame (JPEG bytes, base64)
 // Viewer → server:
-//   { t:'watch', deviceId }               subscribe to a device's frames
+//   { t:'watch', deviceId, ticket }     subscribe to a device's frames
+//                                       (ticket = one-time WS ticket from
+//                                       POST /api/phone/watch-ticket)
 //   { t:'tap', x, y }                     normalized 0..1
 //   { t:'swipe', x1,y1,x2,y2, ms }        normalized 0..1, ms 50..5000
 //   { t:'text', text }                    max 1024 chars
@@ -311,7 +314,7 @@ function isUnit(v: unknown): v is number {
 export type ValidatedMessage =
   | { t: 'hello'; deviceId: string; token: string }
   | { t: 'frame'; jpg: string; w: number; h: number; ts: number }
-  | { t: 'watch'; deviceId: string }
+  | { t: 'watch'; deviceId: string; ticket?: string }
   | { t: 'tap'; x: number; y: number }
   | { t: 'swipe'; x1: number; y1: number; x2: number; y2: number; ms: number }
   | { t: 'text'; text: string }
@@ -332,7 +335,17 @@ export function validateMessage(raw: unknown): { ok: true; msg: ValidatedMessage
       return { ok: true, msg: { t: 'hello', deviceId: m.deviceId as string, token: m.token } };
     case 'watch':
       if (!validDeviceId(m.deviceId)) return { ok: false, error: 'bad_device_id' };
-      return { ok: true, msg: { t: 'watch', deviceId: m.deviceId as string } };
+      // The one-time WS ticket is issued to bearer-authed HTTP clients via
+      // POST /api/phone/watch-ticket (see phone-routes.ts). Browsers can't
+      // send Authorization headers on WS handshakes, so the ticket carries
+      // the auth into the socket.
+      if (m.ticket !== undefined && (typeof m.ticket !== 'string' || m.ticket.length === 0 || m.ticket.length > 128)) {
+        return { ok: false, error: 'bad_ticket' };
+      }
+      return {
+        ok: true,
+        msg: { t: 'watch', deviceId: m.deviceId as string, ticket: m.ticket as string | undefined },
+      };
     case 'frame':
       if (typeof m.jpg !== 'string' || m.jpg.length === 0 || m.jpg.length > MAX_FRAME_B64) return { ok: false, error: 'bad_frame' };
       if (!/^[A-Za-z0-9+/=]+$/.test(m.jpg)) return { ok: false, error: 'bad_frame' };
@@ -679,6 +692,16 @@ export class PhoneSessionHub {
           return;
         }
         if (msg.t === 'watch') {
+          if (!consumeWsTicket(msg.ticket)) {
+            this.audit('phone.auth_failed', {
+              actor: 'api',
+              toolName: 'phone',
+              detail: { deviceId: msg.deviceId, remoteAddr, reason: 'bad_watch_ticket' },
+            });
+            sendErr('auth_failed');
+            sock.close(4401);
+            return;
+          }
           viewerConn = { socket: sock, watching: msg.deviceId };
           this.viewers.add(viewerConn);
           role = 'viewer';

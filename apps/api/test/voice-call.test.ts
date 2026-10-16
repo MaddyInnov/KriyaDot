@@ -19,7 +19,7 @@ import {
   resolveVoiceApiKey,
   MAX_UTTERANCE_BYTES,
 } from '../src/voice-call.js';
-import { createVoiceCallRouter, createVoiceCallUpgrade } from '../src/voice-call-routes.js';
+import { createVoiceCallRouter, createVoiceCallUpgrade, MAX_UTTERANCE_B64 } from '../src/voice-call-routes.js';
 import { validateVoiceSettings } from '../src/bot-roster-routes.js';
 
 const bot = (over: Partial<BotConfig> = {}): BotConfig =>
@@ -272,10 +272,11 @@ describe('voice-call REST routes', () => {
 describe('voice-call WebSocket protocol', () => {
   let server: ReturnType<typeof createServer> | null = null;
   let base = '';
+  const WS_TOKEN = 'test-loopback-token-abc123';
 
   beforeEach(async () => {
     const { svc } = makeService();
-    const upgrade = createVoiceCallUpgrade({ service: svc });
+    const upgrade = createVoiceCallUpgrade({ service: svc, loopbackToken: WS_TOKEN });
     const app = express();
     app.use(express.json());
     app.use('/api/voice', createVoiceCallRouter({ service: svc }));
@@ -311,9 +312,13 @@ describe('voice-call WebSocket protocol', () => {
     return body.callId;
   }
 
-  function connect(callId: string): Promise<{ ws: WebSocket; frames: Array<Record<string, unknown>> }> {
+  function connect(
+    callId: string,
+    token: string | null = WS_TOKEN,
+  ): Promise<{ ws: WebSocket; frames: Array<Record<string, unknown>> }> {
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(`ws://127.0.0.1:${new URL(base).port}/api/voice/calls/ws?callId=${callId}`);
+      const qs = `callId=${encodeURIComponent(callId)}${token === null ? '' : `&token=${encodeURIComponent(token)}`}`;
+      const ws = new WebSocket(`ws://127.0.0.1:${new URL(base).port}/api/voice/calls/ws?${qs}`);
       const frames: Array<Record<string, unknown>> = [];
       const timer = setTimeout(() => reject(new Error('no call_started frame')), 5000);
       ws.onmessage = (ev) => {
@@ -368,6 +373,63 @@ describe('voice-call WebSocket protocol', () => {
     await expect(connect('vcall_nope')).rejects.toThrow();
   });
 
+  it('rejects the WS upgrade without a valid ?token= (4401 unauthorized)', async () => {
+    const callId = await startCall();
+    async function tryConnect(token: string | null): Promise<{ detail: string; code: number }> {
+      return new Promise((resolve) => {
+        const qs = `callId=${encodeURIComponent(callId)}${token === null ? '' : `&token=${encodeURIComponent(token)}`}`;
+        const w = new WebSocket(`ws://127.0.0.1:${new URL(base).port}/api/voice/calls/ws?${qs}`);
+        let detail = '';
+        w.onmessage = (ev) => {
+          const f = JSON.parse(String(ev.data)) as { t?: string; detail?: string };
+          if (f.t === 'error') detail = String(f.detail ?? '');
+        };
+        w.onclose = (ev) => resolve({ detail, code: (ev as unknown as { code?: number }).code ?? -1 });
+        setTimeout(() => resolve({ detail, code: -1 }), 5000);
+      });
+    }
+    for (const bad of [null, 'wrong-token']) {
+      const r = await tryConnect(bad);
+      expect(r.detail).toBe('unauthorized');
+      expect(r.code).toBe(4401);
+    }
+    // The call is still usable with the right token afterwards.
+    const { ws, frames } = await connect(callId, WS_TOKEN);
+    expect(frames[0]!.t).toBe('call_started');
+    ws.close();
+  });
+
+  it('accepts a one-time ?ticket= on the WS upgrade', async () => {
+    const { issueWsTicket } = await import('../src/loopback-auth.js');
+    const callId = await startCall();
+    const ticket = issueWsTicket();
+    const qs = `callId=${encodeURIComponent(callId)}&ticket=${encodeURIComponent(ticket)}`;
+    const { ws, frames } = await new Promise<{ ws: WebSocket; frames: Array<Record<string, unknown>> }>(
+      (resolve, reject) => {
+        const w = new WebSocket(`ws://127.0.0.1:${new URL(base).port}/api/voice/calls/ws?${qs}`);
+        const fr: Array<Record<string, unknown>> = [];
+        const timer = setTimeout(() => reject(new Error('no call_started')), 5000);
+        w.onmessage = (ev) => {
+          const f = JSON.parse(String(ev.data)) as Record<string, unknown>;
+          fr.push(f);
+          if (f.t === 'call_started') {
+            clearTimeout(timer);
+            resolve({ ws: w, frames: fr });
+          } else if (f.t === 'error') {
+            clearTimeout(timer);
+            reject(new Error(`rejected: ${String(f.detail)}`));
+          }
+        };
+        w.onerror = () => {
+          clearTimeout(timer);
+          reject(new Error('ws error'));
+        };
+      },
+    );
+    expect(frames[0]!.t).toBe('call_started');
+    ws.close();
+  });
+
   it('runs a full utterance round trip over WS frames', async () => {
     const callId = await startCall();
     const { ws, frames } = await connect(callId);
@@ -402,6 +464,22 @@ describe('voice-call WebSocket protocol', () => {
     // Session still usable.
     ws.send(JSON.stringify({ t: 'utterance', audio: Buffer.from([1, 2]).toString('base64') }));
     await waitFor(frames, 'turn_done');
+    ws.close();
+  });
+
+  it('rejects oversized utterance audio by base64 string length before decoding (H4)', async () => {
+    const callId = await startCall();
+    const { ws, frames } = await connect(callId);
+    // MAX_UTTERANCE_B64+1 chars would decode to more than the 10MB service
+    // limit; the route must refuse it without ever decoding.
+    const huge = 'a'.repeat(MAX_UTTERANCE_B64 + 1);
+    const before = frames.length;
+    ws.send(JSON.stringify({ t: 'utterance', audio: huge }));
+    const err = await waitFor(frames, 'error', 15000, before);
+    expect(String(err.detail)).toContain('audio too large');
+    // Session still usable after the rejection (defense-in-depth intact).
+    ws.send(JSON.stringify({ t: 'utterance', audio: Buffer.from([1, 2]).toString('base64') }));
+    await waitFor(frames, 'turn_done', 15000, before);
     ws.close();
   });
 });

@@ -8,7 +8,7 @@ import {
   createPage,
   deletePage,
   deletePageComment,
-  getApiBase,
+  authedFetch,
   getBots,
   getPage,
   listPageVersions,
@@ -119,7 +119,7 @@ export function PagesPanel() {
   dirtyRef.current = dirty;
   const selectedRef = useRef<string | null>(null);
   selectedRef.current = selectedId;
-  const esRef = useRef<EventSource | null>(null);
+  const esRef = useRef<AbortController | null>(null);
 
   const refreshList = useCallback(async () => {
     try {
@@ -154,23 +154,24 @@ export function PagesPanel() {
     }
   }, []);
 
-  // Live updates for the open page.
+  // Live updates for the open page. Fetch-based SSE: EventSource cannot
+  // send the Authorization header, so the stream is read with a manual loop.
   useEffect(() => {
-    esRef.current?.close();
+    esRef.current?.abort();
     esRef.current = null;
     setLive(false);
     if (!selectedId) return;
-    const es = new EventSource(`${getApiBase()}/api/pages/${encodeURIComponent(selectedId)}/stream`);
-    esRef.current = es;
-    es.onopen = () => setLive(true);
-    es.onerror = () => setLive(false);
-    es.onmessage = (ev) => {
+    const pageId = selectedId;
+    const controller = new AbortController();
+    esRef.current = controller;
+    const handlePageEvent = (
+      data:
+        | { kind: 'page'; page: Page }
+        | { kind: 'comment'; comment: PageComment }
+        | { kind: 'mention'; mention: PageMention }
+        | { kind: 'deleted'; pageId: string },
+    ) => {
       try {
-        const data = JSON.parse(ev.data) as
-          | { kind: 'page'; page: Page }
-          | { kind: 'comment'; comment: PageComment }
-          | { kind: 'mention'; mention: PageMention }
-          | { kind: 'deleted'; pageId: string };
         if (data.kind === 'page') {
           if (dirtyRef.current) {
             setRemoteBanner(
@@ -217,8 +218,40 @@ export function PagesPanel() {
         // ignore malformed events
       }
     };
+    (async () => {
+      try {
+        const streamRes = await authedFetch(`/api/pages/${encodeURIComponent(pageId)}/stream`, {
+          signal: controller.signal,
+        });
+        if (!streamRes.ok || !streamRes.body) throw new Error(`page stream failed (${streamRes.status})`);
+        setLive(true);
+        const reader = streamRes.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const frames = buf.split('\n\n');
+          buf = frames.pop() ?? '';
+          for (const frame of frames) {
+            for (const line of frame.split('\n')) {
+              if (line.startsWith('data:')) {
+                try {
+                  handlePageEvent(JSON.parse(line.slice(5).trim()));
+                } catch {
+                  // ignore malformed events
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        if (!controller.signal.aborted) setLive(false);
+      }
+    })();
     return () => {
-      es.close();
+      controller.abort();
       esRef.current = null;
     };
   }, [selectedId, refreshList]);
