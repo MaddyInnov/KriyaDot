@@ -11,7 +11,7 @@
 //   app.use('/api/agents', createAgentDetectRouter());
 
 import express, { type Router } from 'express';
-import { listAgents, rescanAgents, scanAgents, lastScanTime } from '@mvp/agent-runtime';
+import { listAgents, rescanAgents, scanAgents, lastScanTime, discoverAgentModels } from '@mvp/agent-runtime';
 
 function errorBody(message: string): Record<string, unknown> {
   return { ok: false, error: message };
@@ -45,6 +45,18 @@ export function createAgentDetectRouter(): Router {
       res.json({ ok: true, agents, scannedAt: lastScanTime() });
     } catch (err) {
       res.status(500).json(errorBody(err instanceof Error ? err.message : 'rescan failed'));
+    }
+  });
+
+  // Per-agent model discovery (Codync parity: model picker per backend).
+  // GET /api/agents/:id/models → { ok, agentId, models: AgentModel[] }
+  // Best-effort: unknown agents and probe failures return an empty list.
+  router.get('/:id/models', (req, res) => {
+    try {
+      const models = discoverAgentModels(req.params.id);
+      res.json({ ok: true, agentId: req.params.id, models });
+    } catch (err) {
+      res.status(500).json(errorBody(err instanceof Error ? err.message : 'model discovery failed'));
     }
   });
 

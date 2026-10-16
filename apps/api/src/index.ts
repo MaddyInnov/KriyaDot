@@ -209,6 +209,10 @@ async function boot(): Promise<void> {
   // <dataDir>/bot-workspaces.json. Unset → global workspaceDir.
   const { applyBotWorkspaces } = await import('./bot-workspaces.js');
   applyBotWorkspaces(seed.bots, config.dataDir);
+  // Per-bot model + options (Codync parity: model picker): overlay from
+  // <dataDir>/bot-models.json.
+  const { applyBotModels } = await import('./bot-models.js');
+  applyBotModels(seed.bots, config.dataDir);
   // Chat branching / roster import: overlay previously imported bots.
   applyImportedBots(seed.bots, config.dataDir);
   const botsById = new Map<string, BotConfig>(seed.bots.map((b) => [b.id, b]));

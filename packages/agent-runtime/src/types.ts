@@ -105,6 +105,22 @@ export interface BotPolicy {
  */
 export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
 
+/**
+ * Per-model inference options (Codync parity: model options in bot editor).
+ * Not all options apply to all models — the UI only shows supported ones
+ * (see AgentModel.supports* flags from agent-models.ts).
+ */
+export interface ModelOptions {
+  /** Reasoning effort for models that support it (OpenAI reasoning_effort). */
+  reasoningEffort?: 'low' | 'medium' | 'high';
+  /** Prefer the fastest/lowest-latency variant. */
+  fastMode?: boolean;
+  /** Sampling temperature (0-2). */
+  temperature?: number;
+  /** Max output tokens. */
+  maxTokens?: number;
+}
+
 export interface BotConfig {
   id: string;
   name: string;
@@ -112,6 +128,8 @@ export interface BotConfig {
   systemPrompt: string;
   provider: string;
   model: string;
+  /** Per-model inference options (reasoning effort, fast mode, etc.). */
+  modelOptions?: ModelOptions;
   skills: string[];
   tools: string[];
   mcpServers: string[];

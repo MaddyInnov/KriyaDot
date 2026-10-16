@@ -2,8 +2,8 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { exportBotRoster, getBots, getPersonas, getRedteamReports, importBotRoster, runRedteamSuite, setBotPersona, setBotWorkspace, simulatePolicy, updateBotPolicy } from '../../lib/api';
-import type { BotConfig, BotPolicyEffect, BotPolicyRule, PersonaInfo, PolicySimulationResult, RedteamReport, RosterImportReport } from '../../lib/api';
+import { exportBotRoster, getAgentModels, getBots, getPersonas, getProviders, getRedteamReports, importBotRoster, runRedteamSuite, setBotModel, setBotPersona, setBotWorkspace, simulatePolicy, updateBotPolicy } from '../../lib/api';
+import type { AgentModel, BotConfig, BotPolicyEffect, BotPolicyRule, ModelOptions, PersonaInfo, PolicySimulationResult, ProviderInfo, RedteamReport, RosterImportReport } from '../../lib/api';
 import { useUxMode } from '../../lib/ux-mode';
 import { I18nProvider, LanguageSwitcher, useI18n } from '../../lib/i18n';
 import ComputerPanel from '../../components/panels/computer-panel';
@@ -279,6 +279,136 @@ function PolicySimulator({ bot }: { bot: BotConfig }) {
           )}
           {result.denylist && <div className="muted">Hard denylist on run_command args fired.</div>}
         </div>
+      )}
+    </div>
+  );
+}
+
+function ModelPicker({
+  bot,
+  onSaved,
+}: {
+  bot: BotConfig;
+  onSaved: (botId: string, model: string, modelOptions?: ModelOptions) => void;
+}) {
+  const [providers, setProviders] = useState<ProviderInfo[]>([]);
+  const [agentModels, setAgentModels] = useState<AgentModel[]>([]);
+  const [selected, setSelected] = useState(bot.model);
+  const [options, setOptions] = useState<ModelOptions>(bot.modelOptions ?? {});
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    setSelected(bot.model);
+    setOptions(bot.modelOptions ?? {});
+    setError('');
+  }, [bot.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      try {
+        const provs = await getProviders();
+        if (cancelled) return;
+        setProviders(provs);
+        const prov = provs.find((p) => p.id === bot.provider);
+        if (prov?.bridge) {
+          try {
+            const r = await getAgentModels(prov.bridge);
+            if (!cancelled) setAgentModels(r.models);
+          } catch {
+            if (!cancelled) setAgentModels([]);
+          }
+        } else {
+          if (!cancelled) setAgentModels([]);
+        }
+      } catch {
+        if (!cancelled) setProviders([]);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [bot.id, bot.provider]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const provider = providers.find((p) => p.id === bot.provider);
+  // Prefer live-discovered agent models; fall back to provider catalog.
+  const catalogModels: AgentModel[] = (provider?.models ?? []).map((m) => ({ id: m.id, name: m.name }));
+  const models = agentModels.length > 0 ? agentModels : catalogModels;
+  const current = models.find((m) => m.id === selected);
+
+  // Only show options the current model supports (default: show all when unknown).
+  const showEffort = !current || current.supportsReasoningEffort !== false;
+  const showFast = !current || current.supportsFastMode !== false;
+
+  const save = async () => {
+    setSaving(true);
+    setError('');
+    try {
+      const res = await setBotModel(bot.id, selected || null, Object.keys(options).length > 0 ? options : null);
+      onSaved(bot.id, res.model ?? selected, res.modelOptions);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <h3 style={{ marginTop: 0 }}>Model</h3>
+      <p className="small muted">
+        Pick the model for this bot{provider ? ` (via ${provider.name})` : ''}. Options only appear
+        when the model supports them.
+      </p>
+      {loading ? (
+        <p className="muted">Loading models…</p>
+      ) : models.length === 0 ? (
+        <p className="muted">No models discovered. The bot keeps its current model ({bot.model}).</p>
+      ) : (
+        <>
+          <label className="small" style={{ display: 'block', marginBottom: 4 }}>Model</label>
+          <select
+            value={selected}
+            onChange={(e) => setSelected(e.target.value)}
+            style={{ width: '100%', marginBottom: 12 }}
+          >
+            {models.map((m) => (
+              <option key={m.id} value={m.id}>{m.name}</option>
+            ))}
+          </select>
+          {showEffort && (
+            <div style={{ marginBottom: 12 }}>
+              <label className="small" style={{ display: 'block', marginBottom: 4 }}>Reasoning effort</label>
+              <select
+                value={options.reasoningEffort ?? ''}
+                onChange={(e) => setOptions((o) => ({ ...o, reasoningEffort: (e.target.value || undefined) as ModelOptions['reasoningEffort'] }))}
+                style={{ width: '100%' }}
+              >
+                <option value="">Default</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+              </select>
+            </div>
+          )}
+          {showFast && (
+            <label className="small" style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+              <input
+                type="checkbox"
+                checked={options.fastMode ?? false}
+                onChange={(e) => setOptions((o) => ({ ...o, fastMode: e.target.checked || undefined }))}
+              />
+              Fast mode (prefer lowest-latency variant)
+            </label>
+          )}
+          <button onClick={save} disabled={saving} className="btn btn-primary">
+            {saving ? 'Saving…' : 'Save model'}
+          </button>
+          {error && <p className="small" style={{ color: 'var(--danger, #c00)' }}>{error}</p>}
+        </>
       )}
     </div>
   );
@@ -577,7 +707,7 @@ function BotsPageInner() {
   const [bots, setBots] = useState<BotConfig[]>([]);
   const [selectedBotId, setSelectedBotId] = useState('');
   const [error, setError] = useState('');
-  const [tab, setTab] = useState<'policy' | 'robustness' | 'computer' | 'memory'>('policy');
+  const [tab, setTab] = useState<'policy' | 'model' | 'robustness' | 'computer' | 'memory'>('policy');
   const [mode] = useUxMode();
   const [rosterBusy, setRosterBusy] = useState(false);
   const [rosterError, setRosterError] = useState('');
@@ -585,6 +715,7 @@ function BotsPageInner() {
   const importFileRef = useRef<HTMLInputElement>(null);
   const tabs = [
     { id: 'policy' as const, label: t('bots.tabPolicy') },
+    { id: 'model' as const, label: t('bots.tabModel') },
     { id: 'computer' as const, label: t('bots.tabComputer') },
     { id: 'memory' as const, label: t('bots.tabMemory') },
     // Pro surface: hidden in Simple mode.
@@ -656,6 +787,10 @@ function BotsPageInner() {
 
   const onWorkspaceSaved = (botId: string, workspace: string | null) => {
     setBots((prev) => prev.map((b) => (b.id === botId ? { ...b, workspace: workspace ?? undefined } : b)));
+  };
+
+  const onModelSaved = (botId: string, model: string, modelOptions?: ModelOptions) => {
+    setBots((prev) => prev.map((b) => (b.id === botId ? { ...b, model, modelOptions } : b)));
   };
 
   const selectedBot = bots.find((b) => b.id === selectedBotId);
@@ -780,6 +915,8 @@ function BotsPageInner() {
                   <RulesEditor key={selectedBot.id} bot={selectedBot} onSaved={onSaved} />
                   <PolicySimulator key={`sim-${selectedBot.id}`} bot={selectedBot} />
                 </>
+              ) : activeTab === 'model' ? (
+                <ModelPicker key={`model-${selectedBot.id}`} bot={selectedBot} onSaved={onModelSaved} />
               ) : activeTab === 'computer' ? (
                 <ComputerPanel key={`computer-${selectedBot.id}`} botId={selectedBot.id} />
               ) : activeTab === 'memory' ? (

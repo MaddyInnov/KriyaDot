@@ -38,6 +38,7 @@ export interface BotConfig {
   systemPrompt: string;
   provider: string;
   model: string;
+  modelOptions?: ModelOptions;
   skills: string[];
   tools: string[];
   mcpServers: string[];
@@ -536,6 +537,37 @@ export const setBotPersona = (botId: string, persona: string | null): Promise<{ 
   apiJson(`/api/bots/${encodeURIComponent(botId)}/persona`, {
     method: 'PUT',
     body: JSON.stringify({ persona }),
+  });
+
+// ---- Per-bot model + options (Codync parity: model picker) ----------------
+
+export interface AgentModel {
+  id: string;
+  name: string;
+  description?: string;
+  supportsReasoningEffort?: boolean;
+  supportsFastMode?: boolean;
+  supportsTemperature?: boolean;
+}
+
+export interface ModelOptions {
+  reasoningEffort?: 'low' | 'medium' | 'high';
+  fastMode?: boolean;
+  temperature?: number;
+  maxTokens?: number;
+}
+
+export const getAgentModels = (agentId: string): Promise<{ ok: boolean; agentId: string; models: AgentModel[] }> =>
+  apiJson(`/api/agents/${encodeURIComponent(agentId)}/models`);
+
+export const setBotModel = (
+  botId: string,
+  model: string | null,
+  modelOptions: ModelOptions | null,
+): Promise<{ ok: boolean; botId: string; model?: string; modelOptions?: ModelOptions }> =>
+  apiJson(`/api/bots/${encodeURIComponent(botId)}/model`, {
+    method: 'PUT',
+    body: JSON.stringify({ model, modelOptions }),
   });
 export const getProviders = (): Promise<ProviderInfo[]> => apiJson('/api/providers');
 export const getModels = (freeOnly = false): Promise<ModelPriceInfo[]> =>

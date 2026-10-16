@@ -77,6 +77,7 @@ import type { CompanionHub, CompanionStore } from './companion.js';
 import { TieredMemoryStore } from '@mvp/agent-runtime';
 import { PERSONAS, MBTI_TYPES, QUIZ_QUESTIONS, scoreQuiz, resolvePersona } from '@mvp/agent-runtime';
 import { saveBotPersona } from './bot-personas.js';
+import { saveBotModel } from './bot-models.js';
 // Phase 4: marketplace + billing + tenancy/vault + protocols/voice + muse modules.
 import { registerMarketplaceRoutes } from './marketplace.js';
 import { registerBillingRoutes } from './billing.js';
@@ -1047,6 +1048,22 @@ export function createRouter(deps: RouteDeps): express.Router {
       const message = err instanceof Error ? err.message : String(err);
       const status = message.startsWith('Unknown bot') ? 404 : 400;
       res.status(status).json(errorBody('Failed to save workspace', message));
+    }
+  });
+
+  // ---- Per-bot model + options (Codync parity: model picker) ---------------
+  // PUT body: { model?: string, modelOptions?: ModelOptions }.
+  // Persisted to <dataDir>/bot-models.json and applied to the in-memory
+  // bot immediately; also applied at boot (see bot-models.ts).
+  router.put('/bots/:id/model', (req, res) => {
+    const body = (req.body ?? {}) as { model?: unknown; modelOptions?: unknown };
+    try {
+      const sel = saveBotModel(config.dataDir, bots, req.params.id, body.model, body.modelOptions);
+      res.json({ ok: true, botId: req.params.id, ...sel });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const status = message.startsWith('Unknown bot') ? 404 : 400;
+      res.status(status).json(errorBody('Failed to save model', message));
     }
   });
 

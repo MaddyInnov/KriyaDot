@@ -591,7 +591,9 @@ export class AgentRuntime {
             onRetry: () => {
               if (telRunId) this.telemetry?.noteRetry(telRunId);
             },
-            reasoningEffort: opts.reasoningEffort,
+            // Per-bot model options (Codync parity): bot.modelOptions wins over
+            // the call-site override.
+            reasoningEffort: opts.bot.modelOptions?.reasoningEffort ?? opts.reasoningEffort,
           });
           llmStep?.end({ ok: true });
         } catch (err) {
