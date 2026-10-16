@@ -303,7 +303,7 @@ export function createBotRosterRouter(deps: BotRosterDeps): Router {
    * skipped (reported), malformed entries land in `errors`, everything else
    * is created with its manifest id preserved.
    */
-  router.post('/import', (req, res) => {
+  router.post('/import', async (req, res) => {
     const body = (req.body ?? {}) as { manifest?: unknown };
     if (body.manifest === undefined) {
       res.status(400).json(errorBody('body.manifest is required'));
@@ -320,10 +320,17 @@ export function createBotRosterRouter(deps: BotRosterDeps): Router {
     const bots = deps.getBots();
     const botIds = new Set(bots.map((b) => b.id));
     const persisted = readImportedBots(deps.dataDir);
+    const { allocateBotWorkspace } = await import('./bot-workspace-alloc.js');
     for (const bot of manifest.bots) {
       if (botIds.has(bot.id)) {
         result.skipped.push({ id: bot.id, reason: 'bot id already exists — import never overwrites' });
         continue;
+      }
+      // Auto-allocate a workspace for the imported bot (Codync parity).
+      try {
+        allocateBotWorkspace(bot, deps.dataDir);
+      } catch {
+        // Invalid bot id — workspace allocation is best-effort on import.
       }
       bots.push(bot);
       botIds.add(bot.id);

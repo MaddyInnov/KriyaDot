@@ -43,6 +43,8 @@ import { mountWebAssets } from './web-assets.js';
 import { createComputerView } from './computer-view.js';
 import { createChatThreadsRouter } from './chat-threads-routes.js';
 import { createMessageThreadsRouter } from './message-threads-routes.js';
+import { createMessageReactionsRouter } from './message-reactions-routes.js';
+import { MessageReactionStore } from './message-reactions.js';
 import { createGroupChatsRouter } from './group-chats-routes.js';
 import { applyImportedBots, createBotRosterRouter } from './bot-roster-routes.js';
 import { registerRoutineRoutes } from './bot-routines.js';
@@ -215,6 +217,11 @@ async function boot(): Promise<void> {
   applyBotModels(seed.bots, config.dataDir);
   // Chat branching / roster import: overlay previously imported bots.
   applyImportedBots(seed.bots, config.dataDir);
+  // Auto-allocated per-bot workspaces (Codync parity): every bot gets
+  // <dataDir>/bots/<botId>/workspace unless it already has an explicit
+  // workspace configured.
+  const { allocateBotWorkspaces } = await import('./bot-workspace-alloc.js');
+  allocateBotWorkspaces(seed.bots, config.dataDir);
   const botsById = new Map<string, BotConfig>(seed.bots.map((b) => [b.id, b]));
 
   // 2. Governance + tools.
@@ -745,6 +752,15 @@ async function boot(): Promise<void> {
       dataDir: config.dataDir,
       branchSession: (id, msgId, opts) => agentRuntime.branchSession(id, msgId, opts),
       listThreadMessages: (id) => agentRuntime.listThreadMessages(id),
+      audit: (action, fields) => governance.audit(action, fields),
+    }),
+  );
+  // Message reactions (Codync parity): emoji reactions on chat messages.
+  const messageReactionStore = new MessageReactionStore(config.dataDir);
+  app.use(
+    '/api/chat/:sessionId/messages',
+    createMessageReactionsRouter({
+      store: messageReactionStore,
       audit: (action, fields) => governance.audit(action, fields),
     }),
   );

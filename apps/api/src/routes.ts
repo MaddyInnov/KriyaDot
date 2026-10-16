@@ -109,6 +109,7 @@ import marketplaceRegistryJson from '@mvp/marketplace/registry/registry.json' wi
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync, createReadStream } from 'node:fs';
 import { join, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { botWorkspacePath } from './bot-workspace-alloc.js';
 import {
   connectBridge,
   disconnectBridge,
@@ -297,7 +298,14 @@ export function createRouter(deps: RouteDeps): express.Router {
 
   router.get('/bots', (_req, res) => {
     // Bot configs carry no secrets (system prompts are content, not keys).
-    res.json(bots);
+    // Include the resolved workspacePath for each bot (Codync parity:
+    // auto-allocated per-bot workspaces).
+    res.json(
+      bots.map((bot) => ({
+        ...bot,
+        workspacePath: botWorkspacePath(bot, config.dataDir),
+      })),
+    );
   });
 
   // ---- Per-bot governance policy ------------------------------------------

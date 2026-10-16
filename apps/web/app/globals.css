@@ -2705,6 +2705,81 @@ html[data-theme='midnight'] .tk-fn { color: #67e8f9; }
   border-radius: 10px;
 }
 
+/* --- Message reactions (Codync parity) --- */
+.msg-reactions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+.msg-reaction-picker-wrap {
+  position: relative;
+}
+.msg-react-btn {
+  opacity: 0.6;
+}
+.msg-head:hover .msg-react-btn,
+.msg-react-btn:focus-visible {
+  opacity: 1;
+}
+.msg-reaction-picker {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  display: flex;
+  gap: 2px;
+  padding: 6px 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.25));
+  border-radius: 12px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  z-index: 20;
+  margin-bottom: 4px;
+}
+.msg-reaction-option {
+  font-size: 20px;
+  background: none;
+  border: none;
+  border-radius: 8px;
+  padding: 4px 6px;
+  cursor: pointer;
+  line-height: 1;
+}
+.msg-reaction-option:hover {
+  background: var(--surface-3, rgba(128, 128, 128, 0.15));
+  transform: scale(1.2);
+}
+.msg-reaction-chips {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.msg-reaction-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 14px;
+  padding: 2px 8px;
+  border-radius: 12px;
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.25));
+  background: var(--surface-1);
+  cursor: pointer;
+  line-height: 1.4;
+}
+.msg-reaction-chip:hover {
+  background: var(--surface-2);
+}
+.msg-reaction-chip.mine {
+  border-color: var(--accent, #8b7cf6);
+  background: color-mix(in srgb, var(--accent, #8b7cf6) 12%, transparent);
+}
+.msg-reaction-count {
+  font-size: 11px;
+  font-weight: 600;
+  opacity: 0.8;
+}
+
 /* --- Suggestion chips (empty state) --- */
 .chips {
   display: flex;

@@ -11,6 +11,7 @@ import {
   getApiBase,
   getBots,
   getChatThreadMessages,
+  getMessageReactions,
   getMessageThread,
   getMessageThreads,
   getModels,
@@ -22,6 +23,7 @@ import {
   streamChat,
   uploadFile,
   deleteUploadedFile,
+  type MessageReaction,
 } from '../lib/api';
 import type {
   BotConfig,
@@ -47,6 +49,7 @@ import { VOICE_NOTE_PERSIST_LIMIT, type VoiceNote } from '../lib/voice-notes';
 import { CallPanel, VoiceNoteBubble, VoiceNoteRecorder } from '../components/voice';
 import { NoteAttachButton } from '../components/chat/note-attach-button';
 import { BotConversationSheet, BotNoticeRow, type BotNoticeData } from '../components/chat/bot-notice';
+import { MessageReactions } from '../components/chat/message-reactions';
 import { useCodeSession } from '../components/code/useCodeSession';
 import { CodeSessionView } from '../components/code/CodeSessionView';
 import { CodingSessionStrip } from '../components/code/CodingSessionStrip';
@@ -438,6 +441,9 @@ function ChatPageInner() {
   const [renameDraft, setRenameDraft] = useState('');
   // Branching a thread at a message (server round-trip in progress).
   const [branching, setBranching] = useState(false);
+  // Message reactions (Codync parity): per-message emoji reactions,
+  // keyed by client message id.
+  const [messageReactions, setMessageReactions] = useState<Record<string, MessageReaction[]>>({});
   // Slack-style reply threads: the open thread panel, its messages, and
   // per-root summaries (reply counts + unread flags) for the active convo.
   const [openThread, setOpenThread] = useState<{
@@ -582,12 +588,12 @@ function ChatPageInner() {
     const list = convosRef.current[selectedBot.id] ?? [];
     if (cid && list.some((c) => c.id === cid)) {
       setBlocks(loadBlocks(cid));
-      void loadThreadSummaries(cid);
+      void loadThreadSummaries(cid); void loadMessageReactions(cid);
     } else if (list.length > 0 && list[0]) {
       // Fall back to the most recent conversation.
       persistActiveConvo({ ...activeConvoRef.current, [selectedBot.id]: list[0].id });
       setBlocks(loadBlocks(list[0].id));
-      void loadThreadSummaries(list[0].id);
+      void loadThreadSummaries(list[0].id); void loadMessageReactions(list[0].id);
     } else {
       setBlocks([]);
       setThreadSummaries({});
@@ -663,7 +669,7 @@ function ChatPageInner() {
     setBlocks(loadBlocks(convoId));
     setSideOpen(false);
     closeThread();
-    void loadThreadSummaries(convoId);
+    void loadThreadSummaries(convoId); void loadMessageReactions(convoId);
   };
 
   /**
@@ -752,6 +758,58 @@ function ChatPageInner() {
       // Threads are additive; a failure here must not break the chat.
     }
   }, []);
+
+  /**
+   * Load message reactions for the active conversation (Codync parity).
+   * Maps client block ids to server message ids, then batch-fetches.
+   * Reacted messages are exempt from auto-mark-as-unread.
+   */
+  const loadMessageReactions = useCallback(async (cid: string) => {
+    try {
+      const log = await getChatThreadMessages(cid);
+      const serverMessages = log.messages.filter((m) => m.role === 'user' || m.role === 'assistant');
+      if (serverMessages.length === 0) {
+        setMessageReactions({});
+        return;
+      }
+      const serverIds = serverMessages.map((m) => String(m.id));
+      const res = await getMessageReactions(cid, serverIds);
+      // Map server message id -> client block id via ordinal position.
+      const blocks = blocksRef.current.filter((b) => b.kind === 'user' || b.kind === 'assistant');
+      const byBlockId: Record<string, MessageReaction[]> = {};
+      serverMessages.forEach((sm, idx) => {
+        const block = blocks[idx];
+        const reactions = res.byMessageId[String(sm.id)];
+        if (block && reactions && reactions.length > 0) {
+          byBlockId[block.id] = reactions;
+        }
+      });
+      setMessageReactions(byBlockId);
+    } catch {
+      // Reactions are additive; a failure here must not break the chat.
+    }
+  }, []);
+
+  /**
+   * Toggle a reaction on a message block (Codync parity). Resolves the
+   * client block id to the server message id, then toggles.
+   */
+  const toggleReactionForBlock = async (blockId: string, emoji: string) => {
+    const botId = botIdRef.current;
+    const cid = activeConvoRef.current[botId];
+    if (!cid) return;
+    try {
+      const mapped = await mapBlockToServerMessage(blockId, cid);
+      if (!mapped) return;
+      const { toggleMessageReaction } = await import('../lib/api');
+      const res = await toggleMessageReaction(cid, mapped.serverId, emoji);
+      if (res.ok) {
+        setMessageReactions((prev) => ({ ...prev, [blockId]: res.reactions }));
+      }
+    } catch {
+      // Reactions are additive; failures must not break the chat.
+    }
+  };
 
   /**
    * Open the reply thread anchored to a message block: create the thread
@@ -1704,6 +1762,11 @@ function ChatPageInner() {
                       />
                     </div>
                     <div className="msg-text">{b.text}</div>
+                    <MessageReactions
+                      reactions={messageReactions[b.id] ?? []}
+                      onToggle={(emoji) => toggleReactionForBlock(b.id, emoji)}
+                      disabled={sending}
+                    />
                     {summary && summary.replyCount > 0 && (
                       <button
                         type="button"
@@ -1797,6 +1860,13 @@ function ChatPageInner() {
                         </>
                       )}
                     </div>
+                    {!b.streaming && (
+                      <MessageReactions
+                        reactions={messageReactions[b.id] ?? []}
+                        onToggle={(emoji) => toggleReactionForBlock(b.id, emoji)}
+                        disabled={sending}
+                      />
+                    )}
                     {b.usage && (
                       <UsageFooter usage={b.usage} contextLength={contextLength} costUsd={b.costUsd} />
                     )}

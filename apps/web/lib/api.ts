@@ -485,6 +485,38 @@ export const replyInMessageThread = (
     },
   );
 
+// ---- Message reactions (Codync parity) -------------------------------------
+
+export interface MessageReaction {
+  emoji: string;
+  userId: string;
+  createdAt: string;
+}
+
+/** Common emoji options for the reaction picker. */
+export const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏'] as const;
+
+/** Toggle a reaction on a message (adds if absent, removes if present). */
+export const toggleMessageReaction = (
+  sessionId: string,
+  messageId: string | number,
+  emoji: string,
+): Promise<{ ok: boolean; reactions: MessageReaction[]; added: boolean }> =>
+  apiJson(`/api/chat/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(String(messageId))}/reactions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ emoji }),
+  });
+
+/** Batch-fetch reactions for a list of message ids. */
+export const getMessageReactions = (
+  sessionId: string,
+  messageIds: Array<string | number>,
+): Promise<{ ok: boolean; byMessageId: Record<string, MessageReaction[]> }> =>
+  apiJson(
+    `/api/chat/${encodeURIComponent(sessionId)}/messages/reactions?ids=${messageIds.map((id) => encodeURIComponent(String(id))).join(',')}`,
+  );
+
 // ---- Bot roster import/export ----------------------------------------------
 
 export interface RosterReportItem {
