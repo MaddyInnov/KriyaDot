@@ -6,6 +6,7 @@ import { AccentPicker } from '../../components/accent/AccentPicker';
 import { McpScopesPanel } from '../../components/panels/mcp-scopes-panel';
 import { McpOAuthPanel } from '../../components/panels/mcp-oauth-panel';
 import { DetectedAgentsPanel } from '../../components/panels/detected-agents-panel';
+import { AnalyticsPanel } from '../../components/panels/analytics-panel';
 import { useUxMode } from '../../lib/ux-mode';
 
 interface LearnedPreference {
@@ -160,6 +161,16 @@ export default function PreferencesPage() {
           Coding-agent CLIs found on this computer's PATH. Bots can use any installed agent as a backend.
         </p>
         <DetectedAgentsPanel />
+      </section>
+
+      <section className="card">
+        <h2>Privacy & analytics</h2>
+        <p className="muted small">
+          Product analytics and crash reporting are <strong>off by default</strong>.
+          When enabled, only feature-use counts are collected — never message content,
+          prompts, or anything you typed.
+        </p>
+        <AnalyticsPanel />
       </section>
 
       <section className="card">

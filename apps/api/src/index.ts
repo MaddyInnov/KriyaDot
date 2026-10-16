@@ -33,6 +33,7 @@ import { registerDelegateTools } from './delegate-wiring.js';
 import { registerBotTeamToolsWiring } from './bot-team-wiring.js';
 import { createBotConversationsRouter } from './bot-conversations-routes.js';
 import { createAgentDetectRouter } from './agent-detect-routes.js';
+import { createAnalyticsRouter } from './analytics-routes.js';
 import { createSummarizer } from './summarizer.js';
 import { createRouter } from './routes.js';
 import { renderKriyaDotMeter } from './kriyadot-meter.js';
@@ -860,6 +861,8 @@ async function boot(): Promise<void> {
   // (Stores are created once above and shared by both routers.)
   // Agent auto-detection (Codync parity: detected coding CLIs + install hints).
   app.use('/api/agents', createAgentDetectRouter());
+  // Opt-in product analytics (off by default; local-first privacy posture).
+  app.use('/api/analytics', createAnalyticsRouter({ dataDir: config.dataDir }));
 
   app.use('/api/routines', routinesRouter);
   app.use('/webhooks/routines', routineWebhookRouter);
