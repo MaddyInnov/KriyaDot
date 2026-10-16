@@ -28,7 +28,8 @@
       "list_bots",
       "ask_bot",
       "message_bot",
-      "type_login"
+      "type_login",
+      "ask_user_question"
     ]
   },
   {
@@ -53,7 +54,8 @@
       "workflow_start",
       "list_bots",
       "ask_bot",
-      "message_bot"
+      "message_bot",
+      "ask_user_question"
     ]
   },
   {
@@ -85,7 +87,8 @@
       "list_bots",
       "ask_bot",
       "message_bot",
-      "type_login"
+      "type_login",
+      "ask_user_question"
     ]
   },
   {
@@ -111,7 +114,8 @@
       "workflow_start",
       "list_bots",
       "ask_bot",
-      "message_bot"
+      "message_bot",
+      "ask_user_question"
     ],
     "mcpServers": []
   },
@@ -132,7 +136,8 @@
       "notes_search",
       "list_bots",
       "ask_bot",
-      "message_bot"
+      "message_bot",
+      "ask_user_question"
     ],
     "mcpServers": []
   },
@@ -154,7 +159,8 @@
       "notes_search",
       "list_bots",
       "ask_bot",
-      "message_bot"
+      "message_bot",
+      "ask_user_question"
     ],
     "mcpServers": []
   },
@@ -178,7 +184,8 @@
       "workflow_start",
       "list_bots",
       "ask_bot",
-      "message_bot"
+      "message_bot",
+      "ask_user_question"
     ],
     "mcpServers": []
   },
@@ -198,7 +205,8 @@
       "notes_search",
       "list_bots",
       "ask_bot",
-      "message_bot"
+      "message_bot",
+      "ask_user_question"
     ],
     "mcpServers": []
   },
@@ -218,7 +226,8 @@
       "notes_search",
       "list_bots",
       "ask_bot",
-      "message_bot"
+      "message_bot",
+      "ask_user_question"
     ],
     "mcpServers": []
   },
@@ -239,7 +248,8 @@
       "notes_search",
       "list_bots",
       "ask_bot",
-      "message_bot"
+      "message_bot",
+      "ask_user_question"
     ],
     "mcpServers": []
   },
@@ -261,7 +271,8 @@
       "workflow_start",
       "list_bots",
       "ask_bot",
-      "message_bot"
+      "message_bot",
+      "ask_user_question"
     ],
     "mcpServers": []
   },
@@ -282,7 +293,8 @@
       "notes_search",
       "list_bots",
       "ask_bot",
-      "message_bot"
+      "message_bot",
+      "ask_user_question"
     ],
     "mcpServers": []
   }

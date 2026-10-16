@@ -38,6 +38,13 @@ export const DEFAULT_POLICY: Policy = {
       reason: 'Read-only tools are safe to auto-allow',
     },
     {
+      id: 'allow-ask-user-question',
+      toolPattern: '^ask_user_question$',
+      effect: 'allow',
+      reason:
+        'Interactive question to the user: the human answer IS the decision; the tool cannot act without it',
+    },
+    {
       id: 'mcp-require-approval',
       toolPattern: '^mcp:',
       effect: 'require-approval',

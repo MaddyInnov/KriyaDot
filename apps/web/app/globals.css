@@ -1873,6 +1873,129 @@ html[data-ux='pro'] .widget {
   margin-right: 5px;
 }
 
+/* ---------- interactive widgets (buttons/select/input/confirm/progress/image-view) ---------- */
+
+.widget-question {
+  margin: 0 0 10px;
+  font-weight: 600;
+}
+
+.widget-buttons,
+.widget-select,
+.widget-input,
+.widget-confirm,
+.widget-progress,
+.widget-imageview {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.widget-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.widget-options .btn.opt {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+  gap: 2px;
+  border: 1px solid var(--border);
+}
+
+.widget-options .btn.opt.selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.widget-options .btn.opt:disabled:not(.selected) {
+  opacity: 0.75;
+  cursor: default;
+}
+
+.opt-desc {
+  font-weight: 400;
+}
+
+.widget-freetext,
+.widget-textarea,
+.widget-dropdown {
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: var(--radius-sm, 10px);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+}
+
+.widget-freetext:disabled,
+.widget-textarea:disabled,
+.widget-dropdown:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.widget-textarea {
+  resize: vertical;
+  min-height: 76px;
+}
+
+.widget-dropdown[multiple] {
+  min-height: 96px;
+}
+
+.widget-answered {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm, 10px);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.progress-track {
+  height: 10px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  position: relative;
+}
+
+.progress-bar {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 0.4s var(--ease);
+}
+
+.progress-bar.indeterminate {
+  position: absolute;
+  top: 0;
+  left: -40%;
+  width: 40%;
+  animation: widget-progress-slide 1.4s var(--ease) infinite;
+}
+
+@keyframes widget-progress-slide {
+  0% { left: -40%; }
+  100% { left: 100%; }
+}
+
+.widget-image {
+  max-width: 100%;
+  border-radius: var(--radius-sm, 10px);
+  border: 1px solid var(--border);
+  display: block;
+}
+
 /* ================= misc layouts ================= */
 
 .grid-2 {

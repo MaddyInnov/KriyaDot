@@ -6,6 +6,8 @@ import type { ProvenanceNote } from './provenance.js';
 export type { ProvenanceNote };
 import type { ComputerSurface } from './tools/computer-surfaces.js';
 export type { ComputerSurface };
+import type { WidgetAnswer, WidgetHost, WidgetPayload } from './widgets.js';
+export type { WidgetAnswer, WidgetHost, WidgetPayload };
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -72,6 +74,31 @@ export type StreamEvent =
       done: boolean;
       botId: string;
       botName: string;
+    }
+  /**
+   * Interactive widget raised for this turn (OpenMausBot parity P1 #15).
+   * Emitted when a widget is raised: interactive widgets (from
+   * `ask_user_question`) pause the turn until answered; display widgets
+   * (from a tool result's `widget` attachment) render inline.
+   */
+  | {
+      type: 'widget';
+      widgetId: string;
+      sessionId: string;
+      /** Validated widget payload (same shapes the web client renders). */
+      widget: WidgetPayload;
+      expiresAt: number;
+      /** True when the turn pauses for a human answer. */
+      interactive: boolean;
+    }
+  /**
+   * Emitted when an interactive widget is answered, expires, or the wait
+   * is aborted. `answered:false` + `expired:true` means the TTL ran out.
+   */
+  | {
+      type: 'widget_answered';
+      widgetId: string;
+      answer: { answered: boolean; value?: unknown; expired?: boolean; answeredAt: number };
     };
 
 export interface ToolContext {
@@ -104,6 +131,20 @@ export interface ToolContext {
    * RunTurnOptions.conversationId.
    */
   conversationId?: string;
+  /**
+   * Interactive widgets (OpenMausBot parity P1 #15). Set by the runtime
+   * when the host passed a WidgetCoordinator: tools can raise widgets
+   * (ask_user_question pauses the turn for a human answer) and await
+   * answers through this per-turn host. Undefined → no interactive UI is
+   * attached; tools must fall back to their best judgment.
+   */
+  widget?: WidgetHost;
+  /**
+   * AbortSignal for this turn (same signal the runtime passes as
+   * RunTurnOptions.signal). Tools that block on the human (e.g.
+   * ask_user_question's awaitAnswer) reject when it aborts.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ToolDefinition {

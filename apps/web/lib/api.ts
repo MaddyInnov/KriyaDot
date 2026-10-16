@@ -249,9 +249,29 @@ export type StreamEvent =
   /**
    * Rich inline card. `widget` is validated client-side against the widget
    * schema (components/widgets) — invalid payloads render as an error block,
-   * never raw.
+   * never raw. Interactive widgets (buttons/select/input/confirm) carry the
+   * server stream `widgetId` so answers can be POSTed back; `expiresAt`
+   * disables the answer UI once the answer window closes, and `interactive`
+   * marks whether the widget is answerable at all.
    */
-  | { type: 'widget'; widget: unknown }
+  | {
+      type: 'widget';
+      widgetId: string;
+      sessionId: string;
+      widget: unknown;
+      expiresAt: number;
+      interactive: boolean;
+    }
+  /**
+   * Answer state for an interactive widget: the server's authoritative
+   * resolution (user answered, another client answered, or the widget
+   * expired unanswered). Applied to the widget chat block by `widgetId`.
+   */
+  | {
+      type: 'widget_answered';
+      widgetId: string;
+      answer: { answered: boolean; value?: unknown; expired?: boolean; answeredAt: number };
+    }
   /**
    * Live code-writing event for the code session view. Emitted after a
    * write_file tool executes successfully. The UI animates `after`
@@ -776,6 +796,24 @@ export function allowTool(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ tool }),
+  });
+}
+
+// ---- Interactive widgets (OpenMausBot parity: AskUserQuestion) ----------------
+
+/**
+ * Post an interactive widget's answer.
+ * POST /api/widgets/:id/answer with { value } -> { ok: true, widget }.
+ * Answer value shapes:
+ * - buttons/select: { selected: string[] (option ids), freeText?: string }
+ * - input: { text: string }
+ * - confirm: { confirmed: boolean }
+ */
+export function answerWidget(widgetId: string, value: unknown): Promise<{ ok: boolean }> {
+  return apiJson(`/api/widgets/${encodeURIComponent(widgetId)}/answer`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ value }),
   });
 }
 

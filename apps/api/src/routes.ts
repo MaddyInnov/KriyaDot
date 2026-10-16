@@ -10,7 +10,7 @@
 
 import express from 'express';
 import { BotMemoryStore, SpaceStore, getProviderPreset, isFreeModel, listProviderPresets, resolveApiKey, resolveBotWorkspaceDir, routeMessage } from '@mvp/agent-runtime';
-import type { AgentRuntime, BotConfig, StreamEvent, TokenUsage } from '@mvp/agent-runtime';
+import type { AgentRuntime, BotConfig, StreamEvent, TokenUsage, WidgetCoordinator } from '@mvp/agent-runtime';
 import type { PerBotComputerManager } from '@mvp/agent-runtime';
 // pricing.ts is not re-exported from the agent-runtime index (index untouched);
 // import the built subpath directly.
@@ -255,6 +255,13 @@ export interface RouteDeps {
       prompt: string;
     }) => Promise<string>;
   };
+  /**
+   * Interactive widgets (OpenMausBot parity P1 #15). Created by index.ts;
+   * the chat route passes it into runTurn so `ask_user_question` can pause
+   * the turn for a human answer. Optional: omitted in tests that don't
+   * exercise widgets.
+   */
+  widgetCoordinator?: WidgetCoordinator;
 }
 
 const TERMINAL_RUN_STATUSES: ReadonlySet<WorkflowRun['status']> = new Set(['succeeded', 'failed']);
@@ -1623,6 +1630,9 @@ export function createRouter(deps: RouteDeps): express.Router {
           // Spaces: per-turn workspace + API-key overrides.
           workspaceOverride: spaceCtx?.space.workspaceOverride,
           apiKeyOverride: spaceCtx?.apiKeyOverride,
+          // Interactive widgets (OpenMausBot parity P1 #15): lets
+          // ask_user_question pause the turn for a human answer.
+          widgetCoordinator: deps.widgetCoordinator,
           onEvent,
         });
       } catch (err) {

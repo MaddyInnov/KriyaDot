@@ -125,6 +125,147 @@ describe('validateWidget', () => {
   });
 });
 
+describe('interactive widgets (buttons/select/input/confirm/progress/image-view)', () => {
+  const opts = [
+    { id: 'a', label: 'Alpha', description: 'first option' },
+    { id: 'b', label: 'Beta' },
+  ];
+
+  it('validates a buttons widget and strips extras', () => {
+    const r = validateWidget({
+      kind: 'buttons',
+      title: 'Pick one',
+      question: 'Which plan?',
+      options: opts,
+      multiSelect: true,
+      allowFreeText: true,
+      onclick: 'alert(1)',
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok || r.widget.kind !== 'buttons') return;
+    expect(r.widget.question).toBe('Which plan?');
+    expect(r.widget.multiSelect).toBe(true);
+    expect(r.widget.allowFreeText).toBe(true);
+    expect(r.widget.options).toEqual(opts);
+    expect('onclick' in r.widget).toBe(false);
+  });
+
+  it('rejects buttons with empty/missing/too many options', () => {
+    expect(validateWidget({ kind: 'buttons', options: [] }).ok).toBe(false);
+    expect(validateWidget({ kind: 'buttons' }).ok).toBe(false);
+    expect(validateWidget({ kind: 'buttons', options: [{ id: 'x' }] }).ok).toBe(false);
+    const many = Array.from({ length: 21 }, (_, i) => ({ id: `o${i}`, label: `Option ${i}` }));
+    expect(validateWidget({ kind: 'buttons', options: many }).ok).toBe(false);
+  });
+
+  it('caps buttons option id/label/description/question lengths', () => {
+    const long = 'x'.repeat(300);
+    const r = validateWidget({
+      kind: 'buttons',
+      question: 'q'.repeat(600),
+      options: [{ id: long, label: long, description: 'd'.repeat(600) }],
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok || r.widget.kind !== 'buttons') return;
+    expect(r.widget.question!.length).toBe(500);
+    expect(r.widget.options[0].id.length).toBe(200);
+    expect(r.widget.options[0].label.length).toBe(200);
+    expect(r.widget.options[0].description!.length).toBe(500);
+  });
+
+  it('validates a select widget', () => {
+    const r = validateWidget({ kind: 'select', label: 'Region', options: opts, multiSelect: true });
+    expect(r.ok).toBe(true);
+    if (!r.ok || r.widget.kind !== 'select') return;
+    expect(r.widget.label).toBe('Region');
+    expect(r.widget.multiSelect).toBe(true);
+    expect(r.widget.options.length).toBe(2);
+    expect(validateWidget({ kind: 'select', options: [] }).ok).toBe(false);
+    expect(validateWidget({ kind: 'select' }).ok).toBe(false);
+  });
+
+  it('validates an input widget with defaults and multiline', () => {
+    const r = validateWidget({
+      kind: 'input',
+      title: 'Name',
+      label: 'Your name',
+      placeholder: 'Ada Lovelace',
+      default: 'Ada',
+      multiline: true,
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok || r.widget.kind !== 'input') return;
+    expect(r.widget.label).toBe('Your name');
+    expect(r.widget.placeholder).toBe('Ada Lovelace');
+    expect(r.widget.default).toBe('Ada');
+    expect(r.widget.multiline).toBe(true);
+    // bare input is valid too
+    expect(validateWidget({ kind: 'input' }).ok).toBe(true);
+  });
+
+  it('validates a confirm widget, requiring a question', () => {
+    const r = validateWidget({
+      kind: 'confirm',
+      question: 'Delete the database?',
+      confirmLabel: 'Yes, delete',
+      cancelLabel: 'Keep it',
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok || r.widget.kind !== 'confirm') return;
+    expect(r.widget.question).toBe('Delete the database?');
+    expect(r.widget.confirmLabel).toBe('Yes, delete');
+    expect(validateWidget({ kind: 'confirm' }).ok).toBe(false);
+    expect(validateWidget({ kind: 'confirm', question: '   ' }).ok).toBe(false);
+  });
+
+  it('validates a progress widget and clamps percent to 0-100', () => {
+    const r = validateWidget({ kind: 'progress', title: 'Deploy', label: 'Uploading', percent: 42 });
+    expect(r.ok).toBe(true);
+    if (!r.ok || r.widget.kind !== 'progress') return;
+    expect(r.widget.percent).toBe(42);
+    const hi = validateWidget({ kind: 'progress', percent: 150 });
+    expect(hi.ok).toBe(true);
+    if (hi.ok && hi.widget.kind === 'progress') expect(hi.widget.percent).toBe(100);
+    const lo = validateWidget({ kind: 'progress', percent: -5 });
+    expect(lo.ok).toBe(true);
+    if (lo.ok && lo.widget.kind === 'progress') expect(lo.widget.percent).toBe(0);
+    expect(validateWidget({ kind: 'progress', indeterminate: true }).ok).toBe(true);
+    expect(validateWidget({ kind: 'progress', percent: NaN }).ok).toBe(false);
+    expect(validateWidget({ kind: 'progress', percent: 'half' }).ok).toBe(false);
+  });
+
+  it('validates an image-view widget, requiring url or dataUrl', () => {
+    const r = validateWidget({
+      kind: 'image-view',
+      url: 'https://example.com/chart.png',
+      caption: 'Weekly MRR',
+      alt: 'Bar chart of weekly MRR',
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok || r.widget.kind !== 'image-view') return;
+    expect(r.widget.url).toBe('https://example.com/chart.png');
+    expect(r.widget.caption).toBe('Weekly MRR');
+    expect(validateWidget({ kind: 'image-view', dataUrl: 'data:image/png;base64,AAA' }).ok).toBe(true);
+    expect(validateWidget({ kind: 'image-view', caption: 'no source' }).ok).toBe(false);
+    expect(validateWidget({ kind: 'image-view', url: '   ' }).ok).toBe(false);
+  });
+
+  it('caps image-view dataUrl length', () => {
+    const big = `data:image/png;base64,${'A'.repeat(2_000_001)}`;
+    const r = validateWidget({ kind: 'image-view', dataUrl: big });
+    expect(r.ok).toBe(true);
+    if (!r.ok || r.widget.kind !== 'image-view') return;
+    expect(r.widget.dataUrl!.length).toBe(2_000_000);
+  });
+
+  it('registers every new kind in the renderer', () => {
+    for (const k of ['buttons', 'select', 'input', 'confirm', 'progress', 'image-view'] as const) {
+      expect(WIDGET_REGISTRY[k]).toBeTypeOf('function');
+      expect(registeredWidgetKinds()).toContain(k);
+    }
+  });
+});
+
 describe('widget registry', () => {
   it('covers every schema kind', () => {
     expect(registeredWidgetKinds().sort()).toEqual([...WIDGET_KINDS].sort());

@@ -56,6 +56,8 @@ import { EvalRunStore, EvalSuiteStore } from './evals.js';
 import { createSummarizer } from './summarizer.js';
 import { createPeerApprovalRouter, createPeerApprovalBroker } from './peer-approval-routes.js';
 import { PeerApprovalStore, createPeerApprovalGate } from '@mvp/agent-runtime';
+import { createWidgetRouter, sweepWidgets } from './widget-routes.js';
+import { WidgetCoordinator, WidgetStore } from '@mvp/agent-runtime';
 import { createRouter } from './routes.js';
 import { renderKriyaDotMeter } from './kriyadot-meter.js';
 import { createWebhookRouter } from './webhooks.js';
@@ -524,6 +526,21 @@ async function boot(): Promise<void> {
         governance.audit(type, { actor: 'peer-approval-gate', detail });
       } catch {
         // Audit failures must never break the gate.
+      }
+    },
+  });
+
+  // Interactive widgets + AskUserQuestion (OpenMausBot parity P1 #15):
+  // WidgetStore persists widget cards in widgets.db; the coordinator holds
+  // in-flight waiters and fails them closed on expiry. The chat route passes
+  // the coordinator into runTurn so ask_user_question can pause for answers.
+  const widgetStore = new WidgetStore(config.dataDir);
+  const widgetCoordinator = new WidgetCoordinator(widgetStore, {
+    audit: (type, detail) => {
+      try {
+        governance.audit(type, { actor: 'widget-coordinator', detail });
+      } catch {
+        // Audit failures must never break widgets.
       }
     },
   });
@@ -1182,6 +1199,9 @@ async function boot(): Promise<void> {
       omniStore,
       omniCollector,
       computerManager,
+      // Interactive widgets (OpenMausBot parity P1 #15): the chat route
+      // passes this into runTurn so ask_user_question can pause for answers.
+      widgetCoordinator,
     }),
   );
   // Parity workstreams: routers. All factories; none of these existed before.
@@ -1339,6 +1359,26 @@ async function boot(): Promise<void> {
     }
   }, 60_000);
   if (typeof peerApprovalSweep.unref === 'function') peerApprovalSweep.unref();
+
+  // Interactive widgets (OpenMausBot parity P1 #15): answer inbox for
+  // ask_user_question + display-widget listing. Backstop sweep expires
+  // stale widgets even when no waiter watches.
+  app.use(
+    '/api',
+    createWidgetRouter({
+      store: widgetStore,
+      coordinator: widgetCoordinator,
+      audit: (action, fields) => governance.audit(action, fields),
+    }),
+  );
+  const widgetSweep = setInterval(() => {
+    try {
+      sweepWidgets(widgetCoordinator, (action, fields) => governance.audit(action, fields));
+    } catch {
+      // Sweeps must never break the server.
+    }
+  }, 60_000);
+  if (typeof widgetSweep.unref === 'function') widgetSweep.unref();
 
   // Chief of Staff (OpenMausBot parity): chief assignment, managed
   // sections, team-setup proposals, incidents/escalations inbox. The store
@@ -1503,7 +1543,17 @@ async function boot(): Promise<void> {
       // ignore
     }
     try {
+      clearInterval(widgetSweep);
+    } catch {
+      // ignore
+    }
+    try {
       peerApprovalStore.close();
+    } catch {
+      // ignore
+    }
+    try {
+      widgetStore.close();
     } catch {
       // ignore
     }

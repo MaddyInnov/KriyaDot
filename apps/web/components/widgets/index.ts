@@ -12,7 +12,19 @@ export type {
   WidgetAction,
   MapWidget,
   FileWidget,
+  WidgetOption,
+  ButtonsWidget,
+  SelectWidget,
+  InputWidget,
+  ConfirmWidget,
+  ProgressWidget,
+  ImageViewWidget,
+  WidgetAnswerState,
   WidgetValidation,
 } from './schema';
-export { WIDGET_REGISTRY, registeredWidgetKinds, WidgetRenderer } from './widgets';
-export type { WidgetActionHandler } from './widgets';
+export {
+  WIDGET_REGISTRY,
+  registeredWidgetKinds,
+  WidgetRenderer,
+} from './widgets';
+export type { WidgetActionHandler, WidgetAnswerHandler, WidgetRuntimeProps } from './widgets';

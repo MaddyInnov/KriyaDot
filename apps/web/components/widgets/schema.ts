@@ -9,7 +9,19 @@
 // This module is pure TypeScript (no React) so it can be unit-tested and
 // shared between the stream handler and the renderer.
 
-export const WIDGET_KINDS = ['table', 'chart', 'actions', 'map', 'file'] as const;
+export const WIDGET_KINDS = [
+  'table',
+  'chart',
+  'actions',
+  'map',
+  'file',
+  'buttons',
+  'select',
+  'input',
+  'confirm',
+  'progress',
+  'image-view',
+] as const;
 export type WidgetKind = (typeof WIDGET_KINDS)[number];
 
 export interface WidgetBase {
@@ -76,11 +88,97 @@ export interface FileWidget extends WidgetBase {
   url?: string;
 }
 
-export type Widget = TableWidget | ChartWidget | ActionsWidget | MapWidget | FileWidget;
+export type Widget =
+  | TableWidget
+  | ChartWidget
+  | ActionsWidget
+  | MapWidget
+  | FileWidget
+  | ButtonsWidget
+  | SelectWidget
+  | InputWidget
+  | ConfirmWidget
+  | ProgressWidget
+  | ImageViewWidget;
 
 export type WidgetValidation =
   | { ok: true; widget: Widget }
   | { ok: false; error: string };
+
+/* ---------- interactive widgets (OpenMausBot parity: AskUserQuestion) ---------- */
+
+/** One selectable option in a buttons/select widget. */
+export interface WidgetOption {
+  id: string;
+  label: string;
+  description?: string;
+}
+
+export interface ButtonsWidget extends WidgetBase {
+  kind: 'buttons';
+  /** Prompt shown above the options. */
+  question?: string;
+  options: WidgetOption[];
+  multiSelect?: boolean;
+  allowFreeText?: boolean;
+}
+
+export interface SelectWidget extends WidgetBase {
+  kind: 'select';
+  /** Label for the dropdown. */
+  label?: string;
+  options: WidgetOption[];
+  multiSelect?: boolean;
+}
+
+export interface InputWidget extends WidgetBase {
+  kind: 'input';
+  /** Label above the field. */
+  label?: string;
+  placeholder?: string;
+  /** Prefilled text. */
+  default?: string;
+  multiline?: boolean;
+}
+
+export interface ConfirmWidget extends WidgetBase {
+  kind: 'confirm';
+  /** The yes/no question. */
+  question: string;
+  confirmLabel?: string;
+  cancelLabel?: string;
+}
+
+export interface ProgressWidget extends WidgetBase {
+  kind: 'progress';
+  /** Label shown next to the bar. */
+  label?: string;
+  /** 0-100. When omitted (or indeterminate is true) the bar animates. */
+  percent?: number;
+  indeterminate?: boolean;
+}
+
+export interface ImageViewWidget extends WidgetBase {
+  kind: 'image-view';
+  caption?: string;
+  alt?: string;
+  /** Remote image URL. */
+  url?: string;
+  /** Inline data: URL (image/*). */
+  dataUrl?: string;
+}
+
+/**
+ * Runtime answer state for an interactive widget. Kept by the page layer
+ * (optimistic local answer + server `widget_answered` stream events), not
+ * by the validator.
+ */
+export interface WidgetAnswerState {
+  answered: boolean;
+  value?: unknown;
+  expired?: boolean;
+  answeredAt: number;
+}
 
 // Hard caps keep a malicious/buggy payload from blowing up the chat UI.
 const MAX_COLUMNS = 50;
@@ -89,6 +187,13 @@ const MAX_LABELS = 200;
 const MAX_DATASETS = 12;
 const MAX_BUTTONS = 10;
 const MAX_STR = 500;
+// Interactive-widget caps (OpenMausBot AskUserQuestion protocol).
+const MAX_OPTIONS = 20;
+const MAX_OPTION_ID = 200;
+const MAX_OPTION_DESC = 500;
+const MAX_QUESTION = 500;
+const MAX_IMAGE_URL = 2000;
+const MAX_DATA_URL = 2_000_000;
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -102,6 +207,10 @@ function str(v: unknown, cap = MAX_STR): string | undefined {
 
 function num(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+}
+
+function bool(v: unknown): boolean | undefined {
+  return typeof v === 'boolean' ? v : undefined;
 }
 
 function fail(error: string): WidgetValidation {
@@ -245,6 +354,118 @@ function validateFile(raw: Record<string, unknown>): WidgetValidation {
   return { ok: true, widget: w };
 }
 
+/* ---------- interactive widget validators ---------- */
+
+/**
+ * Shared option-list validation for buttons/select.
+ * Returns the sanitized options or undefined when invalid.
+ */
+function validateOptions(raw: unknown): WidgetOption[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  if (raw.length > MAX_OPTIONS) return undefined;
+  const options: WidgetOption[] = [];
+  for (const o of raw) {
+    if (!isRecord(o)) return undefined;
+    const id = str(o.id, MAX_OPTION_ID);
+    const label = str(o.label, MAX_OPTION_ID);
+    if (id === undefined || label === undefined) return undefined;
+    const opt: WidgetOption = { id, label };
+    const description = str(o.description, MAX_OPTION_DESC);
+    if (description !== undefined) opt.description = description;
+    options.push(opt);
+  }
+  return options;
+}
+
+function flag(raw: Record<string, unknown>, key: string): boolean | undefined {
+  const v = raw[key];
+  return v === undefined ? undefined : bool(v);
+}
+
+function validateButtons(raw: Record<string, unknown>): WidgetValidation {
+  const base = baseOf(raw, 'buttons');
+  const options = validateOptions(raw.options);
+  if (!options) return fail('buttons widget requires a non-empty "options" array (at most 20) of {id,label}');
+  const w: ButtonsWidget = { ...base, kind: 'buttons', options };
+  const question = str(raw.question, MAX_QUESTION);
+  if (question !== undefined) w.question = question;
+  const multiSelect = flag(raw, 'multiSelect');
+  if (multiSelect !== undefined) w.multiSelect = multiSelect;
+  const allowFreeText = flag(raw, 'allowFreeText');
+  if (allowFreeText !== undefined) w.allowFreeText = allowFreeText;
+  return { ok: true, widget: w };
+}
+
+function validateSelect(raw: Record<string, unknown>): WidgetValidation {
+  const base = baseOf(raw, 'select');
+  const options = validateOptions(raw.options);
+  if (!options) return fail('select widget requires a non-empty "options" array (at most 20) of {id,label}');
+  const w: SelectWidget = { ...base, kind: 'select', options };
+  const label = str(raw.label);
+  if (label !== undefined) w.label = label;
+  const multiSelect = flag(raw, 'multiSelect');
+  if (multiSelect !== undefined) w.multiSelect = multiSelect;
+  return { ok: true, widget: w };
+}
+
+function validateInput(raw: Record<string, unknown>): WidgetValidation {
+  const base = baseOf(raw, 'input');
+  const w: InputWidget = { ...base, kind: 'input' };
+  const label = str(raw.label);
+  if (label !== undefined) w.label = label;
+  const placeholder = str(raw.placeholder);
+  if (placeholder !== undefined) w.placeholder = placeholder;
+  const def = str(raw.default);
+  if (def !== undefined) w.default = def;
+  const multiline = flag(raw, 'multiline');
+  if (multiline !== undefined) w.multiline = multiline;
+  return { ok: true, widget: w };
+}
+
+function validateConfirm(raw: Record<string, unknown>): WidgetValidation {
+  const base = baseOf(raw, 'confirm');
+  const question = str(raw.question, MAX_QUESTION);
+  if (question === undefined) return fail('confirm widget requires a "question" string');
+  const w: ConfirmWidget = { ...base, kind: 'confirm', question };
+  const confirmLabel = str(raw.confirmLabel, MAX_OPTION_ID);
+  if (confirmLabel !== undefined) w.confirmLabel = confirmLabel;
+  const cancelLabel = str(raw.cancelLabel, MAX_OPTION_ID);
+  if (cancelLabel !== undefined) w.cancelLabel = cancelLabel;
+  return { ok: true, widget: w };
+}
+
+function validateProgress(raw: Record<string, unknown>): WidgetValidation {
+  const base = baseOf(raw, 'progress');
+  const w: ProgressWidget = { ...base, kind: 'progress' };
+  const label = str(raw.label);
+  if (label !== undefined) w.label = label;
+  if (raw.percent !== undefined) {
+    const p = num(raw.percent);
+    if (p === undefined) return fail('progress widget "percent" must be a finite number');
+    w.percent = Math.min(100, Math.max(0, p));
+  }
+  const indeterminate = flag(raw, 'indeterminate');
+  if (indeterminate !== undefined) w.indeterminate = indeterminate;
+  return { ok: true, widget: w };
+}
+
+function validateImageView(raw: Record<string, unknown>): WidgetValidation {
+  const base = baseOf(raw, 'image-view');
+  const w: ImageViewWidget = { ...base, kind: 'image-view' };
+  const url = str(raw.url, MAX_IMAGE_URL);
+  if (url !== undefined) w.url = url;
+  const dataUrl = str(raw.dataUrl, MAX_DATA_URL);
+  if (dataUrl !== undefined) w.dataUrl = dataUrl;
+  if (w.url === undefined && w.dataUrl === undefined) {
+    return fail('image-view widget requires a "url" or "dataUrl"');
+  }
+  const caption = str(raw.caption);
+  if (caption !== undefined) w.caption = caption;
+  const alt = str(raw.alt);
+  if (alt !== undefined) w.alt = alt;
+  return { ok: true, widget: w };
+}
+
 /**
  * Validate an untrusted widget payload from the stream.
  * Returns the sanitized widget (unknown fields stripped) or an error.
@@ -266,6 +487,18 @@ export function validateWidget(payload: unknown): WidgetValidation {
       return validateMap(payload);
     case 'file':
       return validateFile(payload);
+    case 'buttons':
+      return validateButtons(payload);
+    case 'select':
+      return validateSelect(payload);
+    case 'input':
+      return validateInput(payload);
+    case 'confirm':
+      return validateConfirm(payload);
+    case 'progress':
+      return validateProgress(payload);
+    case 'image-view':
+      return validateImageView(payload);
   }
 }
 

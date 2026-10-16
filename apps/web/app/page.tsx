@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   allowTool,
+  answerWidget,
   authedFetch,
   branchChatThread,
   createMessageThread,
@@ -52,7 +53,7 @@ import type {
 } from '../lib/api';
 import { COST_ESTIMATE_TOOLTIP, contextMeter, costOfUsage, formatTokens, formatUsd } from '../lib/usage';
 import { WidgetRenderer, validateWidget } from '../components/widgets';
-import type { Widget, WidgetAction } from '../components/widgets';
+import type { Widget, WidgetAction, WidgetAnswerState } from '../components/widgets';
 import { CodeBlock, LineDiffView, UnifiedDiffView } from '../components/code/CodeBlock';
 import LazyClayScene from '../components/three';
 import { Pet } from '../components/pet/Pet';
@@ -95,7 +96,20 @@ type ChatBlock =
       preview: string;
       status: 'pending' | 'allowed' | 'denied' | 'expired';
     }
-  | { kind: 'widget'; id: string; widget: Widget }
+  /**
+   * Interactive in-chat widget (OpenMausBot parity). `widgetId` is the
+   * server stream id used to POST answers; `answered` carries the
+   * optimistic local answer plus server `widget_answered` resolutions.
+   */
+  | {
+      kind: 'widget';
+      id: string;
+      widgetId: string;
+      widget: Widget;
+      expiresAt: number;
+      interactive: boolean;
+      answered?: WidgetAnswerState;
+    }
   | { kind: 'error'; id: string; text: string }
   | { kind: 'interrupted'; id: string; text: string }
   | { kind: 'notice'; id: string; text: string }
@@ -1119,13 +1133,30 @@ function ChatPageInner() {
         case 'widget': {
           const validated = validateWidget(event.widget);
           if (validated.ok) {
-            next.push({ kind: 'widget', id: nextId(), widget: validated.widget });
+            next.push({
+              kind: 'widget',
+              id: nextId(),
+              widgetId: event.widgetId,
+              widget: validated.widget,
+              expiresAt: event.expiresAt,
+              interactive: event.interactive,
+            });
           } else {
             next.push({
               kind: 'error',
               id: nextId(),
               text: `Widget failed validation: ${validated.error}`,
             });
+          }
+          break;
+        }
+        case 'widget_answered': {
+          // Server-side resolution for an interactive widget: user answered
+          // (possibly from another client), or the widget expired unanswered.
+          const idx = next.findIndex((b) => b.kind === 'widget' && b.widgetId === event.widgetId);
+          if (idx >= 0) {
+            const b = next[idx];
+            if (b.kind === 'widget') next[idx] = { ...b, answered: event.answer };
           }
           break;
         }
@@ -1429,6 +1460,42 @@ function ChatPageInner() {
           kind: 'error',
           id: nextId(),
           text: `Action "${action.label}" failed: ${err instanceof Error ? err.message : String(err)}`,
+        },
+      ]);
+    }
+  };
+
+  /**
+   * POST an interactive widget's answer back to the API. Marks the block
+   * answered immediately (optimistic); rolls back to unanswered on
+   * failure. A later server `widget_answered` event is authoritative.
+   */
+  const handleWidgetAnswer = async (widgetId: string, value: unknown) => {
+    const prev = blocksRef.current.find((b) => b.kind === 'widget' && b.widgetId === widgetId);
+    const prevAnswered = prev && prev.kind === 'widget' ? prev.answered : undefined;
+    setBlocks((blocks) =>
+      blocks.map((b) =>
+        b.kind === 'widget' && b.widgetId === widgetId
+          ? { ...b, answered: { answered: true, value, answeredAt: Date.now() } }
+          : b,
+      ),
+    );
+    try {
+      await answerWidget(widgetId, value);
+    } catch (err) {
+      setBlocks((blocks) =>
+        blocks.map((b) =>
+          b.kind === 'widget' && b.widgetId === widgetId
+            ? { ...b, answered: prevAnswered }
+            : b,
+        ),
+      );
+      setBlocks((blocks) => [
+        ...blocks,
+        {
+          kind: 'error',
+          id: nextId(),
+          text: `Widget answer failed: ${err instanceof Error ? err.message : String(err)}`,
         },
       ]);
     }
@@ -2080,7 +2147,12 @@ function ChatPageInner() {
                   <WidgetRenderer
                     key={b.id}
                     widget={b.widget}
+                    widgetId={b.widgetId}
+                    expiresAt={b.expiresAt}
+                    interactive={b.interactive}
+                    answered={b.answered}
                     onAction={(a, w) => void handleWidgetAction(a, w)}
+                    onAnswer={(wid, value) => void handleWidgetAnswer(wid, value)}
                   />
                 );
               case 'fusion':

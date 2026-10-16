@@ -38,6 +38,8 @@ import type { LearnedRoutingRule } from './routing-learn.js';
 import { resolvePersona } from './personas.js';
 import type { ApprovalMode } from './approval-modes.js';
 import type { PeerApprovalGate } from './peer-approval.js';
+import type { WidgetCoordinator } from './widgets.js';
+import { extractWidgetAttachment } from './widgets.js';
 import type { ProvenanceNote } from './provenance.js';
 import {
   PEER_ORIGIN_INSTRUCTION,
@@ -270,6 +272,14 @@ export interface RunTurnOptions {
    * mode; they always go to the human.
    */
   provenance?: ProvenanceNote;
+  /**
+   * Interactive widgets (OpenMausBot parity P1 #15). When set, the turn
+   * gets ctx.widget: `ask_user_question` pauses for a human answer, and
+   * tool results may carry a `widget` attachment rendered as a
+   * non-interactive widget. Unset → ask_user_question reports
+   * "not available" (previous behavior).
+   */
+  widgetCoordinator?: WidgetCoordinator;
 }
 
 export interface PreviewToolInfo {
@@ -600,6 +610,11 @@ export class AgentRuntime {
     // (reviewer, session auto-approve, bypass) are disabled for this turn.
     const turnProvenance: ProvenanceNote | undefined = opts.provenance;
     const botOriginated = !isUserOrigin(turnProvenance);
+    // Interactive widgets (OpenMausBot parity P1 #15): the per-turn host
+    // fills sessionId/botId into raise() and the turn's AbortSignal into
+    // awaitAnswer(). Unset → tools see ctx.widget === undefined and must
+    // fall back to their best judgment.
+    const widgetCoordinator = opts.widgetCoordinator;
     const ctx: ToolContext = {
       sessionId,
       botId: opts.bot.id,
@@ -609,6 +624,14 @@ export class AgentRuntime {
       provenance: turnProvenance,
       // Per-bot computers (P1 #14): conversation pin override for the surface.
       conversationId: opts.conversationId ?? sessionId,
+      signal: opts.signal,
+      widget: widgetCoordinator
+        ? {
+            raise: (i) => widgetCoordinator.raise({ ...i, sessionId, botId: opts.bot.id }),
+            emit,
+            awaitAnswer: (id, ms) => widgetCoordinator.awaitAnswer(id, ms, opts.signal),
+          }
+        : undefined,
     };
 
     const { prompt: systemPrompt } = await this.buildSystemPrompt(
@@ -1207,6 +1230,28 @@ export class AgentRuntime {
             result = { error: settled.reason instanceof Error ? settled.reason.message : String(settled.reason) };
           }
           await emit({ type: 'tool_result', call, result });
+          // Widget attachments (OpenMausBot parity P1 #15): a tool may
+          // return { ..., widget: <validated payload> } to render a
+          // non-interactive widget (table, progress, image, …) inline with
+          // its result. Never breaks the turn.
+          if (ctx.widget) {
+            try {
+              const attachment = extractWidgetAttachment(result);
+              if (attachment) {
+                const w = await ctx.widget.raise({ kind: attachment.kind, payload: attachment, interactive: false });
+                await ctx.widget.emit({
+                  type: 'widget',
+                  widgetId: w.id,
+                  sessionId,
+                  widget: attachment,
+                  expiresAt: w.expiresAt,
+                  interactive: false,
+                });
+              }
+            } catch {
+              // Widget rendering must never break a turn.
+            }
+          }
           // No-progress guard: feed each executed call; trip → stop the
           // turn with a clear report instead of looping on tokens.
           if (progressGuard) {

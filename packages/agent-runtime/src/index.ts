@@ -54,6 +54,7 @@ export * from './tools/delegate.js';
 export * from './tools/bot-team.js';
 export * from './tools/computer-surfaces.js';
 export * from './peer-approval.js';
+export * from './widgets.js';
 export * from './chief.js';
 export * from './tools/chief.js';
 export * from './teams.js';

@@ -5,6 +5,8 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import type { ToolContext, ToolDefinition } from '../types.js';
+import type { ButtonsWidgetPayload, WidgetAnswer, WidgetHost } from '../widgets.js';
+import { validateWidgetPayload } from '../widgets.js';
 import { executeInPersistentSandbox, executeSandboxedCommand, sandboxBackend } from './sandbox.js';
 import { resolveWorkspaceDir, type WorkspaceSource } from '../workspaces.js';
 
@@ -295,7 +297,7 @@ function webFetchTool(): ToolDefinition {
   };
 }
 
-/** Built-in tools available to every bot: file I/O, shell, and web. */
+/** Built-in tools available to every bot: file I/O, shell, web, and interactive questions. */
 export function createBuiltInTools(opts: { workspaceDir: WorkspaceSource }): ToolDefinition[] {
   const { workspaceDir } = opts;
   return [
@@ -304,5 +306,269 @@ export function createBuiltInTools(opts: { workspaceDir: WorkspaceSource }): Too
     runCommandTool(workspaceDir),
     webSearchTool(),
     webFetchTool(),
+    askUserQuestionTool(),
   ];
+}
+
+// ---------------------------------------------------------------------------
+// ask_user_question (OpenMausBot parity P1 #15)
+// ---------------------------------------------------------------------------
+
+const ASK_QUESTION_TIMEOUT_DEFAULT_MIN = 15;
+const ASK_QUESTION_TIMEOUT_MIN = 1;
+const ASK_QUESTION_TIMEOUT_MAX = 60;
+
+interface AskQuestionOptionInput {
+  id?: string;
+  label: string;
+  description?: string;
+}
+
+interface AskQuestionInput {
+  question: string;
+  options?: AskQuestionOptionInput[];
+  multiSelect?: boolean;
+  allowFreeText?: boolean;
+}
+
+const askQuestionOptionSchema = {
+  type: 'object',
+  properties: {
+    id: { type: 'string', description: 'Stable option id (auto-generated o1, o2, … when omitted)' },
+    label: { type: 'string', description: 'Button label shown to the user' },
+    description: { type: 'string', description: 'Shorter helper text under the label' },
+  },
+  additionalProperties: false,
+};
+
+const askQuestionSingleSchema = {
+  type: 'object',
+  properties: {
+    question: { type: 'string', description: 'The question to ask the user' },
+    options: { type: 'array', items: askQuestionOptionSchema, description: 'Clickable options' },
+    multiSelect: { type: 'boolean', description: 'Allow picking several options' },
+    allowFreeText: { type: 'boolean', description: 'Also accept free text from the user' },
+  },
+  required: ['question'],
+  additionalProperties: false,
+};
+
+function normalizeQuestionInput(raw: unknown): AskQuestionInput | { error: string } {
+  if (typeof raw !== 'object' || raw === null) return { error: 'question must be an object' };
+  const r = raw as Record<string, unknown>;
+  if (typeof r.question !== 'string' || r.question.trim().length === 0) {
+    return { error: 'every question needs non-empty `question` text' };
+  }
+  const out: AskQuestionInput = { question: r.question };
+  if (r.options !== undefined) {
+    if (!Array.isArray(r.options)) return { error: '`options` must be an array' };
+    const options: AskQuestionOptionInput[] = [];
+    for (const o of r.options) {
+      if (typeof o !== 'object' || o === null || typeof (o as Record<string, unknown>).label !== 'string') {
+        return { error: 'every option needs a string `label`' };
+      }
+      const oo = o as Record<string, unknown>;
+      const opt: AskQuestionOptionInput = { label: oo.label as string };
+      if (typeof oo.id === 'string') opt.id = oo.id;
+      if (typeof oo.description === 'string') opt.description = oo.description;
+      options.push(opt);
+    }
+    out.options = options;
+  }
+  if (typeof r.multiSelect === 'boolean') out.multiSelect = r.multiSelect;
+  if (typeof r.allowFreeText === 'boolean') out.allowFreeText = r.allowFreeText;
+  return out;
+}
+
+/**
+ * Interpret a widget answer value into selected option ids + labels +
+ * free text. Defensive: accepts {selected|selectedIds:[ids], freeText},
+ * a bare array of ids, a single id string, or {id}.
+ */
+function interpretQuestionAnswer(
+  answer: WidgetAnswer,
+  payload: ButtonsWidgetPayload,
+): { selected: string[]; labels: string[]; freeText: string | null } {
+  if (!answer.answered) return { selected: [], labels: [], freeText: null };
+  const v = answer.value;
+  let ids: string[] = [];
+  let freeText: string | null = null;
+  if (Array.isArray(v)) {
+    ids = v.map((x) => String(x));
+  } else if (typeof v === 'string') {
+    ids = [v];
+  } else if (typeof v === 'object' && v !== null) {
+    const o = v as Record<string, unknown>;
+    if (Array.isArray(o.selected)) ids = (o.selected as unknown[]).map((x) => String(x));
+    else if (Array.isArray(o.selectedIds)) ids = (o.selectedIds as unknown[]).map((x) => String(x));
+    else if (typeof o.id === 'string') ids = [o.id];
+    if (typeof o.freeText === 'string' && o.freeText.length > 0) freeText = o.freeText;
+    else if (typeof o.text === 'string' && o.text.length > 0) freeText = o.text;
+  }
+  const known = new Map(payload.options.map((o) => [o.id, o.label] as const));
+  const selected = ids.filter((id) => known.has(id));
+  const unknownIds = ids.filter((id) => !known.has(id));
+  if (unknownIds.length > 0 && freeText === null) freeText = unknownIds.join(', ');
+  return {
+    selected,
+    labels: selected.map((id) => known.get(id) ?? id),
+    freeText,
+  };
+}
+
+function askUserQuestionTool(): ToolDefinition {
+  return {
+    name: 'ask_user_question',
+    description: [
+      'Ask the user a question with clickable options and PAUSE the turn until they answer.',
+      'Renders buttons in the chat UI; the turn resumes when the user picks an option (or types free text when allowFreeText is true).',
+      'Use SPARINGLY — only for genuine user decisions you cannot make yourself (preferences, direction choices, disambiguation that blocks progress).',
+      `After timeoutMinutes (default ${ASK_QUESTION_TIMEOUT_DEFAULT_MIN}, clamped to ${ASK_QUESTION_TIMEOUT_MIN}-${ASK_QUESTION_TIMEOUT_MAX}) with no answer, the turn resumes with answered:false — ALWAYS have a fallback default and continue without the answer.`,
+      'Batch related questions in one call via `questions` (all are shown at once, then answered in order) instead of calling repeatedly.',
+    ].join(' '),
+    parameters: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: 'The question to ask (single-question mode)' },
+        options: {
+          type: 'array',
+          items: askQuestionOptionSchema,
+          description: 'Clickable options (single-question mode)',
+        },
+        multiSelect: { type: 'boolean', description: 'Allow picking several options' },
+        allowFreeText: { type: 'boolean', description: 'Also accept free text from the user' },
+        questions: {
+          type: 'array',
+          items: askQuestionSingleSchema,
+          description: 'Batch mode: several questions, all shown at once then answered in order',
+        },
+        timeoutMinutes: {
+          type: 'number',
+          description: `Per-question wait in minutes (default ${ASK_QUESTION_TIMEOUT_DEFAULT_MIN}, clamped to ${ASK_QUESTION_TIMEOUT_MIN}-${ASK_QUESTION_TIMEOUT_MAX})`,
+        },
+      },
+      additionalProperties: false,
+    },
+    handler: async (args, ctx) => {
+      const host: WidgetHost | undefined = ctx.widget;
+      if (!host) {
+        return {
+          error:
+            'ask_user_question is not available in this context (no interactive UI attached). ' +
+            'Proceed with your best judgment instead.',
+        };
+      }
+
+      // Normalize to a question list: batch (`questions`) or single.
+      let inputs: AskQuestionInput[];
+      if (Array.isArray(args.questions)) {
+        inputs = [];
+        for (const raw of args.questions) {
+          const n = normalizeQuestionInput(raw);
+          if ('error' in n) return { error: `invalid questions[${inputs.length}]: ${n.error}` };
+          inputs.push(n);
+        }
+      } else if (typeof args.question === 'string' && args.question.trim().length > 0) {
+        const n = normalizeQuestionInput({
+          question: args.question,
+          options: args.options,
+          multiSelect: args.multiSelect,
+          allowFreeText: args.allowFreeText,
+        });
+        if ('error' in n) return { error: `invalid question: ${n.error}` };
+        inputs = [n];
+      } else {
+        return {
+          error: 'ask_user_question needs at least one question: pass `question` or a non-empty `questions` array.',
+        };
+      }
+      if (inputs.length === 0) {
+        return { error: 'ask_user_question needs at least one question: `questions` was empty.' };
+      }
+
+      const rawTimeout = typeof args.timeoutMinutes === 'number' && Number.isFinite(args.timeoutMinutes)
+        ? args.timeoutMinutes
+        : ASK_QUESTION_TIMEOUT_DEFAULT_MIN;
+      const timeoutMs =
+        Math.min(ASK_QUESTION_TIMEOUT_MAX, Math.max(ASK_QUESTION_TIMEOUT_MIN, rawTimeout)) * 60_000;
+
+      // Batch: raise + emit ALL questions first, then await answers in order.
+      const raised: Array<{ input: AskQuestionInput; widgetId: string; expiresAt: number; payload: ButtonsWidgetPayload }> = [];
+      for (let i = 0; i < inputs.length; i++) {
+        const input = inputs[i]!;
+        const options = (input.options ?? []).map((o, oi) => ({
+          id: typeof o.id === 'string' && o.id.length > 0 ? o.id : `o${oi + 1}`,
+          label: o.label,
+          ...(o.description !== undefined ? { description: o.description } : {}),
+        }));
+        const validated = validateWidgetPayload({
+          kind: 'buttons',
+          title: 'Question for you',
+          question: input.question,
+          options,
+          ...(input.multiSelect ? { multiSelect: true } : {}),
+          ...(input.allowFreeText ? { allowFreeText: true } : {}),
+        });
+        if (!validated.ok) return { error: `invalid question ${i + 1}: ${validated.error}` };
+        const payload = validated.payload as ButtonsWidgetPayload;
+        let widgetId: string;
+        let expiresAt: number;
+        try {
+          const record = await host.raise({ kind: 'buttons', payload, title: 'Question for you', interactive: true });
+          widgetId = record.id;
+          expiresAt = record.expiresAt;
+        } catch (err) {
+          return { error: `could not raise question ${i + 1}: ${err instanceof Error ? err.message : String(err)}` };
+        }
+        raised.push({ input, widgetId, expiresAt, payload });
+        try {
+          await host.emit({
+            type: 'widget',
+            widgetId,
+            sessionId: ctx.sessionId,
+            widget: payload,
+            expiresAt,
+            interactive: true,
+          });
+        } catch {
+          // Event sinks must never break the question flow.
+        }
+      }
+
+      const answers: Array<{
+        question: string;
+        answered: boolean;
+        selected: string[];
+        labels: string[];
+        freeText: string | null;
+      }> = [];
+      for (const { input, widgetId, payload } of raised) {
+        let answer: WidgetAnswer;
+        try {
+          answer = await host.awaitAnswer(widgetId, timeoutMs);
+        } catch {
+          // Aborted (or host error): fail closed — no answer, turn continues.
+          answer = { answered: false };
+        }
+        const answeredAt = Date.now();
+        try {
+          await host.emit({
+            type: 'widget_answered',
+            widgetId,
+            answer: {
+              answered: answer.answered,
+              ...(answer.value !== undefined ? { value: answer.value } : {}),
+              ...(answer.expired ? { expired: true } : {}),
+              answeredAt,
+            },
+          });
+        } catch {
+          // Event sinks must never break the question flow.
+        }
+        const interpreted = interpretQuestionAnswer(answer, payload);
+        answers.push({ question: input.question, answered: answer.answered, ...interpreted });
+      }
+      return { answers, allAnswered: answers.every((a) => a.answered) };
+    },
+  };
 }
