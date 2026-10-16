@@ -5,3 +5,4 @@
 export * from './voice.js';
 export * from './groq.js';
 export * from './openai.js';
+export * from './openai-realtime.js';

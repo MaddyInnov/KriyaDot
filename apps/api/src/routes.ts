@@ -76,6 +76,7 @@ import { getLanIp, registerCompanionRoutes } from './companion-routes.js';
 import type { CompanionHub, CompanionStore } from './companion.js';
 import { createRemoteScreenRouter } from './remote-screen-routes.js';
 import { createVoiceCallRouter } from './voice-call-routes.js';
+import { createRealtimeVoiceRouter } from './voice-realtime-routes.js';
 import { saveBotVoice } from './bot-voice.js';
 import { saveBotApprovalModeForBot } from './bot-approval-modes.js';
 import { buildBotChatFn, saveBotMemorySettings, wireMemoryDistillers } from './memory-fabric.js';
@@ -224,6 +225,14 @@ export interface RouteDeps {
    */
   voiceCall?: {
     service: import('./voice-call.js').VoiceCallService;
+  };
+  /**
+   * Native realtime (speech-to-speech) voice calls (OpenMausBot parity).
+   * Optional like voiceCall; the WS endpoint (/api/voice/realtime/ws) is
+   * wired in index.ts's upgrade handler.
+   */
+  realtimeVoice?: {
+    service: import('./voice-realtime.js').RealtimeVoiceService;
   };
 }
 
@@ -2453,6 +2462,13 @@ export function createRouter(deps: RouteDeps): express.Router {
   // utterance WebSocket (/api/voice/calls/ws, wired in index.ts).
   if (deps.voiceCall) {
     router.use('/voice', createVoiceCallRouter({ service: deps.voiceCall.service }));
+  }
+
+  // Native realtime (speech-to-speech) voice calls (OpenMausBot parity):
+  // session REST at /api/voice/realtime/* + the full-duplex WebSocket
+  // (/api/voice/realtime/ws, wired in index.ts).
+  if (deps.realtimeVoice) {
+    router.use('/voice/realtime', createRealtimeVoiceRouter({ service: deps.realtimeVoice.service }));
   }
 
   // ---- Phase 4: muse-parity modules -------------------------------------

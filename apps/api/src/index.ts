@@ -1010,6 +1010,39 @@ async function boot(): Promise<void> {
     audit: (action, fields) => governance.audit(action, fields),
   });
   const voiceCallUpgrade = createVoiceCallUpgrade({ service: voiceCallService, loopbackToken });
+  // Native realtime (speech-to-speech) voice calls (OpenMausBot parity
+  // P0 #9): full-duplex WS at /api/voice/realtime/ws with server-side VAD,
+  // barge-in, and sentence-chunked TTS — plus an OpenAI Realtime
+  // passthrough engine when the user selects it and a key resolves.
+  const { RealtimeVoiceService } = await import('./voice-realtime.js');
+  const { createRealtimeVoiceUpgrade } = await import('./voice-realtime-routes.js');
+  const realtimeVoiceService = new RealtimeVoiceService({
+    dataDir: config.dataDir,
+    findBot: (botId: string) => (seed.bots as Array<{ id: string }>).find((b) => b.id === botId) as
+      | import('@mvp/agent-runtime').BotConfig
+      | undefined,
+    runBotTurn: async ({ bot, message, sessionId, signal, onText, onApproval }) => {
+      let memoryContext: string | undefined;
+      try {
+        memoryContext = tieredMemoryStore.recallForPrompt(bot.id, message) || undefined;
+      } catch {
+        memoryContext = undefined; // memory must never break calls
+      }
+      await agentRuntime.runTurn({
+        bot,
+        message,
+        sessionId,
+        signal,
+        memoryContext,
+        onEvent: (e) => {
+          if (e.type === 'token') onText(e.content);
+          else if (e.type === 'approval_required') onApproval(e.approvalId, e.call.name);
+        },
+      });
+    },
+    audit: (action, fields) => governance.audit(action, fields),
+  });
+  const realtimeVoiceUpgrade = createRealtimeVoiceUpgrade({ service: realtimeVoiceService, loopbackToken });
   // Phase 2: workflow webhook triggers (shared-secret authenticated).
   app.use('/webhooks', createWebhookRouter({ runner: workflowRunner, triggerStore }));
   // Encrypted push notifications (Codync parity): FCM fan-out to paired
@@ -1085,6 +1118,8 @@ async function boot(): Promise<void> {
       // Realtime voice calls with bots (Codync parity): STT → bot turn →
       // TTS over /api/voice/calls (REST) + /api/voice/calls/ws.
       voiceCall: { service: voiceCallService },
+      // Native realtime speech-to-speech (OpenMausBot parity P0 #9).
+      realtimeVoice: { service: realtimeVoiceService },
       push: pushService,
       recordingStore,
       chatQueueStore,
@@ -1351,6 +1386,8 @@ async function boot(): Promise<void> {
       remoteScreenUpgrade.handleUpgrade(req, socket, head);
     } else if (path === '/api/voice/calls/ws') {
       voiceCallUpgrade.handleUpgrade(req, socket, head);
+    } else if (path === '/api/voice/realtime/ws') {
+      realtimeVoiceUpgrade.handleUpgrade(req, socket, head);
     } else {
       socket.destroy();
     }

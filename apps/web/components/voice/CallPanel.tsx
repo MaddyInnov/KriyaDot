@@ -26,6 +26,17 @@ import {
   type VoiceCallProviderInfo,
   type VoiceCallTurn,
 } from '../../lib/voice-call-client';
+import {
+  RealtimeAudioPlayer,
+  RealtimeCallClient,
+  downsampleToRate,
+  floatToPcm16,
+  getRealtimeEngines,
+  type AudioContextLike,
+  type RealtimeClientEvent,
+  type RealtimeEngineInfo,
+  type RealtimeUsage,
+} from '../../lib/realtime-call-client';
 
 export interface CallPanelProps {
   botId: string;
@@ -90,6 +101,359 @@ function fmtTime(ts: number): string {
   }
 }
 
+function fmtUsd(usd: number): string {
+  if (usd < 0.01) return `$${usd.toFixed(4)}`;
+  return `$${usd.toFixed(2)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Realtime (speech-to-speech) call view.
+// ---------------------------------------------------------------------------
+
+interface RealtimeMessage {
+  id: string;
+  role: 'you' | 'bot';
+  text: string;
+  at: number;
+}
+
+let rtMsgSeq = 0;
+
+interface RealtimeCallViewProps {
+  botId: string;
+  botName?: string;
+  engine: 'chunked' | 'openai-realtime';
+  sttProvider?: string;
+  ttsProvider?: string;
+  onExit: () => void;
+}
+
+/**
+ * Full-duplex realtime call: continuous mic capture (16kHz PCM) with
+ * browser echoCancellation, server-side VAD, barge-in (interrupting the
+ * bot stops its audio instantly), live latency + cost ticker.
+ */
+function RealtimeCallView({ botId, botName, engine, sttProvider, ttsProvider, onExit }: RealtimeCallViewProps) {
+  const { t } = useI18n();
+  const [phase, setPhase] = useState<'connecting' | 'live' | 'error'>('connecting');
+  const [error, setError] = useState<string | null>(null);
+  const [messages, setMessages] = useState<RealtimeMessage[]>([]);
+  const [userSpeaking, setUserSpeaking] = useState(false);
+  const [interrupted, setInterrupted] = useState(false);
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
+  const [usage, setUsage] = useState<RealtimeUsage | null>(null);
+  const [approvalNotice, setApprovalNotice] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [maxMs, setMaxMs] = useState(15 * 60 * 1000);
+  const [path, setPath] = useState('');
+
+  const clientRef = useRef<RealtimeCallClient | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const playerRef = useRef<RealtimeAudioPlayer | null>(null);
+  const procRef = useRef<ScriptProcessorNode | null>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const callStartRef = useRef(0);
+  const mountedRef = useRef(true);
+  const interruptTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const teardown = useCallback(async () => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    if (interruptTimerRef.current) clearTimeout(interruptTimerRef.current);
+    timerRef.current = null;
+    interruptTimerRef.current = null;
+    try {
+      procRef.current?.disconnect();
+    } catch {
+      // ignore
+    }
+    try {
+      streamRef.current?.getTracks().forEach((tr) => tr.stop());
+    } catch {
+      // ignore
+    }
+    try {
+      playerRef.current?.stopAll();
+    } catch {
+      // ignore
+    }
+    try {
+      await audioCtxRef.current?.close();
+    } catch {
+      // ignore
+    }
+    procRef.current = null;
+    streamRef.current = null;
+    audioCtxRef.current = null;
+    playerRef.current = null;
+    const client = clientRef.current;
+    clientRef.current = null;
+    if (client) await client.end().catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      void teardown();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const pushMessage = useCallback((role: 'you' | 'bot', text: string) => {
+    const id = `rtm_${Date.now().toString(36)}_${rtMsgSeq++}`;
+    if (mountedRef.current) {
+      setMessages((prev) => [...prev, { id, role, text, at: Date.now() }]);
+    }
+    return id;
+  }, []);
+
+  const appendToLastBot = useCallback(
+    (text: string) => {
+      if (!mountedRef.current) return;
+      setMessages((prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (last && last.role === 'bot') {
+          next[next.length - 1] = { ...last, text: last.text + text };
+        } else {
+          next.push({ id: `rtm_${Date.now().toString(36)}_${rtMsgSeq++}`, role: 'bot', text, at: Date.now() });
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
+  const handleEvent = useCallback(
+    (e: RealtimeClientEvent) => {
+      if (!mountedRef.current) return;
+      switch (e.type) {
+        case 'connected':
+          setPhase('live');
+          setPath(e.path);
+          setMaxMs(e.maxCallMs || 15 * 60 * 1000);
+          callStartRef.current = Date.now();
+          timerRef.current = setInterval(() => {
+            if (mountedRef.current) setElapsed(Date.now() - callStartRef.current);
+          }, 1000);
+          break;
+        case 'speech_started':
+          setUserSpeaking(true);
+          break;
+        case 'speech_stopped':
+          setUserSpeaking(false);
+          break;
+        case 'transcript':
+          pushMessage('you', e.text);
+          break;
+        case 'reply_delta':
+          appendToLastBot(e.text);
+          break;
+        case 'audio': {
+          const player = playerRef.current;
+          if (!player) break;
+          if (e.sentence) appendToLastBot(e.sentence + ' ');
+          if (e.pcm16) player.playPcm16(e.data, e.sampleRate ?? 24000);
+          else void player.playEncoded(e.data, e.turnId);
+          break;
+        }
+        case 'barge_in':
+          // Stop the bot's audio instantly — the core of barge-in.
+          try {
+            playerRef.current?.stopAll();
+          } catch {
+            // ignore
+          }
+          setInterrupted(true);
+          if (interruptTimerRef.current) clearTimeout(interruptTimerRef.current);
+          interruptTimerRef.current = setTimeout(() => {
+            if (mountedRef.current) setInterrupted(false);
+          }, 2500);
+          break;
+        case 'latency':
+          setLatencyMs(e.ms);
+          break;
+        case 'usage':
+          setUsage(e.usage);
+          break;
+        case 'approval_required':
+          setApprovalNotice(true);
+          break;
+        case 'turn_done':
+          break;
+        case 'error':
+          setError(e.detail);
+          setPhase('error');
+          void teardown();
+          break;
+        case 'ended':
+          void teardown().then(() => {
+            if (mountedRef.current) onExit();
+          });
+          break;
+      }
+    },
+    [appendToLastBot, pushMessage, teardown, onExit],
+  );
+
+  const startRealtime = useCallback(async () => {
+    setError(null);
+    setPhase('connecting');
+    try {
+      // echoCancellation is the client-side half of echo suppression; the
+      // server never feeds its own output back into STT by construction.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      if (!mountedRef.current) {
+        stream.getTracks().forEach((tr) => tr.stop());
+        return;
+      }
+      streamRef.current = stream;
+      const AC =
+        window.AudioContext ??
+        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AC) throw new Error('Web Audio is not available in this browser');
+      const ctx = new AC();
+      try {
+        await ctx.resume();
+      } catch {
+        // ignore
+      }
+      audioCtxRef.current = ctx;
+      playerRef.current = new RealtimeAudioPlayer(ctx as unknown as AudioContextLike);
+
+      // Continuous capture: ScriptProcessor is deprecated but universally
+      // supported; chunks are downsampled to the 16kHz the server expects.
+      const src = ctx.createMediaStreamSource(stream);
+      const proc = ctx.createScriptProcessor(4096, 1, 1);
+      const inputRate = ctx.sampleRate;
+      let pending = new Float32Array(0);
+      proc.onaudioprocess = (ev: AudioProcessingEvent) => {
+        const input = ev.inputBuffer.getChannelData(0);
+        const down = downsampleToRate(input, inputRate, 16000);
+        const merged = new Float32Array(pending.length + down.length);
+        merged.set(pending, 0);
+        merged.set(down, pending.length);
+        pending = merged;
+        const client = clientRef.current;
+        // ~100ms PCM16 chunks to the server.
+        while (pending.length >= 1600 && client) {
+          try {
+            client.sendPcm16(floatToPcm16(pending.slice(0, 1600)));
+          } catch {
+            break;
+          }
+          pending = pending.slice(1600);
+        }
+        // Safety: never let an unsent backlog grow unbounded.
+        if (pending.length > 16000 * 5) pending = pending.slice(pending.length - 16000 * 5);
+      };
+      src.connect(proc);
+      // ScriptProcessor only fires when connected downstream; a zero-gain
+      // node keeps it alive without audible feedback.
+      const mute = ctx.createGain();
+      mute.gain.value = 0;
+      proc.connect(mute);
+      mute.connect(ctx.destination);
+      procRef.current = proc;
+
+      const client = new RealtimeCallClient(handleEvent);
+      clientRef.current = client;
+      await client.start(botId, {
+        engine,
+        ...(sttProvider ? { sttProvider } : {}),
+        ...(ttsProvider ? { ttsProvider } : {}),
+      });
+    } catch (err) {
+      if (!mountedRef.current) return;
+      setError(err instanceof Error ? err.message : String(err));
+      setPhase('error');
+      await teardown();
+    }
+  }, [botId, engine, sttProvider, ttsProvider, handleEvent, teardown]);
+
+  useEffect(() => {
+    void startRealtime();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const timeLeft = Math.max(0, maxMs - elapsed);
+
+  return (
+    <div className="call-panel card" role="region" aria-label={t('call.title')}>
+      <div className="row-between">
+        <h3 style={{ margin: 0 }}>
+          ⚡ {t('call.modeRealtime')}
+          {botName ? <span className="small muted"> · {botName}</span> : null}
+        </h3>
+        <button type="button" className="btn btn-danger btn-sm" onClick={() => void teardown().then(onExit)}>
+          {t('call.end')}
+        </button>
+      </div>
+
+      <p className="small muted" style={{ marginTop: 8 }}>
+        {t('call.realtimeJustTalk')}
+        {path ? <span> · <code>{path}</code></span> : null}
+      </p>
+
+      <div className="call-status" aria-live="polite">
+        <span className={`call-dot phase-${phase === 'live' ? (userSpeaking ? 'recording' : 'speaking') : 'quiet'}`} aria-hidden="true" />
+        <strong>
+          {phase === 'connecting'
+            ? t('call.connecting')
+            : interrupted
+              ? t('call.realtimeInterrupted')
+              : userSpeaking
+                ? t('call.realtimeUserSpeaking')
+                : t('call.realtimeWaiting')}
+        </strong>
+        <span className="small muted" style={{ marginLeft: 8 }}>
+          {t('call.timeLeftLabel')}: {fmtDuration(timeLeft)}
+        </span>
+        {latencyMs !== null && (
+          <span className="small muted" style={{ marginLeft: 8 }}>
+            {t('call.latencyLabel')}: {latencyMs} ms
+          </span>
+        )}
+        {usage && (
+          <span className="small muted" style={{ marginLeft: 8 }} title={t('call.costLabel')}>
+            {t('call.costLabel')}: {fmtUsd(usage.usdApprox)}
+          </span>
+        )}
+      </div>
+
+      {approvalNotice && (
+        <div className="notice-box" role="status">
+          {t('call.realtimeApproval')}
+        </div>
+      )}
+
+      {error && (
+        <div className="error-box" role="alert">
+          {error}
+        </div>
+      )}
+
+      <div className="call-transcript" aria-label={t('voice.transcript')}>
+        {messages.length === 0 && <p className="small muted">{t('call.empty')}</p>}
+        {messages.map((m) => (
+          <div key={m.id} className={`call-line ${m.role === 'you' ? 'you' : 'bot'}`}>
+            <span className="call-speaker">{m.role === 'you' ? t('call.you') : (botName ?? t('call.bot'))}</span>
+            <span className="call-text">{m.text}</span>
+            <span className="call-time small muted">{fmtTime(m.at)}</span>
+          </div>
+        ))}
+      </div>
+
+      <p className="small muted" style={{ marginTop: 8 }}>
+        {t('call.realtimeMaxed')}
+      </p>
+    </div>
+  );
+}
+
 /** Play base64 audio; resolves when playback ends. */
 function playAudio(data: string, mimeType: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -122,6 +486,10 @@ export default function CallPanel({ botId, botName, language, captureDeps, clien
   const [autoVad, setAutoVad] = useState(false);
   const [approvalNotice, setApprovalNotice] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+  const [mode, setMode] = useState<'standard' | 'realtime'>('standard');
+  const [realtimeActive, setRealtimeActive] = useState(false);
+  const [engines, setEngines] = useState<RealtimeEngineInfo[]>([]);
+  const [engine, setEngine] = useState<'chunked' | 'openai-realtime'>('chunked');
 
   const clientRef = useRef<VoiceCallClient | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -151,6 +519,13 @@ export default function CallPanel({ botId, botName, language, captureDeps, clien
       })
       .catch(() => {
         // Providers are optional pre-call info; the start call will surface errors.
+      });
+    getRealtimeEngines()
+      .then((list) => {
+        if (mountedRef.current) setEngines(list);
+      })
+      .catch(() => {
+        // Realtime engines are optional; standard mode still works.
       });
     return () => {
       mountedRef.current = false;
@@ -412,6 +787,25 @@ export default function CallPanel({ botId, botName, language, captureDeps, clien
             : null;
 
   const configuredProviders = providers.filter((p) => p.configured);
+  const availableEngines = engines.filter((e) => e.available);
+
+  // Realtime (speech-to-speech) mode owns its own lifecycle.
+  if (realtimeActive) {
+    return (
+      <RealtimeCallView
+        botId={botId}
+        botName={botName}
+        engine={engine}
+        sttProvider={sttProvider || undefined}
+        ttsProvider={ttsProvider || undefined}
+        onExit={() => {
+          setRealtimeActive(false);
+          setPhase('idle');
+          setMic('quiet');
+        }}
+      />
+    );
+  }
 
   return (
     <div className="call-panel card" role="region" aria-label={t('call.title')}>
@@ -425,7 +819,18 @@ export default function CallPanel({ botId, botName, language, captureDeps, clien
             {t('call.end')}
           </button>
         ) : (
-          <button type="button" className="btn btn-primary btn-sm" onClick={() => void startCall()}>
+          <button
+            type="button"
+            className="btn btn-primary btn-sm"
+            onClick={() => {
+              if (mode === 'realtime') {
+                setError(null);
+                setRealtimeActive(true);
+              } else {
+                void startCall();
+              }
+            }}
+          >
             {t('call.start')}
           </button>
         )}
@@ -436,6 +841,54 @@ export default function CallPanel({ botId, botName, language, captureDeps, clien
           <p className="small muted" style={{ marginTop: 8 }}>
             {t('call.idleHint')}
           </p>
+          <div className="call-providers" style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 8 }}>
+            <label className="small" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <input
+                type="radio"
+                name="call-mode"
+                checked={mode === 'standard'}
+                onChange={() => setMode('standard')}
+              />
+              {t('call.modeStandard')}
+            </label>
+            <label className="small" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <input
+                type="radio"
+                name="call-mode"
+                checked={mode === 'realtime'}
+                onChange={() => setMode('realtime')}
+                disabled={availableEngines.length === 0}
+              />
+              {t('call.modeRealtime')}
+            </label>
+          </div>
+          <p className="small muted" style={{ marginTop: 4 }}>
+            {t('call.modeHint')}
+          </p>
+          {mode === 'realtime' && (
+            <div className="call-providers" style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 8 }}>
+              <label className="small">
+                {t('call.engineLabel')}:{' '}
+                <select
+                  value={engine}
+                  onChange={(e) => setEngine(e.target.value as 'chunked' | 'openai-realtime')}
+                  aria-label={t('call.engineLabel')}
+                >
+                  {engines.map((e) => (
+                    <option key={e.id} value={e.id} disabled={!e.available}>
+                      {e.label}
+                      {e.available ? '' : ` — ${t('call.providerUnconfigured')}`}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <span className="small muted">
+                {engine === 'openai-realtime' ? t('call.engineRealtimeHint') : t('call.engineChunkedHint')}
+              </span>
+            </div>
+          )}
+          {mode === 'standard' && (
+          <>
           <div className="call-providers" style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 8 }}>
             <label className="small">
               {t('call.providerStt')}:{' '}
@@ -470,6 +923,8 @@ export default function CallPanel({ botId, botName, language, captureDeps, clien
             <p className="small muted" style={{ marginTop: 8 }}>
               {t('call.idleHint')}
             </p>
+          )}
+          </>
           )}
         </>
       )}
