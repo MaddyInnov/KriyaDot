@@ -124,7 +124,8 @@ describe('TieredMemoryStore', () => {
   it('uses an injected LLM distiller when provided', async () => {
     const distiller = vi.fn(async () => [{ fact: 'LLM fact.', entities: ['TestCo'], confidence: 0.95 }]);
     const s2 = new TieredMemoryStore(dir, { distiller });
-    s2.ingestTurn('helper', 'sess-1', 'hello', 'hi there');
+    // Substantive user text so the keeper's trivial-turn skip doesn't fire.
+    s2.ingestTurn('helper', 'sess-1', 'Please remember that TestCo is our biggest client account.', 'hi there');
     await new Promise((r) => setTimeout(r, 50));
     expect(distiller).toHaveBeenCalled();
     const atoms = s2.getAtoms('helper');

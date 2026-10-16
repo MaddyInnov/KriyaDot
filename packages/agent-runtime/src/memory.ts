@@ -185,6 +185,19 @@ export interface AtomCard {
   createdAt: number;
   /** Privacy tier (write-time tag; defaults to `cloud-ok`). */
   tier: PrivacyTier;
+  /** Pinned memories always surface first in recall and are never auto-pruned. */
+  pinned: boolean;
+  /** Memory category: fact | preference | summary | decision. */
+  category: MemoryCategory;
+}
+
+/** Durable memory categories (Engram parity). */
+export type MemoryCategory = 'fact' | 'preference' | 'summary' | 'decision';
+
+const MEMORY_CATEGORIES: ReadonlySet<string> = new Set(['fact', 'preference', 'summary', 'decision']);
+
+function normalizeCategory(c: unknown): MemoryCategory {
+  return typeof c === 'string' && MEMORY_CATEGORIES.has(c) ? (c as MemoryCategory) : 'fact';
 }
 
 /** L3: an entity page aggregating atoms. */
@@ -209,6 +222,58 @@ export interface DistilledFact {
  * extractor below is used — no model call, no latency, no cost.
  */
 export type LlmDistiller = (turnText: string) => Promise<DistilledFact[]>;
+
+/**
+ * Minimal LLM chat function for the keeper. The host wires this to the
+ * bot's own provider; keeping it a tiny interface avoids coupling
+ * memory.ts to the full AgentRuntime.
+ */
+export type KeeperChatFn = (systemPrompt: string, userText: string) => Promise<string>;
+
+const KEEPER_SYSTEM_PROMPT = `You extract durable facts about the user from conversations for long-term memory.
+Return ONLY a JSON array of objects, each with "fact" (a concise declarative sentence),
+"entities" (array of proper nouns mentioned), and "confidence" (0-1).
+Include: preferences, names, projects, decisions, goals, important context.
+Exclude: transient chit-chat, greetings, one-off questions with no lasting value.
+If nothing is worth remembering, return [].
+Example: [{"fact": "The user's preferred name is \\"Ashutosh\\".", "entities": ["Ashutosh"], "confidence": 0.95}]`;
+
+/**
+ * Build an LLM distiller from a chat function. Parses the model's JSON
+ * response; falls back to the heuristic extractor on any failure
+ * (bad JSON, model error) — the keeper must never lose facts to a
+ * malformed response.
+ */
+export function createLlmDistiller(chat: KeeperChatFn): LlmDistiller {
+  return async (turnText: string): Promise<DistilledFact[]> => {
+    let raw: string;
+    try {
+      raw = await chat(KEEPER_SYSTEM_PROMPT, turnText.slice(0, 4000));
+    } catch {
+      return heuristicDistill(turnText);
+    }
+    try {
+      // Strip markdown code fences if the model wrapped the JSON.
+      const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+      const parsed = JSON.parse(cleaned) as Array<{ fact?: unknown; entities?: unknown; confidence?: unknown }>;
+      if (!Array.isArray(parsed)) return heuristicDistill(turnText);
+      const facts: DistilledFact[] = [];
+      for (const item of parsed.slice(0, 10)) {
+        if (typeof item?.fact !== 'string' || !item.fact.trim()) continue;
+        facts.push({
+          fact: item.fact.trim().slice(0, 500),
+          entities: Array.isArray(item.entities)
+            ? (item.entities.filter((e): e is string => typeof e === 'string').map((e) => e.trim()).filter(Boolean).slice(0, 10))
+            : [],
+          confidence: typeof item.confidence === 'number' ? Math.min(1, Math.max(0, item.confidence)) : 0.7,
+        });
+      }
+      return facts;
+    } catch {
+      return heuristicDistill(turnText);
+    }
+  };
+}
 
 const ATOM_TABLE = `
   CREATE TABLE IF NOT EXISTS memory_atoms (
@@ -280,6 +345,18 @@ function readTier(v: unknown): PrivacyTier {
 
 function normEntity(entity: string): string {
   return entity.toLowerCase().trim();
+}
+
+/**
+ * Heuristic category inference for keeper-extracted facts.
+ * Preferences ("I like/prefer") and decisions ("decided/agreed") get their
+ * own categories so recall can weight them; everything else is a fact.
+ */
+function inferCategory(factText: string): MemoryCategory {
+  const t = factText.toLowerCase();
+  if (/\b(i (?:like|love|prefer|hate|dislike|enjoy)|preferred name is)\b/.test(t)) return 'preference';
+  if (/\b(decided|agreed|chosen|will use|going with)\b/.test(t)) return 'decision';
+  return 'fact';
 }
 
 /**
@@ -382,6 +459,13 @@ export class TieredMemoryStore {
     if (!atomCols.some((c) => c.name === 'tier')) {
       this.db.exec('ALTER TABLE memory_atoms ADD COLUMN tier TEXT');
     }
+    // Engram parity: pinned flag + category. Idempotent for existing DBs.
+    if (!atomCols.some((c) => c.name === 'pinned')) {
+      this.db.exec('ALTER TABLE memory_atoms ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!atomCols.some((c) => c.name === 'category')) {
+      this.db.exec("ALTER TABLE memory_atoms ADD COLUMN category TEXT NOT NULL DEFAULT 'fact'");
+    }
     const eventCols = this.db.prepare('PRAGMA table_info(memory_events)').all() as Array<{ name: string }>;
     if (!eventCols.some((c) => c.name === 'tier')) {
       this.db.exec('ALTER TABLE memory_events ADD COLUMN tier TEXT');
@@ -412,8 +496,24 @@ export class TieredMemoryStore {
   // ---- Turn ingestion (async, non-blocking) --------------------------------
 
   /**
+   * Per-bot LLM distillers for the keeper. When set for a bot, the keeper
+   * uses the bot's own model for extraction instead of the heuristic.
+   * Unset bots fall back to the store-wide distiller, then the heuristic.
+   */
+  private readonly botDistillers = new Map<string, LlmDistiller>();
+
+  /** Register (or clear with undefined) a per-bot LLM distiller. */
+  setBotDistiller(botId: string, distiller: LlmDistiller | undefined): void {
+    if (distiller) this.botDistillers.set(botId, distiller);
+    else this.botDistillers.delete(botId);
+  }
+
+  /**
    * Record a completed turn's L0 events and kick off L2 distillation in the
    * background. Never throws into the caller; never blocks the turn.
+   *
+   * The keeper is cheap by design: turns with trivial user text (< 20 chars
+   * or no alphanumeric content) skip distillation entirely.
    */
   ingestTurn(botId: string, sessionId: string, userText: string, assistantText: string, toolCalls: string[] = [], tier?: PrivacyTier): void {
     try {
@@ -422,6 +522,9 @@ export class TieredMemoryStore {
     } catch {
       return; // memory must never break chat
     }
+    // Skip trivial exchanges — the keeper only runs on substantive turns.
+    const substantive = userText.replace(/[^a-zA-Z0-9]/g, '').length >= 20;
+    if (!substantive) return;
     // Fire-and-forget distillation.
     const turnText = `User: ${userText}\nAssistant: ${assistantText}`;
     void this.distillAndStore(botId, sessionId, turnText).catch(() => undefined);
@@ -430,7 +533,8 @@ export class TieredMemoryStore {
   private async distillAndStore(botId: string, sessionId: string, turnText: string): Promise<void> {
     let facts: DistilledFact[];
     try {
-      facts = this.distiller ? await this.distiller(turnText) : heuristicDistill(turnText);
+      const distiller = this.botDistillers.get(botId) ?? this.distiller;
+      facts = distiller ? await distiller(turnText) : heuristicDistill(turnText);
     } catch {
       return;
     }
@@ -449,7 +553,13 @@ export class TieredMemoryStore {
    * Store one atom, deduped against existing atoms (normalized-text match).
    * Returns the atom id, or the existing id when deduped.
    */
-  storeAtom(botId: string, fact: DistilledFact, sourceTurn: string, tier?: PrivacyTier): string {
+  storeAtom(
+    botId: string,
+    fact: DistilledFact,
+    sourceTurn: string,
+    tier?: PrivacyTier,
+    opts: { category?: MemoryCategory; pinned?: boolean } = {},
+  ): string {
     const factText = fact.fact.trim().slice(0, 500);
     if (!factText) throw new Error('fact must be non-empty');
     const factNorm = normFact(factText);
@@ -460,14 +570,89 @@ export class TieredMemoryStore {
 
     const id = randomUUID();
     const entities = [...new Set(fact.entities.map((e) => e.trim()).filter(Boolean))].slice(0, 10);
+    const category = normalizeCategory(opts.category ?? inferCategory(factText));
     this.db
       .prepare(
-        'INSERT INTO memory_atoms (id, bot_id, fact, fact_norm, entities_json, confidence, source_turn, created_at, tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO memory_atoms (id, bot_id, fact, fact_norm, entities_json, confidence, source_turn, created_at, tier, pinned, category) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
-      .run(id, botId, factText, factNorm, JSON.stringify(entities), Math.min(1, Math.max(0, fact.confidence)), sourceTurn, Date.now(), resolveTier('memory', tier));
+      .run(
+        id,
+        botId,
+        factText,
+        factNorm,
+        JSON.stringify(entities),
+        Math.min(1, Math.max(0, fact.confidence)),
+        sourceTurn,
+        Date.now(),
+        resolveTier('memory', tier),
+        opts.pinned ? 1 : 0,
+        category,
+      );
     this.indexAtomForSearch(botId, id, factText, entities);
     this.refreshEntityPages(botId, entities, id);
     return id;
+  }
+
+  /**
+   * Save a session summary as a durable memory (category='summary').
+   * Called when a session ends; the summary should be one paragraph.
+   */
+  saveSessionSummary(botId: string, sessionId: string, summary: string, tier?: PrivacyTier): string {
+    const text = summary.trim().slice(0, 1000);
+    if (!text) throw new Error('summary must be non-empty');
+    return this.storeAtom(
+      botId,
+      { fact: text, entities: [], confidence: 0.9 },
+      `session:${sessionId}`,
+      tier,
+      { category: 'summary' },
+    );
+  }
+
+  /** Pin a memory: pinned atoms surface first in recall and are never auto-pruned. */
+  pinAtom(botId: string, id: string): boolean {
+    const res = this.db.prepare('UPDATE memory_atoms SET pinned = 1 WHERE bot_id = ? AND id = ?').run(botId, id);
+    return res.changes > 0;
+  }
+
+  /** Unpin a memory. */
+  unpinAtom(botId: string, id: string): boolean {
+    const res = this.db.prepare('UPDATE memory_atoms SET pinned = 0 WHERE bot_id = ? AND id = ?').run(botId, id);
+    return res.changes > 0;
+  }
+
+  /**
+   * Full-text search over a bot's memories (FTS5/BM25 ranked).
+   * Returns matching atoms ordered by relevance; pinned atoms sort first
+   * on ties. Deleting via deleteAtom() removes the FTS row too (forget).
+   */
+  searchAtoms(botId: string, query: string, limit = 20): AtomCard[] {
+    const q = query.trim();
+    if (!q) return [];
+    const match = buildFtsMatchQuery(q);
+    if (!match) return [];
+    let rows: Array<{ id: string }>;
+    try {
+      rows = this.db
+        .prepare(
+          `SELECT atom_id AS id FROM memory_atoms_fts
+           WHERE memory_atoms_fts MATCH ? AND bot_id = ?
+           ORDER BY bm25(memory_atoms_fts) LIMIT ?`,
+        )
+        .all(match, botId, Math.min(Math.max(limit, 1), 100)) as Array<{ id: string }>;
+    } catch {
+      return [];
+    }
+    if (rows.length === 0) return [];
+    const byId = new Map(this.getAtoms(botId, 5000).map((a) => [a.id, a]));
+    const hits: AtomCard[] = [];
+    for (const r of rows) {
+      const atom = byId.get(r.id);
+      if (atom) hits.push(atom);
+    }
+    // Pinned first, then FTS rank order (already BM25-sorted).
+    hits.sort((a, b) => Number(b.pinned) - Number(a.pinned));
+    return hits;
   }
 
   /**
@@ -514,10 +699,11 @@ export class TieredMemoryStore {
 
   getAtoms(botId: string, limit = 200): AtomCard[] {
     const rows = this.db
-      .prepare('SELECT * FROM memory_atoms WHERE bot_id = ? ORDER BY created_at DESC LIMIT ?')
+      .prepare('SELECT * FROM memory_atoms WHERE bot_id = ? ORDER BY pinned DESC, created_at DESC LIMIT ?')
       .all(botId, limit) as Array<{
         id: string; bot_id: string; fact: string; entities_json: string;
         confidence: number; source_turn: string; created_at: number; tier: string | null;
+        pinned: number | null; category: string | null;
       }>;
     return rows.map((r) => ({
       id: r.id,
@@ -528,6 +714,8 @@ export class TieredMemoryStore {
       sourceTurn: r.source_turn,
       createdAt: r.created_at,
       tier: readTier(r.tier),
+      pinned: (r.pinned ?? 0) === 1,
+      category: normalizeCategory(r.category),
     }));
   }
 
@@ -622,7 +810,11 @@ export class TieredMemoryStore {
     const qTokens = new Set(normFact(query).split(' ').filter((t) => t.length > 2));
     if (qTokens.size === 0) return '';
 
-    const scored = atoms
+    // Pinned memories always lead: they are the user's explicit "don't forget".
+    const pinned = atoms.filter((a) => a.pinned);
+    const rest = atoms.filter((a) => !a.pinned);
+
+    const scored = rest
       .map((a) => {
         const hay = normFact(a.fact + ' ' + a.entities.join(' '));
         let overlap = 0;
@@ -633,9 +825,10 @@ export class TieredMemoryStore {
       .sort((x, y) => y.overlap - x.overlap || y.atom.confidence - x.atom.confidence)
       .slice(0, 12);
 
-    if (scored.length === 0) return '';
+    const ordered = [...pinned, ...scored.map((s) => s.atom)];
+    if (ordered.length === 0) return '';
     let block = '# What I remember (from past conversations)\n';
-    for (const { atom } of scored) {
+    for (const atom of ordered) {
       const line = `- ${atom.fact}\n`;
       if (block.length + line.length > maxChars) break;
       block += line;

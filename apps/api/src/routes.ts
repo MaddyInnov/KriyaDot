@@ -914,6 +914,71 @@ export function createRouter(deps: RouteDeps): express.Router {
     }
   });
 
+  // ---- Engram parity: pin/unpin, FTS search, session summaries ----------
+
+  router.post('/memory/atoms/:id/pin', (req, res) => {
+    const botId = typeof req.query.botId === 'string' ? req.query.botId : '';
+    if (!botId) {
+      res.status(400).json(errorBody('query param "botId" is required'));
+      return;
+    }
+    try {
+      if (!tieredMemoryStore.pinAtom(botId, req.params.id)) {
+        res.status(404).json(errorBody(`Unknown atom "${req.params.id}"`));
+        return;
+      }
+      res.json({ ok: true, pinned: req.params.id });
+    } catch (err) {
+      res.status(500).json(errorBody('Failed to pin atom', err instanceof Error ? err.message : String(err)));
+    }
+  });
+
+  router.post('/memory/atoms/:id/unpin', (req, res) => {
+    const botId = typeof req.query.botId === 'string' ? req.query.botId : '';
+    if (!botId) {
+      res.status(400).json(errorBody('query param "botId" is required'));
+      return;
+    }
+    try {
+      if (!tieredMemoryStore.unpinAtom(botId, req.params.id)) {
+        res.status(404).json(errorBody(`Unknown atom "${req.params.id}"`));
+        return;
+      }
+      res.json({ ok: true, unpinned: req.params.id });
+    } catch (err) {
+      res.status(500).json(errorBody('Failed to unpin atom', err instanceof Error ? err.message : String(err)));
+    }
+  });
+
+  router.get('/memory/search', (req, res) => {
+    const botId = typeof req.query.botId === 'string' ? req.query.botId : '';
+    const q = typeof req.query.q === 'string' ? req.query.q : '';
+    if (!botId || !q) {
+      res.status(400).json(errorBody('query params "botId" and "q" are required'));
+      return;
+    }
+    const limit = Math.min(Math.max(parseInt(typeof req.query.limit === 'string' ? req.query.limit : '20', 10) || 20, 1), 100);
+    try {
+      res.json({ ok: true, botId, query: q, results: tieredMemoryStore.searchAtoms(botId, q, limit) });
+    } catch (err) {
+      res.status(500).json(errorBody('Failed to search memories', err instanceof Error ? err.message : String(err)));
+    }
+  });
+
+  router.post('/memory/summaries', (req, res) => {
+    const body = (req.body ?? {}) as { botId?: unknown; sessionId?: unknown; summary?: unknown };
+    if (typeof body.botId !== 'string' || typeof body.sessionId !== 'string' || typeof body.summary !== 'string') {
+      res.status(400).json(errorBody('Body must be { botId: string, sessionId: string, summary: string }'));
+      return;
+    }
+    try {
+      const id = tieredMemoryStore.saveSessionSummary(body.botId, body.sessionId, body.summary);
+      res.json({ ok: true, id });
+    } catch (err) {
+      res.status(500).json(errorBody('Failed to save session summary', err instanceof Error ? err.message : String(err)));
+    }
+  });
+
   // ---- MBTI personas --------------------------------------------------------
   // Octop parity: 16 personality templates shaping bot tone/working style.
   router.get('/personas', (_req, res) => {
@@ -1360,7 +1425,10 @@ export function createRouter(deps: RouteDeps): express.Router {
       }
       // Tiered memory: ingest this turn (L0 events + async L2 distillation).
       // Fire-and-forget by design — ingestTurn never throws into the caller.
-      tieredMemoryStore.ingestTurn(bot.id, sessionKey ?? 'default', turnMessage, turnAssistantText, turnToolCalls);
+      // The keeper is per-bot toggleable (bot.memoryKeeper, default true).
+      if (bot.memoryKeeper !== false) {
+        tieredMemoryStore.ingestTurn(bot.id, sessionKey ?? 'default', turnMessage, turnAssistantText, turnToolCalls);
+      }
       // The runtime should emit done/error itself; emit a terminal event only
       // if it resolved without one so clients never hang.
       if (!terminalEmitted && !closed) {

@@ -140,6 +140,13 @@ export interface BotConfig {
    * Example: `['billing', 'invoice', 'refund']` for a billing bot.
    */
   routeKeywords?: string[];
+  /**
+   * Durable memory keeper (Engram parity): when true (default), the keeper
+   * automatically extracts durable facts from completed turns into the
+   * bot's TieredMemoryStore. Set false to disable automatic extraction
+   * for this bot (manual memory_store tool still works).
+   */
+  memoryKeeper?: boolean;
 }
 
 export interface LLMProvider {
