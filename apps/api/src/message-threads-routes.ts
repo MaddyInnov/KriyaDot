@@ -49,7 +49,7 @@ import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { BranchSessionResult, IdentifiedMessage } from '@mvp/agent-runtime';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from '@mvp/agent-runtime';
 
 export interface MessageThread {
   id: string;
@@ -91,7 +91,7 @@ export class MessageThreadStore {
 
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSyncImpl(join(dataDir, 'message-threads.db'));
+    this.db = openDb(join(dataDir, 'message-threads.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS threads (
         thread_id TEXT PRIMARY KEY,

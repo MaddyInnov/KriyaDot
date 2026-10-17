@@ -143,50 +143,87 @@ function coveredTopics(bot: RoutableBot, keywordSet: Set<string>): Set<string> {
   return covered;
 }
 
-interface BotScore {
-  bot: RoutableBot;
+/**
+ * Tunable scoring weights for the message router. This is NOT a learned
+ * model — these are hand-set heuristic weights the user can tune
+ * (GET/PUT /api/routing/weights). The router stays fully deterministic.
+ */
+export interface RouterWeights {
+  directHit: number;
+  topicHit: number;
+  phraseBonus: number;
+  /** Bumped whenever the weights change; recorded in the decision log. */
+  version: number;
+}
+
+export const DEFAULT_ROUTER_WEIGHTS: RouterWeights = {
+  directHit: DIRECT_HIT_SCORE,
+  topicHit: TOPIC_HIT_SCORE,
+  phraseBonus: PHRASE_BONUS,
+  version: 1,
+};
+
+export interface ScoredBot {
+  botId: string;
+  botName: string;
   score: number;
   hits: string[];
 }
 
 /**
- * Route a message to the best-fit bot. Pure and deterministic: no I/O,
- * no LLM, no randomness.
+ * Score every bot for a message (the feature/score half of routing).
+ * Pure and deterministic.
  */
-export function routeMessage(text: string, bots: RoutableBot[]): MessageRoute {
-  if (bots.length === 0) {
-    return { botId: '', confidence: 0, reason: 'no bots available' };
-  }
+export function scoreBotsForRouting(
+  text: string,
+  bots: RoutableBot[],
+  weights: RouterWeights = DEFAULT_ROUTER_WEIGHTS,
+): ScoredBot[] {
   const lowered = text.toLowerCase();
   const tokens = tokenize(text);
-
-  const scored: BotScore[] = bots.map((bot) => {
+  return bots.map((bot) => {
     const kw = botKeywordSet(bot);
     const topics = coveredTopics(bot, kw);
     let score = 0;
     const hits: string[] = [];
     for (const phrase of botPhrases(bot)) {
       if (lowered.includes(phrase)) {
-        score += PHRASE_BONUS;
+        score += weights.phraseBonus;
         hits.push(`"${phrase}"`);
       }
     }
     for (const token of tokens) {
       if (kw.has(token)) {
-        score += DIRECT_HIT_SCORE;
+        score += weights.directHit;
         hits.push(token);
         continue;
       }
       for (const [topic, words] of Object.entries(TOPIC_KEYWORDS)) {
         if (words.includes(token) && topics.has(topic)) {
-          score += TOPIC_HIT_SCORE;
+          score += weights.topicHit;
           hits.push(`${token}~${topic}`);
           break;
         }
       }
     }
-    return { bot, score, hits };
+    return { botId: bot.id, botName: bot.name, score, hits };
   });
+}
+
+/**
+ * Route a message to the best-fit bot with explicit weights. Pure and
+ * deterministic: no I/O, no LLM, no randomness.
+ */
+export function routeMessageWithWeights(
+  text: string,
+  bots: RoutableBot[],
+  weights: RouterWeights = DEFAULT_ROUTER_WEIGHTS,
+): MessageRoute {
+  if (bots.length === 0) {
+    return { botId: '', confidence: 0, reason: 'no bots available' };
+  }
+  const scored = scoreBotsForRouting(text, bots, weights);
+  const botById = new Map(bots.map((b) => [b.id, b]));
 
   let winner = scored[0]!;
   for (const s of scored) {
@@ -203,9 +240,18 @@ export function routeMessage(text: string, bots: RoutableBot[]): MessageRoute {
   }
   const confidence = Math.round((winner.score / total) * 100) / 100;
   const uniqueHits = [...new Set(winner.hits)].slice(0, 6).join(', ');
+  const winnerBot = botById.get(winner.botId);
   return {
-    botId: winner.bot.id,
+    botId: winner.botId,
     confidence,
-    reason: `matched ${uniqueHits} for bot "${winner.bot.name}"`,
+    reason: `matched ${uniqueHits} for bot "${winnerBot?.name ?? winner.botId}"`,
   };
+}
+
+/**
+ * Route a message to the best-fit bot. Pure and deterministic: no I/O,
+ * no LLM, no randomness.
+ */
+export function routeMessage(text: string, bots: RoutableBot[]): MessageRoute {
+  return routeMessageWithWeights(text, bots, DEFAULT_ROUTER_WEIGHTS);
 }

@@ -908,6 +908,41 @@ export interface PeerGrant {
 
 export type PeerDecision = 'allow' | 'deny' | 'always-allow';
 
+export interface CredentialProposal {
+  id: string;
+  botId: string;
+  sessionId: string;
+  key: string;
+  label: string;
+  reason: string;
+  status: 'pending' | 'fulfilled' | 'denied' | 'expired';
+  createdAt: number;
+  expiresAt: number;
+}
+
+/** Credential proposal cards: a bot needs a secret it doesn't have. */
+export async function getCredentialProposals(status?: string): Promise<CredentialProposal[]> {
+  const q = status ? `?status=${encodeURIComponent(status)}` : '';
+  const res = await apiJson<{ ok: boolean; cards: CredentialProposal[] }>(`/api/credential-proposals${q}`);
+  return res.cards;
+}
+
+/** Supply the value (goes straight to the vault) or deny the card. */
+export async function decideCredentialProposal(
+  id: string,
+  decision: 'fulfill' | 'deny',
+  value?: string,
+): Promise<CredentialProposal> {
+  const res = await apiJson<{ ok: boolean; card: CredentialProposal }>(
+    `/api/credential-proposals/${encodeURIComponent(id)}`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ decision, ...(value !== undefined ? { value } : {}) }),
+    },
+  );
+  return res.card;
+}
+
 export async function getPeerApprovals(status?: string): Promise<PeerApprovalCard[]> {
   const q = status ? `?status=${encodeURIComponent(status)}` : '';
   const res = await apiJson<{ ok: boolean; cards: PeerApprovalCard[] }>(`/api/peer-approvals${q}`);

@@ -41,8 +41,9 @@ import {
 import { botRosterImportsPath, validateBotRosterManifest } from './bot-roster-routes.js';
 
 // vitest cannot statically resolve `node:sqlite`; load at runtime.
-const { DatabaseSync } = process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite');
-type DatabaseSyncType = InstanceType<typeof DatabaseSync>;
+import { openDb } from '@mvp/agent-runtime';
+import type { DatabaseSync } from 'node:sqlite';
+type DatabaseSyncType = DatabaseSync;
 
 export interface AgentImportRouterDeps {
   dataDir: string;
@@ -118,7 +119,7 @@ export function createAgentImportRouter(deps: AgentImportRouterDeps): Router {
   const skillsDir = join(deps.dataDir, 'skills');
 
   // Track which imported sessions are archived (read-only) imports.
-  const importDb = new DatabaseSync(join(deps.dataDir, 'agent-import.db'));
+  const importDb = openDb(join(deps.dataDir, 'agent-import.db'));
   importDb.exec(`
     CREATE TABLE IF NOT EXISTS imported_sessions (
       session_id TEXT PRIMARY KEY,

@@ -135,6 +135,10 @@ interface Conversation {
   createdAt: number;
   /** Thread this conversation was branched from (if it is a branch). */
   branchedFrom?: string;
+  /** Context-menu state (client-side, persisted in localStorage). */
+  pinned?: boolean;
+  unread?: boolean;
+  hidden?: boolean;
 }
 
 function loadConvos(): Record<string, Conversation[]> {
@@ -497,6 +501,34 @@ function ChatPageInner() {
   const [convos, setConvos] = useState<Record<string, Conversation[]>>({});
   const [activeConvo, setActiveConvo] = useState<Record<string, string>>({});
   const [renamingId, setRenamingId] = useState<string | null>(null);
+  // Conversation context menu (right-click): pin/unpin, unread/read,
+  // duplicate, hide/unhide, copy id. Client-side, persisted in localStorage.
+  const [convoMenu, setConvoMenu] = useState<{ convoId: string; x: number; y: number } | null>(null);
+  const [showHiddenConvos, setShowHiddenConvos] = useState(false);
+
+  const updateConvo = (botId: string, convoId: string, patch: Partial<Conversation>) => {
+    setConvos((prev) => {
+      const next = { ...prev };
+      next[botId] = (next[botId] ?? []).map((c) => (c.id === convoId ? { ...c, ...patch } : c));
+      return next;
+    });
+  };
+
+  const duplicateConvo = (botId: string, convoId: string) => {
+    const src = (convosRef.current[botId] ?? []).find((c) => c.id === convoId);
+    if (!src) return;
+    const copy: Conversation = {
+      ...src,
+      id: `convo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      title: `Copy of ${src.title}`.slice(0, 120),
+      createdAt: Date.now(),
+      pinned: false,
+      unread: false,
+      hidden: false,
+    };
+    setConvos((prev) => ({ ...prev, [botId]: [copy, ...(prev[botId] ?? [])] }));
+    setActiveConvo((prev) => ({ ...prev, [botId]: copy.id }));
+  };
   const [renameDraft, setRenameDraft] = useState('');
   // Branching a thread at a message (server round-trip in progress).
   const [branching, setBranching] = useState(false);
@@ -1773,10 +1805,20 @@ function ChatPageInner() {
           <>
             <h3>Conversations</h3>
             <div className="convo-list">
-              {(convos[selectedBotId] ?? []).map((c) => {
+              {(convos[selectedBotId] ?? [])
+                .filter((c) => showHiddenConvos || !c.hidden)
+                .sort((a, b) => Number(b.pinned ?? false) - Number(a.pinned ?? false))
+                .map((c) => {
                 const isActive = activeConvo[selectedBotId] === c.id;
                 return (
-                  <div key={c.id} className={`convo-item${isActive ? ' active' : ''}`}>
+                  <div
+                    key={c.id}
+                    className={`convo-item${isActive ? ' active' : ''}${c.hidden ? ' convo-hidden' : ''}`}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      setConvoMenu({ convoId: c.id, x: e.clientX, y: e.clientY });
+                    }}
+                  >
                     {renamingId === c.id ? (
                       <input
                         className="input convo-rename"
@@ -1793,9 +1835,14 @@ function ChatPageInner() {
                     ) : (
                       <button
                         className="convo-title"
-                        onClick={() => switchConvo(selectedBotId, c.id)}
+                        onClick={() => {
+                          switchConvo(selectedBotId, c.id);
+                          if (c.unread) updateConvo(selectedBotId, c.id, { unread: false });
+                        }}
                         title={new Date(c.createdAt).toLocaleString()}
                       >
+                        {c.pinned ? '📌 ' : ''}
+                        {c.unread ? '● ' : ''}
                         {c.branchedFrom ? '⑂ ' : ''}
                         {c.title}
                       </button>
@@ -1827,7 +1874,50 @@ function ChatPageInner() {
               {(convos[selectedBotId] ?? []).length === 0 && (
                 <div className="small muted convo-empty">No conversations yet.</div>
               )}
+              {(convos[selectedBotId] ?? []).some((c) => c.hidden) && (
+                <button
+                  className="linklike small muted"
+                  onClick={() => setShowHiddenConvos((v) => !v)}
+                >
+                  {showHiddenConvos ? 'Hide hidden conversations' : `Show hidden (${(convos[selectedBotId] ?? []).filter((c) => c.hidden).length})`}
+                </button>
+              )}
             </div>
+            {convoMenu && selectedBotId && (() => {
+              const target = (convos[selectedBotId] ?? []).find((c) => c.id === convoMenu.convoId);
+              if (!target) return null;
+              const close = () => setConvoMenu(null);
+              const item = (label: string, onClick: () => void) => (
+                <button
+                  key={label}
+                  className="ctx-item"
+                  onClick={() => {
+                    onClick();
+                    close();
+                  }}
+                >
+                  {label}
+                </button>
+              );
+              return (
+                <>
+                  <div className="ctx-scrim" onClick={close} onContextMenu={(e) => { e.preventDefault(); close(); }} />
+                  <div
+                    className="ctx-menu"
+                    role="menu"
+                    style={{ left: Math.min(convoMenu.x, window.innerWidth - 220), top: Math.min(convoMenu.y, window.innerHeight - 240) }}
+                  >
+                    {item(target.pinned ? 'Unpin' : 'Pin', () => updateConvo(selectedBotId, target.id, { pinned: !target.pinned }))}
+                    {item(target.unread ? 'Mark as read' : 'Mark as unread', () => updateConvo(selectedBotId, target.id, { unread: !target.unread }))}
+                    {item('Duplicate conversation', () => duplicateConvo(selectedBotId, target.id))}
+                    {item(target.hidden ? 'Unhide' : 'Hide', () => updateConvo(selectedBotId, target.id, { hidden: !target.hidden }))}
+                    {item('Copy conversation ID', () => {
+                      navigator.clipboard.writeText(target.id).catch(() => {});
+                    })}
+                  </div>
+                </>
+              );
+            })()}
           </>
         )}
         <h3>Bots</h3>

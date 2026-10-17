@@ -4,8 +4,9 @@ import type { ChatMessage, RichMessage, ToolCall } from './types.js';
 
 // vitest (Vite 5.4.21) cannot statically resolve the `node:sqlite` specifier,
 // so load it at runtime via the builtin-module API instead of a top-level import.
-const { DatabaseSync } = process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite');
-type DatabaseSyncType = InstanceType<typeof DatabaseSync>;
+import { openDb } from './sqlite.js';
+import type { DatabaseSync } from 'node:sqlite';
+type DatabaseSyncType = DatabaseSync;
 
 export interface SessionRecord {
   id: string;
@@ -186,7 +187,7 @@ export class SessionStore {
   private readonly compactionCache = new Map<string, { summary: string; upToId: number }>();
 
   constructor(dbPath: string, opts: SessionStoreOptions = {}) {
-    this.db = new DatabaseSync(dbPath);
+    this.db = openDb(dbPath);
     this.historyLimit =
       parsePositiveInt(opts.historyLimit) ??
       parsePositiveInt(process.env[HISTORY_LIMIT_ENV_VAR]) ??
@@ -482,6 +483,47 @@ export class SessionStore {
     const newSession = this.getSession(newSessionId);
     if (!newSession) return { ok: false, reason: 'thread-not-found' };
     return { ok: true, session: newSession, copiedMessages: Number(copied.changes) };
+  }
+
+  /**
+   * Duplicate a session: new session for the same bot with the FULL history
+   * copied (unlike branchSession, which copies up to a message). Returns
+   * the new session id, or undefined when the source is unknown.
+   */
+  duplicateSession(sessionId: string): string | undefined {
+    const session = this.getSession(sessionId);
+    if (!session) return undefined;
+    const newId = this.createSession(session.botId);
+    this.db
+      .prepare(
+        `INSERT INTO messages (session_id, role, content, tool_name, tool_call_id, tool_calls, ts)
+         SELECT ?, role, content, tool_name, tool_call_id, tool_calls, ts
+         FROM messages WHERE session_id = ? ORDER BY id ASC`,
+      )
+      .run(newId, sessionId);
+    // Copy the compaction summary so the duplicate keeps its context window.
+    this.db
+      .prepare(
+        `INSERT INTO compactions (session_id, summary, up_to_id, updated_at)
+         SELECT ?, summary, up_to_id, updated_at FROM compactions WHERE session_id = ?`,
+      )
+      .run(newId, sessionId);
+    return newId;
+  }
+
+  /**
+   * Delete a session and all its messages, compactions, worktree links, and
+   * FTS rows (the FTS delete trigger keeps the index consistent). Returns
+   * true when a session was deleted.
+   */
+  deleteSession(sessionId: string): boolean {
+    const session = this.getSession(sessionId);
+    if (!session) return false;
+    this.db.prepare('DELETE FROM messages WHERE session_id = ?').run(sessionId);
+    this.db.prepare('DELETE FROM compactions WHERE session_id = ?').run(sessionId);
+    this.db.prepare('DELETE FROM session_worktrees WHERE session_id = ?').run(sessionId);
+    const res = this.db.prepare('DELETE FROM sessions WHERE id = ?').run(sessionId);
+    return res.changes > 0;
   }
 
   /**

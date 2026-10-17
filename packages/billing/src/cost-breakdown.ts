@@ -19,8 +19,9 @@ import { randomUUID } from 'node:crypto';
 
 // vitest cannot statically resolve the `node:sqlite` specifier, so load it
 // at runtime via the builtin-module API (same trick as meter.ts).
-const { DatabaseSync } = process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite');
-type DatabaseSyncType = InstanceType<typeof DatabaseSync>;
+import { openDb } from './sqlite.js';
+import type { DatabaseSync } from 'node:sqlite';
+type DatabaseSyncType = DatabaseSync;
 
 export interface CostEventInput {
   /** Feature bucket, e.g. 'chat', 'workflows', 'mcp', 'memory-distill'. */
@@ -181,7 +182,7 @@ export class CostTracker {
    * (e.g. `<dataDir>/billing.db`); tables are created idempotently.
    */
   constructor(dbPath: string) {
-    this.db = new DatabaseSync(dbPath);
+    this.db = openDb(dbPath);
     this.db.exec(SCHEMA);
   }
 

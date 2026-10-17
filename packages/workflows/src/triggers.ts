@@ -16,7 +16,7 @@ import type { WorkflowRunner } from './runner.js';
 
 // `node:sqlite` cannot be statically imported under vitest's Vite 5 pipeline
 // (see store.ts for the full explanation); load at runtime instead.
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from '@mvp/agent-runtime';
 
 export type TriggerKind = 'cron' | 'webhook';
 
@@ -51,7 +51,7 @@ export class TriggerStore {
   private db: DatabaseSync;
 
   constructor(dbPath: string) {
-    this.db = new DatabaseSyncImpl(dbPath);
+    this.db = openDb(dbPath);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS triggers (
         id TEXT PRIMARY KEY,

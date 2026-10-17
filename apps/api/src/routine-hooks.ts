@@ -39,7 +39,7 @@ import type { AgentRuntime, BotConfig } from '@mvp/agent-runtime';
 import { RoutineStore, type BotRoutine } from './bot-routines.js';
 import { renderRoutinePrompt } from './webhooks.js';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb as openSqliteDb } from '@mvp/agent-runtime';
 
 export const HOOK_BODY_LIMIT_BYTES = 64 * 1024;
 export const HOOK_MAX_ATTEMPTS = 3;
@@ -109,7 +109,7 @@ function openDb(dataDir: string): DatabaseSync {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { join } = require('node:path') as typeof import('node:path');
   mkdirSync(dataDir, { recursive: true });
-  const db: DatabaseSync = new DatabaseSyncImpl(join(dataDir, 'bot-routines.db'));
+  const db: DatabaseSync = openSqliteDb(join(dataDir, 'bot-routines.db'));
   db.exec(`
     CREATE TABLE IF NOT EXISTS webhook_deliveries (
       id TEXT PRIMARY KEY,
@@ -425,9 +425,32 @@ function parseBody(raw: Buffer): { parsed: unknown; isJson: boolean } {
  * express.json() middleware (see the mount in index.ts).
  *
  * POST /api/hooks/:routineId/:secret
+ *
+ * SECURITY NOTE (L2): the `:secret` path segment is a bearer <redacted> embedded
+ * in the URL. That keeps GitHub-style webhook configuration working (GitHub
+ * only allows a static URL — no custom headers), but URLs leak: they land
+ * in access logs, proxy logs, browser history, and Referer headers. For
+ * production, prefer one of the header alternatives the handler also
+ * accepts — `x-signature-256` / `x-hub-signature-256` HMAC signatures, or
+ * `Authorization: Bearer <redacted> — and treat the path form as the
+ * compatibility route. The API ships no HTTP access logger, and the
+ * routine hook-info endpoints redact the secret from displayed URLs, but
+ * any reverse proxy in front of this server should be configured not to
+ * log the /api/hooks/* path either.
  */
 export function createPublicHookRouter(opts: PublicHookRouterOptions): Router {
   const router = Router();
+
+  // L2: one boot-time reminder that the path-secret form is the
+  // compatibility route — HMAC headers are the production recommendation.
+  // eslint-disable-next-line no-console
+  console.warn(
+    '[routine-hooks] Public webhook URLs embed the secret in the path ' +
+      '(POST /api/hooks/:routineId/:secret). For production, prefer the ' +
+      'x-signature-256 / x-hub-signature-256 HMAC header or ' +
+      'Authorization: Bearer <redacted> The path form stays available because GitHub ' +
+      'webhooks require a static URL with no custom headers.',
+  );
 
   router.post('/:routineId/:secret', (req: Request, res: Response) => {
     const { routineId, secret: urlSecret } = req.params;

@@ -9,8 +9,9 @@ import type { ToolDefinition } from './types.js';
 
 // vitest (Vite 5.4.21) cannot statically resolve the `node:sqlite` specifier,
 // so load it at runtime via the builtin-module API instead of a top-level import.
-const { DatabaseSync } = process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite');
-type DatabaseSyncType = InstanceType<typeof DatabaseSync>;
+import { openDb } from './sqlite.js';
+import type { DatabaseSync } from 'node:sqlite';
+type DatabaseSyncType = DatabaseSync;
 
 /**
  * Progressive disclosure: the system prompt carries only name+description
@@ -87,7 +88,7 @@ export class SkillPinStore {
   private readonly db: DatabaseSyncType;
 
   constructor(dbPath: string) {
-    this.db = new DatabaseSync(dbPath);
+    this.db = openDb(dbPath);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS skill_pins (
         skill_name TEXT PRIMARY KEY,

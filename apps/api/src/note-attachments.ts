@@ -34,7 +34,7 @@ import type { AgentRuntime } from '@mvp/agent-runtime';
 import { NoteStore, type Note } from './notes.js';
 import { PageStore, type Page } from './pages.js';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from '@mvp/agent-runtime';
 
 export type AttachmentKind = 'note' | 'page';
 
@@ -91,7 +91,7 @@ export class NoteAttachmentStore {
   constructor(dataDir: string) {
     this.dataDir = dataDir;
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSyncImpl(join(dataDir, 'note-attachments.db'));
+    this.db = openDb(join(dataDir, 'note-attachments.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS note_attachments (
         id TEXT PRIMARY KEY,

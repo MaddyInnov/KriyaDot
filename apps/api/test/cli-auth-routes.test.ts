@@ -65,7 +65,7 @@ describe('cli-auth routes', () => {
     expect(status).toBe(200);
     const body = json as { ok: boolean; clis: Array<Record<string, unknown>> };
     expect(body.ok).toBe(true);
-    expect(body.clis.map((c) => c['cliId']).sort()).toEqual(['claude', 'codex', 'opencode']);
+    expect(body.clis.map((c) => c['cliId']).sort()).toEqual(['antigravity', 'claude', 'codex', 'opencode']);
     for (const c of body.clis) {
       expect(c).toHaveProperty('cliPresent');
       expect(c).toHaveProperty('signedIn');

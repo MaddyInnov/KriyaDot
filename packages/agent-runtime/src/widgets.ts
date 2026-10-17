@@ -24,7 +24,7 @@
 
 import { randomUUID } from 'node:crypto';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from './sqlite.js';
 import type { DatabaseSync } from 'node:sqlite';
 
 import type { StreamEvent } from './types.js';
@@ -475,7 +475,7 @@ export class WidgetStore {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { join } = require('node:path') as typeof import('node:path');
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSyncImpl(join(dataDir, 'widgets.db'));
+    this.db = openDb(join(dataDir, 'widgets.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS widgets (
         id TEXT PRIMARY KEY,

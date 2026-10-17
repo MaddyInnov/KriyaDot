@@ -10,8 +10,10 @@ import {
   decidePeerApproval,
   getPeerGrants,
   revokePeerGrant,
+  getCredentialProposals,
+  decideCredentialProposal,
 } from '../../lib/api';
-import type { ApprovalRecord, PeerApprovalCard, PeerGrant, PeerDecision } from '../../lib/api';
+import type { ApprovalRecord, PeerApprovalCard, PeerGrant, PeerDecision, CredentialProposal } from '../../lib/api';
 import { BulkBar, ShortcutHelp, useActivityShortcuts, type TriageHandlers } from '../activity/triage';
 import { PeerOriginSecurityNote } from '../provenance-chip';
 
@@ -45,6 +47,8 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
   const [peerPending, setPeerPending] = useState<PeerApprovalCard[]>([]);
   const [peerDecided, setPeerDecided] = useState<PeerApprovalCard[]>([]);
   const [peerGrants, setPeerGrants] = useState<PeerGrant[]>([]);
+  // --- Credential proposal cards (a bot needs a secret it doesn't have) ---
+  const [credPending, setCredPending] = useState<CredentialProposal[]>([]);
   const [error, setError] = useState('');
   const [acting, setActing] = useState<string>('');
   // --- Bulk triage state -------------------------------------------------
@@ -61,18 +65,20 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
 
   const refresh = useCallback(async () => {
     try {
-      const [p, all, pp, ppAll, grants] = await Promise.all([
+      const [p, all, pp, ppAll, grants, creds] = await Promise.all([
         getApprovals('pending'),
         getApprovals(),
         getPeerApprovals('pending'),
         getPeerApprovals(),
         getPeerGrants(),
+        getCredentialProposals('pending'),
       ]);
       setPending(p);
       setDecided(all.filter((a) => a.status !== 'pending').slice(0, 20));
       setPeerPending(pp);
       setPeerDecided(ppAll.filter((c) => c.status !== 'pending').slice(0, 20));
       setPeerGrants(grants);
+      setCredPending(creds);
       setError('');
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -421,6 +427,16 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
         </>
       )}
 
+      {/* --- Credential proposal cards: a bot needs a secret it doesn't have.
+          Fulfill writes the value straight to the vault and resumes the turn;
+          the value never lands in the proposals DB or the audit trail. ---- */}
+      <CredentialProposalsSection
+        cards={credPending}
+        acting={acting}
+        setActing={setActing}
+        refresh={refresh}
+      />
+
       {/* --- Peer grants ------------------------------------------------- */}
       <div className="row-between mt">
         <h3 className="mt0">Peer grants ({peerGrants.length})</h3>
@@ -500,5 +516,89 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
       </div>
       <ShortcutHelp open={helpOpen} onClose={() => setHelpOpen(false)} />
     </div>
+  );
+}
+
+function CredentialProposalsSection({
+  cards,
+  acting,
+  setActing,
+  refresh,
+}: {
+  cards: CredentialProposal[];
+  acting: string;
+  setActing: (s: string) => void;
+  refresh: () => Promise<void>;
+}) {
+  const [values, setValues] = useState<Record<string, string>>({});
+  if (cards.length === 0) return null;
+
+  const decide = async (id: string, decision: 'fulfill' | 'deny') => {
+    const value = values[id] ?? '';
+    if (decision === 'fulfill' && !value) return;
+    setActing(id);
+    try {
+      await decideCredentialProposal(id, decision, decision === 'fulfill' ? value : undefined);
+      setValues((v) => {
+        const next = { ...v };
+        delete next[id];
+        return next;
+      });
+      await refresh();
+    } finally {
+      setActing('');
+    }
+  };
+
+  return (
+    <>
+      <div className="row-between mt">
+        <h3 className="mt0">Credential requests ({cards.length})</h3>
+        <span className="small muted" title="A bot asked for a secret it doesn't have. Supply it once — it goes straight to the vault.">
+          bot → vault · 15-min expiry
+        </span>
+      </div>
+      {cards.map((c) => (
+        <div key={c.id} className="card triage-item" style={{ borderLeft: '3px solid var(--warn, #c90)' }}>
+          <div className="row-between">
+            <div>
+              <span className="chip" title="Credential proposal card">🔑 credential</span>{' '}
+              <strong>{c.label || c.key}</strong>
+              <div className="small muted">
+                {c.botId} needs <code>{c.key}</code>
+                {c.reason ? ` — ${c.reason}` : ''}
+              </div>
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            <input
+              type="password"
+              className="input"
+              placeholder="Paste the secret value"
+              autoComplete="off"
+              value={values[c.id] ?? ''}
+              onChange={(e) => setValues((v) => ({ ...v, [c.id]: e.target.value }))}
+              style={{ flex: 1 }}
+            />
+            <button
+              type="button"
+              className="btn btn-sm btn-primary"
+              disabled={acting === c.id || !(values[c.id] ?? '').trim()}
+              onClick={() => void decide(c.id, 'fulfill')}
+            >
+              Save to vault
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm"
+              disabled={acting === c.id}
+              onClick={() => void decide(c.id, 'deny')}
+            >
+              Deny
+            </button>
+          </div>
+        </div>
+      ))}
+    </>
   );
 }

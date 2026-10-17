@@ -18,7 +18,7 @@ import type {
   TokenUsage,
 } from '@mvp/agent-runtime';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from '@mvp/agent-runtime';
 
 export function newFusionRunId(): string {
   return `fr_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
@@ -62,7 +62,7 @@ export class FusionRunStore {
 
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSyncImpl(join(dataDir, 'fusion-runs.db'));
+    this.db = openDb(join(dataDir, 'fusion-runs.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS fusion_runs (
         run_id TEXT PRIMARY KEY,

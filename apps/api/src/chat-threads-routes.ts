@@ -30,7 +30,7 @@ import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { BranchSessionResult, IdentifiedMessage } from '@mvp/agent-runtime';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from '@mvp/agent-runtime';
 
 export interface ChatThreadsDeps {
   dataDir: string;
@@ -65,7 +65,23 @@ export interface ChatThreadsDeps {
   ) => BranchSessionResult | Promise<BranchSessionResult>;
   /** Verbatim message log — AgentRuntime.listThreadMessages in production. */
   listThreadMessages: (sessionId: string) => IdentifiedMessage[] | Promise<IdentifiedMessage[]>;
+  /**
+   * Duplicate a session (full history copy). SessionStore.duplicateSession
+   * in production.
+   */
+  duplicateThread: (sessionId: string) => string | undefined | Promise<string | undefined>;
+  /**
+   * Delete a session and its messages. SessionStore.deleteSession in
+   * production.
+   */
+  deleteThread: (sessionId: string) => boolean | Promise<boolean>;
   audit: (action: string, fields: { actor?: string; sessionId?: string; detail?: unknown }) => void;
+  /**
+   * Called after a thread is deleted (session + titles + flags removed).
+   * The host wires this to agentRuntime.clearSessionCircuitState so the
+   * deleted session's circuit-breaker state can't leak.
+   */
+  onThreadDeleted?: (threadId: string) => void;
   /**
    * Shared title store (optional). When omitted the router creates its own
    * against dataDir. Pass a shared instance when another router (e.g.
@@ -82,6 +98,15 @@ export interface ThreadInfo {
   createdAt: number;
 }
 
+/** Per-conversation management flags (bot context-menu: pin, unread, hide). */
+export interface ThreadFlags {
+  pinned: boolean;
+  unread: boolean;
+  hidden: boolean;
+}
+
+const EMPTY_FLAGS: ThreadFlags = { pinned: false, unread: false, hidden: false };
+
 function errorBody(message: string, detail?: string): Record<string, unknown> {
   return { ok: false, error: message, ...(detail ? { detail } : {}) };
 }
@@ -92,13 +117,20 @@ export class ThreadTitleStore {
 
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSyncImpl(join(dataDir, 'chat-threads.db'));
+    this.db = openDb(join(dataDir, 'chat-threads.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS thread_titles (
         thread_id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
         branched_from TEXT,
         created_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS thread_flags (
+        thread_id TEXT PRIMARY KEY,
+        pinned INTEGER NOT NULL DEFAULT 0,
+        unread INTEGER NOT NULL DEFAULT 0,
+        hidden INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL
       );
     `);
   }
@@ -137,6 +169,39 @@ export class ThreadTitleStore {
       .run(threadId, title, branchedFrom ?? null, Date.now());
   }
 
+  /** Management flags for one thread (all false when never set). */
+  getFlags(threadId: string): ThreadFlags {
+    const row = this.db
+      .prepare('SELECT pinned, unread, hidden FROM thread_flags WHERE thread_id = ?')
+      .get(threadId) as { pinned: number; unread: number; hidden: number } | undefined;
+    if (!row) return { ...EMPTY_FLAGS };
+    return { pinned: row.pinned === 1, unread: row.unread === 1, hidden: row.hidden === 1 };
+  }
+
+  /** Set any subset of flags; returns the merged flags. */
+  setFlags(threadId: string, patch: Partial<ThreadFlags>): ThreadFlags {
+    const current = this.getFlags(threadId);
+    const next: ThreadFlags = {
+      pinned: patch.pinned ?? current.pinned,
+      unread: patch.unread ?? current.unread,
+      hidden: patch.hidden ?? current.hidden,
+    };
+    this.db
+      .prepare(
+        `INSERT INTO thread_flags (thread_id, pinned, unread, hidden, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET pinned = excluded.pinned, unread = excluded.unread, hidden = excluded.hidden, updated_at = excluded.updated_at`,
+      )
+      .run(threadId, next.pinned ? 1 : 0, next.unread ? 1 : 0, next.hidden ? 1 : 0, Date.now());
+    return next;
+  }
+
+  /** Drop a thread's title + flags (used on thread delete). */
+  deleteThread(threadId: string): void {
+    this.db.prepare('DELETE FROM thread_titles WHERE thread_id = ?').run(threadId);
+    this.db.prepare('DELETE FROM thread_flags WHERE thread_id = ?').run(threadId);
+  }
+
   close(): void {
     this.db.close();
   }
@@ -159,26 +224,31 @@ export function createChatThreadsRouter(deps: ChatThreadsDeps): Router {
 
   /**
    * Thread list: every chat session, most recently active first, with the
-   * stored title (when the thread was ever titled or branched) merged in.
+   * stored title (when the thread was ever titled or branched) and
+   * management flags merged in. Pinned threads sort first. Hidden threads
+   * are excluded unless ?includeHidden=1.
    * Used by the web branch picker and the headless CLI (`kriyadot threads list`).
    */
   router.get('/', async (req, res) => {
     const botId = typeof req.query.botId === 'string' && req.query.botId.trim() ? req.query.botId.trim() : undefined;
     const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : NaN;
     const limit = Number.isSafeInteger(rawLimit) ? rawLimit : undefined;
+    const includeHidden = req.query.includeHidden === '1' || req.query.includeHidden === 'true';
     try {
       const sessions = await deps.listThreads({ ...(botId ? { botId } : {}), ...(limit !== undefined ? { limit } : {}) });
-      res.json({
-        ok: true,
-        threads: sessions.map((s) => ({
+      const threads = sessions
+        .map((s) => ({
           id: s.id,
           botId: s.botId,
           title: titles.getTitle(s.id) ?? null,
+          flags: titles.getFlags(s.id),
           createdAt: s.createdAt,
           messageCount: s.messageCount,
           lastMessageTs: s.lastMessageTs,
-        })),
-      });
+        }))
+        .filter((t) => includeHidden || !t.flags.hidden)
+        .sort((a, b) => Number(b.flags.pinned) - Number(a.flags.pinned));
+      res.json({ ok: true, threads });
     } catch (err) {
       res.status(500).json(errorBody('Failed to list threads', err instanceof Error ? err.message : String(err)));
     }
@@ -315,6 +385,91 @@ export function createChatThreadsRouter(deps: ChatThreadsDeps): Router {
         createdAt: result.session.createdAt,
       },
     });
+  });
+
+  /**
+   * Management flags (bot context-menu): pin/unpin, mark unread/read,
+   * hide/unhide. PATCH /:threadId/flags { pinned?, unread?, hidden? }.
+   */
+  router.patch('/:threadId/flags', async (req, res) => {
+    const threadId = req.params.threadId;
+    if (!threadId || threadId.length > 256) {
+      res.status(400).json(errorBody('threadId is required'));
+      return;
+    }
+    const body = (req.body ?? {}) as { pinned?: unknown; unread?: unknown; hidden?: unknown };
+    const patch: Partial<ThreadFlags> = {};
+    for (const key of ['pinned', 'unread', 'hidden'] as const) {
+      if (body[key] === undefined) continue;
+      if (typeof body[key] !== 'boolean') {
+        res.status(400).json(errorBody(`"${key}" must be a boolean`));
+        return;
+      }
+      patch[key] = body[key];
+    }
+    if (Object.keys(patch).length === 0) {
+      res.status(400).json(errorBody('Provide at least one of: pinned, unread, hidden'));
+      return;
+    }
+    const messages = await deps.listThreadMessages(threadId);
+    if (messages.length === 0) {
+      res.status(404).json(errorBody(`Unknown thread "${threadId}"`));
+      return;
+    }
+    const flags = titles.setFlags(threadId, patch);
+    deps.audit('chat.thread_flags', { actor: 'api', sessionId: threadId, detail: { flags } });
+    res.json({ ok: true, threadId, flags });
+  });
+
+  /**
+   * Duplicate a thread: new session for the same bot with the full history
+   * copied. Titled "Copy of <original>".
+   */
+  router.post('/:threadId/duplicate', async (req, res) => {
+    const threadId = req.params.threadId;
+    if (!threadId || threadId.length > 256) {
+      res.status(400).json(errorBody('threadId is required'));
+      return;
+    }
+    const newId = await deps.duplicateThread(threadId);
+    if (!newId) {
+      res.status(404).json(errorBody(`Unknown thread "${threadId}"`));
+      return;
+    }
+    const originalTitle = titles.getTitle(threadId) ?? threadId;
+    const newTitle = `Copy of ${originalTitle}`.slice(0, 120);
+    titles.setTitle(newId, newTitle, threadId);
+    deps.audit('chat.thread_duplicate', {
+      actor: 'api',
+      sessionId: newId,
+      detail: { fromThreadId: threadId },
+    });
+    res.status(201).json({ ok: true, thread: { id: newId, title: newTitle, branchedFrom: threadId } });
+  });
+
+  /**
+   * Delete a thread: removes the session + messages, titles, and flags.
+   * Also clears the session's circuit-breaker state (via onThreadDeleted).
+   */
+  router.delete('/:threadId', async (req, res) => {
+    const threadId = req.params.threadId;
+    if (!threadId || threadId.length > 256) {
+      res.status(400).json(errorBody('threadId is required'));
+      return;
+    }
+    const deleted = await deps.deleteThread(threadId);
+    if (!deleted) {
+      res.status(404).json(errorBody(`Unknown thread "${threadId}"`));
+      return;
+    }
+    titles.deleteThread(threadId);
+    try {
+      deps.onThreadDeleted?.(threadId);
+    } catch {
+      // circuit-state cleanup must never break deletion
+    }
+    deps.audit('chat.thread_delete', { actor: 'api', sessionId: threadId });
+    res.json({ ok: true, deleted: threadId });
   });
 
   return router;

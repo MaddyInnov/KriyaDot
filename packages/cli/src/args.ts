@@ -13,7 +13,7 @@ export interface GlobalFlags {
 }
 
 export interface ParsedArgs {
-  /** Top-level command: chat, run, bots, threads, routines, models, mcp, login, config, help. */
+  /** Top-level command: chat, run, bots, threads, routines, team, serve, models, mcp, login, config, help. */
   command: string;
   /** Second token for grouped commands (bots list, threads show, …). */
   subcommand: string;
@@ -101,7 +101,7 @@ export function flagBool(flags: Record<string, string | boolean>, name: string):
   return v === true || v === 'true' || v === '1';
 }
 
-const GROUPED = new Set(['bots', 'threads', 'routines']);
+const GROUPED = new Set(['bots', 'threads', 'routines', 'team']);
 
 /**
  * Validate the parsed command against the known command table. Returns a
@@ -128,11 +128,16 @@ export function validateCommand(p: ParsedArgs): string | null {
       }
       return usage('kriyadot bots <list|run>.');
     case 'threads':
-      if (p.subcommand === 'list' || p.subcommand === 'show' || p.subcommand === 'branch') return null;
-      return usage('kriyadot threads <list|show|branch>.');
+      if (p.subcommand === 'list' || p.subcommand === 'show' || p.subcommand === 'branch' || p.subcommand === 'delete') return null;
+      return usage('kriyadot threads <list|show|branch|delete>.');
     case 'routines':
       if (p.subcommand === 'list' || p.subcommand === 'run' || p.subcommand === 'runs') return null;
       return usage('kriyadot routines <list|run|runs>.');
+    case 'team':
+      if (p.subcommand === 'apply' || p.subcommand === 'export') return null;
+      return usage('kriyadot team <apply|export>.');
+    case 'serve':
+      return null;
     case 'models':
     case 'mcp':
       if (p.subcommand === 'list') return null;

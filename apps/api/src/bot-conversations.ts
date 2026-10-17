@@ -15,7 +15,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { BotExchange } from '@mvp/agent-runtime';
 import { parseProvenanceNote, serializeProvenanceNote } from '@mvp/agent-runtime';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from '@mvp/agent-runtime';
 
 export type { BotExchange };
 
@@ -36,7 +36,7 @@ export class BotConversationStore {
 
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSyncImpl(join(dataDir, 'bot-conversations.db'));
+    this.db = openDb(join(dataDir, 'bot-conversations.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS bot_exchanges (
         exchange_id TEXT PRIMARY KEY,

@@ -27,7 +27,8 @@ import type {
 } from '@mvp/agent-runtime';
 import type { GovernanceAdapter } from './governance-adapter.js';
 
-const { DatabaseSync } = process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite');
+import { openDb } from '@mvp/agent-runtime';
+import type { DatabaseSync } from 'node:sqlite';
 
 export interface DelegateWiringOpts {
   registry: Map<string, ToolDefinition>;
@@ -52,7 +53,7 @@ export interface DelegateWiringOpts {
 
 /** Ensure the minted child session id has a row in the sessions table. */
 function ensureSessionRow(dbPath: string, sessionId: string, botId: string): void {
-  const db = new DatabaseSync(dbPath);
+  const db = openDb(dbPath);
   try {
     db.prepare('INSERT OR IGNORE INTO sessions (id, bot_id, created_at) VALUES (?, ?, ?)').run(
       sessionId,

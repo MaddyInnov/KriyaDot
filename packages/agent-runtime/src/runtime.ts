@@ -41,6 +41,7 @@ import type { PeerApprovalGate } from './peer-approval.js';
 import type { WidgetCoordinator } from './widgets.js';
 import { extractWidgetAttachment } from './widgets.js';
 import type { ProvenanceNote } from './provenance.js';
+import type { CredentialProposer } from './credential-proposals.js';
 import {
   PEER_ORIGIN_INSTRUCTION,
   defusePeerText,
@@ -413,6 +414,7 @@ export class AgentRuntime {
    */
   private readonly contextProviders: TurnContextProvider[] = [];
   private defaultSpendCapGateFactory: ((botId: string) => SpendCapGate) | null = null;
+  private credentialProposer: CredentialProposer | null = null;
 
   constructor(opts: AgentRuntimeOptions) {
     this.store = new SessionStore(opts.dbPath, opts.sessionStoreOptions);
@@ -456,6 +458,16 @@ export class AgentRuntime {
    */
   setDefaultSpendCapGateFactory(factory: ((botId: string) => SpendCapGate) | null): void {
     this.defaultSpendCapGateFactory = factory;
+  }
+
+  /**
+   * Host wiring: credential/profile proposal host (OpenMausBot parity).
+   * When set, the `request_credential` tool raises a proposal card through
+   * this host and awaits the user's value. Covers every runTurn caller.
+   * Null restores previous behavior (tool falls back to Vault guidance).
+   */
+  setCredentialProposer(proposer: CredentialProposer | null): void {
+    this.credentialProposer = proposer;
   }
 
   /**
@@ -680,6 +692,7 @@ export class AgentRuntime {
       // Per-bot computers (P1 #14): conversation pin override for the surface.
       conversationId: opts.conversationId ?? sessionId,
       signal: opts.signal,
+      credentialProposer: this.credentialProposer ?? undefined,
       widget: widgetCoordinator
         ? {
             raise: (i) => widgetCoordinator.raise({ ...i, sessionId, botId: opts.bot.id }),

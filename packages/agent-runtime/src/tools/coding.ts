@@ -23,18 +23,15 @@ import { readdirSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import type { ToolDefinition } from '../types.js';
 import { resolveWorkspaceDir, type WorkspaceSource } from '../workspaces.js';
+import { confineRealpath } from '../confine.js';
 
 /**
- * Resolve `p` inside `workspaceDir`. Throws if the resolved path escapes the
- * workspace (directory traversal). Mirrors tools/builtin.ts.
+ * Resolve `p` inside `workspaceDir`, following symlinks (M3). Throws if the
+ * real path escapes the workspace (directory traversal or symlink escape).
+ * Mirrors tools/builtin.ts.
  */
 function confine(workspaceDir: string, p: string): string {
-  const root = resolve(workspaceDir);
-  const resolved = resolve(root, p);
-  if (resolved !== root && !resolved.startsWith(root + sep)) {
-    throw new Error(`Path escapes workspace: "${p}"`);
-  }
-  return resolved;
+  return confineRealpath(workspaceDir, p);
 }
 
 function wsRelative(workspaceDir: string, abs: string): string {

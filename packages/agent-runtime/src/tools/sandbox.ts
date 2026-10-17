@@ -14,6 +14,7 @@
  * the caller explicitly opts in, and output is capped to bound memory.
  */
 import { spawn, spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { Sandbox } from 'e2b';
 
 export interface SandboxCommandOptions {
@@ -223,9 +224,17 @@ async function runInDocker(cmd: string, opts: SandboxCommandOptions): Promise<Sa
   const maxBytes = resolveMaxOutputBytes(opts.maxOutputBytes);
   const network = opts.network === true;
 
+  // M7: unique container name so a timed-out / errored / completed run can
+  // be reaped explicitly. `--rm` removes the container on clean exit, but a
+  // SIGKILLed `docker run` client can leave the container behind — hence the
+  // best-effort `docker kill` on every terminal path below.
+  const containerName = `kriyadot-sandbox-${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+
   const args = [
     'run',
     '--rm',
+    '--name',
+    containerName,
     '--network',
     network ? 'bridge' : 'none',
     '--memory',
@@ -255,6 +264,20 @@ async function runInDocker(cmd: string, opts: SandboxCommandOptions): Promise<Sa
       reject(new Error(`Docker backend failed to start: ${err instanceof Error ? err.message : String(err)}`));
       return;
     }
+
+    /** Best-effort container reaping (M7): never throws, never blocks. */
+    const reapContainer = (): void => {
+      try {
+        const killer = spawn('docker', ['kill', containerName], {
+          stdio: 'ignore',
+          windowsHide: true,
+        });
+        killer.on('error', () => {});
+        (killer as { unref?: () => void }).unref?.();
+      } catch {
+        // ignore — cleanup is best-effort
+      }
+    };
 
     let stdout = '';
     let stderr = '';
@@ -292,6 +315,7 @@ async function runInDocker(cmd: string, opts: SandboxCommandOptions): Promise<Sa
       if (settled) return;
       settled = true;
       child.kill('SIGKILL');
+      reapContainer(); // M7: the SIGKILLed client may leave the container behind
       resolve(finish(TIMEOUT_EXIT_CODE, true));
     }, timeoutMs);
     timer.unref?.();
@@ -302,12 +326,14 @@ async function runInDocker(cmd: string, opts: SandboxCommandOptions): Promise<Sa
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      reapContainer(); // M7: clean up the container on spawn/stream errors too
       reject(new Error(`Docker backend failed: ${err.message}`));
     });
     child.on('close', (code, signal) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      reapContainer(); // M7: no-op when --rm already removed it; ignored on error
       resolve(finish(signal === 'SIGKILL' ? TIMEOUT_EXIT_CODE : (code ?? 1)));
     });
   });

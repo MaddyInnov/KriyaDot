@@ -581,6 +581,157 @@ export function MemoryPanel({ botId }: { botId: string }) {
           })}
         </ul>
       )}
+
+      <MemoryUpkeepSection botId={botId} />
+    </div>
+  );
+}
+
+/** Memory upkeep (OpenMausBot parity): about-me, capture/tidy, undoable journal. */
+function MemoryUpkeepSection({ botId }: { botId: string }) {
+  const [aboutMe, setAboutMe] = useState('');
+  const [aboutMeDraft, setAboutMeDraft] = useState('');
+  const [journal, setJournal] = useState<Array<{ id: string; ts: number; action: string; note?: string }>>([]);
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState('');
+
+  const load = useCallback(async () => {
+    try {
+      const [me, j] = await Promise.all([
+        apiJson(`/api/memory/about-me`),
+        apiJson(`/api/memory/upkeep/journal?botId=${encodeURIComponent(botId)}&limit=10`),
+      ]);
+      setAboutMe(me.text ?? '');
+      setAboutMeDraft(me.text ?? '');
+      setJournal(j.entries ?? []);
+    } catch {
+      // upkeep endpoints are optional; the atoms UI still works
+    }
+  }, [botId]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const saveAboutMe = async () => {
+    setBusy(true);
+    try {
+      await apiJson('/api/memory/about-me', {
+        method: 'PUT',
+        body: JSON.stringify({ text: aboutMeDraft }),
+      });
+      setAboutMe(aboutMeDraft);
+      setNotice('About-me saved — the bot reads it into context.');
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runCapture = async () => {
+    setBusy(true);
+    try {
+      const r = await apiJson('/api/memory/upkeep/capture', {
+        method: 'POST',
+        body: JSON.stringify({ botId }),
+      });
+      setNotice(`Capture: scanned ${r.eventsScanned ?? 0} events, stored ${r.atomsStored ?? 0} facts.`);
+      await load();
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runTidy = async () => {
+    setBusy(true);
+    try {
+      const r = await apiJson('/api/memory/upkeep/tidy', {
+        method: 'POST',
+        body: JSON.stringify({ botId }),
+      });
+      setNotice(
+        `Tidy: examined ${r.examined ?? 0}, deduped ${r.duplicatesDeactivated ?? 0}, ` +
+          `contradictions opened ${r.contradictionsOpened ?? 0}.`,
+      );
+      await load();
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const undoLast = async () => {
+    setBusy(true);
+    try {
+      const r = await apiJson('/api/memory/upkeep/journal/undo', {
+        method: 'POST',
+        body: JSON.stringify({ botId }),
+      });
+      setNotice(`Undid: ${r.undone?.action ?? 'last change'}.`);
+      await load();
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="card" style={{ marginTop: 16 }}>
+      <h3>Memory upkeep</h3>
+      {notice && <p className="small muted">{notice}</p>}
+
+      <h4>About me</h4>
+      <p className="small muted">
+        A short profile the bot reads into context on every turn. Edit freely — it is yours.
+      </p>
+      <textarea
+        rows={3}
+        style={{ width: '100%' }}
+        value={aboutMeDraft}
+        onChange={(e) => setAboutMeDraft(e.target.value)}
+        placeholder="e.g. Night owl. Building robots. Prefers terse answers."
+      />
+      <div style={{ marginTop: 6, display: 'flex', gap: 8 }}>
+        <button type="button" className="btn btn-sm" disabled={busy || aboutMeDraft === aboutMe} onClick={() => void saveAboutMe()}>
+          Save about-me
+        </button>
+      </div>
+
+      <h4 style={{ marginTop: 12 }}>Background passes</h4>
+      <p className="small muted">
+        Capture extracts durable facts from recent turns on idle; tidy dedupes atoms and flags
+        contradictions. Both also run automatically (idle capture every 15 min, tidy nightly).
+      </p>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <button type="button" className="btn btn-sm" disabled={busy} onClick={() => void runCapture()}>
+          Run capture now
+        </button>
+        <button type="button" className="btn btn-sm" disabled={busy} onClick={() => void runTidy()}>
+          Run tidy now
+        </button>
+        <button type="button" className="btn btn-sm" disabled={busy || journal.length === 0} onClick={() => void undoLast()}>
+          Undo last memory change
+        </button>
+      </div>
+
+      {journal.length > 0 && (
+        <>
+          <h4 style={{ marginTop: 12 }}>Recent changes (undoable)</h4>
+          <ul className="list small">
+            {journal.map((e) => (
+              <li key={e.id}>
+                <span className="muted">{new Date(e.ts).toLocaleString()}</span> — {e.action}
+                {e.note ? ` — ${e.note}` : ''}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
     </div>
   );
 }

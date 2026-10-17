@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { openDb } from './sqlite.js';
 // Peer provenance + origin tracking (OpenMausBot parity P1 #13).
 //
 // Cross-bot text (ask_bot / message_bot replies, group-chat member replies,
@@ -51,6 +52,13 @@ originBotName?: string;
 relayPath: string[];
 relayNames?: string[];
 timestamp: string;
+/**
+* Guarded external messages: true when this message was relayed from an
+* external source (webhook, ACP, email). Relayed messages are shown with a
+* "relayed" badge and can NEVER satisfy an approval (enforced in
+* @mvp/governance).
+*/
+relayed?: boolean;
 }
 
 /** Fence markers wrapping untrusted peer content in a bot's context. */
@@ -212,8 +220,10 @@ export const PEER_ORIGIN_INSTRUCTION = [
 */
 export function parseProvenanceNote(raw: unknown): ProvenanceNote | undefined {
 try {
-if (!raw || typeof raw!== 'object') return undefined;
-const r = raw as Record<string, unknown>;
+// Accept the JSON string serializeProvenanceNote produces, or a plain object.
+const input: unknown = typeof raw === 'string' ? JSON.parse(raw) : raw;
+if (!input || typeof input!== 'object') return undefined;
+const r = input as Record<string, unknown>;
 if (!isMessageOrigin(r.origin)) return undefined;
 if (!Array.isArray(r.relayPath) ||!r.relayPath.every((x) => typeof x === 'string')) return undefined;
 if (typeof r.timestamp!== 'string') return undefined;
@@ -227,6 +237,7 @@ if (typeof r.originBotName === 'string') note.originBotName = r.originBotName;
 if (Array.isArray(r.relayNames) && r.relayNames.every((x) => typeof x === 'string')) {
 note.relayNames = [...r.relayNames];
 }
+if (r.relayed === true) note.relayed = true;
 return note;
 } catch {
 return undefined;
@@ -242,5 +253,151 @@ originBotName: note.originBotName?? null,
 relayPath: note.relayPath,
 relayNames: note.relayNames?? null,
 timestamp: note.timestamp,
+...(note.relayed === true? { relayed: true }: {}),
 });
+}
+
+// ---------------------------------------------------------------------------
+// Guarded external messages: relayed flag + onBehalfOf ledger
+// ---------------------------------------------------------------------------
+
+/**
+* External sources whose inbound messages are "relayed": they arrive via a
+* third party (webhook, ACP client, email bridge, messaging provider) and
+* must never be mistaken for the human user — in the UI they carry a
+* "relayed" badge, and (enforced in @mvp/governance) a relayed message can
+* NEVER satisfy an approval.
+*/
+export type RelayedSource = 'webhook' | 'acp' | 'email' | 'messaging' | 'api-relay';
+
+const RELAYED_SOURCES: readonly string[] = ['webhook', 'acp', 'email', 'messaging', 'api-relay'];
+
+export function isRelayedSource(v: unknown): v is RelayedSource {
+return typeof v === 'string' && (RELAYED_SOURCES as readonly string[]).includes(v);
+}
+
+/** Message origins that count as "relayed" for approval gating. */
+export function isRelayedOrigin(origin: MessageOrigin | undefined): boolean {
+return origin === 'webhook' || origin === 'external';
+}
+
+export interface RelayedMessageRecord {
+  /** The inbound message's id. */
+  messageId: string;
+  relayed: true;
+  source: RelayedSource;
+  /** Who sent it (sender id/handle from the external system). */
+  from: string;
+  /** On whose behalf it was relayed (user/bot id or display label). */
+  onBehalfOf: string;
+  /** Epoch ms when the relay was recorded. */
+  at: number;
+  note?: string;
+}
+
+export interface RecordRelayedInput {
+  messageId: string;
+  source: RelayedSource;
+  from: string;
+  onBehalfOf: string;
+  note?: string;
+}
+
+type ProvenanceDatabaseSync = import('node:sqlite').DatabaseSync;
+
+/**
+* Append-only onBehalfOf ledger: who sent what on whose behalf, when.
+* Backed by SQLite (<dataDir>/on-behalf-of.db).
+*/
+export class OnBehalfOfLedger {
+  private readonly db: ProvenanceDatabaseSync;
+
+  constructor(dataDir: string) {
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { mkdirSync } = require('node:fs') as typeof import('node:fs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { join } = require('node:path') as typeof import('node:path');
+    mkdirSync(dataDir, { recursive: true });
+    this.db = openDb(join(dataDir, 'on-behalf-of.db'));
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS relayed_messages (
+        message_id TEXT PRIMARY KEY,
+        source TEXT NOT NULL,
+        sender TEXT NOT NULL,
+        on_behalf_of TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        note TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_relayed_at ON relayed_messages (at DESC);
+    `);
+  }
+
+  /** Record one relayed message. Idempotent on messageId. */
+  record(input: RecordRelayedInput): RelayedMessageRecord {
+    const rec: RelayedMessageRecord = {
+      messageId: input.messageId,
+      relayed: true,
+      source: input.source,
+      from: input.from.slice(0, 200),
+      onBehalfOf: input.onBehalfOf.slice(0, 200),
+      at: Date.now(),
+      ...(input.note ? { note: input.note.slice(0, 500) } : {}),
+    };
+    this.db
+      .prepare(
+        `INSERT INTO relayed_messages (message_id, source, sender, on_behalf_of, at, note)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(message_id) DO NOTHING`,
+      )
+      .run(rec.messageId, rec.source, rec.from, rec.onBehalfOf, rec.at, rec.note ?? null);
+    return rec;
+  }
+
+  get(messageId: string): RelayedMessageRecord | undefined {
+    const row = this.db
+      .prepare(
+        'SELECT message_id AS messageId, source, sender AS "from", on_behalf_of AS onBehalfOf, at, note FROM relayed_messages WHERE message_id = ?',
+      )
+      .get(messageId) as
+      | { messageId: string; source: string; from: string; onBehalfOf: string; at: number; note: string | null }
+      | undefined;
+    if (!row) return undefined;
+    return {
+      messageId: row.messageId,
+      relayed: true,
+      source: row.source as RelayedSource,
+      from: row.from,
+      onBehalfOf: row.onBehalfOf,
+      at: row.at,
+      ...(row.note ? { note: row.note } : {}),
+    };
+  }
+
+  /** True when the message id is in the relay ledger. */
+  isRelayed(messageId: string): boolean {
+    return this.get(messageId) !== undefined;
+  }
+
+  list(limit = 100): RelayedMessageRecord[] {
+    const rows = this.db
+      .prepare(
+        'SELECT message_id AS messageId, source, sender AS "from", on_behalf_of AS onBehalfOf, at, note FROM relayed_messages ORDER BY at DESC LIMIT ?',
+      )
+      .all(Math.min(Math.max(limit, 1), 500)) as Array<{
+        messageId: string; source: string; from: string; onBehalfOf: string; at: number; note: string | null;
+      }>;
+    return rows.map((row) => ({
+      messageId: row.messageId,
+      relayed: true as const,
+      source: row.source as RelayedSource,
+      from: row.from,
+      onBehalfOf: row.onBehalfOf,
+      at: row.at,
+      ...(row.note ? { note: row.note } : {}),
+    }));
+  }
+
+  close(): void {
+    this.db.close();
+  }
 }

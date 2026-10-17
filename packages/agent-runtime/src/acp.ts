@@ -17,8 +17,13 @@ import { spawn, type ChildProcess } from 'node:child_process';
 export interface AcpClientOptions {
   command: string;
   args?: string[];
-  /** Working directory for the external agent (confined to the workspace). */
-  cwd?: string;
+  /**
+   * Working directory for the external agent. REQUIRED (L4): the caller —
+   * which owns the workspace — must decide explicitly. There is no
+   * process.cwd() fallback; an external coding agent must never inherit an
+   * ambient working directory by accident.
+   */
+  cwd: string;
   /** Spawn timeout ms. */
   spawnTimeoutMs?: number;
   /**
@@ -39,6 +44,7 @@ interface PendingRequest {
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000;
+const KILL_GRACE_MS = 3_000; // M8: SIGTERM → SIGKILL escalation delay
 
 /**
  * Spawn an external ACP agent and speak the minimal protocol over stdio.
@@ -72,9 +78,12 @@ export class AcpClient {
       env[k] = v;
     }
     this.proc = spawn(this.opts.command, this.opts.args ?? [], {
-      cwd: this.opts.cwd ?? process.cwd(),
+      cwd: this.opts.cwd,
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
+      // M8: detached so close() can kill the whole process group — the
+      // agent may have spawned grandchildren of its own.
+      detached: true,
     });
     this.proc.stdout?.on('data', (d: Buffer) => this.onData(d.toString('utf8')));
     this.proc.stderr?.on('data', () => {
@@ -180,10 +189,37 @@ export class AcpClient {
     this.sendNotification('cancel', sessionId ? { sessionId } : {});
   }
 
+  /**
+   * Shut the agent down. SIGTERMs the whole process group (the child was
+   * spawned detached), escalates to SIGKILL after a grace period if it is
+   * still alive — a SIGTERM-ignoring agent can no longer linger forever.
+   */
   close(): void {
     this.onClose(new AcpError('ACP client closed'));
-    this.proc?.kill('SIGTERM');
+    const proc = this.proc;
     this.proc = null;
+    if (!proc) return;
+    const pid = proc.pid;
+    // Negative pids (process groups) are POSIX-only; on Windows fall back
+    // to signalling the child directly.
+    const group = typeof pid === 'number' && pid > 0 && process.platform !== 'win32';
+    try {
+      if (group) process.kill(-pid, 'SIGTERM');
+      else proc.kill('SIGTERM');
+    } catch {
+      // already gone
+    }
+    const escalate = setTimeout(() => {
+      try {
+        if (proc.exitCode === null && proc.signalCode === null) {
+          if (group) process.kill(-pid!, 'SIGKILL');
+          else proc.kill('SIGKILL');
+        }
+      } catch {
+        // already gone
+      }
+    }, KILL_GRACE_MS);
+    escalate.unref?.();
   }
 
   private sendNotification(method: string, params: Record<string, unknown>): void {
@@ -261,7 +297,7 @@ export class AcpClient {
 }
 
 /** Parse a bot's ACP config into client options. Returns null when not configured. */
-export function acpOptionsFromBot(bot: { acp?: { command?: string; args?: string[] } } | undefined): AcpClientOptions | null {
+export function acpOptionsFromBot(bot: { acp?: { command?: string; args?: string[] } } | undefined): Omit<AcpClientOptions, 'cwd'> | null {
   const command = bot?.acp?.command?.trim();
   if (!command) return null;
   return {

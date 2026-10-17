@@ -26,6 +26,7 @@
 
 import express, { type Request, type Response, type Router } from 'express';
 import { join } from 'node:path';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import {
   DEFAULT_DELEGATION_POLICY,
   DELEGATION_POLICIES,
@@ -41,6 +42,9 @@ import {
   teamManifestFilename,
   validateTeamManifest,
   withEnrichedRunActors,
+  parseTeamMarkdown,
+  resolveMarkdownBots,
+  serializeTeamMarkdown,
   type AgentRuntime,
   type BotConfig,
   type DelegateGate,
@@ -167,6 +171,43 @@ function errorBody(message: string, detail?: string): Record<string, unknown> {
   return { ok: false, error: message, ...(detail ? { detail } : {}) };
 }
 
+/**
+ * Markdown team-spec sidecar (<dataDir>/team-markdown-meta.json): data the
+ * teams table doesn't hold — the roster prompt, description, and per-member
+ * persona/tool notes from a markdown import. Keyed by team id; read back by
+ * GET /:id/export-markdown so the round trip is lossless.
+ */
+interface TeamMarkdownMeta {
+  rosterPrompt?: string;
+  description?: string;
+  members?: Array<{ botId: string; persona?: string; tools?: string[]; note?: string; name?: string }>;
+}
+
+function markdownMetaPath(dataDir: string): string {
+  return join(dataDir, 'team-markdown-meta.json');
+}
+
+function readMarkdownMeta(dataDir: string): Record<string, TeamMarkdownMeta> {
+  try {
+    const raw = readFileSync(markdownMetaPath(dataDir), 'utf8');
+    const parsed = JSON.parse(raw) as unknown;
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      return parsed as Record<string, TeamMarkdownMeta>;
+    }
+  } catch {
+    // absent or corrupt → empty
+  }
+  return {};
+}
+
+function writeMarkdownMeta(dataDir: string, meta: Record<string, TeamMarkdownMeta>): void {
+  mkdirSync(dataDir, { recursive: true });
+  const tmp = `${markdownMetaPath(dataDir)}.tmp`;
+  writeFileSync(tmp, JSON.stringify(meta, null, 2), 'utf8');
+  const { renameSync } = require('node:fs') as typeof import('node:fs');
+  renameSync(tmp, markdownMetaPath(dataDir));
+}
+
 /** Heuristic: does the body look like a raw team manifest (not wrapped)? */
 function isManifestLike(body: Record<string, unknown>): boolean {
   return body.format === TEAM_MANIFEST_FORMAT && typeof body.team === 'object' && body.team !== null;
@@ -187,7 +228,17 @@ function summarizeResult(result: unknown): string {
   return text.slice(0, 400);
 }
 
-export function registerTeamRoutes(router: Router, deps: TeamRouteDeps): TeamStore {
+export interface TeamRoutesHandle {
+  store: TeamStore;
+  /**
+   * Retry a team run: starts a fresh run with the same task and executes
+   * it. Used by the crash-recovery resume path. Returns the new run, or
+   * undefined when the team/run is unknown or still running.
+   */
+  retryRun: (teamId: string, runId: string) => TeamRun | undefined;
+}
+
+export function registerTeamRoutes(router: Router, deps: TeamRouteDeps): TeamRoutesHandle {
   const store = new TeamStore(join(deps.dataDir));
   const dirStore = new TeamDirectoryStore(join(deps.dataDir));
   // runId → subscriber set for live SSE progress
@@ -592,7 +643,131 @@ export function registerTeamRoutes(router: Router, deps: TeamRouteDeps): TeamSto
       res.status(404).json(errorBody(`Unknown team "${id}"`));
       return;
     }
+    // Drop the markdown sidecar entry with the team.
+    const meta = readMarkdownMeta(deps.dataDir);
+    if (meta[id]) {
+      delete meta[id];
+      writeMarkdownMeta(deps.dataDir, meta);
+    }
     res.json({ ok: true, deleted: id });
+  });
+
+  // -- Markdown team import/export (BotMRR parity) ---------------------------
+  //   POST /import-markdown { markdown } → parses the markdown team-spec
+  //     (see packages/agent-runtime/src/team-markdown.ts for the format),
+  //     validates, resolves member bot references, and creates the team via
+  //     the same TeamStore as the JSON API. Roster prompt / description /
+  //     member personas persist in the markdown sidecar.
+  //   GET /:id/export-markdown → { ok, teamId, markdown } round-trips the
+  //     team back to the spec format (add ?download=1 for a .md attachment).
+
+  router.post('/import-markdown', (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as { markdown?: unknown };
+    if (typeof body.markdown !== 'string' || !body.markdown.trim()) {
+      res.status(400).json(errorBody('"markdown" (a team-spec document) is required'));
+      return;
+    }
+    if (body.markdown.length > 100_000) {
+      res.status(400).json(errorBody('markdown document is too large (max 100KB)'));
+      return;
+    }
+    const parsed = parseTeamMarkdown(body.markdown);
+    if (!parsed.ok || !parsed.spec) {
+      res.status(400).json({
+        ok: false,
+        error: 'Could not parse the team document',
+        issues: parsed.issues,
+      });
+      return;
+    }
+    const spec = parsed.spec;
+    let resolved: Array<{ name: string; role: string; botId: string; persona?: string; tools?: string[]; note?: string }>;
+    try {
+      resolved = resolveMarkdownBots(spec, deps.getBots());
+    } catch (err) {
+      res.status(400).json(errorBody(err instanceof Error ? err.message : 'Unknown bots'));
+      return;
+    }
+    const coordinator = resolved.find((m) => m.role === 'coordinator') ?? resolved[0]!;
+    const members = resolved.filter((m) => m.botId !== coordinator.botId).map((m) => m.botId);
+    if (members.length === 0) {
+      res.status(400).json(errorBody('The team needs at least one member besides the coordinator'));
+      return;
+    }
+    const team = store.createTeam(spec.name, coordinator.botId, members);
+    const policy = spec.coordinationRules.delegationPolicy;
+    if (policy || spec.coordinationRules.overrides) {
+      store.setDelegationPolicy(
+        team.id,
+        (policy ?? DEFAULT_DELEGATION_POLICY) as DelegationPolicy,
+        spec.coordinationRules.overrides as Record<string, DelegationPolicy> | undefined,
+      );
+    }
+    const meta = readMarkdownMeta(deps.dataDir);
+    meta[team.id] = {
+      ...(spec.rosterPrompt ? { rosterPrompt: spec.rosterPrompt } : {}),
+      ...(spec.description ? { description: spec.description } : {}),
+      members: resolved.map((m) => ({
+        botId: m.botId,
+        name: m.name,
+        ...(m.persona ? { persona: m.persona } : {}),
+        ...(m.tools ? { tools: m.tools } : {}),
+        ...(m.note ? { note: m.note } : {}),
+      })),
+    };
+    writeMarkdownMeta(deps.dataDir, meta);
+    deps.audit?.('teams.markdown_import', {
+      actor: 'api',
+      detail: { teamId: team.id, name: team.name, members: members.length + 1 },
+    });
+    res.status(201).json({
+      ok: true,
+      team: store.getTeam(team.id) ?? team,
+      issues: parsed.issues,
+      note: 'Team created from the markdown spec. Roster prompt and member notes are kept for export round-trip.',
+    });
+  });
+
+  router.get('/:id/export-markdown', (req: Request, res: Response) => {
+    const id = req.params.id;
+    if (!validId(id)) {
+      res.status(400).json(errorBody('Invalid team id'));
+      return;
+    }
+    const team = store.getTeam(id);
+    if (!team) {
+      res.status(404).json(errorBody(`Unknown team "${id}"`));
+      return;
+    }
+    const bots = deps.getBots();
+    const meta = readMarkdownMeta(deps.dataDir)[id];
+    const metaMembers = new Map((meta?.members ?? []).map((m) => [m.botId, m]));
+    const markdown = serializeTeamMarkdown(
+      {
+        name: team.name,
+        description: meta?.description,
+        coordinatorBotId: team.coordinatorBotId,
+        memberBotIds: team.memberBotIds,
+        delegationPolicy: team.delegationPolicy ?? DEFAULT_DELEGATION_POLICY,
+        delegationPolicyOverrides: team.delegationPolicyOverrides,
+        rosterPrompt: meta?.rosterPrompt,
+      },
+      bots.map((b) => {
+        const mm = metaMembers.get(b.id);
+        return {
+          id: b.id,
+          name: mm?.name ?? b.name,
+          ...(mm?.persona ? { persona: mm.persona } : {}),
+        };
+      }),
+    );
+    if (req.query.download === '1') {
+      res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${team.name.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.team.md"`);
+      res.send(markdown);
+      return;
+    }
+    res.json({ ok: true, teamId: id, markdown });
   });
 
   /** Fire-and-forget coordinator turn for a team run. */
@@ -609,12 +784,15 @@ export function registerTeamRoutes(router: Router, deps: TeamRouteDeps): TeamSto
     const members = team.memberBotIds
       .map((id) => bots.get(id))
       .filter((b): b is BotConfig => Boolean(b));
+    const customRoster = readMarkdownMeta(deps.dataDir)[team.id]?.rosterPrompt;
     const prompt = buildCoordinatorPrompt({
       teamName: team.name,
       coordinatorName: coordinator.name,
       members: members.map((m) => ({ id: m.id, name: m.name, description: m.description })),
       task: run.task,
     });
+    // A markdown-imported custom roster prompt is prepended verbatim.
+    const fullPrompt = customRoster ? `${customRoster}\n\n${prompt}` : prompt;
 
     let resultText = '';
     let steps: TeamStep[] = [];
@@ -624,7 +802,7 @@ export function registerTeamRoutes(router: Router, deps: TeamRouteDeps): TeamSto
       try {
         await deps.agentRuntime.runTurn({
           bot: coordinator,
-          message: prompt,
+          message: fullPrompt,
           sessionId: `team_${team.id}_${runId}`,
           taskType: 'chat',
           // Peer-delegation approval (workstream C): bot→bot delegation is
@@ -724,6 +902,38 @@ export function registerTeamRoutes(router: Router, deps: TeamRouteDeps): TeamSto
     res.json({ ok: true, run: enrichRun(run) });
   });
 
+  /**
+   * Retry an interrupted/failed team run: starts a FRESH run with the same
+   * task (crash-recovery resume path). The original run record is kept.
+   */
+  router.post('/:id/runs/:runId/retry', (req: Request, res: Response) => {
+    const id = req.params.id;
+    if (!validId(id)) {
+      res.status(400).json(errorBody('Invalid team id'));
+      return;
+    }
+    const team = store.getTeam(id);
+    if (!team) {
+      res.status(404).json(errorBody(`Unknown team "${id}"`));
+      return;
+    }
+    const run = store.getRun(req.params.runId);
+    if (!run || run.teamId !== id) {
+      res.status(404).json(errorBody('Unknown run'));
+      return;
+    }
+    if (run.status === 'running') {
+      res.status(409).json(errorBody('Run is still in progress'));
+      return;
+    }
+    const fresh = retryRun(id, run.id);
+    if (!fresh) {
+      res.status(404).json(errorBody('Unknown run'));
+      return;
+    }
+    res.status(202).json({ ok: true, run: enrichRun(fresh), retriedFrom: run.id });
+  });
+
   router.get('/:id/runs/:runId/stream', (req: Request, res: Response) => {
     const run = store.getRun(req.params.runId);
     if (!run || run.teamId !== req.params.id) {
@@ -788,5 +998,18 @@ export function registerTeamRoutes(router: Router, deps: TeamRouteDeps): TeamSto
     });
   });
 
-  return store;
+  const retryRun = (teamId: string, runId: string): TeamRun | undefined => {
+    const team = store.getTeam(teamId);
+    const run = store.getRun(runId);
+    if (!team || !run || run.teamId !== teamId || run.status === 'running') return undefined;
+    const fresh = store.startRun(teamId, run.task);
+    executeRun(team, fresh.id);
+    deps.audit?.('teams.run_retry', {
+      actor: 'api',
+      detail: { teamId, fromRunId: run.id, newRunId: fresh.id },
+    });
+    return store.getRun(fresh.id) ?? fresh;
+  };
+
+  return { store, retryRun };
 }

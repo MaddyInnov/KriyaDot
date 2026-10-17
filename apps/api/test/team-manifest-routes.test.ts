@@ -57,7 +57,7 @@ describe('team manifest routes', () => {
     const app = express();
     app.use(express.json());
     const teamsRouter = express.Router();
-    const store = registerTeamRoutes(teamsRouter, {
+    const { store } = registerTeamRoutes(teamsRouter, {
       dataDir: dir,
       agentRuntime: {} as AgentRuntime,
       getBots: () => bots,

@@ -5,7 +5,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ChatQueueStore } from '../src/chat-queue.js';
+import { ChatQueueError, ChatQueueStore, MAX_QUEUE_DEPTH_PER_SESSION } from '../src/chat-queue.js';
 
 function freshStore(): ChatQueueStore {
   return new ChatQueueStore(mkdtempSync(join(tmpdir(), 'chat-queue-test-')));
@@ -97,5 +97,38 @@ describe('ChatQueueStore', () => {
     expect(n.planMode).toBe(true);
     expect(n.maxBudgetUsd).toBe(0.5);
     expect(n.sandboxMode).toBe('read-only');
+  });
+
+  it('rejects the 51st queued message per session with a 429 (L6)', () => {
+    const q = freshStore();
+    for (let i = 0; i < MAX_QUEUE_DEPTH_PER_SESSION; i++) {
+      q.enqueue({ sessionId: 's1', botId: 'b1', message: `m${i}` });
+    }
+    // A different session is unaffected by s1's full queue.
+    expect(() => q.enqueue({ sessionId: 's2', botId: 'b1', message: 'ok' })).not.toThrow();
+    try {
+      q.enqueue({ sessionId: 's1', botId: 'b1', message: 'one too many' });
+      expect.unreachable('expected ChatQueueError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ChatQueueError);
+      expect((err as ChatQueueError).statusCode).toBe(429);
+    }
+    // Draining one slot makes room again.
+    q.markStarted(q.nextForSession('s1')!.id);
+    expect(q.enqueue({ sessionId: 's1', botId: 'b1', message: 'fits now' }).position).toBe(
+      MAX_QUEUE_DEPTH_PER_SESSION,
+    );
+  });
+
+  it('rejects oversize messages with a 400 (L6, consistent with /chat L5)', () => {
+    const q = freshStore();
+    try {
+      q.enqueue({ sessionId: 's1', botId: 'b1', message: 'x'.repeat(200_001) });
+      expect.unreachable('expected ChatQueueError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ChatQueueError);
+      expect((err as ChatQueueError).statusCode).toBe(400);
+    }
+    expect(q.enqueue({ sessionId: 's1', botId: 'b1', message: 'x'.repeat(200_000) }).position).toBe(1);
   });
 });

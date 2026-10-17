@@ -20,8 +20,9 @@ import { randomUUID } from 'node:crypto';
 
 // vitest cannot statically resolve `node:sqlite`, so load it at runtime via
 // the builtin-module API (same trick as SubagentStore in @mvp/agent-runtime).
-const { DatabaseSync } = process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite');
-type DatabaseSyncType = InstanceType<typeof DatabaseSync>;
+import { openDb } from './sqlite.js';
+import type { DatabaseSync } from 'node:sqlite';
+type DatabaseSyncType = DatabaseSync;
 
 // ---------------------------------------------------------------------------
 // Roles
@@ -284,7 +285,7 @@ export class TenantStore {
   private readonly db: DatabaseSyncType;
 
   constructor(dbPath: string) {
-    this.db = new DatabaseSync(dbPath);
+    this.db = openDb(dbPath);
     this.db.exec(TENANCY_SCHEMA);
   }
 

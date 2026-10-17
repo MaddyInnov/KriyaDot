@@ -43,6 +43,15 @@ export interface RoutineSummary {
   [key: string]: unknown;
 }
 
+export interface RoutineRunSummary {
+  id: string;
+  routineId: string;
+  status: string;
+  startedAt?: number;
+  finishedAt?: number;
+  [key: string]: unknown;
+}
+
 export interface McpServerInfo {
   id: string;
   label?: string;
@@ -210,6 +219,45 @@ export class KriyaDotApi {
         body: JSON.stringify({ fromMessageId: opts.fromMessageId, ...(opts.title ? { title: opts.title } : {}) }),
       },
     ).then((r) => r.thread);
+  }
+
+  /** Delete a chat thread (W1). */
+  deleteThread(threadId: string): Promise<void> {
+    return this.request<{ ok: boolean }>(`/chat/threads/${encodeURIComponent(threadId)}`, {
+      method: 'DELETE',
+    }).then(() => undefined);
+  }
+
+  /** List runs for a routine (W1). */
+  listRoutineRuns(routineId: string, limit = 20): Promise<RoutineRunSummary[]> {
+    return this.request<{ ok: boolean; runs: RoutineRunSummary[] }>(
+      `/routines/${encodeURIComponent(routineId)}/runs?limit=${limit}`,
+    ).then((r) => r.runs);
+  }
+
+  /** Import a team from a markdown doc (G1). */
+  importTeamMarkdown(markdown: string): Promise<{ id: string; name: string }> {
+    return this.request<{ ok: boolean; team: { id: string; name: string } }>('/teams/import-markdown', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ markdown }),
+    }).then((r) => r.team);
+  }
+
+  /** Export a team as markdown (G1). */
+  exportTeamMarkdown(teamId: string): Promise<string> {
+    return this.request<{ ok: boolean; markdown: string }>(
+      `/teams/${encodeURIComponent(teamId)}/export-markdown`,
+    ).then((r) => r.markdown);
+  }
+
+  /** Apply a kriyadot.team.json manifest (G5). */
+  importTeamManifest(manifest: unknown): Promise<{ id: string; name: string }> {
+    return this.request<{ ok: boolean; team: { id: string; name: string } }>('/teams/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ manifest }),
+    }).then((r) => r.team);
   }
 
   listRoutines(): Promise<RoutineSummary[]> {

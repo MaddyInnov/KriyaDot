@@ -29,12 +29,28 @@ import {
   type CliBridgeId,
 } from './cli-bridge.js';
 
-export type CliAuthId = 'claude' | 'codex' | 'opencode';
+export type CliAuthId = 'claude' | 'codex' | 'opencode' | 'antigravity';
 
-/** Map the auth-module ids onto the bridge ids (same CLIs). */
+/** Map the auth-module ids onto the bridge ids (same CLIs). Antigravity has no bridge. */
 function toBridgeId(id: CliAuthId): CliBridgeId {
+  if (id === 'antigravity') throw new Error('antigravity has no CLI bridge');
   return id;
 }
+
+/**
+ * Antigravity (Google's agent IDE/CLI, `agy`) auth layout, from public
+ * community sources (the `agy` binary is proprietary; this mirrors the
+ * claude/codex in-app pattern against its documented behavior):
+ * - First run of bare `agy` walks through a one-time Google sign-in; in a
+ *   headless session (SSH / no display) it prints an authorization URL for
+ *   a local browser — exactly the URL-capture flow below.
+ * - OAuth tokens live in the OS native keyring (unreadable from Node), and
+ *   the ACP server profile keeps OAuth state under `~/.gemini/`
+ *   (`~/.gemini/antigravity-acp/oauth_creds.json` per community reports).
+ * Detection is therefore best-effort file-shape based and labeled as such;
+ * sign-in completion falls back to "credential file appeared/changed".
+ */
+const ANTIGRAVITY_CRED_REL = join('.gemini', 'antigravity-acp', 'oauth_creds.json');
 
 export interface CliLoginStatus {
   cliId: CliAuthId;
@@ -89,6 +105,7 @@ const CLI_COMMANDS: Record<CliAuthId, string> = {
   claude: 'claude',
   codex: 'codex',
   opencode: 'opencode',
+  antigravity: 'agy',
 };
 
 /**
@@ -97,11 +114,15 @@ const CLI_COMMANDS: Record<CliAuthId, string> = {
  * - claude: a bare `claude` starts the interactive login when unauthenticated.
  * - codex: `codex login` manages login (prints the device/browser URL).
  * - opencode: `opencode auth login` (best-effort; the opencode CLI surface varies).
+ * - antigravity: bare `agy` runs the first-run Google sign-in walkthrough;
+ *   in a headless session it prints an authorization URL instead of opening
+ *   a browser (documented `agy` behavior).
  */
 const LOGIN_ARGS: Record<CliAuthId, string[]> = {
   claude: [],
   codex: ['login'],
   opencode: ['auth', 'login'],
+  antigravity: [],
 };
 
 /** Command that reports login status without starting a flow (when available). */
@@ -111,6 +132,8 @@ const STATUS_COMMAND: Record<CliAuthId, string[] | null> = {
   // `codex login status` prints "Not logged in" or account info.
   codex: ['login', 'status'],
   opencode: null,
+  // No status subcommand; fall back to the ~/.gemini profile shape.
+  antigravity: null,
 };
 
 const URL_RE = /https?:\/\/[^\s"'<>]+/;
@@ -182,6 +205,7 @@ export class CliAuthManager {
   }
 
   private credentialsPath(id: CliAuthId): string {
+    if (id === 'antigravity') return join(this.homeDir, ANTIGRAVITY_CRED_REL);
     const rel =
       id === 'claude'
         ? join('.claude', '.credentials.json')
@@ -189,6 +213,16 @@ export class CliAuthManager {
           ? join('.codex', 'auth.json')
           : join('.local', 'share', 'opencode', 'auth.json');
     return join(this.homeDir, rel);
+  }
+
+  /**
+   * Best-effort "usable credential" check. Antigravity keeps OAuth tokens
+   * in the OS keyring (unreadable from Node), so file-shape presence of the
+   * ACP profile's oauth_creds.json is the signal — documented as heuristic.
+   */
+  private hasUsableCredential(id: CliAuthId): boolean {
+    if (id === 'antigravity') return this.fileExists(this.credentialsPath(id));
+    return bridgeHasUsableToken(toBridgeId(id), this.homeDir);
   }
 
   cliPresent(id: CliAuthId): boolean {
@@ -212,10 +246,11 @@ export class CliAuthManager {
       // Status command failed — fall through to the file-shape probe.
     }
 
-    const signedIn = credentialsPresent && bridgeHasUsableToken(toBridgeId(id), this.homeDir);
+    const signedIn = credentialsPresent && this.hasUsableCredential(id);
     let expired: boolean | undefined;
     let accountHint: string | undefined;
-    if (signedIn) {
+    // Antigravity tokens live in the OS keyring — no expiry/hint available.
+    if (signedIn && id !== 'antigravity') {
       const expiry = bridgeTokenExpiry(toBridgeId(id), this.homeDir);
       expired = expiry !== undefined ? expiry <= this.now() : undefined;
       accountHint = bridgeAccountHint(toBridgeId(id), this.homeDir);
@@ -264,7 +299,7 @@ export class CliAuthManager {
   startLogin(id: CliAuthId): ActiveLogin {
     const credPath = this.credentialsPath(id);
     const beforeMtime = this.fileMtimeMs(credPath);
-    const beforeValid = bridgeHasUsableToken(toBridgeId(id), this.homeDir);
+    const beforeValid = this.hasUsableCredential(id);
 
     let handle: SpawnHandle;
     try {
@@ -355,7 +390,7 @@ export class CliAuthManager {
         // changed since we started (avoids "already logged in" false-positives
         // when the user never completes THIS flow... though an existing valid
         // login also satisfies sign-in — see below).
-        if (bridgeHasUsableToken(toBridgeId(id), this.homeDir) && (beforeMtime === undefined || mtime === undefined || mtime > beforeMtime || !beforeValid)) {
+        if (this.hasUsableCredential(id) && (beforeMtime === undefined || mtime === undefined || mtime > beforeMtime || !beforeValid)) {
           kill(handle);
           return { ok: true };
         }
@@ -363,7 +398,7 @@ export class CliAuthManager {
       kill(handle);
       if (cancelled) return { ok: false, reason: 'Login cancelled.' };
       // Final check: maybe the user was already signed in and the CLI reused it.
-      if (bridgeHasUsableToken(toBridgeId(id), this.homeDir)) return { ok: true };
+      if (this.hasUsableCredential(id)) return { ok: true };
       return {
         ok: false,
         reason: `Login not completed within ${Math.round(this.loginTimeoutMs / 1000 / 60)} minutes. The authorize URL expired — start again for a fresh one.`,

@@ -245,6 +245,20 @@ async function doThreads(deps: CommandDeps, p: ParsedArgs): Promise<number> {
     }
     return 0;
   }
+  if (p.subcommand === 'delete') {
+    const id = p.positional[0];
+    if (!id) throw new Error('Usage: kriyadot threads delete <id> [--yes]');
+    if (!flagBool(p.flags, 'yes')) {
+      throw new Error(`Refusing to delete thread "${id}" without --yes.`);
+    }
+    await deps.api.deleteThread(id);
+    if (p.global.format === 'json') {
+      printJson(deps, { ok: true, deleted: id });
+      return 0;
+    }
+    out(deps, `Deleted thread ${id}\n`);
+    return 0;
+  }
   // threads branch <id> --from <msgId> [--title t]
   const id = p.positional[0];
   if (!id) throw new Error('Usage: kriyadot threads branch <id> --from <msgId> [--title t]');
@@ -278,19 +292,136 @@ async function doRoutines(deps: CommandDeps, p: ParsedArgs): Promise<number> {
     return 0;
   }
   // routines run <id>
-  const id = p.positional[0];
-  if (!id) throw new Error('Usage: kriyadot routines run <id>');
-  const runId = await deps.api.runRoutineNow(id);
-  if (p.global.format === 'json') {
-    printJson(deps, { ok: true, routineId: id, runId });
+  if (p.subcommand === 'run') {
+    const id = p.positional[0];
+    if (!id) throw new Error('Usage: kriyadot routines run <id>');
+    const runId = await deps.api.runRoutineNow(id);
+    if (p.global.format === 'json') {
+      printJson(deps, { ok: true, routineId: id, runId });
+      return 0;
+    }
+    out(deps, `Run started: ${runId}\n`);
     return 0;
   }
-  out(deps, `Run started: ${runId}\n`);
+  // routines runs <id> [--limit n]
+  if (p.subcommand === 'runs') {
+    const id = p.positional[0];
+    if (!id) throw new Error('Usage: kriyadot routines runs <id> [--limit n]');
+    const limitRaw = flagString(p.flags, 'limit');
+    const limit = limitRaw !== undefined ? Number(limitRaw) : 20;
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('--limit must be a positive integer');
+    const runs = await deps.api.listRoutineRuns(id, limit);
+    if (p.global.format === 'json') {
+      printJson(deps, runs);
+      return 0;
+    }
+    if (runs.length === 0) {
+      out(deps, 'No runs yet.\n');
+      return 0;
+    }
+    for (const r of runs) {
+      const when = r.startedAt ? new Date(r.startedAt).toISOString() : '—';
+      out(deps, `${r.id}\t${r.status}\t${when}\n`);
+    }
+    return 0;
+  }
+  throw new Error('Usage: kriyadot routines <list|run|runs>.');
+}
+
+/**
+ * team apply <file> — applies a kriyadot.team.json manifest or a markdown
+ * team doc (.md) via the API. team export <teamId> [--markdown] prints the
+ * team (manifest JSON by default, markdown with --markdown).
+ */
+async function doTeam(deps: CommandDeps, p: ParsedArgs): Promise<number> {
+  const { readFileSync } = await import('node:fs');
+  if (p.subcommand === 'apply') {
+    const file = p.positional[0];
+    if (!file) throw new Error('Usage: kriyadot team apply <file.json|file.md>');
+    const text = readFileSync(file, 'utf8');
+    if (file.endsWith('.md')) {
+      const team = await deps.api.importTeamMarkdown(text);
+      if (p.global.format === 'json') {
+        printJson(deps, { ok: true, team });
+        return 0;
+      }
+      out(deps, `Team imported: ${team.name} (${team.id})\n`);
+      return 0;
+    }
+    let manifest: unknown;
+    try {
+      manifest = JSON.parse(text);
+    } catch {
+      throw new Error(`"${file}" is not valid JSON and does not end in .md`);
+    }
+    const team = await deps.api.importTeamManifest(manifest);
+    if (p.global.format === 'json') {
+      printJson(deps, { ok: true, team });
+      return 0;
+    }
+    out(deps, `Team applied: ${team.name} (${team.id})\n`);
+    return 0;
+  }
+  if (p.subcommand === 'export') {
+    const teamId = p.positional[0];
+    if (!teamId) throw new Error('Usage: kriyadot team export <teamId> [--markdown]');
+    if (flagBool(p.flags, 'markdown')) {
+      out(deps, `${await deps.api.exportTeamMarkdown(teamId)}\n`);
+      return 0;
+    }
+    // JSON export: fetch the team via the API manifest surface.
+    const team = await deps.api.request<{ ok: boolean; team: unknown }>(
+      `/teams/${encodeURIComponent(teamId)}`,
+    );
+    printJson(deps, team.team);
+    return 0;
+  }
+  throw new Error('Usage: kriyadot team <apply|export>.');
+}
+
+/**
+ * serve --port N — starts the API server in the foreground for headless/CI
+ * use. Resolves the API entry the same way the desktop shell does: the
+ * workspace's @mvp/api dist when present, else the installed package.
+ */
+async function doServe(deps: CommandDeps, p: ParsedArgs): Promise<number> {
+  const { spawn } = await import('node:child_process');
+  const { existsSync } = await import('node:fs');
+  const { dirname, join, resolve } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const portRaw = flagString(p.flags, 'port');
+  const port = portRaw !== undefined ? Number(portRaw) : 3000;
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw new Error('--port must be 1-65535');
+
+  // The CLI ships inside the workspace next to apps/api; resolve its dist
+  // entry. Fall back to a node_modules-installed @mvp/api.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    resolve(here, '..', '..', 'apps', 'api', 'dist', 'index.js'),
+    resolve(here, '..', 'node_modules', '@mvp', 'api', 'dist', 'index.js'),
+  ];
+  const entry = candidates.find((c) => existsSync(c));
+  if (!entry) {
+    throw new Error('Could not find the API server entry (apps/api/dist/index.js). Build the API first.');
+  }
+  out(deps, `Starting API server on port ${port} (${entry})…\n`);
+  // The API resolves its port from `--port <n>` → PORT env → 4000, so pass
+  // the flag explicitly (the desktop sidecar does the same).
+  const child = spawn(process.execPath, [entry, '--port', String(port)], {
+    env: { ...process.env, PORT: String(port) },
+    stdio: 'inherit',
+  });
+  await new Promise<void>((resolve, reject) => {
+    child.on('error', reject);
+    child.on('exit', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`API server exited with code ${code}`));
+    });
+  });
   return 0;
 }
 
-async function doModels(deps: CommandDeps, p: ParsedArgs): Promise<number> {
-  const models = await deps.api.listModels();
+async function doModels(deps: CommandDeps, p: ParsedArgs): Promise<number> {  const models = await deps.api.listModels();
   if (p.global.format === 'json') {
     printJson(deps, models);
     return 0;
@@ -425,6 +556,10 @@ export async function runCommand(p: ParsedArgs, deps: CommandDeps): Promise<numb
         return await doThreads(deps, p);
       case 'routines':
         return await doRoutines(deps, p);
+      case 'team':
+        return await doTeam(deps, p);
+      case 'serve':
+        return await doServe(deps, p);
       case 'models':
         return await doModels(deps, p);
       case 'mcp':

@@ -9,7 +9,7 @@ import type { MetricSample, RunHealth, TurnHealth } from './types.js';
 
 // `node:sqlite` cannot be statically imported under vitest's Vite 5 pipeline
 // (see packages/workflows/src/store.ts): load it at runtime instead.
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from './sqlite.js';
 
 interface RunHealthRow {
   run_id: string;
@@ -60,7 +60,7 @@ export class RunHealthStore {
   private db: DatabaseSync;
 
   constructor(dbPath: string) {
-    this.db = new DatabaseSyncImpl(dbPath);
+    this.db = openDb(dbPath);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS run_health_scores (
         run_id TEXT PRIMARY KEY,

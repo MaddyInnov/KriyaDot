@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { execFile } from 'node:child_process';
+import { lookup as dnsLookup, type LookupAddress } from 'node:dns';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
@@ -9,6 +10,11 @@ import type { ButtonsWidgetPayload, WidgetAnswer, WidgetHost } from '../widgets.
 import { validateWidgetPayload } from '../widgets.js';
 import { executeInPersistentSandbox, executeSandboxedCommand, sandboxBackend } from './sandbox.js';
 import { resolveWorkspaceDir, type WorkspaceSource } from '../workspaces.js';
+// Shared catastrophic-shell detection (M1): the governance hard floor's
+// rm flag-cluster expansion, reused here so the tool-level denylist and the
+// CLI kill-switch catch `rm -rfv /etc`, `rm -rf --one-file-system /`, etc.
+import { catastrophicRmTarget } from '@mvp/governance';
+import { confineRealpath } from '../confine.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -26,7 +32,8 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
  * they go through the governance approval path instead.
  */
 const COMMAND_DENYLIST: RegExp[] = [
-  /rm\s+-rf\s+\//, // rm -rf /
+  // `rm -rf /` and its flag variants are covered by catastrophicRmTarget()
+  // (shared with the governance hard floor) — see isCatastrophicCommand.
   /mkfs/, // filesystem formatting
   /\bdd\b[^;&|]*\bof=\s*\/dev\//, // dd writing to a raw block device
   /\b(shred|wipefs|fdisk|sfdisk|gdisk|sgdisk|cgdisk|parted)\b/, // disk wipe/partition tools
@@ -46,20 +53,19 @@ function truncate(s: string, maxBytes: number): string {
  * a human approval can never lift it.
  */
 export function isCatastrophicCommand(text: string): boolean {
+  // Shared rm detection (M1): catches `rm -rf /` plus flag variants like
+  // `rm -rfv /etc`, `rm -rf --one-file-system /`, `rm --recursive --force /`.
+  if (catastrophicRmTarget(text) !== null) return true;
   return COMMAND_DENYLIST.some((pattern) => pattern.test(text));
 }
 
 /**
- * Resolve `p` inside `workspaceDir`. Throws if the resolved path escapes the
- * workspace (directory traversal).
+ * Resolve `p` inside `workspaceDir`, following symlinks (M3). Throws if the
+ * real path escapes the workspace — a symlink pointing outside is rejected,
+ * while symlinks staying inside are allowed.
  */
 function confine(workspaceDir: string, p: string): string {
-  const root = resolve(workspaceDir);
-  const resolved = resolve(root, p);
-  if (resolved !== root && !resolved.startsWith(root + sep)) {
-    throw new Error(`Path escapes workspace: "${p}"`);
-  }
-  return resolved;
+  return confineRealpath(workspaceDir, p);
 }
 
 function readFileTool(workspaceDir: WorkspaceSource): ToolDefinition {
@@ -261,6 +267,117 @@ function stripHtml(html: string): string {
     .trim();
 }
 
+// ---------------------------------------------------------------------------
+// web_fetch SSRF gate (M2)
+// ---------------------------------------------------------------------------
+
+const FETCH_MAX_REDIRECTS = 5;
+const DNS_LOOKUP_TIMEOUT_MS = 3_000;
+
+function ipv4ToInt(ip: string): number | null {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  let n = 0;
+  for (const p of parts) {
+    if (!/^\d+$/.test(p)) return null;
+    const v = Number(p);
+    if (v < 0 || v > 255) return null;
+    n = n * 256 + v;
+  }
+  return n >>> 0;
+}
+
+function inCidr(n: number, base: string, bits: number): boolean {
+  const b = ipv4ToInt(base);
+  if (b === null) return false;
+  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+  return (n & mask) === (b & mask);
+}
+
+/**
+ * True when the IP must never be fetched: loopback, private (RFC 1918),
+ * link-local (cloud metadata lives at 169.254.169.254), multicast, or the
+ * 0.0.0.0/8 "this network" range — plus the IPv6 equivalents.
+ */
+export function isBlockedFetchIp(ip: string): boolean {
+  const lower = ip.toLowerCase();
+  if (lower.includes(':')) {
+    // IPv4-mapped IPv6 (::ffff:1.2.3.4) — judge the embedded IPv4 address.
+    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(lower);
+    if (mapped) return isBlockedFetchIp(mapped[1]);
+    const hex = lower.replace(/:/g, '');
+    return (
+      lower === '::1' || // loopback
+      lower === '::' || // unspecified
+      lower.startsWith('ff') || // multicast ff00::/8
+      /^fe[89ab]/i.test(hex.slice(0, 4)) || // link-local fe80::/10
+      /^(fc|fd)/i.test(hex.slice(0, 2)) // unique-local fc00::/7
+    );
+  }
+  const n = ipv4ToInt(lower);
+  if (n === null) return true; // unparseable → fail closed
+  return (
+    inCidr(n, '127.0.0.0', 8) ||
+    inCidr(n, '10.0.0.0', 8) ||
+    inCidr(n, '172.16.0.0', 12) ||
+    inCidr(n, '192.168.0.0', 16) ||
+    inCidr(n, '169.254.0.0', 16) ||
+    inCidr(n, '0.0.0.0', 8) ||
+    inCidr(n, '224.0.0.0', 4) ||
+    n === 0xffffffff
+  );
+}
+
+function lookupAllWithTimeout(host: string, timeoutMs = DNS_LOOKUP_TIMEOUT_MS): Promise<LookupAddress[]> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`DNS lookup timed out for "${host}"`)), timeoutMs);
+    timer.unref?.();
+    dnsLookup(host, { all: true }, (err, addresses) => {
+      clearTimeout(timer);
+      if (err) reject(err);
+      else resolve(addresses);
+    });
+  });
+}
+
+/**
+ * Validate a fetch URL against SSRF: http(s) only, hostname must resolve
+ * (all records — DNS rebinding with one private record is rejected) to
+ * public IPs, literal IPs are checked without DNS.
+ */
+export async function assertPublicFetchUrl(raw: string): Promise<URL> {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`Invalid URL: "${raw.slice(0, 120)}"`);
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(`Only http(s) URLs may be fetched: "${raw.slice(0, 120)}"`);
+  }
+  const host = url.hostname;
+  if (!host) throw new Error(`URL has no hostname: "${raw.slice(0, 120)}"`);
+  let addresses: string[];
+  if (ipv4ToInt(host) !== null || host.includes(':')) {
+    addresses = [host]; // literal IP — no DNS needed
+  } else {
+    let records: LookupAddress[];
+    try {
+      records = await lookupAllWithTimeout(host);
+    } catch (err) {
+      throw new Error(`DNS lookup failed for "${host}": ${err instanceof Error ? err.message : String(err)}`);
+    }
+    addresses = records.map((r) => r.address);
+    if (addresses.length === 0) throw new Error(`No DNS records for "${host}"`);
+  }
+  for (const ip of addresses) {
+    if (isBlockedFetchIp(ip)) {
+      throw new Error(`Refusing to fetch non-public address for "${host}"`);
+    }
+  }
+  return url;
+}
+
 function webFetchTool(): ToolDefinition {
   return {
     name: 'web_fetch',
@@ -273,11 +390,28 @@ function webFetchTool(): ToolDefinition {
     },
     handler: async (args, _ctx: ToolContext) => {
       const url = String(args.url);
-      if (!/^https?:\/\//i.test(url)) throw new Error(`Only http(s) URLs may be fetched: "${url}"`);
-      const res = await fetch(url, {
-        signal: AbortSignal.timeout(20_000),
-        headers: { 'User-Agent': 'mvp-agent-runtime/0.1.0' },
-      });
+      // SSRF gate + manual redirect following: every hop is re-validated so
+      // a public URL cannot redirect into loopback/private/metadata IPs.
+      let current = url;
+      let res: Response | null = null;
+      for (let hop = 0; hop <= FETCH_MAX_REDIRECTS; hop++) {
+        const target = await assertPublicFetchUrl(current);
+        const attempt = await fetch(target.toString(), {
+          redirect: 'manual',
+          signal: AbortSignal.timeout(20_000),
+          headers: { 'User-Agent': 'mvp-agent-runtime/0.1.0' },
+        });
+        const location = attempt.headers.get('location');
+        if (attempt.status >= 300 && attempt.status < 400 && location) {
+          if (hop === FETCH_MAX_REDIRECTS) throw new Error(`Too many redirects fetching ${url}`);
+          await attempt.arrayBuffer().catch(() => undefined); // drain before next hop
+          current = new URL(location, target).toString();
+          continue;
+        }
+        res = attempt;
+        break;
+      }
+      if (!res) throw new Error(`Fetch failed for ${url}`);
       if (!res.ok) throw new Error(`Fetch failed: HTTP ${res.status} for ${url}`);
       const reader = res.body?.getReader();
       if (!reader) throw new Error('Empty response body');

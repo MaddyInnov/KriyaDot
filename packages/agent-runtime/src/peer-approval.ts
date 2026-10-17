@@ -19,7 +19,7 @@
 
 import { randomUUID } from 'node:crypto';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from './sqlite.js';
 import type { DatabaseSync } from 'node:sqlite';
 
 import type { StreamEvent, ToolCall, ToolContext } from './types.js';
@@ -171,7 +171,7 @@ export class PeerApprovalStore {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { join } = require('node:path') as typeof import('node:path');
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSyncImpl(join(dataDir, 'peer-approval.db'));
+    this.db = openDb(join(dataDir, 'peer-approval.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS peer_cards (
         id TEXT PRIMARY KEY,

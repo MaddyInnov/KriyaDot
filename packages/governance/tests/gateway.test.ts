@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it, afterEach } from 'vitest';
+import { describe, expect, it, afterEach, vi } from 'vitest';
 import {
   GovernanceGateway,
   DEFAULT_POLICY,
@@ -316,6 +316,51 @@ describe('audit log', () => {
     expect(all.map((e) => e.action)).toEqual(['a3', 'a2', 'a1']);
     const page = gw.listAudit(1, 1);
     expect(page.map((e) => e.action)).toEqual(['a2']);
+  });
+});
+
+describe('audit log retention (M4)', () => {
+  it('pruneAuditLog keeps the newest N rows', () => {
+    vi.useFakeTimers();
+    try {
+      const gw = fresh();
+      vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+      for (let i = 0; i < 10; i++) gw.audit(`a${i}`, { actor: 'u' });
+      vi.setSystemTime(new Date('2026-04-11T00:00:00Z')); // 100 days later
+      const { deleted } = gw.pruneAuditLog(3, 90 * 24 * 60 * 60 * 1000);
+      expect(deleted).toBe(7);
+      expect(gw.listAudit(10).map((e) => e.action)).toEqual(['a9', 'a8', 'a7']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('pruneAuditLog keeps rows newer than the age cutoff even beyond maxRows', () => {
+    const gw = fresh();
+    for (let i = 0; i < 10; i++) gw.audit(`a${i}`, { actor: 'u' });
+    // All rows are fresh: the 90-day rule keeps more than maxRows=3.
+    const { deleted } = gw.pruneAuditLog(3, 90 * 24 * 60 * 60 * 1000);
+    expect(deleted).toBe(0);
+    expect(gw.listAudit(20)).toHaveLength(10);
+  });
+
+  it('prune runs automatically every K inserts', () => {
+    const gw = new GovernanceGateway({
+      dbPath: ':memory:',
+      policy: DEFAULT_POLICY,
+      auditRetention: {
+        maxRows: 10_000,
+        maxAgeMs: 90 * 24 * 60 * 60 * 1000,
+        pruneEveryInserts: 20,
+      },
+    });
+    gateways.push(gw);
+    const spy = vi.spyOn(gw, 'pruneAuditLog');
+    for (let i = 0; i < 25; i++) gw.audit(`a${i}`, { actor: 'u' });
+    // Sweep fired exactly once (on the 20th insert) with the configured bounds.
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith(10_000, 90 * 24 * 60 * 60 * 1000);
+    expect(gw.listAudit(50)).toHaveLength(25); // nothing pruned: all fresh
   });
 });
 

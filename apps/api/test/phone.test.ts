@@ -288,6 +288,19 @@ describe('PhoneSessionHub', () => {
     expect(row?.endedAt).not.toBeNull();
   });
 
+  it('clears the cached latest frame when the phone disconnects (L1)', () => {
+    const phone = new MockSocket();
+    hub.acceptSocket(phone, '127.0.0.1');
+    phone.clientSend({ t: 'hello', deviceId, token });
+    expect(phone.lastJson().t).toBe('ok');
+    phone.clientSend({ t: 'frame', jpg: 'aGVsbG8=', w: 720, h: 1600, ts: 42 });
+    expect(hub.latestFrame(deviceId)?.jpg).toBe('aGVsbG8=');
+    // Disconnect → cleanup() drops the latestFrames entry: no stale frame
+    // survives for the polling fallback, and the map cannot grow forever.
+    phone.close();
+    expect(hub.latestFrame(deviceId)).toBeUndefined();
+  });
+
   it('does not route input when the device is offline', () => {
     const viewer = new MockSocket();
     hub.acceptSocket(viewer, '127.0.0.1');

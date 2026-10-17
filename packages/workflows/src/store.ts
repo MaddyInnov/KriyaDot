@@ -15,7 +15,7 @@ import type {
 // which is fully typed in @types/node and works in both vitest and node.
 // (The `import type` above is erased at compile time and never resolved
 // by Vite.)
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from '@mvp/agent-runtime';
 
 /** Raw DB row shapes (narrowed from the driver's generic record type). */
 interface RunRow {
@@ -51,7 +51,7 @@ export class WorkflowStore {
   private db: DatabaseSync;
 
   constructor(dbPath: string) {
-    this.db = new DatabaseSyncImpl(dbPath);
+    this.db = openDb(dbPath);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS workflows (
         id TEXT PRIMARY KEY,

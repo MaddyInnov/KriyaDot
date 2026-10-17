@@ -66,6 +66,73 @@ function argsText(args: Record<string, unknown>): string {
 }
 
 /**
+ * Classify one `rm` operand token as a catastrophic target, or null.
+ * Mirrors the previous regex semantics: `/`, `/*`, the system directories,
+ * and the home directory (~, $HOME, ${HOME}).
+ */
+function classifyRmTarget(operand: string): string | null {
+  if (/^\/([^a-zA-Z0-9_*]|$)/.test(operand)) return 'rm -rf /';
+  if (operand.startsWith('/*')) return 'rm -rf /*';
+  if (/^\/(tmp|etc|home|root|var|usr)(\/|$)/.test(operand)) return 'rm -rf on system dir';
+  if (/^(~|\$HOME|\$\{HOME\})(\/|$)/.test(operand)) return 'rm -rf on home directory';
+  return null;
+}
+
+/**
+ * Detect `rm` invocations that would recursively delete a catastrophic
+ * target (`/`, `/*`, system dirs, home dir).
+ *
+ * Short-flag clusters are expanded letter by letter, so `rm -rfv /etc`,
+ * `rm -rf --one-file-system /` and `rm -rfv --preserve-root=no /` are
+ * caught exactly like `rm -rf /etc`; `--recursive` counts too. Matching the
+ * previous regex semantics, a recursive flag alone (no `-f`) is enough for
+ * these targets. A lone `--` ends flag parsing (everything after is an
+ * operand), and an `rm` invocation never spans `;`, `&`, `|` or newlines.
+ *
+ * Returns a label for the matched target, or null.
+ * Exported for the agent-runtime tool-level denylist (defense in depth):
+ * the same hard floor applies to CLI-observed tool calls.
+ */
+export function catastrophicRmTarget(text: string): string | null {
+  const segments = text.split(/[;&|\n]+/);
+  for (const seg of segments) {
+    const rmRe = /\brm\b/g;
+    let m: RegExpExecArray | null;
+    while ((m = rmRe.exec(seg)) !== null) {
+      const rest = seg.slice(m.index + m[0].length);
+      const tokens = rest.trim().split(/\s+/).filter(Boolean);
+      let recursive = false;
+      let endOfFlags = false;
+      let target: string | null = null;
+      for (const tok of tokens) {
+        if (!endOfFlags && tok === '--') {
+          endOfFlags = true;
+          continue;
+        }
+        if (!endOfFlags && tok.startsWith('--') && tok.length > 2) {
+          // Long flags: --recursive counts; --force / --no-preserve-root are
+          // handled by their own patterns; the rest (--one-file-system,
+          // --preserve-root=no, …) are ignored for flag purposes.
+          if (tok.slice(2).split('=')[0].toLowerCase() === 'recursive') recursive = true;
+          continue;
+        }
+        if (!endOfFlags && tok.startsWith('-') && tok.length > 1 && !/^-\d/.test(tok)) {
+          for (const ch of tok.slice(1)) {
+            if (ch === 'r' || ch === 'R') recursive = true;
+          }
+          continue;
+        }
+        // Operand: strip JSON/string punctuation the serializer may add.
+        const operand = tok.replace(/^["']+|["',}\]]+$/g, '');
+        if (!target) target = classifyRmTarget(operand);
+      }
+      if (recursive && target) return target;
+    }
+  }
+  return null;
+}
+
+/**
  * Built-in hard floors. These cannot be disabled individually. Patterns are
  * evaluated in array order — the catastrophic shell floor comes first so a
  * catastrophic command is never misclassified as merely destructive.
@@ -77,15 +144,23 @@ export const HARD_FLOOR_PATTERNS: HardFloorPattern[] = [
     toolPattern: '^(run_command|shell|exec)$',
     argCheck: (args) => {
       const text = argsText(args);
+      // rm flag-variant bypass fix (M1): expand short-flag clusters so
+      // `rm -rfv /etc`, `rm -rf --one-file-system /` etc. are caught.
+      const rmHit = catastrophicRmTarget(text);
+      if (rmHit) return `catastrophic shell pattern: ${rmHit}`;
+      // L3: `${IFS}` alone is a legitimate (if unusual) shell feature, not a
+      // catastrophe — only flag it when combined with a destructive payload
+      // in the same command (the classic obfuscation trick).
+      if (
+        /\$\{IFS\}/.test(text) &&
+        /\b(rm|dd|mkfs|shred|wipefs|fdisk|sfdisk|gdisk|sgdisk|cgdisk|parted|chmod|chown|curl|wget)\b|:\(\)\s*\{\s*:[|\s]+:[&\s]*\s*\}|\/dev\//i.test(
+          text,
+        )
+      ) {
+        return 'catastrophic shell pattern: ${IFS} obfuscation with destructive command';
+      }
       const patterns: Array<[RegExp, string]> = [
         [/\brm\s+.*--no-preserve-root\b/i, 'rm with --no-preserve-root'],
-        [/\brm\s+[-\w\s]*-[a-zA-Z]*R[a-zA-Z]*\s+\/(?![\w])/i, 'rm -R /'],
-        [/\brm\s+(-r\s+-f|-f\s+-r|-rf?)\s+\/(?![\w])/i, 'rm -rf /'],
-        [/\brm\s+(-r\s+-f|-f\s+-r|-rf?)\s+\/\*/, 'rm -rf /*'],
-        [/\brm\s+(-r\s+-f|-f\s+-r|-rf?)\s+\/(tmp|etc|home|root|var|usr)(\/|\s|$)/i, 'rm -rf on system dir'],
-        // MEDIUM fix: home-directory wipes (rm -rf ~, $HOME, ${HOME}).
-        // Terminators include `"` because args are matched JSON-serialized.
-        [/\brm\s+(-r\s+-f|-f\s+-r|-rf?)\s+(~(\/|[\s"']|$)|\$HOME(\/|[\s"']|$)|\$\{HOME\}(\/|[\s"']|$))/, 'rm -rf on home directory'],
         [/\bmkfs\b/, 'mkfs'],
         [/\bdd\b[^;&|]*\bof\s*=\s*\/dev\//i, 'dd writing to a raw block device'],
         // MEDIUM fix: shell redirection straight into a block device
@@ -95,7 +170,6 @@ export const HARD_FLOOR_PATTERNS: HardFloorPattern[] = [
         [/\bfind\s+\/\*?\s+[^;&|]*-delete\b/, 'find / -delete'],
         [/\b(shred|wipefs|fdisk|sfdisk|gdisk|sgdisk|cgdisk|parted)\b/i, 'disk wipe/partition tool'],
         [/:\(\)\s*\{\s*:[|\s]+:[&\s]*\s*\}\s*;?\s*:?/, 'fork bomb'],
-        [/\$\{IFS\}/, 'shell IFS obfuscation with destructive command'],
       ];
       for (const [re, label] of patterns) {
         if (re.test(text)) return `catastrophic shell pattern: ${label}`;

@@ -8,6 +8,8 @@ import type { ComputerSurface } from './tools/computer-surfaces.js';
 export type { ComputerSurface };
 import type { WidgetAnswer, WidgetHost, WidgetPayload } from './widgets.js';
 export type { WidgetAnswer, WidgetHost, WidgetPayload };
+import type { CredentialProposer } from './credential-proposals.js';
+export type { CredentialProposer };
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -157,6 +159,14 @@ export interface ToolContext {
    * ask_user_question's awaitAnswer) reject when it aborts.
    */
   signal?: AbortSignal;
+  /**
+   * Credential/profile proposal host (OpenMausBot parity: profile/
+   * credential proposal cards). When set, the `request_credential` tool
+   * raises a proposal card and awaits the user's supplied value; unset →
+   * the tool falls back to directing the user to Settings → Vault.
+   * Set by the runtime from its credential proposer (host-wired).
+   */
+  credentialProposer?: CredentialProposer;
 }
 
 export interface ToolDefinition {

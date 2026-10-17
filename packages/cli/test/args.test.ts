@@ -106,7 +106,7 @@ describe('validateCommand', () => {
   it('rejects unknown commands and bad subcommands', () => {
     expect(validateCommand(parseArgs(['frobnicate']))).toMatch(/Unknown command/);
     expect(validateCommand(parseArgs(['bots', 'delete']))).toMatch(/bots <list\|run>/);
-    expect(validateCommand(parseArgs(['threads', 'merge']))).toMatch(/threads <list\|show\|branch>/);
+    expect(validateCommand(parseArgs(['threads', 'merge']))).toMatch(/threads <list\|show\|branch\|delete>/);
     expect(validateCommand(parseArgs(['models', 'refresh']))).toMatch(/models list/);
     expect(validateCommand(parseArgs(['run']))).toMatch(/--bot/);
     expect(validateCommand(parseArgs(['bots', 'run']))).toMatch(/bots run <bot>/);

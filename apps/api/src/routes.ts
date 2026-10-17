@@ -9,7 +9,7 @@
 //   id → real approval id translation.
 
 import express from 'express';
-import { BotMemoryStore, SpaceStore, getProviderPreset, isFreeModel, listProviderPresets, readModelsDevCache, resolveApiKey, resolveBotWorkspaceDir, routeMessage } from '@mvp/agent-runtime';
+import { BotMemoryStore, SpaceStore, getProviderPreset, isFreeModel, listProviderPresets, readModelsDevCache, resolveApiKey, resolveBotWorkspaceDir, routeMessage, RouterDecisionLog, loadRouterWeights, routeMessageLogged } from '@mvp/agent-runtime';
 import type { AgentRuntime, BotConfig, StreamEvent, TokenUsage, WidgetCoordinator } from '@mvp/agent-runtime';
 import type { PerBotComputerManager } from '@mvp/agent-runtime';
 import type { VpsConnectionPool } from '@mvp/agent-runtime';
@@ -48,7 +48,7 @@ import { saveBotWorkspace } from './bot-workspaces.js';
 import { PreferenceStore } from './preferences.js';
 import { RecordingStore, recordingToWorkflow } from './recordings.js';
 import { registerComputerRecordRoutes } from './computer-record-routes.js';
-import { ChatQueueStore } from './chat-queue.js';
+import { ChatQueueError, ChatQueueStore } from './chat-queue.js';
 import {
   createPullRequest,
   isGitHubConfigured,
@@ -62,6 +62,7 @@ import { registerMcpDirectoryRoutes } from './mcp-directory-routes.js';
 import { registerModelsDevRoutes } from './models-dev-routes.js';
 import type { McpServerConfig } from './seed.js';
 import { registerMessagingRoutes } from './messaging.js';
+import { channelContextSection, createChannelConfigRouter } from './channel-config.js';
 import { registerNotesRoutes } from './notes.js';
 import { registerAnnotationRoutes } from './annotations.js';
 import { registerKnowledgeRoutes } from './knowledge.js';
@@ -90,6 +91,10 @@ import { saveBotVoice } from './bot-voice.js';
 import { saveBotApprovalModeForBot } from './bot-approval-modes.js';
 import { buildBotChatFn, saveBotMemorySettings, wireMemoryDistillers } from './memory-fabric.js';
 import { createMemoryFabricRouter } from './memory-fabric-routes.js';
+import { createMemoryUpkeepRouter } from './memory-upkeep-routes.js';
+import { createCrashRecoveryRouter } from './crash-recovery.js';
+import type { TurnTracker } from './crash-recovery.js';
+import { OnBehalfOfLedger } from '@mvp/agent-runtime';
 import { TieredMemoryStore } from '@mvp/agent-runtime';
 import { PERSONAS, MBTI_TYPES, QUIZ_QUESTIONS, scoreQuiz, resolvePersona } from '@mvp/agent-runtime';
 import { saveBotPersona } from './bot-personas.js';
@@ -188,6 +193,12 @@ export interface RouteDeps {
   mcpServers: Record<string, McpServerConfig>;
   /** Tiered memory store (L0 events → L2 atoms → L3 entity pages). */
   tieredMemoryStore: TieredMemoryStore;
+  /**
+   * In-flight chat turn tracker (crash recovery). The chat route marks
+   * turns; the boot sweep treats leftovers as interrupted. Optional —
+   * the route works without it.
+   */
+  turnTracker?: TurnTracker;
   /** Run health scores + metric samples (features #2/#5). */
   runHealth: RunHealthStore;
   /** Omni rolling-summary store (Omni panel backend, <dataDir>/omni.db). */
@@ -321,6 +332,23 @@ function sseHeaders(res: express.Response): void {
 }
 
 /** Normalize an optional model override: empty string falls back to undefined. */
+
+/**
+ * L5: bound on chat message length. An unbounded message blows up the model
+ * context and memory downstream. The chat queue (chat-queue.ts L6) enforces
+ * the same bound. Exported for tests.
+ */
+export const MAX_CHAT_MESSAGE_CHARS = 200_000;
+
+/** Validate a chat message. Returns an error string, or null when valid. */
+export function validateChatMessage(message: unknown): string | null {
+  if (typeof message !== 'string' || !message.trim()) return 'message is required';
+  if (message.length > MAX_CHAT_MESSAGE_CHARS) {
+    return `message exceeds ${MAX_CHAT_MESSAGE_CHARS} characters`;
+  }
+  return null;
+}
+
 export function createRouter(deps: RouteDeps): express.Router {
   const router = express.Router();
   const { config, bots, agentRuntime, governance, governanceAdapter, workflowRunner, threadScheduleStore, checkpointStore, dotStore, preferenceStore, recordingStore, chatQueueStore, mcpServers, tieredMemoryStore, runHealth, mcpServer, mcpScopeStore, omniStore, omniCollector } = deps;
@@ -1112,6 +1140,17 @@ export function createRouter(deps: RouteDeps): express.Router {
     }),
   );
 
+  // ---- Memory upkeep (OpenMausBot parity): background capture, nightly
+  // tidy, about-me, undoable journal. Same /memory mount, no new top level.
+  router.use(
+    '/memory',
+    createMemoryUpkeepRouter({
+      dataDir: config.dataDir,
+      tieredMemoryStore,
+      getBots: () => bots.map((b) => ({ id: b.id })),
+    }),
+  );
+
   // ---- MBTI personas --------------------------------------------------------
   // Octop parity: 16 personality templates shaping bot tone/working style.
   router.get('/personas', (_req, res) => {
@@ -1346,8 +1385,9 @@ export function createRouter(deps: RouteDeps): express.Router {
       res.status(400).json(errorBody('botId is required'));
       return;
     }
-    if (typeof body.message !== 'string' || !body.message.trim()) {
-      res.status(400).json(errorBody('message is required'));
+    const messageError = validateChatMessage(body.message);
+    if (messageError || typeof body.message !== 'string') {
+      res.status(400).json(errorBody(messageError ?? 'message is required'));
       return;
     }
     const bot = bots.find((b) => b.id === body.botId);
@@ -1412,21 +1452,27 @@ export function createRouter(deps: RouteDeps): express.Router {
         body.taskType === 'code' || body.taskType === 'chat' || body.taskType === 'reasoning' || body.taskType === 'simple-qa'
           ? body.taskType
           : undefined;
-      const { id, position } = chatQueueStore.enqueue({
-        sessionId: sessionKey,
-        botId: bot.id,
-        message: chatMessage,
-        provider: typeof body.provider === 'string' && body.provider.trim() ? body.provider.trim() : undefined,
-        model: typeof body.model === 'string' && body.model.trim() ? body.model.trim() : undefined,
-        reasoningEffort: body.reasoningEffort === 'low' || body.reasoningEffort === 'medium' || body.reasoningEffort === 'high' ? body.reasoningEffort : undefined,
-        fileIds: Array.isArray(body.fileIds) ? body.fileIds.filter((x): x is string => typeof x === 'string') : undefined,
-        taskType,
-        autoApprove: body.autoApprove === true,
-        planMode: body.planMode === true,
-        maxBudgetUsd: typeof body.maxBudgetUsd === 'number' && body.maxBudgetUsd >= 0 ? body.maxBudgetUsd : undefined,
-        sandboxMode: body.sandboxMode === 'read-only' || body.sandboxMode === 'workspace-write' || body.sandboxMode === 'danger-full-access' ? body.sandboxMode : undefined,
-      });
-      res.json({ ok: true, queued: true, id, position, sessionId: sessionKey });
+      try {
+        const { id, position } = chatQueueStore.enqueue({
+          sessionId: sessionKey,
+          botId: bot.id,
+          message: chatMessage,
+          provider: typeof body.provider === 'string' && body.provider.trim() ? body.provider.trim() : undefined,
+          model: typeof body.model === 'string' && body.model.trim() ? body.model.trim() : undefined,
+          reasoningEffort: body.reasoningEffort === 'low' || body.reasoningEffort === 'medium' || body.reasoningEffort === 'high' ? body.reasoningEffort : undefined,
+          fileIds: Array.isArray(body.fileIds) ? body.fileIds.filter((x): x is string => typeof x === 'string') : undefined,
+          taskType,
+          autoApprove: body.autoApprove === true,
+          planMode: body.planMode === true,
+          maxBudgetUsd: typeof body.maxBudgetUsd === 'number' && body.maxBudgetUsd >= 0 ? body.maxBudgetUsd : undefined,
+          sandboxMode: body.sandboxMode === 'read-only' || body.sandboxMode === 'workspace-write' || body.sandboxMode === 'danger-full-access' ? body.sandboxMode : undefined,
+        });
+        res.json({ ok: true, queued: true, id, position, sessionId: sessionKey });
+      } catch (err) {
+        // L6: queue-full → 429, oversize message → 400.
+        const status = err instanceof ChatQueueError ? err.statusCode : 500;
+        res.status(status).json(errorBody(err instanceof Error ? err.message : 'Failed to queue message'));
+      }
       return;
     }
 
@@ -1663,6 +1709,18 @@ export function createRouter(deps: RouteDeps): express.Router {
         }
       }
       try {
+        // Crash recovery: track the in-flight turn so a server restart can
+        // mark it interrupted and offer resume. endTurn runs in the finally
+        // below — tracking never breaks chat.
+        const trackSessionId = typeof body.sessionId === 'string' && body.sessionId ? body.sessionId : undefined;
+        if (trackSessionId) {
+          deps.turnTracker?.beginTurn({
+            sessionId: trackSessionId,
+            botId: bot.id,
+            message: messageWithFiles,
+            startedAt: Date.now(),
+          });
+        }
         turnUsage = await agentRuntime.runTurn({
           bot,
           message: messageWithFiles,
@@ -1699,6 +1757,10 @@ export function createRouter(deps: RouteDeps): express.Router {
         turnError = err instanceof Error ? err.message : String(err);
         throw err;
       } finally {
+        // Crash recovery: the turn settled — clear the in-flight marker.
+        if (typeof body.sessionId === 'string' && body.sessionId) {
+          deps.turnTracker?.endTurn(body.sessionId);
+        }
         try {
           recordTurnHealth({
             botId: bot.id,
@@ -2441,9 +2503,23 @@ export function createRouter(deps: RouteDeps): express.Router {
   // Inbound bot mentions (Discord/Slack) run an agent turn through the chat
   // pipeline and reply in the channel. The turn uses the default bot; the
   // session is scoped per (provider, channel) so the bot keeps context.
+  // Per-channel richness (shared instructions + working folder + responder
+  // rules, one surface): GET/PUT /api/messaging/channels[/:id].
+  router.use(
+    '/messaging',
+    createChannelConfigRouter({
+      dataDir: config.dataDir,
+      audit: (action, fields) => governance.audit(action, fields),
+    }),
+  );
+
   registerMessagingRoutes(router, {
     config,
     governance,
+    // Guarded external messages: inbound provider messages are relayed —
+    // ledgered on receipt, and the turn carries external provenance so the
+    // approval gate marks its approvals relayed (they can never be approved).
+    relayLedger: new OnBehalfOfLedger(config.dataDir),
     onMention: async (info) => {
       // Bot picker for inbound mentions: an explicit MESSAGING_DEFAULT_BOT
       // always wins (manual override). Otherwise the fast message router
@@ -2454,7 +2530,9 @@ export function createRouter(deps: RouteDeps): express.Router {
       const defaultBotId = process.env.MESSAGING_DEFAULT_BOT;
       let bot = defaultBotId ? bots.find((b) => b.id === defaultBotId) : undefined;
       if (!bot && process.env.MESSAGE_ROUTER_ENABLED !== '0') {
-        const routed = routeMessage(
+        // Scored decision log: every routing decision records its features
+        // + outcome (raw text never logged — only a hash).
+        const routed = routeMessageLogged(
           info.text,
           bots.map((b) => ({
             id: b.id,
@@ -2462,6 +2540,8 @@ export function createRouter(deps: RouteDeps): express.Router {
             description: b.description,
             keywords: b.routeKeywords,
           })),
+          new RouterDecisionLog(config.dataDir),
+          loadRouterWeights(config.dataDir),
         );
         bot = bots.find((b) => b.id === routed.botId);
       }
@@ -2469,6 +2549,10 @@ export function createRouter(deps: RouteDeps): express.Router {
       if (!bot) return undefined;
       let reply = '';
       try {
+        // Per-channel richness: the channel's shared instructions +
+        // responder rules ride into the turn's context (memoryContext is
+        // appended to the system prompt by the runtime).
+        const channelCtx = channelContextSection(config.dataDir, info.providerId);
         await agentRuntime.runTurn({
           bot,
           message: info.text,
@@ -2476,6 +2560,17 @@ export function createRouter(deps: RouteDeps): express.Router {
           // Learning-from-corrections routing (feature #4): inbound mentions
           // honor the same learned rules as the chat route.
           routingRules: loadChatRoutingRules(),
+          ...(channelCtx ? { memoryContext: channelCtx } : {}),
+          // Guarded external messages: this turn was triggered by a relayed
+          // provider message — approvals it mints are marked relayed and can
+          // never be approved.
+          provenance: {
+            origin: 'external',
+            relayPath: [info.providerId],
+            relayNames: [info.providerId],
+            timestamp: new Date().toISOString(),
+            relayed: true,
+          },
           onEvent: async (event) => {
             if (event.type === 'token') reply += event.content;
           },
@@ -2644,7 +2739,7 @@ export function createRouter(deps: RouteDeps): express.Router {
   router.use('/terminal', terminalRouter);
 
   const teamsRouter = express.Router();
-  registerTeamRoutes(teamsRouter, {
+  const teamRoutes = registerTeamRoutes(teamsRouter, {
     dataDir: config.dataDir,
     agentRuntime,
     getBots: () => bots,
@@ -2654,6 +2749,21 @@ export function createRouter(deps: RouteDeps): express.Router {
     audit: (action, fields) => deps.governance.audit(action, fields),
   });
   router.use('/teams', teamsRouter);
+
+  // Crash recovery (OpenMausBot parity): orphan inbox + one-click resume.
+  // Mounted here (not index.ts) so the team-run resume can reuse the teams
+  // router's live retryRun (start + execute), not just a DB record.
+  router.use(
+    '/recovery',
+    createCrashRecoveryRouter({
+      dataDir: config.dataDir,
+      retryTeamRun: async (teamId, runId) => {
+        const fresh = teamRoutes.retryRun(teamId, runId);
+        return fresh ? { ok: true, newRunId: fresh.id } : { ok: false, error: 'team run not found or still running' };
+      },
+      audit: (action, fields) => deps.governance.audit(action, fields),
+    }),
+  );
 
   // Group goals (OpenMausBot parity P1 #11): bounded multi-turn
   // coordinator/worker runs with explicit completion decisions. Mounted

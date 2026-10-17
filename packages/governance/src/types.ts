@@ -39,6 +39,12 @@ export interface ApprovalRecord {
   note?: string;
   /** Where the approval came from (hard floor, reviewer escalation, etc.). */
   provenance?: string;
+  /**
+   * Guarded external messages: true when this approval was raised from a
+   * relayed external message. Such approvals can NEVER be approved —
+   * decide() throws on 'approved' (fail-closed).
+   */
+  relayed?: boolean;
 }
 
 /** Append-only audit entry. `detail` must NEVER contain secrets. */
@@ -58,6 +64,12 @@ export interface EvalContext {
   sessionId: string;
   botId: string;
   actor: string;
+  /**
+   * Guarded external messages: true when the turn was triggered by a
+   * relayed external message (webhook / external origin). Approvals minted
+   * with relayed=true can never be approved (fail-closed in decide()).
+   */
+  relayed?: boolean;
 }
 
 /** Result of evaluating a proposed tool call against the policy. */

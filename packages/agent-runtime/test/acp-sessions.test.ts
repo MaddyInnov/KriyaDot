@@ -89,7 +89,7 @@ describe('AcpSessionManager', () => {
   });
 
   const create = (mode: string, extra: Record<string, unknown> = {}) =>
-    manager.createSession({ command: process.execPath, args: [agentPath, mode], label: `fake-${mode}`, ...extra });
+    manager.createSession({ command: process.execPath, args: [agentPath, mode], label: `fake-${mode}`, cwd: dir, ...extra });
 
   it('creates, lists, and closes a session', async () => {
     const s = await create('echo');
@@ -103,11 +103,11 @@ describe('AcpSessionManager', () => {
   });
 
   it('rejects an empty command', async () => {
-    await expect(manager.createSession({ command: '   ' })).rejects.toMatchObject({ kind: 'spawn-failed' });
+    await expect(manager.createSession({ command: '   ', cwd: dir })).rejects.toMatchObject({ kind: 'spawn-failed' });
   });
 
   it('maps a missing binary to spawn-failed', async () => {
-    await expect(manager.createSession({ command: '/nonexistent/acp-binary-xyz' })).rejects.toMatchObject({
+    await expect(manager.createSession({ command: '/nonexistent/acp-binary-xyz', cwd: dir })).rejects.toMatchObject({
       kind: 'spawn-failed',
     });
   });

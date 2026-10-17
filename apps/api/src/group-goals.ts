@@ -23,7 +23,7 @@ import {
   type GoalControlDecision,
 } from '@mvp/agent-runtime';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from '@mvp/agent-runtime';
 
 export type GroupGoalStatus =
   | 'running'
@@ -167,7 +167,7 @@ export class GroupGoalStore {
 
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSyncImpl(join(dataDir, 'group-goals.db'));
+    this.db = openDb(join(dataDir, 'group-goals.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS goals (
         goal_id TEXT PRIMARY KEY,

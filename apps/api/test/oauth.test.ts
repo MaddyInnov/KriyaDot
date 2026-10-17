@@ -321,3 +321,36 @@ describe('oauth routes', () => {
     expect((await fetch(`${baseUrl}/oauth/nope`, { method: 'DELETE' })).status).toBe(404);
   });
 });
+
+describe('pending-state sweeper (L7)', () => {
+  it('purges expired states on the 60s interval without route traffic', async () => {
+    const { __testOAuthHooks } = await import('../src/oauth.js');
+    vi.useFakeTimers();
+    try {
+      __testOAuthHooks.stopSweepForTest(); // drop any real-timer sweep from earlier tests
+      const before = __testOAuthHooks.pendingStateCount();
+      __testOAuthHooks.addPendingState('expired-1', 10 * 60 * 1000);
+      __testOAuthHooks.addPendingState('fresh-1', 10 * 60 * 1000);
+      expect(__testOAuthHooks.pendingStateCount()).toBe(before + 2);
+      // Advance past the TTL: the interval sweeper fires and drops the old ones.
+      vi.advanceTimersByTime(11 * 60 * 1000);
+      expect(__testOAuthHooks.pendingStateCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps unexpired states across sweeps', async () => {
+    const { __testOAuthHooks } = await import('../src/oauth.js');
+    vi.useFakeTimers();
+    try {
+      __testOAuthHooks.stopSweepForTest();
+      const before = __testOAuthHooks.pendingStateCount();
+      __testOAuthHooks.addPendingState('fresh-2', 10 * 60 * 1000);
+      vi.advanceTimersByTime(5 * 60 * 1000);
+      expect(__testOAuthHooks.pendingStateCount()).toBe(before + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

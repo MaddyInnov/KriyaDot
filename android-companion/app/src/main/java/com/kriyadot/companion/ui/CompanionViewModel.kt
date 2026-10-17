@@ -77,6 +77,14 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
     private val _socketLive = MutableStateFlow(false)
     val socketLive: StateFlow<Boolean> = _socketLive.asStateFlow()
 
+    /**
+     * True when the push socket stopped because the server rejected our
+     * device token (M9). The UI shows a "re-pair required" prompt; cleared
+     * on the next successful connect or unpair.
+     */
+    private val _rePairRequired = MutableStateFlow(false)
+    val rePairRequired: StateFlow<Boolean> = _rePairRequired.asStateFlow()
+
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
 
@@ -137,6 +145,7 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
         socket.stop()
         store.clear()
         _paired.value = false
+        _rePairRequired.value = false
         _status.value = null
         _approvals.value = emptyList()
         _runs.value = emptyList()
@@ -166,7 +175,14 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
 
             override fun onConnectionChanged(connected: Boolean) {
                 _socketLive.value = connected
-                if (connected) refreshAll()
+                if (connected) {
+                    _rePairRequired.value = false
+                    refreshAll()
+                }
+            }
+
+            override fun onRePairRequired() {
+                _rePairRequired.value = true
             }
         })
     }

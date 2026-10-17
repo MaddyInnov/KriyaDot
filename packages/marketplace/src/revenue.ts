@@ -10,8 +10,9 @@
 
 // vitest cannot statically resolve the `node:sqlite` specifier, so load it
 // at runtime via the builtin-module API (same trick as agent-runtime stores).
-const { DatabaseSync } = process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite');
-type DatabaseSyncType = InstanceType<typeof DatabaseSync>;
+import { openDb } from './sqlite.js';
+import type { DatabaseSync } from 'node:sqlite';
+type DatabaseSyncType = DatabaseSync;
 
 export type LedgerKind = 'sale' | 'install' | 'usage' | 'payout' | 'adjustment';
 
@@ -54,7 +55,7 @@ export class RevenueLedger {
   private readonly creatorShare: number;
 
   constructor(dbPath: string, creatorShare?: number) {
-    this.db = new DatabaseSync(dbPath);
+    this.db = openDb(dbPath);
     this.creatorShare = creatorShare ?? resolveCreatorShare();
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS marketplace_installs (

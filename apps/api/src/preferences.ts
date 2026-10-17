@@ -14,7 +14,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from '@mvp/agent-runtime';
 
 export interface LearnedPreference {
   id: string;
@@ -60,7 +60,7 @@ export class PreferenceStore {
 
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSyncImpl(join(dataDir, 'preferences.db'));
+    this.db = openDb(join(dataDir, 'preferences.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS preferences (
         id TEXT PRIMARY KEY,

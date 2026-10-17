@@ -37,8 +37,9 @@ import { SkillNotUsableError } from './skills.js';
 
 // vitest (Vite 5.4.21) cannot statically resolve the `node:sqlite` specifier,
 // so load it at runtime via the builtin-module API instead of a top-level import.
-const { DatabaseSync } = process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite');
-type DatabaseSyncType = InstanceType<typeof DatabaseSync>;
+import { openDb } from './sqlite.js';
+import type { DatabaseSync } from 'node:sqlite';
+type DatabaseSyncType = DatabaseSync;
 
 export type UserSkillStatus = 'draft' | 'active' | 'disabled' | 'rejected';
 export type UserSkillSource = 'agent-created' | 'learned' | 'manual' | 'imported';
@@ -230,7 +231,7 @@ export class UserSkillStore {
     this.seedSkillsDir = opts.seedSkillsDir;
     this.audit = opts.audit;
     mkdirSync(skillsDir, { recursive: true });
-    this.db = new DatabaseSync(join(dataDir, 'user-skills.db'));
+    this.db = openDb(join(dataDir, 'user-skills.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS user_skills (
         name TEXT PRIMARY KEY,

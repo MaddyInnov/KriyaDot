@@ -27,7 +27,7 @@ import { randomUUID } from 'node:crypto';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb as openSqliteDb } from '@mvp/agent-runtime';
 import type { DatabaseSync } from 'node:sqlite';
 
 // ---------------------------------------------------------------------------
@@ -94,7 +94,7 @@ function openDb(dataDir: string): DatabaseSync {
   const { mkdirSync } = require('node:fs') as typeof import('node:fs');
   const { join } = require('node:path') as typeof import('node:path');
   mkdirSync(dataDir, { recursive: true });
-  const db = new DatabaseSyncImpl(join(dataDir, 'databases.db'));
+  const db = openSqliteDb(join(dataDir, 'databases.db'));
   db.exec(SCHEMA);
   return db;
 }

@@ -3,8 +3,9 @@
 // database. Works alongside any BillingProvider implementation — the
 // provider settles money, this ledger keeps the local books.
 
-const { DatabaseSync } = process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite');
-type DatabaseSyncType = InstanceType<typeof DatabaseSync>;
+import { openDb } from './sqlite.js';
+import type { DatabaseSync } from 'node:sqlite';
+type DatabaseSyncType = DatabaseSync;
 
 import type { BillingInvoice, InvoiceLine, InvoiceStatus } from './provider.js';
 
@@ -24,7 +25,7 @@ export class BillingLedger {
   private readonly db: DatabaseSyncType;
 
   constructor(dbPath: string) {
-    this.db = new DatabaseSync(dbPath);
+    this.db = openDb(dbPath);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS billing_invoices (
         id TEXT PRIMARY KEY,

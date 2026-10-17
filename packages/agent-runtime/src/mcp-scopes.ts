@@ -26,8 +26,9 @@
 
 // `node:sqlite` via the runtime builtin-module trick (vitest/Vite 5 cannot
 // statically resolve the specifier) — same pattern as the other stores.
-const { DatabaseSync } = process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite');
-type DatabaseSyncType = InstanceType<typeof DatabaseSync>;
+import { openDb } from './sqlite.js';
+import type { DatabaseSync } from 'node:sqlite';
+type DatabaseSyncType = DatabaseSync;
 
 /** The three per-tool scope toggles. */
 export type McpScope = 'read' | 'write' | 'egress';
@@ -96,7 +97,7 @@ export class McpScopeStore {
   private readonly db: DatabaseSyncType;
 
   constructor(dbPath: string) {
-    this.db = new DatabaseSync(dbPath);
+    this.db = openDb(dbPath);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS tool_scopes (
         tool_name TEXT PRIMARY KEY,

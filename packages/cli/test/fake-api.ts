@@ -23,6 +23,7 @@ export interface FakeApiOptions {
   messages?: ThreadMessage[];
   branchResult?: { id: string; title: string; botId: string };
   routines?: RoutineSummary[];
+  routineRuns?: Array<{ id: string; routineId: string; status: string; startedAt?: number }>;
   mcpServers?: McpServerInfo[];
   /** Scripted SSE events for each sendChat call. */
   chatScript?: ChatEvent[];
@@ -33,6 +34,10 @@ export interface FakeApiOptions {
 export interface FakeApi extends FakeApiOptions {
   decisions: Array<{ approvalId: string; decision: string }>;
   chatRequests: ChatRequest[];
+  deletedThreads: string[];
+  importedMarkdown?: string;
+  exportedMarkdown?: string;
+  importedManifest?: unknown;
   asApi(): KriyaDotApi;
 }
 
@@ -41,6 +46,7 @@ export function makeFakeApi(opts: FakeApiOptions = {}): FakeApi {
     ...opts,
     decisions: [],
     chatRequests: [],
+    deletedThreads: [],
     asApi() {
       const self = this;
       return {
@@ -50,9 +56,22 @@ export function makeFakeApi(opts: FakeApiOptions = {}): FakeApi {
         listThreads: async () => self.threads ?? [],
         threadMessages: async () => self.messages ?? [],
         branchThread: async () => self.branchResult ?? { id: 'new-thread', title: 'Branch', botId: 'bot-a' },
+        deleteThread: async (threadId: string) => {
+          self.deletedThreads.push(threadId);
+        },
         listRoutines: async () => self.routines ?? [],
         runRoutineNow: async () => 'run-123',
+        listRoutineRuns: async () => self.routineRuns ?? [],
         listMcpServers: async () => self.mcpServers ?? [],
+        importTeamMarkdown: async (markdown: string) => {
+          self.importedMarkdown = markdown;
+          return { id: 'team-1', name: 'Imported team' };
+        },
+        exportTeamMarkdown: async () => self.exportedMarkdown ?? '# Team: Exported\n',
+        importTeamManifest: async (manifest: unknown) => {
+          self.importedManifest = manifest;
+          return { id: 'team-2', name: 'Manifest team' };
+        },
         decideApproval: async (approvalId: string, decision: 'approved' | 'denied') => {
           self.decisions.push({ approvalId, decision });
         },

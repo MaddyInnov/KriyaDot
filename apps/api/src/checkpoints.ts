@@ -15,7 +15,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from '@mvp/agent-runtime';
 
 export type RestoreMode = 'code' | 'conversation' | 'both';
 
@@ -56,7 +56,7 @@ export class CheckpointStore {
 
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSyncImpl(join(dataDir, 'checkpoints.db'));
+    this.db = openDb(join(dataDir, 'checkpoints.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS checkpoints (
         id TEXT PRIMARY KEY,

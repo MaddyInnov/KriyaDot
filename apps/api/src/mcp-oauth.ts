@@ -214,6 +214,7 @@ interface PendingFlow {
 /** In-memory pending flows: state → PKCE verifier + redirect URI. */
 const pendingFlows = new Map<string, PendingFlow>();
 const FLOW_TTL_MS = 10 * 60 * 1000;
+const FLOW_SWEEP_INTERVAL_MS = 60_000;
 
 function pruneFlows(): void {
   const now = Date.now();
@@ -221,6 +222,41 @@ function pruneFlows(): void {
     if (v.expires <= now) pendingFlows.delete(k);
   }
 }
+
+let flowSweepTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Periodic purge of expired pending MCP-OAuth flows (L7). Mirrors the
+ * WS-ticket sweeper in loopback-auth.ts: opportunistic pruning on route
+ * hits is not enough for abandoned flows with no further traffic.
+ */
+function scheduleFlowSweep(): void {
+  if (flowSweepTimer) return;
+  flowSweepTimer = setInterval(() => {
+    pruneFlows();
+  }, FLOW_SWEEP_INTERVAL_MS);
+  // Never keep the process alive just for the sweep.
+  if (typeof flowSweepTimer.unref === 'function') flowSweepTimer.unref();
+}
+
+/** Test-only hooks for the pending-flow sweeper (L7). Not public API. */
+export const __testMcpOAuthHooks = {
+  addPendingFlow: (state: string, ttlMs: number): void => {
+    pendingFlows.set(
+      state,
+      { serverId: 'test', codeVerifier: 'v', redirectUri: 'http://localhost/cb', expires: Date.now() + ttlMs },
+    );
+    scheduleFlowSweep();
+  },
+  pendingFlowCount: (): number => pendingFlows.size,
+  /** Clear the interval (lets a test re-schedule it under fake timers). */
+  stopSweepForTest: (): void => {
+    if (flowSweepTimer) {
+      clearInterval(flowSweepTimer);
+      flowSweepTimer = null;
+    }
+  },
+};
 
 function oauthServerConfig(
   mcpServers: Record<string, McpServerConfig>,
@@ -300,6 +336,7 @@ export function registerMcpOAuthRoutes(router: express.Router, deps: McpOAuthRou
         display,
         expires: Date.now() + FLOW_TTL_MS,
       });
+      scheduleFlowSweep();
       const client = makeClient(serverId, serverUrl, redirectUri);
       const authUrl = await client.buildAuthorizationUrl({ state, codeVerifier, redirectUri, scope });
       res.json({ ok: true, server: serverId, authUrl, state });

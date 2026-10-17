@@ -25,8 +25,9 @@ import { redactSecrets } from './redact.js';
 // `node:sqlite` is loaded at runtime via process.getBuiltinModule instead of
 // a static import because this repo's vitest (Vite 5.4.21) cannot statically
 // resolve that specifier ("Failed to load url sqlite").
-const { DatabaseSync } = process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite');
-type Database = InstanceType<typeof DatabaseSync>;
+import { openDb } from './sqlite.js';
+import type { DatabaseSync } from 'node:sqlite';
+type Database = DatabaseSync;
 
 /** Actions a processing rule can take on a matched item. */
 export type ProcessingActionType = 'tag' | 'route' | 'run-agent' | 'egress';
@@ -351,7 +352,7 @@ export class ProcessingRuleStore {
   private readonly db: Database;
 
   constructor(dbPath: string) {
-    this.db = new DatabaseSync(dbPath);
+    this.db = openDb(dbPath);
     this.db.exec(SCHEMA);
   }
 

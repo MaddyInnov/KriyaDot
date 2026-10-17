@@ -35,7 +35,7 @@ import {
   type RoutineSchedule,
 } from './routine-schedules.js';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb as openSqliteDb } from '@mvp/agent-runtime';
 
 export interface BotRoutine {
   id: string;
@@ -147,7 +147,7 @@ function openDb(dataDir: string): DatabaseSync {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { join } = require('node:path') as typeof import('node:path');
   mkdirSync(dataDir, { recursive: true });
-  const db: DatabaseSync = new DatabaseSyncImpl(join(dataDir, 'bot-routines.db'));
+  const db: DatabaseSync = openSqliteDb(join(dataDir, 'bot-routines.db'));
   db.exec(`
     CREATE TABLE IF NOT EXISTS bot_routines (
       id TEXT PRIMARY KEY,

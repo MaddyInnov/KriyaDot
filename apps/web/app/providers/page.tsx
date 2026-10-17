@@ -17,6 +17,7 @@ import {
 } from '../../lib/api';
 import type { CliLoginStatus, ModelsCatalogInfo, ProviderInfo, RateLimitSnapshot } from '../../lib/api';
 import { formatResetIn, formatTokens } from '../../lib/usage';
+import { ChannelsPanel } from '../../components/channels/channels-panel';
 
 /**
  * Quota line for one provider, e.g. "28/30 req remaining · 1.8M/2M tokens ·
@@ -649,6 +650,8 @@ export default function ProvidersPage() {
         </div>
       ))}
       {providers.length === 0 && !error && <p className="muted">Loading providers…</p>}
+
+      <ChannelsPanel />
     </div>
   );
 }

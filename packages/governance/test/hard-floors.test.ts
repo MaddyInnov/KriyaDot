@@ -61,6 +61,56 @@ describe('hard floors', () => {
     );
   });
 
+  it('catches rm flag variants (M1): -rfv, extra long flags, --preserve-root=no', () => {
+    // These used to slip past the (-r -f | -rf?) flag group and become
+    // merely human-approvable instead of never-approvable denials.
+    for (const command of [
+      'rm -rfv /etc',
+      'rm -rf --one-file-system /',
+      'rm -rfv --preserve-root=no /',
+      'rm --recursive --force /',
+      'rm -rfi /tmp/cache',
+      'sudo rm -rfv /usr',
+    ]) {
+      const hit = checkHardFloor('run_command', { command });
+      expect(hit?.tier).toBe('catastrophic');
+      expect(hit?.patternId).toBe('catastrophic-shell');
+    }
+  });
+
+  it('keeps existing rm semantics: system-dir targets stay catastrophic, workspace paths stay clean', () => {
+    // Existing behavior preserved: /tmp is a listed system dir, so this was
+    // (and stays) catastrophic, not merely dangerous.
+    expect(checkHardFloor('run_command', { command: 'rm -rf /tmp/foo' })?.tier).toBe(
+      'catastrophic',
+    );
+    expect(checkHardFloor('run_command', { command: 'rm -r /var/log' })?.tier).toBe(
+      'catastrophic',
+    );
+    // A `--` ends flag parsing: `rm -- -rf /` deletes a file literally
+    // named "-rf" (and fails on `/` without -r) — not catastrophic.
+    expect(checkHardFloor('run_command', { command: 'rm -- -rf /' })).toBeNull();
+    // Workspace-relative deletes are untouched by the catastrophic floor.
+    expect(checkHardFloor('run_command', { command: 'rm -rf ./build' })).toBeNull();
+    expect(checkHardFloor('run_command', { command: 'rm -rf workspace/out.txt' })).toBeNull();
+    // Force without recursive on a directory is not catastrophic.
+    expect(checkHardFloor('run_command', { command: 'rm -f /' })).toBeNull();
+  });
+
+  it('scopes ${IFS} to destructive combinations only (L3)', () => {
+    // Bare ${IFS} is a legitimate shell feature — no longer a floor hit.
+    expect(checkHardFloor('run_command', { command: 'echo ${IFS}hello' })).toBeNull();
+    expect(checkHardFloor('run_command', { command: 'for w in a${IFS}b; do echo $w; done' })).toBeNull();
+    // Combined with a destructive payload it stays catastrophic.
+    expect(
+      checkHardFloor('run_command', { command: 'eval${IFS}rm${IFS}-rf${IFS}/' })?.tier,
+    ).toBe('catastrophic');
+    expect(
+      checkHardFloor('run_command', { command: 'x=${IFS}; dd${x}if=/dev/zero${x}of=/dev/sda' })
+        ?.tier,
+    ).toBe('catastrophic');
+  });
+
   it('gateway denies catastrophic hard floors even with allow-all policy', async () => {
     const gw = makeGateway();
     const res = await gw.evaluate(

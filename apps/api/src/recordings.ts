@@ -10,7 +10,7 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from '@mvp/agent-runtime';
 
 export type RecordedEventType =
   | 'click'
@@ -86,7 +86,7 @@ export class RecordingStore {
     const { mkdirSync } = require('node:fs') as typeof import('node:fs');
     const { join } = require('node:path') as typeof import('node:path');
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSyncImpl(join(dataDir, 'recordings.db'));
+    this.db = openDb(join(dataDir, 'recordings.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS recordings (
         id TEXT PRIMARY KEY,

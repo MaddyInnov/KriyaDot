@@ -104,6 +104,96 @@ describe('TerminalManager', () => {
   });
 });
 
+describe('TerminalManager session eviction (M6)', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'terminal-'));
+  });
+
+  it('sweepNow evicts closed sessions older than 30 minutes, keeps open and recent ones', async () => {
+    vi.useFakeTimers();
+    try {
+      const children: FakeChild[] = [];
+      const mgr = new TerminalManager(fakeSpawn(children), { pty: () => undefined, docker: () => false });
+      const old = await mgr.create({ workspaceDir: dir });
+      mgr.close(old.id);
+      // 31 minutes pass; then a fresh session is opened and closed.
+      vi.advanceTimersByTime(31 * 60 * 1000);
+      const recent = await mgr.create({ workspaceDir: dir });
+      mgr.close(recent.id);
+      const open = await mgr.create({ workspaceDir: dir });
+      mgr.sweepNow();
+      expect(mgr.get(old.id)).toBeUndefined();
+      expect(mgr.get(recent.id)).toBeDefined();
+      expect(mgr.get(open.id)).toBeDefined();
+      expect(mgr.output(recent.id)).toBeDefined();
+      mgr.stopSweep();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('caps tracked sessions at 200, evicting oldest-closed first', async () => {
+    const children: FakeChild[] = [];
+    const mgr = new TerminalManager(fakeSpawn(children), { pty: () => undefined, docker: () => false });
+    const ids: string[] = [];
+    for (let i = 0; i < 205; i++) {
+      const s = await mgr.create({ workspaceDir: dir });
+      ids.push(s.id);
+    }
+    for (const id of ids) mgr.close(id);
+    mgr.sweepNow();
+    expect(mgr.list()).toHaveLength(200);
+    expect(mgr.get(ids[0])).toBeUndefined(); // oldest closed evicted
+    expect(mgr.get(ids[204])).toBeDefined();
+    mgr.stopSweep();
+  });
+
+  it('close() kills orphaned grandchildren via the process group', async () => {
+    if (process.platform === 'win32') return; // POSIX process groups only
+    const mgr = new TerminalManager(undefined, {
+      pty: () => undefined,
+      docker: () => false,
+    });
+    try {
+      const s = await mgr.create({ workspaceDir: dir });
+      const pids: number[] = [];
+      const gotPid = new Promise<void>((resolve) => {
+        const unsub = mgr.subscribe(s.id, (c) => {
+          for (const m of c.matchAll(/GRANDCHILD:(\d+)/g)) pids.push(Number(m[1]));
+          if (pids.length > 0) {
+            unsub();
+            resolve();
+          }
+        });
+      });
+      expect(mgr.write(s.id, 'sleep 300 & echo GRANDCHILD:$!\n')).toBe(true);
+      await Promise.race([
+        gotPid,
+        new Promise((_, rej) => setTimeout(() => rej(new Error('no grandchild pid')), 10_000)),
+      ]);
+      const grandchild = pids[0];
+      expect(() => process.kill(grandchild, 0)).not.toThrow(); // alive before close
+      mgr.close(s.id);
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        let alive = true;
+        try {
+          process.kill(grandchild, 0);
+        } catch (e) {
+          if ((e as NodeJS.ErrnoException).code === 'ESRCH') alive = false;
+          else throw e;
+        }
+        if (!alive) break;
+        if (Date.now() > deadline) throw new Error('grandchild survived close()');
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    } finally {
+      mgr.stopSweep();
+    }
+  }, 30_000);
+});
+
 describe('parseSuggestion', () => {
   it('parses plain JSON', () => {
     expect(parseSuggestion('{"command": "ls -la", "explanation": "lists files"}')).toEqual({

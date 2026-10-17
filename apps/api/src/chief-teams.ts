@@ -28,7 +28,7 @@ import type {
   NewChiefIncident,
 } from '@mvp/agent-runtime';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from '@mvp/agent-runtime';
 
 export interface ChiefConfig {
   chiefBotId: string | null;
@@ -126,7 +126,7 @@ export class ChiefTeamsStore {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { join } = require('node:path') as typeof import('node:path');
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSyncImpl(join(dataDir, 'chief-teams.db'));
+    this.db = openDb(join(dataDir, 'chief-teams.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS chief_config (
         id INTEGER PRIMARY KEY CHECK (id = 1),

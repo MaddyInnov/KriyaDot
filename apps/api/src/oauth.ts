@@ -319,6 +319,7 @@ export interface OAuthRouteDeps {
  */
 const pendingStates = new Map<string, { redirectUri: string; expires: number }>();
 const STATE_TTL_MS = 10 * 60 * 1000;
+const STATE_SWEEP_INTERVAL_MS = 60_000;
 
 function pruneStates(): void {
   const now = Date.now();
@@ -326,6 +327,39 @@ function pruneStates(): void {
     if (v.expires <= now) pendingStates.delete(k);
   }
 }
+
+let stateSweepTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Periodic purge of expired pending OAuth states (L7). Pruning also runs
+ * opportunistically on route hits, but abandoned flows with no further
+ * traffic would linger without this — mirrors the WS-ticket sweeper in
+ * loopback-auth.ts.
+ */
+function scheduleStateSweep(): void {
+  if (stateSweepTimer) return;
+  stateSweepTimer = setInterval(() => {
+    pruneStates();
+  }, STATE_SWEEP_INTERVAL_MS);
+  // Never keep the process alive just for the sweep.
+  if (typeof stateSweepTimer.unref === 'function') stateSweepTimer.unref();
+}
+
+/** Test-only hooks for the pending-state sweeper (L7). Not public API. */
+export const __testOAuthHooks = {
+  addPendingState: (state: string, ttlMs: number): void => {
+    pendingStates.set(state, { redirectUri: 'http://localhost/cb', expires: Date.now() + ttlMs });
+    scheduleStateSweep();
+  },
+  pendingStateCount: (): number => pendingStates.size,
+  /** Clear the interval (lets a test re-schedule it under fake timers). */
+  stopSweepForTest: (): void => {
+    if (stateSweepTimer) {
+      clearInterval(stateSweepTimer);
+      stateSweepTimer = null;
+    }
+  },
+};
 
 function errorBody(error: string, detail?: string): { error: string; detail?: string } {
   return detail ? { error, detail } : { error };
@@ -347,6 +381,7 @@ export function registerOAuthRoutes(router: express.Router, deps: OAuthRouteDeps
     const state = typeof req.query.state === 'string' && req.query.state ? req.query.state : randomUUID();
     const redirectUri = `${req.protocol}://${req.get('host')}/api/oauth/${provider.id}/callback`;
     pendingStates.set(state, { redirectUri, expires: Date.now() + STATE_TTL_MS });
+    scheduleStateSweep();
     try {
       const url = buildAuthUrl(provider.id, state, redirectUri);
       res.redirect(url);

@@ -57,6 +57,20 @@ import { EvalRunStore, EvalSuiteStore } from './evals.js';
 import { createSummarizer } from './summarizer.js';
 import { createPeerApprovalRouter, createPeerApprovalBroker } from './peer-approval-routes.js';
 import { PeerApprovalStore, createPeerApprovalGate } from '@mvp/agent-runtime';
+import { createCredentialProposalRouter } from './credential-proposal-routes.js';
+import {
+  CredentialProposalStore,
+  createRequestCredentialTool,
+  OnBehalfOfLedger,
+} from '@mvp/agent-runtime';
+import { createMemoryUpkeepRouter, startMemoryUpkeep, aboutMeContext } from './memory-upkeep-routes.js';
+import {
+  TurnTracker,
+  OrphanLedger,
+  reconcileOnBoot,
+  INTERRUPTED_NOTE,
+} from './crash-recovery.js';
+import { createSentinelRouter, startSentinel } from './sentinel.js';
 import { createWidgetRouter, sweepWidgets } from './widget-routes.js';
 import { WidgetCoordinator, WidgetStore } from '@mvp/agent-runtime';
 import { createRouter } from './routes.js';
@@ -602,6 +616,13 @@ async function boot(): Promise<void> {
     },
   });
 
+  // Profile/credential proposal cards (OpenMausBot parity): the
+  // `request_credential` agent tool mints a card here instead of failing
+  // when a bot needs a credential it doesn't have. The user fulfills it in
+  // the approvals inbox; the value lands in the vault; the turn resumes.
+  const credentialProposalStore = new CredentialProposalStore(config.dataDir);
+  toolRegistry.set('request_credential', createRequestCredentialTool());
+
   const agentRuntime = new AgentRuntime({
     dbPath: `${config.dataDir}/agent.db`,
     skillsDir: path.join(seedDir, 'skills'),
@@ -632,6 +653,21 @@ async function boot(): Promise<void> {
     // rates, and token cost per bot turn. Metadata-tier only, guarded.
     telemetry,
   });
+
+  // Credential proposal host: the `request_credential` tool mints a card and
+  // pauses the turn until the user fulfills/denies it in the approvals
+  // inbox (the fulfill API writes the value to the vault, then releases the
+  // waiter here).
+  agentRuntime.setCredentialProposer({
+    requestCredential: async (input) => {
+      const card = credentialProposalStore.propose(input);
+      const ok = await credentialProposalStore.awaitDecision(card.id);
+      return ok ? { ok: true } : { ok: false, reason: 'The user did not provide the credential (denied or expired).' };
+    },
+  });
+
+  // About-me context: the user's own profile rides into every bot turn.
+  agentRuntime.addContextProvider(({ bot }) => aboutMeContext(config.dataDir, bot.id));
 
   // Phase 2: `delegate` subagent tool. The child runs under the same
   // governance policy; parent/child records + audit events land in
@@ -700,11 +736,10 @@ async function boot(): Promise<void> {
   const { RoutineRunStore, RoutineRunExecutor } = await import('./routine-runs.js');
   const routineRunStore = new RoutineRunStore(config.dataDir);
   // Restart recovery: runs stuck queued/running when the server died are
-  // marked failed ("server restarted") instead of lingering forever.
-  const recoveredRuns = routineRunStore.reconcileRunning();
-  if (recoveredRuns > 0) {
-    console.log(`[routines] marked ${recoveredRuns} interrupted run(s) as failed (server restart)`);
-  }
+  // handled by the crash-recovery sweep below (reconcileOnBoot), which marks
+  // them failed AND files orphan entries for one-click retry. The sweep
+  // runs after governance/audit exist — see the "Automatic crash recovery"
+  // block further down.
   const { renderRoutinePrompt: renderRoutinePromptForRuns } = await import('./webhooks.js');
   // Group goals (OpenMausBot parity P1 #11): mutable hook holder filled by
   // registerGroupGoalRoutes inside createRouter (below); the routine
@@ -1078,7 +1113,14 @@ async function boot(): Promise<void> {
   // the token only when the Origin header is absent or allowlisted, so an
   // evil cross-origin page can never read it.
   app.get('/api/auth/bootstrap', createBootstrapHandler(loopbackToken));
-  app.use(express.json({ limit: '150mb' })); // 100MB file uploads (base64 +33%)
+  // L8: the global JSON body limit is 5mb — the old 150mb global limit let
+  // EVERY route accept a 150MB body. The chat-attachment upload
+  // (POST /api/files/upload, up to 100MB base64) is the only route that
+  // needs more, so it gets its own larger parser mounted here BEFORE the
+  // global one. body-parser sets req._body after parsing, so the global
+  // parser skips requests the upload parser already handled.
+  app.use('/api/files/upload', express.json({ limit: '150mb' }));
+  app.use(express.json({ limit: '5mb' }));
   // Phase 4: A2A agent-card discovery (spec-correct location).
   app.get('/.well-known/agent-card.json', (_req, res) => {
     res.json(defaultAgentCard(`http://127.0.0.1:${config.port}/api/protocols/a2a`));
@@ -1225,6 +1267,80 @@ async function boot(): Promise<void> {
       })
       .catch(() => {});
   };
+  // Automatic crash recovery (OpenMausBot parity): boot-time reconciliation
+  // sweep. In-flight records orphaned by the restart (routine runs, team
+  // runs, group goals, chat turns) are marked `interrupted (server
+  // restart)` and filed as orphan entries for one-click resume via
+  // GET /api/recovery/orphans. Idempotent — only non-terminal records match.
+  const turnTracker = new TurnTracker(config.dataDir);
+  {
+    const { TeamStore } = await import('@mvp/agent-runtime');
+    const { GroupGoalStore } = await import('./group-goals.js');
+    const teamStore = new TeamStore(config.dataDir);
+    const groupGoalStore = new GroupGoalStore(config.dataDir);
+    try {
+      const summary = reconcileOnBoot({
+        dataDir: config.dataDir,
+        listStuckRoutineRuns: () =>
+          routineRunStore.listStuckRuns().map((r) => ({ id: r.id, routineId: r.routineId, routineName: r.routineName })),
+        reconcileRoutineRuns: () => routineRunStore.reconcileRunning(),
+        listRunningTeamRuns: () => {
+          const out: Array<{ runId: string; teamId: string; teamName: string; task: string }> = [];
+          for (const t of teamStore.listTeams()) {
+            for (const r of teamStore.listRuns(t.id)) {
+              if (r.status === 'running') out.push({ runId: r.id, teamId: t.id, teamName: t.name, task: r.task });
+            }
+          }
+          return out;
+        },
+        markTeamRunInterrupted: (runId) => {
+          teamStore.updateRun(runId, { status: 'failed', error: INTERRUPTED_NOTE });
+        },
+        listRunningGroupGoals: () =>
+          groupGoalStore
+            .listGoals(1000)
+            .filter((g) => g.status === 'running')
+            .map((g) => ({ goalId: g.id, title: g.title })),
+        markGroupGoalInterrupted: (goalId) => {
+          // Park as blocked so the existing POST /:id/resume restarts it.
+          groupGoalStore.updateGoal(goalId, {
+            status: 'blocked',
+            summary: `Interrupted: ${INTERRUPTED_NOTE}. Resume to continue.`,
+          });
+        },
+        turnTracker,
+        audit: (action, fields) => governance.audit(action, fields),
+      });
+      if (summary.orphans.length > 0) {
+        console.log(`[recovery] reconciled ${summary.orphans.length} interrupted item(s): ${JSON.stringify(summary.counts)}`);
+      }
+    } finally {
+      teamStore.close();
+      groupGoalStore.close();
+    }
+  }
+
+  // Memory upkeep schedulers (OpenMausBot parity): idle-time background
+  // capture + nightly tidy. isIdle keeps capture off hot paths.
+  const isIdle = (): boolean => turnTracker.listActive().length === 0;
+  const memoryUpkeep = startMemoryUpkeep({
+    dataDir: config.dataDir,
+    tieredMemoryStore,
+    getBots: () => seed.bots.map((b) => ({ id: b.id })),
+    isIdle,
+    audit: (action, fields) => governance.audit(action, fields),
+  });
+  void memoryUpkeep;
+
+  // Sentinel health scanner (OpenMausBot parity): cheap scheduled
+  // self-check; report at GET /api/health/detail.
+  const sentinel = startSentinel({
+    dataDir: config.dataDir,
+    getBots: () => seed.bots.map((b) => ({ id: b.id, provider: b.provider })),
+    audit: (action, fields) => governance.audit(action, fields),
+  });
+  void sentinel;
+
   app.use(
     '/api',
     createRouter({
@@ -1235,6 +1351,7 @@ async function boot(): Promise<void> {
       governanceAdapter,
       workflowRunner,
       mcpConnections,
+      turnTracker,
       mcpServer: platformMcpServer,
       mcpScopeStore,
       threadScheduleStore,
@@ -1286,8 +1403,13 @@ async function boot(): Promise<void> {
       listThreads: (opts) => agentRuntime.sessionStore.listSessions(opts ?? {}),
       branchSession: (id, msgId, opts) => agentRuntime.branchSession(id, msgId, opts),
       listThreadMessages: (id) => agentRuntime.listThreadMessages(id),
+      duplicateThread: (id) => agentRuntime.sessionStore.duplicateSession(id),
+      deleteThread: (id) => agentRuntime.sessionStore.deleteSession(id),
       audit: (action, fields) => governance.audit(action, fields),
       titles: threadTitles,
+      // W2: deleting a thread clears its circuit-breaker state so a
+      // deleted session can't leak breaker/denial state into a recycled id.
+      onThreadDeleted: (id) => agentRuntime.clearSessionCircuitState(id),
     }),
   );
   // Full-text message search (OpenMausBot parity): FTS5 over chat sessions.
@@ -1475,6 +1597,36 @@ async function boot(): Promise<void> {
     }
   }, 60_000);
   if (typeof peerApprovalSweep.unref === 'function') peerApprovalSweep.unref();
+
+  // Profile/credential proposal cards (OpenMausBot parity): the bot raises
+  // a card instead of failing when it needs a credential it doesn't have.
+  // Backstop sweep expires stale cards even when no waiter watches.
+  app.use(
+    '/api',
+    createCredentialProposalRouter({
+      store: credentialProposalStore,
+      dataDir: config.dataDir,
+      audit: (action, fields) => governance.audit(action, fields),
+    }),
+  );
+  const credentialProposalSweep = setInterval(() => {
+    try {
+      const expired = credentialProposalStore.expireStale();
+      for (const id of expired) governance.audit('credential-proposal.expired', { detail: { cardId: id } });
+    } catch {
+      // Sweeps must never break the server.
+    }
+  }, 60_000);
+  if (typeof credentialProposalSweep.unref === 'function') credentialProposalSweep.unref();
+
+  // Sentinel health scanner (OpenMausBot parity): GET /api/health/detail.
+  app.use(
+    '/api/health',
+    createSentinelRouter({
+      dataDir: config.dataDir,
+      getBots: () => seed.bots.map((b) => ({ id: b.id, provider: b.provider })),
+    }),
+  );
 
   // Interactive widgets (OpenMausBot parity P1 #15): answer inbox for
   // ask_user_question + display-widget listing. Backstop sweep expires

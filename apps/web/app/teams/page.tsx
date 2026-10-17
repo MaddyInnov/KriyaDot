@@ -70,6 +70,39 @@ export default function TeamsPage() {
   // ACP tab (OpenMausBot parity P1 #26): external Agent Client Protocol
   // sessions. Same rule — no new top-level nav.
   const [tab, setTab] = useState<'teams' | 'goals' | 'acp'>('teams');
+  // Markdown team import (BotMRR parity): paste a team-spec doc, import it.
+  const [mdImport, setMdImport] = useState('');
+  const [showMdImport, setShowMdImport] = useState(false);
+
+  const importTeamMarkdown = async (): Promise<void> => {
+    if (!mdImport.trim()) {
+      setError('Paste a markdown team doc first.');
+      return;
+    }
+    try {
+      const res = await api<{ ok: boolean; team: Team }>('/api/teams/import-markdown', {
+        method: 'POST',
+        body: JSON.stringify({ markdown: mdImport }),
+      });
+      setNotice(`Imported team "${res.team.name}".`);
+      setMdImport('');
+      setShowMdImport(false);
+      await load();
+      setActiveId(res.team.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const copyTeamMarkdown = async (teamId: string, teamName: string): Promise<void> => {
+    try {
+      const res = await api<{ ok: boolean; markdown: string }>(`/api/teams/${teamId}/export-markdown`);
+      await navigator.clipboard.writeText(res.markdown);
+      setNotice(`Copied "${teamName}" as markdown.`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   const active = teams.find((t) => t.id === activeId) ?? null;
   const botName = (id: string) => bots.find((b) => b.id === id)?.name ?? id;
@@ -327,6 +360,32 @@ export default function TeamsPage() {
       <div className="two-col">
         <div className="card">
           <h2>Teams</h2>
+          <div style={{ marginBottom: 12 }}>
+            <button className="btn btn-sm" onClick={() => setShowMdImport((v) => !v)}>
+              {showMdImport ? 'Hide markdown import' : 'Import from markdown'}
+            </button>
+          </div>
+          {showMdImport && (
+            <div className="card" style={{ marginBottom: 12 }}>
+              <h3>Paste a team doc</h3>
+              <p className="muted small">
+                One-click install: paste a markdown team spec (name, members with roles/personas/tools,
+                roster prompt, coordination rules) and it becomes a team.
+              </p>
+              <textarea
+                rows={10}
+                style={{ width: '100%' }}
+                placeholder={'# Team: Research Squad\n\n## Members\n- **Scout** (role: coordinator)\n  - bot: scout\n\n## Roster prompt\n…'}
+                value={mdImport}
+                onChange={(e) => setMdImport(e.target.value)}
+              />
+              <div style={{ marginTop: 8 }}>
+                <button className="btn btn-primary btn-sm" onClick={importTeamMarkdown}>
+                  Import team
+                </button>
+              </div>
+            </div>
+          )}
           {teams.length === 0 && <p className="muted small">No teams yet — create one below.</p>}
           <ul className="list">
             {teams.map((t) => (
@@ -338,6 +397,9 @@ export default function TeamsPage() {
                   {botName(t.coordinatorBotId)} leads · {t.memberBotIds.map(botName).join(', ')}
                 </div>
                 <button className="btn btn-sm btn-danger" onClick={() => deleteTeam(t.id)}>Delete</button>
+                <button className="btn btn-sm" onClick={() => copyTeamMarkdown(t.id, t.name)} title="Copy the team spec as a markdown doc">
+                  Copy as markdown
+                </button>
                 <button className="btn btn-sm" onClick={() => exportTeam(t.id)}>Export</button>
               </li>
             ))}

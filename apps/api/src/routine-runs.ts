@@ -26,7 +26,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { AgentRuntime, BotConfig } from '@mvp/agent-runtime';
 import type { BotRoutine } from './bot-routines.js';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb as openSqliteDb } from '@mvp/agent-runtime';
 
 export type RunTrigger = 'schedule' | 'webhook' | 'manual';
 export type RunStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'missed' | 'cancelled';
@@ -97,7 +97,7 @@ function openDb(dataDir: string): DatabaseSync {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { join } = require('node:path') as typeof import('node:path');
   mkdirSync(dataDir, { recursive: true });
-  const db: DatabaseSync = new DatabaseSyncImpl(join(dataDir, 'routine-runs.db'));
+  const db: DatabaseSync = openSqliteDb(join(dataDir, 'routine-runs.db'));
   db.exec(`
     CREATE TABLE IF NOT EXISTS routine_runs (
       id TEXT PRIMARY KEY,
@@ -291,6 +291,17 @@ export class RoutineRunStore {
         `SELECT * FROM routine_runs WHERE routine_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`,
       )
       .all(routineId, Math.max(1, limit), Math.max(0, offset)) as unknown as RunRow[];
+    return rows.map(rowToRun);
+  }
+
+  /**
+   * Runs stuck in a non-terminal state (crash-recovery sweep reads these
+   * BEFORE reconcileRunning() marks them failed).
+   */
+  listStuckRuns(): RoutineRun[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM routine_runs WHERE status IN ('queued', 'running') ORDER BY created_at ASC`)
+      .all() as unknown as RunRow[];
     return rows.map(rowToRun);
   }
 

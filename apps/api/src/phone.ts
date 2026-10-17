@@ -20,7 +20,7 @@ import type { Duplex } from 'node:stream';
 import type { DatabaseSync } from 'node:sqlite';
 import { consumeWsTicket } from './loopback-auth.js';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from '@mvp/agent-runtime';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -127,7 +127,7 @@ export class PhoneStore {
 
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSyncImpl(join(dataDir, 'phone.db'));
+    this.db = openDb(join(dataDir, 'phone.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS devices (
         id TEXT PRIMARY KEY,
@@ -622,6 +622,10 @@ export class PhoneSessionHub {
     const cleanup = (): void => {
       if (phoneConn) {
         this.phones.delete(phoneConn.deviceId);
+        // L1: drop the cached frame — a stale last-frame must not survive
+        // the session (privacy: the next viewer/poll would see a dead
+        // device's screen, and memory grows one entry per device forever).
+        this.latestFrames.delete(phoneConn.deviceId);
         const ended = this.store.endSession(phoneConn.session.id);
         this.store.bumpSession(phoneConn.session.id, phoneConn.frames, phoneConn.inputs);
         this.audit('phone.session_ended', {

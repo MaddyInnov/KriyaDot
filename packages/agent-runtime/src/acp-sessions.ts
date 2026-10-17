@@ -29,7 +29,8 @@ import { randomUUID } from 'node:crypto';
 import { AcpClient, AcpError } from './acp.js';
 import { defusePeerText, wrapPeerContent, type ProvenanceNote } from './provenance.js';
 
-const { DatabaseSync } = process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite');
+import { openDb } from './sqlite.js';
+import type { DatabaseSync } from 'node:sqlite';
 
 export type AcpSessionStatus = 'active' | 'busy' | 'closed' | 'error';
 
@@ -143,15 +144,16 @@ export interface AcpCreateOptions {
   command: string;
   args?: string[];
   label?: string;
-  cwd?: string;
+  /** Working directory for the agent. Required (L4): no ambient default. */
+  cwd: string;
 }
 
 /** SQLite-backed session + transcript store. */
 export class AcpSessionStore {
-  private readonly db: InstanceType<typeof DatabaseSync>;
+  private readonly db: DatabaseSync;
 
   constructor(dataDir: string) {
-    this.db = new DatabaseSync(`${dataDir.replace(/\/$/, '')}/acp-sessions.db`);
+    this.db = openDb(`${dataDir.replace(/\/$/, '')}/acp-sessions.db`);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS acp_sessions (
         id TEXT PRIMARY KEY,
@@ -328,7 +330,7 @@ export class AcpSessionManager {
     const args = Array.isArray(opts.args) ? opts.args.filter((a) => typeof a === 'string') : [];
     const id = `acp_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
     const label = opts.label?.trim().slice(0, 80) || command.split(/\s+/)[0] || 'acp-agent';
-    const session = this.store.insertSession({ id, label, command, args, ...(opts.cwd ? { cwd: opts.cwd } : {}), agentName: 'unknown' });
+    const session = this.store.insertSession({ id, label, command, args, cwd: opts.cwd, agentName: 'unknown' });
     try {
       const agentName = await this.attach(id, session);
       this.store.updateSession(id, { agentName });
@@ -477,7 +479,10 @@ export class AcpSessionManager {
     const client = new AcpClient({
       command: session.command,
       args: session.args,
-      ...(session.cwd ? { cwd: session.cwd } : {}),
+      // AcpClient requires an explicit cwd (L4). Sessions created before
+      // that carry no cwd — fall back explicitly here (caller-visible
+      // choice) rather than inside the client.
+      cwd: session.cwd ?? process.cwd(),
       onNotification: (method, params) => this.handleNotification(id, method, params),
     });
     let agentName = 'unknown';

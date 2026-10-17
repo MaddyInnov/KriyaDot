@@ -4,7 +4,7 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { createBuiltInTools } from '../src/tools/builtin.js';
+import { createBuiltInTools, isCatastrophicCommand } from '../src/tools/builtin.js';
 import type { ToolContext, ToolDefinition } from '../src/types.js';
 
 const CTX: ToolContext = { sessionId: 's', botId: 'b' };
@@ -72,5 +72,47 @@ describe('built-in tools', () => {
     expect(ok.stdout.trim()).toBe('hi');
     const failing = (await run.handler({ command: 'exit 3' }, CTX)) as { exitCode: number };
     expect(failing.exitCode).toBe(3);
+  });
+});
+
+describe('isCatastrophicCommand (M1: rm flag-variant bypass)', () => {
+  it('flags rm -rf / and the classic variants', () => {
+    for (const cmd of ['rm -rf /', 'rm -r -f /', 'rm -f -r /', 'rm -r /', 'rm -R /', 'sudo rm -rf /']) {
+      expect(isCatastrophicCommand(cmd)).toBe(true);
+    }
+  });
+
+  it('flags the M1 bypass variants', () => {
+    for (const cmd of [
+      'rm -rfv /etc',
+      'rm -rf --one-file-system /',
+      'rm -rfv --preserve-root=no /',
+      'rm --recursive --force /',
+      'rm -rfi /tmp/cache',
+    ]) {
+      expect(isCatastrophicCommand(cmd)).toBe(true);
+    }
+  });
+
+  it('does not flag benign commands', () => {
+    for (const cmd of [
+      'echo hello',
+      'rm -rf ./build',
+      'rm -rf workspace/out.txt',
+      'rm -f /tmp/stale.lock',
+      'rm -- -rf /',
+      'ls /etc',
+    ]) {
+      expect(isCatastrophicCommand(cmd)).toBe(false);
+    }
+  });
+
+  it('run_command refuses the bypass variants', async () => {
+    const { byName } = await makeTools();
+    const run = byName.get('run_command')!;
+    await expect(run.handler({ command: 'rm -rfv /etc' }, CTX)).rejects.toThrow(/denylist/);
+    await expect(run.handler({ command: 'rm -rf --one-file-system /' }, CTX)).rejects.toThrow(
+      /denylist/,
+    );
   });
 });

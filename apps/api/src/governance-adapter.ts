@@ -21,6 +21,7 @@ import type {
   ToolCall,
   ToolContext,
 } from '@mvp/agent-runtime';
+import { isRelayedOrigin } from '@mvp/agent-runtime';
 import { DEFAULT_POLICY, GovernanceGateway as RealGovernanceGateway } from '@mvp/governance';
 import type { Policy, SimulationResult } from '@mvp/governance';
 import { checkHardFloor } from '@mvp/governance';
@@ -28,8 +29,12 @@ import { checkHardFloor } from '@mvp/governance';
 // (index untouched); import the built subpath directly.
 import { mergeBotPolicy } from '@mvp/governance/dist/bot-policy.js';
 
-function toEvalContext(ctx: ToolContext): { sessionId: string; botId: string; actor: string } {
-  return { sessionId: ctx.sessionId, botId: ctx.botId, actor: ctx.botId };
+function toEvalContext(ctx: ToolContext): { sessionId: string; botId: string; actor: string; relayed?: boolean } {
+  // Guarded external messages: turns triggered by a relayed external
+  // message (webhook / external origin) mint relayed approvals, which can
+  // never be approved (fail-closed in the governance gateway).
+  const relayed = isRelayedOrigin(ctx.provenance?.origin) || ctx.provenance?.relayed === true ? true : undefined;
+  return { sessionId: ctx.sessionId, botId: ctx.botId, actor: ctx.botId, ...(relayed ? { relayed } : {}) };
 }
 
 export interface GovernanceAdapterOptions {

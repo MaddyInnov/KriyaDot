@@ -1101,6 +1101,15 @@ table.tbl tr:last-child td {
   color: var(--amber);
 }
 
+.prov-relayed {
+  font-weight: 700;
+  color: var(--info, #2a7fff);
+  border: 1px solid var(--info, #2a7fff);
+  border-radius: 4px;
+  padding: 0 4px;
+  margin-left: 4px;
+}
+
 .prov-security-note {
   margin-top: 8px;
   padding: 8px 10px;
@@ -2699,6 +2708,41 @@ html[data-theme='midnight'] .tk-fn { color: #67e8f9; }
   background: var(--surface);
   border-color: var(--border);
   box-shadow: var(--clay-pressed);
+}
+
+.convo-item.convo-hidden {
+  opacity: 0.55;
+}
+
+/* Conversation context menu (right-click). */
+.ctx-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+}
+.ctx-menu {
+  position: fixed;
+  z-index: 91;
+  min-width: 200px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--clay-raised);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+}
+.ctx-item {
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.ctx-item:hover {
+  background: var(--surface-2);
 }
 
 .convo-title {

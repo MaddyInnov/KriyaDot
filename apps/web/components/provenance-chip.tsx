@@ -15,6 +15,8 @@ export interface ProvenanceNoteDto {
   relayPath: string[];
   relayNames?: string[];
   timestamp: string;
+  /** Guarded external messages: relayed from an external source. */
+  relayed?: boolean;
 }
 
 const ORIGIN_META: Record<string, { icon: string; label: string }> = {
@@ -50,6 +52,11 @@ export function ProvenanceChip({ note, compact }: { note?: ProvenanceNoteDto | n
     <span className="prov-chip" title={`Origin: ${meta.label} · ${formatRelayChip(note)} · ${note.timestamp}`}>
       <span aria-hidden="true">{meta.icon}</span>{' '}
       <span className="prov-relay">{formatRelayChip(note)}</span>
+      {note.relayed === true && (
+        <span className="prov-relayed" title="Relayed from an external source — can never satisfy an approval">
+          📨 relayed
+        </span>
+      )}
       {!compact && (
         <span className={`prov-origin${untrusted ? ' untrusted' : ''}`}>
           {untrusted ? '⚠️ untrusted origin' : meta.label}

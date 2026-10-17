@@ -294,7 +294,9 @@ describe('docker backend', () => {
     expect(res.stdout).toBe('ok\n');
     const [{ cmd, args }] = dockerState.spawnCalls;
     expect(cmd).toBe('docker');
-    expect(args.slice(0, 3)).toEqual(['run', '--rm', '--network']);
+    expect(args.slice(0, 3)).toEqual(['run', '--rm', '--name']);
+    expect(args[3]).toMatch(/^kriyadot-sandbox-/);
+    expect(args).toContain('--network');
     expect(args).toContain('none');
     expect(args).toContain('--memory');
     expect(args).toContain('512m');
@@ -318,7 +320,10 @@ describe('docker backend', () => {
 
   it('kills the container and reports timedOut on timeout', async () => {
     let childRef: FakeChild | null = null;
-    dockerState.spawnImpl = () => {
+    dockerState.spawnImpl = (_cmd: unknown, args: unknown) => {
+      // The M7 reapContainer() also spawns (`docker kill`); only the `run`
+      // child is the one under test.
+      if (Array.isArray(args) && args[0] === 'kill') return new FakeChild();
       childRef = new FakeChild(); // never emits close
       return childRef;
     };
@@ -326,6 +331,37 @@ describe('docker backend', () => {
     expect(res.exitCode).toBe(124);
     expect(res.timedOut).toBe(true);
     expect(childRef!.killedSignal).toBe('SIGKILL');
+  });
+
+  it('names the container uniquely and docker-kills it on timeout (M7)', async () => {
+    dockerState.spawnImpl = () => new FakeChild(); // never emits close → timeout
+    const res = await executeSandboxedCommand('sleep 999', { timeoutMs: 50 });
+    expect(res.timedOut).toBe(true);
+    const runCall = dockerState.spawnCalls.find((c) => c.cmd === 'docker' && c.args[0] === 'run');
+    expect(runCall).toBeDefined();
+    const nameIdx = runCall!.args.indexOf('--name');
+    expect(nameIdx).toBeGreaterThan(-1);
+    const name = runCall!.args[nameIdx + 1];
+    expect(name).toMatch(/^kriyadot-sandbox-[0-9a-f]{12}$/);
+    const killCall = dockerState.spawnCalls.find(
+      (c) => c.cmd === 'docker' && c.args[0] === 'kill',
+    );
+    expect(killCall).toBeDefined();
+    expect(killCall!.args).toEqual(['kill', name]);
+  });
+
+  it('docker-kills the container on normal completion too (M7, best-effort)', async () => {
+    dockerState.spawnImpl = () => {
+      const child = new FakeChild();
+      queueMicrotask(() => child.emit('close', 0, null));
+      return child;
+    };
+    const res = await executeSandboxedCommand('echo hi');
+    expect(res.exitCode).toBe(0);
+    const killCalls = dockerState.spawnCalls.filter(
+      (c) => c.cmd === 'docker' && c.args[0] === 'kill',
+    );
+    expect(killCalls).toHaveLength(1);
   });
 
   it('truncates oversized docker output with a notice', async () => {

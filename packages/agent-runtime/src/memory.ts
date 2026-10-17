@@ -16,8 +16,9 @@ import {
   type SyncEmbedder,
 } from './hybrid-search.js';
 
-const { DatabaseSync } = process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite');
-type DatabaseSyncType = InstanceType<typeof DatabaseSync>;
+import { openDb } from './sqlite.js';
+import type { DatabaseSync } from 'node:sqlite';
+type DatabaseSyncType = DatabaseSync;
 
 /**
  * Bot ids are used as file names, so restrict them to a safe alphabet.
@@ -593,7 +594,7 @@ export class TieredMemoryStore {
 
   constructor(dataDir: string, opts: TieredMemoryOptions = {}) {
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSync(join(dataDir, 'tiered-memory.db'));
+    this.db = openDb(join(dataDir, 'tiered-memory.db'));
     this.db.exec(ATOM_TABLE);
     this.db.exec(ENTITY_TABLE);
     this.db.exec(EVENT_TABLE);
@@ -804,6 +805,46 @@ export class TieredMemoryStore {
   unpinAtom(botId: string, id: string): boolean {
     const res = this.db.prepare('UPDATE memory_atoms SET pinned = 0 WHERE bot_id = ? AND id = ?').run(botId, id);
     return res.changes > 0;
+  }
+
+  /**
+   * Set an atom's active flag directly (memory-upkeep journal + tidy pass).
+   * Inactive atoms are kept for the audit trail but excluded from recall.
+   */
+  setAtomActive(botId: string, id: string, active: boolean): boolean {
+    const res = this.db
+      .prepare('UPDATE memory_atoms SET active = ? WHERE bot_id = ? AND id = ?')
+      .run(active ? 1 : 0, botId, id);
+    return res.changes > 0;
+  }
+
+  /** Recent L0 raw turn events for a bot, newest first (memory-upkeep capture pass). */
+  listRecentEvents(botId: string, limit = 200): MemoryEvent[] {
+    const rows = this.db
+      .prepare(
+        'SELECT id, ts, bot_id AS botId, session_id AS sessionId, role, text, tool_calls_json AS toolCallsJson, tier FROM memory_events WHERE bot_id = ? ORDER BY ts DESC, rowid DESC LIMIT ?',
+      )
+      .all(botId, Math.min(Math.max(limit, 1), 1000)) as Array<{
+        id: string; ts: number; botId: string; sessionId: string;
+        role: string; text: string; toolCallsJson: string; tier: string | null;
+      }>;
+    return rows.map((r) => ({
+      id: r.id,
+      ts: r.ts,
+      botId: r.botId,
+      sessionId: r.sessionId,
+      role: (r.role === 'assistant' ? 'assistant' : 'user') as 'user' | 'assistant',
+      text: r.text,
+      toolCalls: (() => {
+        try {
+          const v = JSON.parse(r.toolCallsJson) as unknown;
+          return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+        } catch {
+          return [];
+        }
+      })(),
+      tier: (r.tier ?? 'cloud-ok') as PrivacyTier,
+    }));
   }
 
   /**

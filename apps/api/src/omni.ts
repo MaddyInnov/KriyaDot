@@ -33,7 +33,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { TieredMemoryStore, heuristicDistill } from '@mvp/agent-runtime';
 import { OllamaProvider, ollamaHost } from '@mvp/agent-runtime/dist/providers/ollama.js';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from '@mvp/agent-runtime';
 
 export const DAY_MS = 24 * 60 * 60 * 1000;
 export const WEEK_MS = 7 * DAY_MS;
@@ -270,7 +270,7 @@ export class OmniStore {
 
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSyncImpl(join(dataDir, 'omni.db'));
+    this.db = openDb(join(dataDir, 'omni.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS omni_items (
         id TEXT PRIMARY KEY,

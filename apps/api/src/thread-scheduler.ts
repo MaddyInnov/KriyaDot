@@ -17,7 +17,7 @@ import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import type { AgentRuntime, BotConfig } from '@mvp/agent-runtime';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from '@mvp/agent-runtime';
 
 export type ThreadScheduleKind = 'bot-turn' | 'workflow';
 
@@ -121,7 +121,7 @@ export class ThreadScheduleStore {
     const { mkdirSync } = require('node:fs') as typeof import('node:fs');
     const { join } = require('node:path') as typeof import('node:path');
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSyncImpl(join(dataDir, 'thread-schedules.db'));
+    this.db = openDb(join(dataDir, 'thread-schedules.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS thread_schedules (
         id TEXT PRIMARY KEY,

@@ -8,6 +8,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { confineRealpath } from '@mvp/agent-runtime';
 
 export interface FileNode {
   name: string;
@@ -21,14 +22,13 @@ const MAX_FILES = 2000;
 const MAX_FILE_BYTES = 512 * 1024; // 512 KB cap per read
 const SKIP_DIRS = new Set(['node_modules', '.git', '__pycache__', '.venv', 'dist', 'build', '.next']);
 
-/** Resolve `p` inside `root`. Throws if it escapes. */
+/**
+ * Resolve `p` inside `root`, following symlinks (M3). Throws if the real
+ * path escapes — a symlink pointing outside the workspace is rejected,
+ * while symlinks staying inside are allowed.
+ */
 export function confineFile(root: string, p: string): string {
-  const resolvedRoot = path.resolve(root);
-  const resolved = path.resolve(resolvedRoot, p);
-  if (resolved !== resolvedRoot && !resolved.startsWith(resolvedRoot + path.sep)) {
-    throw new Error('Path escapes workspace');
-  }
-  return resolved;
+  return confineRealpath(root, p);
 }
 
 function toPosix(p: string): string {

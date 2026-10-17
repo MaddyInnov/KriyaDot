@@ -35,7 +35,7 @@ import type { Request, Response } from 'express';
 import type { AgentRuntime, BotConfig } from '@mvp/agent-runtime';
 import type { StreamEvent } from '@mvp/agent-runtime';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb as openSqliteDb } from '@mvp/agent-runtime';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -226,7 +226,7 @@ function openDb(dataDir: string): DatabaseSync {
   const { mkdirSync } = require('node:fs') as typeof import('node:fs');
   const { join } = require('node:path') as typeof import('node:path');
   mkdirSync(dataDir, { recursive: true });
-  const db = new DatabaseSyncImpl(join(dataDir, 'pages.db'));
+  const db = openSqliteDb(join(dataDir, 'pages.db'));
   db.exec(SCHEMA);
   return db;
 }

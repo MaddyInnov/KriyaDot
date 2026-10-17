@@ -13,8 +13,9 @@
 // `node:sqlite` specifier, so it is loaded at runtime).
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const { DatabaseSync } = process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite');
-type DatabaseSyncType = InstanceType<typeof DatabaseSync>;
+import { openDb } from '@mvp/agent-runtime';
+import type { DatabaseSync } from 'node:sqlite';
+type DatabaseSyncType = DatabaseSync;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS mm_feed_brief (
@@ -277,7 +278,7 @@ export class ModuleDb {
 
   constructor(dbPath: string) {
     this.path = dbPath;
-    this.db = new DatabaseSync(dbPath);
+    this.db = openDb(dbPath);
     this.db.exec(SCHEMA);
   }
 

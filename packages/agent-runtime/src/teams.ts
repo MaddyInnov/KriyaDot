@@ -12,7 +12,7 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from './sqlite.js';
 
 export interface Team {
   id: string;
@@ -200,7 +200,7 @@ export class TeamStore {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { join } = require('node:path') as typeof import('node:path');
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSyncImpl(join(dataDir, 'teams.db'));
+    this.db = openDb(join(dataDir, 'teams.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS teams (
         id TEXT PRIMARY KEY,

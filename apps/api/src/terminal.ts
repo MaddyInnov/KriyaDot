@@ -48,11 +48,22 @@ interface LiveSession {
   pty?: { write: (d: string) => void; resize: (c: number, r: number) => void; kill: () => void };
   output: string;
   subscribers: Set<(chunk: string) => void>;
+  /**
+   * True when this child was spawned detached (host backend) with a real
+   * pid: close() kills the whole process GROUP so orphaned grandchildren
+   * (e.g. `sleep 300 &`) die too. Only ever set for children we spawned
+   * ourselves via the detached spawn path — never for injected fakes.
+   */
+  groupKill: boolean;
 }
 
 const MAX_OUTPUT = 256 * 1024; // ring buffer per session
 const MAX_WRITE = 64 * 1024; // max bytes per input write
 const DOCKER_BOOT_TIMEOUT_MS = 25_000;
+const KILL_GRACE_MS = 3_000; // SIGTERM → SIGKILL escalation delay
+const SESSION_EVICT_AFTER_MS = 30 * 60 * 1000; // evict closed sessions after 30 min
+const SESSION_SWEEP_INTERVAL_MS = 5 * 60 * 1000; // sweep every 5 min
+const MAX_SESSIONS = 200; // hard cap on tracked sessions
 
 function appendOutput(live: LiveSession, chunk: string): void {
   live.output += chunk;
@@ -107,14 +118,61 @@ export class TerminalManager {
       cmd: string,
       args: string[],
       opts: { cwd: string; env: NodeJS.ProcessEnv },
-    ) => ChildProcess = (cmd, args, opts) => spawn(cmd, args, { ...opts, stdio: ['pipe', 'pipe', 'pipe'] }),
+    ) => ChildProcess = (cmd, args, opts) => spawn(cmd, args, { ...opts, stdio: ['pipe', 'pipe', 'pipe'], detached: true }),
     private readonly probes: {
       pty?: () => unknown | undefined;
       docker?: () => boolean;
     } = {},
   ) {}
 
+  /**
+   * Eviction sweep: drop closed sessions older than SESSION_EVICT_AFTER_MS,
+   * then enforce the MAX_SESSIONS cap by evicting oldest-closed first. Open
+   * sessions are never evicted. Runs periodically (see ensureSweep) and can
+   * be triggered directly via sweepNow() (tests / admin).
+   */
+  sweepNow(): void {
+    const now = Date.now();
+    for (const [id, live] of this.sessions) {
+      if (live.meta.status === 'closed' && (live.meta.closedAt ?? 0) + SESSION_EVICT_AFTER_MS <= now) {
+        this.sessions.delete(id);
+      }
+    }
+    if (this.sessions.size > MAX_SESSIONS) {
+      const closedByAge = [...this.sessions.entries()]
+        .filter(([, live]) => live.meta.status === 'closed')
+        .sort((a, b) => (a[1].meta.closedAt ?? 0) - (b[1].meta.closedAt ?? 0));
+      for (const [id] of closedByAge) {
+        if (this.sessions.size <= MAX_SESSIONS) break;
+        this.sessions.delete(id);
+      }
+    }
+  }
+
+  private sweepTimer: ReturnType<typeof setInterval> | null = null;
+
+  private ensureSweep(): void {
+    if (this.sweepTimer) return;
+    this.sweepTimer = setInterval(() => {
+      try {
+        this.sweepNow();
+      } catch {
+        // sweep must never crash the process
+      }
+    }, SESSION_SWEEP_INTERVAL_MS);
+    this.sweepTimer.unref?.();
+  }
+
+  /** Stop the background eviction sweep (tests / shutdown). */
+  stopSweep(): void {
+    if (this.sweepTimer) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = null;
+    }
+  }
+
   async create(opts: CreateTerminalOptions): Promise<TerminalSession> {
+    this.ensureSweep();
     const id = randomUUID();
     const cols = Math.min(Math.max(opts.cols ?? 100, 20), 300);
     const rows = Math.min(Math.max(opts.rows ?? 30, 5), 120);
@@ -152,7 +210,7 @@ export class TerminalManager {
         env,
       });
       meta.backend = 'pty';
-      const live: LiveSession = { meta, proc: undefined as unknown as ChildProcess, pty: p, output: '', subscribers: new Set() };
+      const live: LiveSession = { meta, proc: undefined as unknown as ChildProcess, pty: p, output: '', subscribers: new Set(), groupKill: false };
       p.onData((d) => appendOutput(live, d));
       p.onExit(() => this.markClosed(id));
       this.sessions.set(id, live);
@@ -166,7 +224,7 @@ export class TerminalManager {
         const proc = await this.spawnDocker(image, opts.workspaceDir, cols, rows, env);
         meta.backend = 'docker';
         meta.sandboxed = true;
-        this.attachProc(id, meta, proc);
+        this.attachProc(id, meta, proc, false);
         return { ...meta };
       } catch {
         // fall through to host shell
@@ -175,7 +233,11 @@ export class TerminalManager {
 
     const shell = shellForPlatform();
     const proc = this.spawnFn(shell.cmd, shell.args, { cwd: opts.workspaceDir, env });
-    this.attachProc(id, meta, proc);
+    // Host shells are spawned detached (see the default spawnFn): close()
+    // kills the whole process group. Only set when the child is real —
+    // injected test fakes have no numeric pid and stay on proc.kill().
+    const groupKill = typeof proc.pid === 'number' && proc.pid > 0;
+    this.attachProc(id, meta, proc, groupKill);
     return { ...meta };
   }
 
@@ -218,8 +280,8 @@ export class TerminalManager {
     });
   }
 
-  private attachProc(id: string, meta: TerminalSession, proc: ChildProcess): void {
-    const live: LiveSession = { meta, proc, output: '', subscribers: new Set() };
+  private attachProc(id: string, meta: TerminalSession, proc: ChildProcess, groupKill: boolean): void {
+    const live: LiveSession = { meta, proc, output: '', subscribers: new Set(), groupKill };
     proc.stdout?.on('data', (d: Buffer) => appendOutput(live, d.toString('utf8')));
     proc.stderr?.on('data', (d: Buffer) => appendOutput(live, d.toString('utf8')));
     proc.on('exit', () => this.markClosed(id));
@@ -282,24 +344,63 @@ export class TerminalManager {
   close(id: string): boolean {
     const live = this.sessions.get(id);
     if (!live || live.meta.status !== 'open') return false;
+    this.killSession(live);
+    this.markClosed(id);
+    return true;
+  }
+
+  /**
+   * Kill a session's child. Host children were spawned detached, so the
+   * whole process GROUP is signalled — orphaned grandchildren (e.g. a
+   * backgrounded `sleep 300 &`) die instead of lingering. SIGTERM first,
+   * SIGKILL after a grace period if the process is still alive. (The old
+   * code gated the SIGKILL escalation on `meta.status === 'open'`, but
+   * markClosed() runs synchronously in close(), so the escalation could
+   * never fire — escalation is now gated on the process actually exiting.)
+   */
+  private killSession(live: LiveSession): void {
     try {
       if (live.pty) {
         live.pty.kill();
-      } else {
-        live.proc.kill('SIGTERM');
-        setTimeout(() => {
+        return;
+      }
+      const proc = live.proc;
+      if (!proc || proc.exitCode != null || proc.signalCode != null) return; // already reaped
+      // Negative pids (process groups) are POSIX-only; on Windows fall back
+      // to signalling the child directly.
+      const groupKill = live.groupKill && typeof proc.pid === 'number' && proc.pid > 0 && process.platform !== 'win32';
+      if (groupKill) {
+        try {
+          process.kill(-proc.pid, 'SIGTERM');
+        } catch {
+          // already gone
+        }
+        const escalate = setTimeout(() => {
           try {
-            if (live.meta.status === 'open') live.proc.kill('SIGKILL');
+            if (proc.exitCode == null && proc.signalCode == null) process.kill(-proc.pid!, 'SIGKILL');
           } catch {
             // already gone
           }
-        }, 2000).unref?.();
+        }, KILL_GRACE_MS);
+        escalate.unref?.();
+      } else {
+        try {
+          proc.kill('SIGTERM');
+        } catch {
+          // already gone
+        }
+        const escalate = setTimeout(() => {
+          try {
+            if (proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+          } catch {
+            // already gone
+          }
+        }, KILL_GRACE_MS);
+        escalate.unref?.();
       }
     } catch {
       // fall through to markClosed
     }
-    this.markClosed(id);
-    return true;
   }
 
   private markClosed(id: string): void {

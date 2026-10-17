@@ -150,7 +150,10 @@ export function createDelegateTools(opts: CreateDelegateToolsOptions): ToolDefin
               `Add { "acp": { "command": "opencode", "args": ["acp"] } } to the bot config.`,
           );
         }
-        const client = new AcpClient({ ...acpOpts, cwd: opts.workspaceDir });
+        // L4: AcpClient requires an explicit cwd. The delegate tool owns the
+        // workspace concept, so the fallback lives here, visibly — not
+        // hidden inside the client.
+        const client = new AcpClient({ ...acpOpts, cwd: opts.workspaceDir ?? process.cwd() });
         try {
           await client.connect();
           const text = await client.prompt(task);

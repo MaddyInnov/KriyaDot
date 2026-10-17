@@ -434,3 +434,36 @@ describe('mcp-oauth probe + manual + deeplink', () => {
     expect(done.json.server).toBe('testmcp');
   });
 });
+
+describe('pending-flow sweeper (L7)', () => {
+  it('purges expired flows on the 60s interval without route traffic', async () => {
+    const { __testMcpOAuthHooks } = await import('../src/mcp-oauth.js');
+    vi.useFakeTimers();
+    try {
+      __testMcpOAuthHooks.stopSweepForTest(); // drop any real-timer sweep from earlier tests
+      const before = __testMcpOAuthHooks.pendingFlowCount();
+      __testMcpOAuthHooks.addPendingFlow('expired-1', 10 * 60 * 1000);
+      __testMcpOAuthHooks.addPendingFlow('fresh-1', 10 * 60 * 1000);
+      expect(__testMcpOAuthHooks.pendingFlowCount()).toBe(before + 2);
+      // Advance past the TTL: the interval sweeper fires and drops the old ones.
+      vi.advanceTimersByTime(11 * 60 * 1000);
+      expect(__testMcpOAuthHooks.pendingFlowCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps unexpired flows across sweeps', async () => {
+    const { __testMcpOAuthHooks } = await import('../src/mcp-oauth.js');
+    vi.useFakeTimers();
+    try {
+      __testMcpOAuthHooks.stopSweepForTest();
+      const before = __testMcpOAuthHooks.pendingFlowCount();
+      __testMcpOAuthHooks.addPendingFlow('fresh-2', 10 * 60 * 1000);
+      vi.advanceTimersByTime(5 * 60 * 1000);
+      expect(__testMcpOAuthHooks.pendingFlowCount()).toBe(before + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

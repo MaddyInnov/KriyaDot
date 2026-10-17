@@ -36,7 +36,7 @@ import type { MetricSample, RegressionAlert, RunHealthStore } from '@mvp/run-hea
 import { CalendarEventStore } from './tasks.js';
 import { NoteStore } from './notes.js';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from '@mvp/agent-runtime';
 
 // ---- Contract types (mirror apps/web/lib/kriyadot-api.ts) -----------------------
 
@@ -127,7 +127,7 @@ export class BriefingStore {
 
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSyncImpl(join(dataDir, 'briefing.db'));
+    this.db = openDb(join(dataDir, 'briefing.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS briefings (
         id TEXT PRIMARY KEY,

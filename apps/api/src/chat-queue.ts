@@ -11,9 +11,28 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 
-const { DatabaseSync: DatabaseSyncImpl } = process.getBuiltinModule('node:sqlite');
+import { openDb } from '@mvp/agent-runtime';
 
 export type QueuedMessageStatus = 'queued' | 'started';
+
+/**
+ * L6: per-session queue bounds. A runaway client (or a stuck turn) must not
+ * grow one session's queue without limit, and a queued message obeys the
+ * same size bound as a direct /chat message (L5).
+ */
+export const MAX_QUEUE_DEPTH_PER_SESSION = 50;
+export const MAX_QUEUED_MESSAGE_CHARS = 200_000;
+
+/** Error from enqueue() carrying the HTTP status the route should return. */
+export class ChatQueueError extends Error {
+  constructor(
+    message: string,
+    readonly statusCode: number,
+  ) {
+    super(message);
+    this.name = 'ChatQueueError';
+  }
+}
 
 export interface QueuedMessage {
   id: string;
@@ -87,7 +106,7 @@ export class ChatQueueStore {
     const { mkdirSync } = require('node:fs') as typeof import('node:fs');
     const { join } = require('node:path') as typeof import('node:path');
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSyncImpl(join(dataDir, 'chat-queue.db'));
+    this.db = openDb(join(dataDir, 'chat-queue.db'));
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS chat_queue (
         id TEXT PRIMARY KEY,
@@ -110,6 +129,15 @@ export class ChatQueueStore {
 
   /** Enqueue a message. Returns the id and 1-based position in the session queue. */
   enqueue(input: EnqueueInput): { id: string; position: number } {
+    if (input.message.length > MAX_QUEUED_MESSAGE_CHARS) {
+      throw new ChatQueueError(`message exceeds ${MAX_QUEUED_MESSAGE_CHARS} characters`, 400);
+    }
+    if (this.countForSession(input.sessionId) >= MAX_QUEUE_DEPTH_PER_SESSION) {
+      throw new ChatQueueError(
+        `session queue is full (${MAX_QUEUE_DEPTH_PER_SESSION} pending messages)`,
+        429,
+      );
+    }
     const id = randomUUID();
     const now = Date.now();
     this.db

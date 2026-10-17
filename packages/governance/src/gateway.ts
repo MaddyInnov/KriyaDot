@@ -6,10 +6,9 @@ import { redactSecrets } from './redact.js';
 // instead of a top-level `import ... from 'node:sqlite'` because this repo's
 // vitest (Vite 5.4.21) cannot statically resolve that specifier
 // ("Failed to load url sqlite"). The cast keeps full typing.
-const { DatabaseSync } = process.getBuiltinModule(
-  'node:sqlite',
-) as typeof import('node:sqlite');
-type Database = InstanceType<typeof DatabaseSync>;
+import { openDb } from './sqlite.js';
+import type { DatabaseSync } from 'node:sqlite';
+type Database = DatabaseSync;
 import { DENYLIST_COMMAND_RE } from './default-policy.js';
 import { checkHardFloor, type HardFloorConfig, type HardFloorHit } from './hard-floors.js';
 import type {
@@ -45,6 +44,16 @@ export interface GatewayOptions {
   approvalTimeoutMs?: number;
   /** Hard floors config. Defaults to { enabled: true }. */
   hardFloors?: HardFloorConfig;
+  /** Audit-log retention tuning (M4). Defaults keep newest 50,000 rows plus
+   *  the last 90 days, pruning every 1,000 inserts. */
+  auditRetention?: AuditRetentionOptions;
+}
+
+/** Tunables for the audit_log retention sweep (M4). */
+export interface AuditRetentionOptions {
+  maxRows?: number;
+  maxAgeMs?: number;
+  pruneEveryInserts?: number;
 }
 
 export type PreHook = (
@@ -79,6 +88,7 @@ interface ApprovalRow {
   decided_by: string | null;
   note: string | null;
   provenance: string | null;
+  relayed: number | null;
 }
 
 /** Raw DB row shape for the audit_log table. */
@@ -124,6 +134,17 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 `;
 
 /**
+ * Audit-log retention (M4): the audit table is append-only but bounded.
+ * Pruning keeps the NEWEST `AUDIT_RETENTION_MAX_ROWS` rows plus every row
+ * from the last `AUDIT_RETENTION_MAX_AGE_MS` — whichever keeps more — and
+ * deletes the rest. Pruning runs every `AUDIT_PRUNE_EVERY_INSERTS` inserts
+ * so a long-lived gateway never grows the table without bound.
+ */
+export const AUDIT_RETENTION_MAX_ROWS = 50_000;
+export const AUDIT_RETENTION_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
+export const AUDIT_PRUNE_EVERY_INSERTS = 1_000;
+
+/**
  * Deny-by-default action gateway.
  *
  * Every proposed tool call is classified, matched against the policy (first
@@ -158,16 +179,31 @@ export class GovernanceGateway {
   private readonly waiters = new Map<string, Waiter>();
   private readonly preHooks: PreHook[] = [];
   private readonly postHooks: PostHook[] = [];
+  private auditInsertsSincePrune = 0;
+  private readonly auditMaxRows: number;
+  private readonly auditMaxAgeMs: number;
+  private readonly auditPruneEvery: number;
 
   constructor(options: GatewayOptions) {
     this.policy = options.policy;
     this.approvalTimeoutMs = options.approvalTimeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS;
     this.hardFloorConfig = options.hardFloors ?? { enabled: true };
-    this.db = new DatabaseSync(options.dbPath);
+    const ar = options.auditRetention ?? {};
+    this.auditMaxRows = ar.maxRows ?? AUDIT_RETENTION_MAX_ROWS;
+    this.auditMaxAgeMs = ar.maxAgeMs ?? AUDIT_RETENTION_MAX_AGE_MS;
+    this.auditPruneEvery = ar.pruneEveryInserts ?? AUDIT_PRUNE_EVERY_INSERTS;
+    this.db = openDb(options.dbPath);
     this.db.exec(SCHEMA);
     // Migration: provenance column for older databases.
     try {
       this.db.exec('ALTER TABLE approvals ADD COLUMN provenance TEXT');
+    } catch {
+      // Column already exists.
+    }
+    // Migration (guarded external messages): relayed flag — a relayed
+    // message can NEVER satisfy an approval.
+    try {
+      this.db.exec('ALTER TABLE approvals ADD COLUMN relayed INTEGER NOT NULL DEFAULT 0');
     } catch {
       // Column already exists.
     }
@@ -326,7 +362,10 @@ export class GovernanceGateway {
       return { effect: 'deny' };
     }
     if (floorHit) {
-      const approvalId = this.requestApproval(toolName, args, ctx, { provenance: 'hard-floor-escalated' });
+      const approvalId = this.requestApproval(toolName, args, ctx, {
+        provenance: 'hard-floor-escalated',
+        relayed: ctx.relayed,
+      });
       this.audit('tool.evaluate', {
         actor: ctx.actor,
         sessionId: ctx.sessionId,
@@ -387,7 +426,7 @@ export class GovernanceGateway {
     }
 
     // require-approval: persist a pending approval with a redacted args snapshot.
-    const approvalId = this.requestApproval(toolName, args, ctx);
+    const approvalId = this.requestApproval(toolName, args, ctx, { relayed: ctx.relayed });
     this.audit('approval.created', {
       actor: ctx.actor,
       sessionId: ctx.sessionId,
@@ -407,7 +446,7 @@ export class GovernanceGateway {
     toolName: string,
     args: Record<string, unknown>,
     ctx: EvalContext,
-    opts: { provenance?: string } = {},
+    opts: { provenance?: string; relayed?: boolean } = {},
   ): string {
     const record: ApprovalRecord = {
       id: randomUUID(),
@@ -419,12 +458,13 @@ export class GovernanceGateway {
       args: redactSecrets(args),
       status: 'pending',
       provenance: opts.provenance,
+      ...(opts.relayed === true ? { relayed: true } : {}),
     };
     this.db
       .prepare(
         `INSERT INTO approvals
-           (id, ts, session_id, bot_id, actor, tool_name, args_json, status, provenance)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (id, ts, session_id, bot_id, actor, tool_name, args_json, status, provenance, relayed)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         record.id,
@@ -436,6 +476,7 @@ export class GovernanceGateway {
         JSON.stringify(record.args),
         record.status,
         record.provenance ?? null,
+        record.relayed === true ? 1 : 0,
       );
     return record.id;
   }
@@ -481,6 +522,10 @@ export class GovernanceGateway {
    * Record a human decision on a pending approval. Throws if the approval
    * does not exist or is no longer pending. Resolves any in-flight
    * awaitDecision() waiter and appends an audit entry.
+   *
+   * Guarded external messages: a relayed approval can NEVER be approved —
+   * the decision throws, the approval stays pending (the operator can deny
+   * it explicitly). Denying a relayed approval is always allowed.
    */
   decide(
     approvalId: string,
@@ -493,6 +538,18 @@ export class GovernanceGateway {
     }
     if (rec.status !== 'pending') {
       throw new Error(`approval ${approvalId} is ${rec.status}, not pending`);
+    }
+    if (decision === 'approved' && rec.relayed === true) {
+      this.audit('approval.relayed_blocked', {
+        actor: opts.decidedBy ?? rec.actor,
+        sessionId: rec.sessionId,
+        toolName: rec.toolName,
+        decision: 'deny',
+        detail: { approvalId, reason: 'relayed messages can never satisfy an approval' },
+      });
+      throw new Error(
+        `approval ${approvalId} was raised from a relayed external message and cannot be approved — deny it or handle it out of band`,
+      );
     }
     const now = Date.now();
     this.db
@@ -580,6 +637,37 @@ export class GovernanceGateway {
         fields.decision ?? null,
         detailJson,
       );
+    // M4: periodic retention sweep — every K inserts, prune old rows. A
+    // prune failure must never break auditing, so it is best-effort.
+    this.auditInsertsSincePrune += 1;
+    if (this.auditInsertsSincePrune >= this.auditPruneEvery) {
+      this.auditInsertsSincePrune = 0;
+      try {
+        this.pruneAuditLog(this.auditMaxRows, this.auditMaxAgeMs);
+      } catch {
+        // ignore — auditing continues; the next sweep retries
+      }
+    }
+  }
+
+  /**
+   * Enforce audit-log retention (M4): keep the newest `maxRows` rows plus
+   * every row newer than `maxAgeMs` — whichever keeps more — and delete the
+   * rest. Public so admins/tests can trigger it directly.
+   */
+  pruneAuditLog(
+    maxRows: number = AUDIT_RETENTION_MAX_ROWS,
+    maxAgeMs: number = AUDIT_RETENTION_MAX_AGE_MS,
+  ): { deleted: number } {
+    const cutoff = Date.now() - maxAgeMs;
+    const result = this.db
+      .prepare(
+        `DELETE FROM audit_log
+          WHERE id NOT IN (SELECT id FROM audit_log ORDER BY id DESC LIMIT ?)
+            AND ts < ?`,
+      )
+      .run(Math.max(0, Math.floor(maxRows)), cutoff);
+    return { deleted: Number(result.changes ?? 0) };
   }
 
   /** Append-only audit log, newest first. */
@@ -679,6 +767,7 @@ export class GovernanceGateway {
       decidedBy: row.decided_by ?? undefined,
       note: row.note ?? undefined,
       provenance: row.provenance ?? undefined,
+      relayed: row.relayed === 1 ? true : undefined,
     };
   }
 }

@@ -43,6 +43,8 @@ describe('chat-threads router', () => {
         listThreads: (opts) => store.listSessions(opts ?? {}),
         branchSession: (id, msgId, opts) => store.branchSession(id, msgId, opts?.botId),
         listThreadMessages: (id) => store.listThreadMessages(id),
+        duplicateThread: (id) => store.duplicateSession(id),
+        deleteThread: (id) => store.deleteSession(id),
         audit: (action, fields) => {
           audits.push({ action, fields });
         },

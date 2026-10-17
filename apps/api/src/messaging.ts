@@ -23,6 +23,7 @@ import { randomUUID } from 'node:crypto';
 import type { GovernanceGateway } from '@mvp/governance';
 import type { AppConfig } from './config.js';
 import { syncProviderKeysToEnv } from './providers.js';
+import type { OnBehalfOfLedger } from '@mvp/agent-runtime';
 
 // ---------------------------------------------------------------------------
 // Provider interface + registry
@@ -404,6 +405,12 @@ export interface InboundMessage {
   text?: string;
   /** Full raw payload for provider-specific fields. */
   raw: unknown;
+  /**
+   * Guarded external messages: inbound provider messages are always
+   * relayed — they arrive via a third party and can never satisfy an
+   * approval. The onBehalfOf ledger holds the (from, on-behalf-of) entry.
+   */
+  relayed: true;
 }
 
 const MAX_INBOUND_LOG = 200;
@@ -437,6 +444,7 @@ function parseTelegramUpdate(update: unknown): InboundMessage | null {
     chatId: m.chat?.id !== undefined ? String(m.chat.id) : undefined,
     text: typeof m.text === 'string' ? m.text : undefined,
     raw: update,
+    relayed: true,
   };
 }
 
@@ -477,6 +485,7 @@ export function parseDiscordMessage(payload: unknown, botUserId?: string): Disco
     chatId: p.channel_id,
     text: content || undefined,
     raw: payload,
+    relayed: true,
     mentioned: mentionsBot,
   };
 }
@@ -520,6 +529,7 @@ export function parseSlackEvent(payload: unknown): SlackInbound {
           chatId: e.channel,
           text: text || undefined,
           raw: payload,
+          relayed: true,
         },
       };
     }
@@ -573,6 +583,13 @@ export interface MessagingRouteDeps {
    * mentions are logged/audited but not answered.
    */
   onMention?: (info: MentionInfo) => Promise<string | undefined>;
+  /**
+   * Guarded external messages: onBehalfOf ledger. When set, every inbound
+   * provider message is recorded as a relayed message (who sent it on whose
+   * behalf, when) and the approval gate treats turns from these messages as
+   * relayed (they can never satisfy an approval).
+   */
+  relayLedger?: OnBehalfOfLedger;
 }
 
 function errorBody(error: string, detail?: string): { error: string; detail?: string } {
@@ -587,7 +604,7 @@ function clampWaitMs(raw: unknown): number {
 }
 
 export function registerMessagingRoutes(router: express.Router, deps: MessagingRouteDeps): void {
-  const { config, governance, onMention } = deps;
+  const { config, governance, onMention, relayLedger } = deps;
 
   /** Run the agent turn for a mention and reply in the channel. Fire-and-forget from the webhook. */
   const handleMention = (info: MentionInfo): void => {
@@ -616,6 +633,18 @@ export function registerMessagingRoutes(router: express.Router, deps: MessagingR
 
   const recordInbound = (inbound: InboundMessage): void => {
     pushInbound(inbound);
+    // Guarded external messages: ledger the relay (who → on whose behalf).
+    try {
+      relayLedger?.record({
+        messageId: inbound.id,
+        source: 'messaging',
+        from: inbound.from ?? inbound.providerId,
+        onBehalfOf: inbound.chatId ?? inbound.providerId,
+        note: `inbound ${inbound.providerId} message`,
+      });
+    } catch {
+      // ledgering must never break receipt
+    }
     governance.audit('message.inbound', {
       actor: 'provider',
       sessionId: inbound.chatId,

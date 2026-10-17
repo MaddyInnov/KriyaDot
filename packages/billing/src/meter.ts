@@ -5,8 +5,9 @@
 
 // vitest cannot statically resolve the `node:sqlite` specifier, so load it
 // at runtime via the builtin-module API (same trick as agent-runtime stores).
-const { DatabaseSync } = process.getBuiltinModule('node:sqlite') as typeof import('node:sqlite');
-type DatabaseSyncType = InstanceType<typeof DatabaseSync>;
+import { openDb } from './sqlite.js';
+import type { DatabaseSync } from 'node:sqlite';
+type DatabaseSyncType = DatabaseSync;
 
 export type UsageKind = 'tokens' | 'workflow' | 'sandbox';
 
@@ -54,7 +55,7 @@ export class UsageMeter {
   private readonly db: DatabaseSyncType;
 
   constructor(dbPath: string) {
-    this.db = new DatabaseSync(dbPath);
+    this.db = openDb(dbPath);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS usage_events (
         id TEXT PRIMARY KEY,

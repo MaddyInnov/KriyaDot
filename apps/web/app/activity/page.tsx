@@ -11,6 +11,9 @@ import { CostPanel } from '../../components/activity/cost-panel';
 import { useUxMode } from '../../lib/ux-mode';
 
 import { RulesPanel } from '../../components/activity/rules-panel';
+import { HealthPanel } from '../../components/activity/health-panel';
+import { RoutingPanel } from '../../components/activity/routing-panel';
+import { RecoveryPanel } from '../../components/activity/recovery-panel';
 
 const TABS = [
   { id: 'briefing', label: 'Briefing', pro: false },
@@ -18,6 +21,9 @@ const TABS = [
   { id: 'spaces', label: 'Spaces', pro: false },
   { id: 'summary', label: 'Summary', pro: false },
   { id: 'rules', label: 'Rules', pro: false },
+  { id: 'routing', label: 'Routing', pro: false },
+  { id: 'recovery', label: 'Recovery', pro: false },
+  { id: 'health', label: 'Health', pro: false },
   { id: 'cost', label: 'Cost', pro: true },
   { id: 'audit', label: 'Audit log', pro: false },
 ] as const;
@@ -56,6 +62,9 @@ export default function ActivityPage() {
         {activeTab === "spaces" && <SpacePanel />}
         {activeTab === "summary" && <OmniPanel />}
         {activeTab === "rules" && <RulesPanel />}
+        {activeTab === "routing" && <RoutingPanel />}
+        {activeTab === "recovery" && <RecoveryPanel />}
+        {activeTab === "health" && <HealthPanel />}
         {activeTab === "cost" && <CostPanel />}
         {activeTab === "audit" && <AuditPanel hideHeader />}
       </div>
