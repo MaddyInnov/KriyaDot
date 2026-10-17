@@ -162,7 +162,7 @@ fn refresh_tray_menu(app: &AppHandle, state: &SidecarState) {
 fn start_health_watch(app: AppHandle, state: SidecarState) {
     tauri::async_runtime::spawn(async move {
         loop {
-            tauri::async_runtime::sleep(Duration::from_secs(15)).await;
+            tokio::time::sleep(Duration::from_secs(15)).await;
             let alive = tauri::async_runtime::spawn_blocking(|| {
                 use std::net::TcpStream;
                 TcpStream::connect_timeout(
@@ -222,9 +222,17 @@ fn main() {
             let menu = Menu::with_items(app, &[&show, &status, &restart, &quit])?;
 
             let tray_state = state.clone();
+            // tauri 2.x Image has no from_bytes: decode the bundled PNG to
+            // raw RGBA first (the asset is compiled in, so this cannot fail
+            // at runtime unless the build itself is broken).
+            let icon_img = image::load_from_memory(include_bytes!("../icons/32x32.png"))
+                .expect("bundled tray icon decodes")
+                .to_rgba8();
+            let (icon_w, icon_h) = (icon_img.width(), icon_img.height());
+            let icon = tauri::image::Image::new_owned(icon_img.into_raw(), icon_w, icon_h);
             let _tray = TrayIconBuilder::with_id("main")
                 .tooltip("KriyaDot")
-                .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))?)
+                .icon(icon)
                 .menu(&menu)
                 .show_menu_on_left_click(true)
                 .on_menu_event(move |app, event| match event.id.as_ref() {
