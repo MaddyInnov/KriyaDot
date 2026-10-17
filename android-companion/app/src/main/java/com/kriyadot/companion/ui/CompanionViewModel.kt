@@ -31,6 +31,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import org.json.JSONObject
 
 /**
@@ -196,7 +197,7 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 val messaging = com.google.firebase.messaging.FirebaseMessaging.getInstance()
-                val token = kotlinx.coroutines.tasks.await(messaging.token)
+                val token = messaging.token.await()
                 api.registerFcmToken(token)
             } catch (_: Exception) {
                 // FCM unavailable — the WebSocket covers the foreground case.

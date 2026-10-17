@@ -106,6 +106,7 @@ fun ScreenShareScreen(vm: CompanionViewModel, nav: NavController) {
                         color = MaterialTheme.colorScheme.primary,
                     )
                     ZoomableScreenImage(bitmap = bitmap!!, scale = scale, offset = offset,
+                        modifier = Modifier.weight(1f, fill = false),
                         onTransform = { zoom, pan ->
                             scale = (scale * zoom).coerceIn(1f, 6f)
                             offset = if (scale <= 1f) Offset.Zero else offset + pan
@@ -125,15 +126,15 @@ private fun ZoomableScreenImage(
     scale: Float,
     offset: Offset,
     onTransform: (zoom: Float, pan: Offset) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val imageBitmap = remember(bitmap) { bitmap.asImageBitmap() }
     Image(
         bitmap = imageBitmap,
         contentDescription = "Live PC screen",
         contentScale = ContentScale.Fit,
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
-            .weight(1f, fill = false)
             .graphicsLayer(
                 scaleX = scale,
                 scaleY = scale,
