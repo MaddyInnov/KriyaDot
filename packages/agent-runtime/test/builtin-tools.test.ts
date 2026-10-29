@@ -61,6 +61,9 @@ describe('built-in tools', () => {
     await expect(run.handler({ command: ':(){ :|:& };:' }, CTX)).rejects.toThrow(/denylist/);
   });
 
+  // 60s, not the 5s default: on machines with Docker this goes through a
+  // real `docker run` (cold image pull + container start included), which
+  // is environment latency, not test work — 5s made CI flake on slow pulls.
   it('runs benign commands and captures output', async () => {
     const { byName } = await makeTools();
     const run = byName.get('run_command')!;
@@ -72,7 +75,7 @@ describe('built-in tools', () => {
     expect(ok.stdout.trim()).toBe('hi');
     const failing = (await run.handler({ command: 'exit 3' }, CTX)) as { exitCode: number };
     expect(failing.exitCode).toBe(3);
-  });
+  }, 60_000);
 });
 
 describe('isCatastrophicCommand (M1: rm flag-variant bypass)', () => {
