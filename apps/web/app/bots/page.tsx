@@ -12,6 +12,8 @@ import { ApprovalModeSelector } from '../../components/panels/approval-mode-sele
 import { MemoryPanel } from '../../components/panels/memory-panel';
 import { RoutinesPanel } from '../../components/panels/routines-panel';
 import TeamsPanel from '../../components/panels/teams-panel';
+import PeoplePanel from '../../components/panels/people-panel';
+import { BotSetupPanel } from '../../components/panels/bot-setup-panel';
 
 const EFFECTS: BotPolicyEffect[] = ['allow', 'deny', 'require-approval'];
 
@@ -293,12 +295,19 @@ function ModelPicker({
   onSaved,
 }: {
   bot: BotConfig;
-  onSaved: (botId: string, model: string, modelOptions?: ModelOptions) => void;
+  onSaved: (
+    botId: string,
+    model: string,
+    modelOptions?: ModelOptions,
+    backup?: { backupProvider?: string; backupModel?: string },
+  ) => void;
 }) {
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [agentModels, setAgentModels] = useState<AgentModel[]>([]);
   const [selected, setSelected] = useState(bot.model);
   const [options, setOptions] = useState<ModelOptions>(bot.modelOptions ?? {});
+  const [backupProvider, setBackupProvider] = useState(bot.backupProvider ?? '');
+  const [backupModel, setBackupModel] = useState(bot.backupModel ?? '');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -306,6 +315,8 @@ function ModelPicker({
   useEffect(() => {
     setSelected(bot.model);
     setOptions(bot.modelOptions ?? {});
+    setBackupProvider(bot.backupProvider ?? '');
+    setBackupModel(bot.backupModel ?? '');
     setError('');
   }, [bot.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -347,12 +358,26 @@ function ModelPicker({
   const showEffort = !current || current.supportsReasoningEffort !== false;
   const showFast = !current || current.supportsFastMode !== false;
 
+  const backupProviderInfo = providers.find((p) => p.id === backupProvider);
+  const backupModels: AgentModel[] = (backupProviderInfo?.models ?? []).map((m) => ({ id: m.id, name: m.name }));
+
   const save = async () => {
     setSaving(true);
     setError('');
     try {
-      const res = await setBotModel(bot.id, selected || null, Object.keys(options).length > 0 ? options : null);
-      onSaved(bot.id, res.model ?? selected, res.modelOptions);
+      const res = await setBotModel(
+        bot.id,
+        selected || null,
+        Object.keys(options).length > 0 ? options : null,
+        {
+          backupProvider: backupProvider || null,
+          backupModel: backupProvider ? backupModel || null : null,
+        },
+      );
+      onSaved(bot.id, res.model ?? selected, res.modelOptions, {
+        backupProvider: res.backupProvider,
+        backupModel: res.backupModel,
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -408,6 +433,56 @@ function ModelPicker({
               Fast mode (prefer lowest-latency variant)
             </label>
           )}
+          {provider?.usageWarning && (
+            <div className="error-box" style={{ marginBottom: 12 }} role="status">
+              ⚠️ {provider.usageWarning.message} — this provider is approaching its limit.
+            </div>
+          )}
+          <div style={{ borderTop: '1px solid var(--border, #e5e7eb)', paddingTop: 12, marginBottom: 12 }}>
+            <label className="small" style={{ display: 'block', marginBottom: 4 }}>
+              Backup AI provider <span className="muted">(failover — used automatically when the primary hits its usage limit)</span>
+            </label>
+            <select
+              value={backupProvider}
+              onChange={(e) => {
+                setBackupProvider(e.target.value);
+                setBackupModel('');
+              }}
+              style={{ width: '100%', marginBottom: 12 }}
+              aria-label="Backup AI provider"
+            >
+              <option value="">None — use the next eligible provider</option>
+              {providers
+                .filter((p) => p.id !== bot.provider)
+                .map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                    {p.usageWarning ? ` — ⚠️ ${p.usageWarning.usedPercent}% used` : ''}
+                  </option>
+                ))}
+            </select>
+            {backupProvider && backupModels.length > 0 && (
+              <>
+                <label className="small" style={{ display: 'block', marginBottom: 4 }}>Backup model</label>
+                <select
+                  value={backupModel}
+                  onChange={(e) => setBackupModel(e.target.value)}
+                  style={{ width: '100%', marginBottom: 12 }}
+                  aria-label="Backup AI model"
+                >
+                  <option value="">Provider default</option>
+                  {backupModels.map((m) => (
+                    <option key={m.id} value={m.id}>{m.name}</option>
+                  ))}
+                </select>
+              </>
+            )}
+            {backupProviderInfo?.usageWarning && (
+              <p className="small" style={{ color: 'var(--warn, #e65100)' }}>
+                ⚠️ {backupProviderInfo.usageWarning.message} — the backup is also near its limit.
+              </p>
+            )}
+          </div>
           <button onClick={save} disabled={saving} className="btn btn-primary">
             {saving ? 'Saving…' : 'Save model'}
           </button>
@@ -713,6 +788,7 @@ function BotsPageInner() {
   const [error, setError] = useState('');
   const [tab, setTab] = useState<'policy' | 'model' | 'robustness' | 'computer' | 'memory' | 'routines'>('policy');
   const [pageTab, setPageTab] = useState<'bots' | 'teams'>('bots');
+  const [showSetup, setShowSetup] = useState(false);
   const [mode] = useUxMode();
   const [rosterBusy, setRosterBusy] = useState(false);
   const [rosterError, setRosterError] = useState('');
@@ -799,8 +875,19 @@ function BotsPageInner() {
     setBots((prev) => prev.map((b) => (b.id === botId ? { ...b, approvalMode } : b)));
   };
 
-  const onModelSaved = (botId: string, model: string, modelOptions?: ModelOptions) => {
-    setBots((prev) => prev.map((b) => (b.id === botId ? { ...b, model, modelOptions } : b)));
+  const onModelSaved = (
+    botId: string,
+    model: string,
+    modelOptions?: ModelOptions,
+    backup?: { backupProvider?: string; backupModel?: string },
+  ) => {
+    setBots((prev) =>
+      prev.map((b) =>
+        b.id === botId
+          ? { ...b, model, modelOptions, backupProvider: backup?.backupProvider, backupModel: backup?.backupModel }
+          : b,
+      ),
+    );
   };
 
   const onVoiceSaved = (botId: string, voice: VoiceSettings) => {
@@ -848,7 +935,10 @@ function BotsPageInner() {
         </button>
       </div>
       {pageTab === 'teams' ? (
-        <TeamsPanel bots={bots} onRosterChanged={refresh} />
+        <>
+          <TeamsPanel bots={bots} onRosterChanged={refresh} />
+          <PeoplePanel bots={bots} onRosterChanged={refresh} />
+        </>
       ) : (
       <div className="chat-layout">
         <aside className="bot-roster">
@@ -869,6 +959,9 @@ function BotsPageInner() {
           ))}
           {bots.length === 0 && !error && <div className="small muted">{t('bots.loadingBots')}</div>}
           <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button type="button" className="btn btn-sm btn-primary" onClick={() => setShowSetup(true)}>
+              ✨ Set me up
+            </button>
             <button type="button" className="btn btn-sm" onClick={onExportRoster} disabled={rosterBusy}>
               ⬇ Export roster
             </button>
@@ -933,7 +1026,12 @@ function BotsPageInner() {
           )}
         </aside>
         <div className="chat-main">
-          {selectedBot ? (
+          {showSetup ? (
+            <BotSetupPanel
+              onCreated={() => void refresh()}
+              onCancel={() => setShowSetup(false)}
+            />
+          ) : selectedBot ? (
             <>
               <div className="tabs" role="tablist" aria-label="Bot sections" style={{ marginBottom: 12 }}>
                 {tabs.map((t) => (

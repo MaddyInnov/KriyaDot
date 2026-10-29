@@ -55,6 +55,25 @@ import {
   noProgressReport,
   type TurnFailureKind,
 } from './progress-guard.js';
+import {
+  classifyProviderError,
+  computeResumeAtMs,
+  currentUsageWarning,
+  resolveFailoverTarget,
+  usageWarningFromSnapshot,
+  type UsageWarning,
+} from './failover.js';
+import { getRateLimit } from './providers/rate-limit.js';
+import { TurnStateRegistry } from './turn-state.js';
+import { BotTurnScheduler } from './turn-scheduler.js';
+import { isOwnWorkspaceRead } from './own-files.js';
+import {
+  SpanStore,
+  detectLoops,
+  extractToolCostCents,
+  mapTurnOutcome,
+} from './spans.js';
+import type { RunOutcome, SpanKind } from './spans.js';
 
 export interface AgentRuntimeOptions {
   dbPath: string;
@@ -120,6 +139,25 @@ export interface AgentRuntimeOptions {
    * Unset → no peer gating (previous behavior).
    */
   peerApprovalGate?: PeerApprovalGate;
+  /**
+  /**
+   * W13 observability: span/trace store. When set, every turn is recorded
+   * as session > turn > llm/tool spans (auto-instrumented at the provider
+   * and tool-execution choke points in runTurn). When unset and `dbPath`
+   * is a real file, the runtime lazily opens a sibling `spans.db` next to
+   * the session DB; with `dbPath: ':memory:'` and no store, recording is
+   * off. Span-store failures are always isolated — they never break a turn.
+   */
+  spanStore?: SpanStore;
+  /**
+   * Per-bot extra tools (W9: per-bot private MCP servers). Called per turn
+   * with the bot id; returned definitions are merged into the bot's tool
+   * set for that turn only (an extra with the same name as a registry tool
+   * replaces it for this bot). The provider must scope strictly by botId —
+   * the runtime trusts it the same way it trusts the shared registry.
+   * Unset → no per-bot extras (previous behavior).
+   */
+  extraToolsForBot?: (botId: string) => ToolDefinition[];
 }
 
 /**
@@ -168,6 +206,13 @@ export interface RunTurnOptions {
   bot: BotConfig;
   message: string;
   sessionId?: string;
+  /**
+   * Multiplayer layer (W7): the person who owns the private 1:1 chat this
+   * turn belongs to. When the runtime creates a NEW session for this turn
+   * it is stamped with this owner; existing sessions keep their owner.
+   * Absent → the session is unowned (belongs to the default user).
+   */
+  ownerPersonId?: string;
   /**
    * Conversation id for per-conversation overrides (P1 #14: pinned computer
    * surface). Defaults to sessionId when the call site doesn't set it.
@@ -310,6 +355,15 @@ export interface RunTurnOptions {
    * gate is treated as a deny (fail closed).
    */
   spendCapGate?: SpendCapGate;
+  /**
+   * Own-files auto-allow (W8e): absolute paths of this bot's OWN
+   * workspace/memory areas. Read-only file operations whose realpath-
+   * confined target lies inside one of these are auto-allowed before
+   * governance policy evaluation, at any approval level. Writes and
+   * reads outside these areas are governed normally. Unset → no
+   * auto-allow (previous behavior).
+   */
+  ownWorkspaceDirs?: string[];
 }
 
 export interface PreviewToolInfo {
@@ -396,6 +450,11 @@ export class AgentRuntime {
    * AgentRuntimeOptions.peerApprovalGate; consulted before governance.
    */
   private readonly peerApprovalGate?: PeerApprovalGate;
+  private readonly extraToolsForBot?: AgentRuntimeOptions['extraToolsForBot'];
+  /** W13: span store (explicit, or lazily opened sibling spans.db). */
+  private spanStoreExplicit?: SpanStore;
+  private spanStoreLazy: SpanStore | null | undefined;
+  private readonly dbPath: string;
   /** Provider instances cached per providerId (see resolveProvider). */
   private readonly providerCache = new Map<string, LLMProvider>();
   /**
@@ -415,6 +474,23 @@ export class AgentRuntime {
   private readonly contextProviders: TurnContextProvider[] = [];
   private defaultSpendCapGateFactory: ((botId: string) => SpendCapGate) | null = null;
   private credentialProposer: CredentialProposer | null = null;
+  /**
+   * Live turn state (W8a): what each busy bot is doing right now.
+   * Updated as turns progress; entries clear on turn end/error. The
+   * API layer serves this at GET /api/chat/now ("Now" cards).
+   */
+  readonly turnStates = new TurnStateRegistry();
+  /**
+   * Parallel threads (W8g): per-bot cap of 16 concurrent turns. Turns
+   * for different threads/bots never serialize on each other — a turn
+   * only waits when its bot is already at the cap.
+   */
+  private readonly turnScheduler = new BotTurnScheduler();
+
+  /** The per-bot parallel-thread scheduler (exposed for host/tests). */
+  get scheduler(): BotTurnScheduler {
+    return this.turnScheduler;
+  }
 
   constructor(opts: AgentRuntimeOptions) {
     this.store = new SessionStore(opts.dbPath, opts.sessionStoreOptions);
@@ -429,6 +505,32 @@ export class AgentRuntime {
     this.telemetry = opts.telemetry;
     this.hooks = opts.hooks;
     this.peerApprovalGate = opts.peerApprovalGate;
+    this.extraToolsForBot = opts.extraToolsForBot;
+    this.spanStoreExplicit = opts.spanStore;
+    this.dbPath = opts.dbPath;
+  }
+
+  /**
+   * W13: resolve the span store for auto-instrumentation. An explicitly
+   * provided store wins; otherwise a sibling `spans.db` next to the
+   * session database is opened lazily (never for ':memory:'). Any failure
+   * resolves to null — observability must never break a turn.
+   */
+  getSpanStore(): SpanStore | null {
+    if (this.spanStoreExplicit) return this.spanStoreExplicit;
+    if (this.spanStoreLazy !== undefined) return this.spanStoreLazy;
+    try {
+      if (!this.dbPath || this.dbPath === ':memory:') {
+        this.spanStoreLazy = null;
+      } else {
+        const slash = this.dbPath.lastIndexOf('/');
+        const dir = slash >= 0 ? this.dbPath.slice(0, slash) : '.';
+        this.spanStoreLazy = new SpanStore(`${dir}/spans.db`);
+      }
+    } catch {
+      this.spanStoreLazy = null;
+    }
+    return this.spanStoreLazy;
   }
 
   /** Direct access to the session store (host API layers, e.g. worktree binding). */
@@ -438,6 +540,14 @@ export class AgentRuntime {
 
   close(): void {
     this.store.close();
+    if (this.spanStoreLazy) {
+      try {
+        this.spanStoreLazy.close();
+      } catch {
+        // best-effort
+      }
+      this.spanStoreLazy = null;
+    }
   }
 
   /**
@@ -616,10 +726,40 @@ export class AgentRuntime {
       if (def) tools.push(def);
       else missing.push(name);
     }
+    // Per-bot extras (W9 private MCP servers): scoped to THIS bot by the
+    // host provider; same-named extras replace registry entries for this
+    // bot's turn only — the shared registry is never mutated.
+    if (this.extraToolsForBot) {
+      let extras: ToolDefinition[] = [];
+      try {
+        extras = this.extraToolsForBot(bot.id) ?? [];
+      } catch {
+        extras = [];
+      }
+      for (const extra of extras) {
+        const idx = tools.findIndex((t) => t.name === extra.name);
+        if (idx >= 0) tools[idx] = extra;
+        else tools.push(extra);
+      }
+    }
     return { tools, missing };
   }
 
+  /**
+   * Run one turn. Wrapped by the per-bot parallel-thread scheduler
+   * (W8g): up to 16 concurrent turns per bot, FIFO beyond the cap;
+   * different bots never block each other.
+   */
   async runTurn(opts: RunTurnOptions): Promise<TokenUsage> {
+    const release = await this.turnScheduler.acquire(opts.bot.id);
+    try {
+      return await this.runTurnInner(opts);
+    } finally {
+      release();
+    }
+  }
+
+  private async runTurnInner(opts: RunTurnOptions): Promise<TokenUsage> {
     // Model resolution (Phase 3 smart routing):
     // 1. Call-site providerId/model always win outright.
     // 2. A bot-pinned model wins (user override per bot).
@@ -655,7 +795,9 @@ export class AgentRuntime {
     assertModelAllowed(providerId, model);
     // Spaces: a per-turn API key override bypasses the cached provider so
     // this turn (and only this turn) authenticates with the space's key.
-    const provider: LLMProvider = opts.apiKeyOverride
+    // AI failover (W1): `provider` is mutable — a hard limit failure swaps
+    // it (plus providerId/model) for the backup exactly once per turn.
+    let provider: LLMProvider = opts.apiKeyOverride
       ? createProvider(providerId, { apiKey: opts.apiKeyOverride })
       : this.resolveProvider(providerId);
     const maxIterations = opts.maxIterations ?? DEFAULT_MAX_ITERATIONS;
@@ -664,10 +806,85 @@ export class AgentRuntime {
       await opts.onEvent(e);
     };
 
-    const sessionId = opts.sessionId ?? this.store.createSession(opts.bot.id);
+    const sessionId =
+      opts.sessionId ?? this.store.createSession(opts.bot.id, { ownerPersonId: opts.ownerPersonId });
     if (opts.sessionId === undefined && this.hooks) {
       // session.created hook — never blocks a turn.
       await this.hooks.emit('session.created', { sessionId, botId: opts.bot.id }).catch(() => undefined);
+    }
+    // Live step line (W8a): register this turn in the turn-state
+    // registry and mirror every step change as a `step` stream event.
+    // The entry is cleared in the main try's finally below, on every
+    // exit path (done / error / interrupted / abort).
+    this.turnStates.begin({ botId: opts.bot.id, botName: opts.bot.name, sessionId, step: 'Thinking' });
+    const emitStep = async (step: string, stepIndex?: number, stepTotal?: number): Promise<void> => {
+      const state = this.turnStates.update(sessionId, { step, stepIndex, stepTotal });
+      if (!state) return;
+      await emit({
+        type: 'step',
+        botId: state.botId,
+        sessionId: state.sessionId,
+        step: state.step,
+        stepIndex: state.stepIndex,
+        stepTotal: state.stepTotal,
+        startedAt: state.startedAt,
+        elapsedMs: state.elapsedMs,
+      });
+    };
+    // W13 observability: open the run + session/turn span tree for this
+    // turn. All span writes go through failure-isolated helpers — a span
+    // store error must never break a turn, so every call is wrapped.
+    const spanStore = this.getSpanStore();
+    let spanRunId: string | null = null;
+    let sessionSpanId: string | null = null;
+    let turnSpanId: string | null = null;
+    let turnOutcome: RunOutcome = 'success';
+    let turnError: string | undefined;
+    const spanStart = (
+      kind: SpanKind,
+      name: string,
+      parentSpanId: string | null,
+      payload?: unknown,
+    ): string | null => {
+      if (!spanStore || !spanRunId) return null;
+      try {
+        return spanStore.startSpan({
+          runId: spanRunId,
+          sessionId,
+          parentSpanId,
+          kind,
+          name,
+          botId: opts.bot.id,
+          payload,
+        }).id;
+      } catch {
+        return null;
+      }
+    };
+    const spanEnd = (
+      id: string | null,
+      patch: { status: 'ok' | 'error'; payload?: unknown; error?: string; costCents?: number },
+    ): void => {
+      if (!spanStore || !id) return;
+      try {
+        spanStore.endSpan(id, patch);
+      } catch {
+        // Span persistence must never break a turn.
+      }
+    };
+    if (spanStore) {
+      try {
+        const run = spanStore.createRun({ sessionId, botId: opts.bot.id, kind: 'session' });
+        spanRunId = run.runId;
+        sessionSpanId = spanStart('session', `session ${sessionId}`, null);
+        turnSpanId = spanStart('turn', 'turn', sessionSpanId, {
+          input: { message: opts.message },
+        });
+      } catch {
+        spanRunId = null;
+        sessionSpanId = null;
+        turnSpanId = null;
+      }
     }
     // Peer provenance (OpenMausBot parity P1 #13): when the triggering
     // message did not originate with the user, the turn is bot-originated.
@@ -695,7 +912,14 @@ export class AgentRuntime {
       credentialProposer: this.credentialProposer ?? undefined,
       widget: widgetCoordinator
         ? {
-            raise: (i) => widgetCoordinator.raise({ ...i, sessionId, botId: opts.bot.id }),
+            // W7: questions are addressed to the bot's owner person.
+            raise: (i) =>
+              widgetCoordinator.raise({
+                ...i,
+                sessionId,
+                botId: opts.bot.id,
+                addresseePersonId: opts.bot.ownerId,
+              }),
             emit,
             awaitAnswer: (id, ms) => widgetCoordinator.awaitAnswer(id, ms, opts.signal),
           }
@@ -727,6 +951,32 @@ export class AgentRuntime {
     // builds one (fresh per turn, so in-flight cost reservations never
     // leak across turns). Covers chat, group rooms, routines, fusion.
     const spendCapGate = opts.spendCapGate ?? this.defaultSpendCapGateFactory?.(opts.bot.id);
+    // AI failover (W1): at most ONE provider switch per turn — no loops.
+    // `failoverNotified` enforces the tell-the-user-once rule; when the
+    // backup also limit-fails the error surfaces normally.
+    let failoverUsed = false;
+    let failoverNotified = false;
+    let limitFailureRecorded = false;
+    const warnedProviders = new Set<string>();
+    const emitUsageWarning = async (w: UsageWarning | null): Promise<void> => {
+      if (!w || warnedProviders.has(w.providerId)) return;
+      warnedProviders.add(w.providerId);
+      this.audit({
+        type: 'turn.usage_warning',
+        sessionId,
+        botId: opts.bot.id,
+        detail: { providerId: w.providerId, usedPercent: w.usedPercent, source: w.source },
+      });
+      await emit({
+        type: 'usage_warning',
+        providerId: w.providerId,
+        providerName: w.providerName,
+        usedPercent: w.usedPercent,
+        source: w.source,
+        message: w.message,
+      });
+      await emit({ type: 'notice', kind: 'near-limit', message: `${w.message} — approaching the provider limit.` });
+    };
     let totalUsage = emptyUsage();
     // Approval ids minted by THIS turn, so an abort can withdraw them
     // (fail-closed) instead of leaving stale cards in the inbox.
@@ -780,6 +1030,9 @@ export class AgentRuntime {
         );
         totalUsage = addUsage(totalUsage, planOk.usage);
         if (!planOk.approved) {
+          // W13 outcome: the turn ended AT the plan-approval gate — it was
+          // waiting on human input (denied / timed out / no plan).
+          turnOutcome = mapTurnOutcome({ waitingForInput: true });
           this.finishTelemetryRun(telRunId, 'interrupted', totalUsage, providerId, model, telIterations);
           return totalUsage;
         }
@@ -787,6 +1040,7 @@ export class AgentRuntime {
       }
       for (let iteration = 0; iteration < maxIterations; iteration++) {
         telIterations += 1;
+        await emitStep('Thinking', iteration + 1, maxIterations);
         opts.signal?.throwIfAborted();
         // Privacy-tier gate: the provider call is a cloud egress. When the
         // host attached tier-tagged items, a single `local-only` item denies
@@ -822,6 +1076,8 @@ export class AgentRuntime {
               detail: { estimatedCallCostCents: estCallCents, iteration },
             });
             recordTurnFailure('spend_cap_exceeded', msg, { estimatedCallCostCents: estCallCents });
+            turnOutcome = mapTurnOutcome({ errored: true });
+            turnError = msg;
             await emit({ type: 'spend_cap_reached', message: msg, capKind: 'spend-cap' });
             await emit({ type: 'error', message: msg });
             this.finishTelemetryRun(telRunId, 'interrupted', totalUsage, providerId, model, telIterations);
@@ -842,17 +1098,35 @@ export class AgentRuntime {
               detail: { projected, cap: opts.maxBudgetUsd, iteration },
             });
             recordTurnFailure('budget_exceeded', msg, { projected, cap: opts.maxBudgetUsd });
+            turnOutcome = mapTurnOutcome({ errored: true });
+            turnError = msg;
             await emit({ type: 'spend_cap_reached', message: msg, capKind: 'turn-budget' });
             await emit({ type: 'error', message: msg });
             this.finishTelemetryRun(telRunId, 'interrupted', totalUsage, providerId, model, telIterations);
             return totalUsage;
           }
         }
+        // Near-limit warning (W1): from the provider's latest rate-limit
+        // header snapshot. No snapshot / no numbers → no warning (the
+        // provider exposes no usage data; nothing is fabricated).
+        await emitUsageWarning(currentUsageWarning(providerId));
         const llmStep = telRunId ? this.telemetry?.startStep(telRunId, `llm:${model}`, 'llm') : null;
         let turn: Awaited<ReturnType<LLMProvider['chat']>>;
-        try {
-          turn = await provider.chat(messages, tools, {
-            model,
+        // W13 AUTO-INSTRUMENTATION (provider choke point): EVERY LLM call
+        // in the platform funnels through doChat → provider.chat, so the
+        // llm span is created here — no per-feature manual logging. The
+        // payload records the exact (redacted, capped) prompt messages at
+        // start and the completion at end; cost is the token cost in cents.
+        const doChat = async (
+          p: LLMProvider,
+          mdl: string,
+        ): Promise<Awaited<ReturnType<LLMProvider['chat']>>> => {
+          const llmSpanId = spanStart('llm', `llm:${mdl}`, turnSpanId, {
+            input: { providerId: p.providerId, model: mdl, messages },
+          });
+          try {
+            const result = await p.chat(messages, tools, {
+            model: mdl,
             onToken: (t) => {
               void emit({ type: 'token', content: t });
             },
@@ -900,11 +1174,123 @@ export class AgentRuntime {
               }
             },
           });
+            // Cost attribution must never break the call it measures.
+            let llmCostCents: number | undefined;
+            try {
+              llmCostCents = costOfUsage(p.providerId, mdl, result.usage).total * 100;
+            } catch {
+              llmCostCents = undefined;
+            }
+            spanEnd(llmSpanId, {
+              status: 'ok',
+              costCents: llmCostCents,
+              payload: {
+                output: { content: result.content, toolCalls: result.toolCalls, usage: result.usage },
+              },
+            });
+            return result;
+          } catch (err) {
+            spanEnd(llmSpanId, {
+              status: 'error',
+              error: err instanceof Error ? err.message : String(err),
+            });
+            throw err;
+          }
+        };
+        try {
+          turn = await doChat(provider, model);
           llmStep?.end({ ok: true });
         } catch (err) {
-          llmStep?.end({ ok: false, errorKind: err instanceof Error ? err.name : 'Error' });
-          throw err;
+          // AI failover (W1): a hard usage-limit / quota failure switches
+          // the turn to the backup provider/model ONCE and retries this
+          // call. Transient 429s never reach here as failover triggers —
+          // the drivers already retry them, and classification requires
+          // quota semantics. If the backup also limit-fails (or no target
+          // exists), the original error surfaces normally.
+          const classified = classifyProviderError(err, { providerId });
+          if (classified.usagePercent !== undefined && classified.usagePercent >= 80) {
+            await emitUsageWarning({
+              providerId,
+              providerName: providerId,
+              usedPercent: classified.usagePercent,
+              source: 'error',
+              message: `${providerId}: ${classified.usagePercent}% used`,
+            });
+          }
+          const target =
+            classified.isLimit && !failoverUsed
+              ? resolveFailoverTarget({ bot: opts.bot, excludeProviderId: providerId })
+              : null;
+          if (!target) {
+            llmStep?.end({ ok: false, errorKind: err instanceof Error ? err.name : 'Error' });
+            if (classified.isLimit) {
+              limitFailureRecorded = true;
+              recordTurnFailure('provider_limit', classified.message, {
+                providerId,
+                model,
+                resetAtMs: classified.resetAtMs,
+                resumeAtMs: computeResumeAtMs(classified),
+                failoverUsed,
+              });
+            }
+            throw err;
+          }
+          failoverUsed = true;
+          let backupProvider: LLMProvider;
+          try {
+            assertModelAllowed(target.providerId, target.modelId);
+            backupProvider = opts.apiKeyOverride
+              ? createProvider(target.providerId, { apiKey: opts.apiKeyOverride })
+              : this.resolveProvider(target.providerId);
+          } catch {
+            llmStep?.end({ ok: false, errorKind: err instanceof Error ? err.name : 'Error' });
+            throw err;
+          }
+          const fromProvider = providerId;
+          const fromModel = model;
+          provider = backupProvider;
+          providerId = target.providerId;
+          model = target.modelId;
+          const noticeMsg =
+            `${fromProvider}/${fromModel} hit its usage limit — this turn continues on ` +
+            `${target.providerId}/${target.modelId} (${target.reason}).`;
+          this.audit({
+            type: 'turn.failover',
+            sessionId,
+            botId: ctx.botId,
+            detail: {
+              fromProvider,
+              fromModel,
+              toProvider: target.providerId,
+              toModel: target.modelId,
+              reason: target.reason,
+              resetAtMs: classified.resetAtMs,
+              resumeAtMs: computeResumeAtMs(classified),
+            },
+          });
+          if (!failoverNotified) {
+            failoverNotified = true;
+            await emit({
+              type: 'failover',
+              fromProvider,
+              fromModel,
+              toProvider: target.providerId,
+              toModel: target.modelId,
+              reason: target.reason,
+              message: noticeMsg,
+            });
+            await emit({ type: 'notice', kind: 'failover', message: noticeMsg });
+          }
+          try {
+            turn = await doChat(provider, model);
+            llmStep?.end({ ok: true });
+          } catch (backupErr) {
+            llmStep?.end({ ok: false, errorKind: backupErr instanceof Error ? backupErr.name : 'Error' });
+            throw backupErr;
+          }
         }
+        // Post-call near-limit check: the call just refreshed the snapshot.
+        await emitUsageWarning(usageWarningFromSnapshot(providerId, getRateLimit(providerId)));
         totalUsage = addUsage(totalUsage, turn.usage);
 
         // Budget cap: stop fail-closed if the turn's accumulated cost
@@ -916,6 +1302,8 @@ export class AgentRuntime {
             const msg = `Budget cap reached: $${cost.toFixed(4)} spent (cap $${opts.maxBudgetUsd.toFixed(4)}). Turn stopped.`;
             this.audit({ type: 'turn.budget_cap', sessionId, botId: ctx.botId, detail: { cost, cap: opts.maxBudgetUsd } });
             recordTurnFailure('budget_exceeded', msg, { cost, cap: opts.maxBudgetUsd });
+            turnOutcome = mapTurnOutcome({ errored: true });
+            turnError = msg;
             await emit({ type: 'error', message: msg });
             this.finishTelemetryRun(telRunId, 'interrupted', totalUsage, providerId, model, telIterations);
             return totalUsage;
@@ -1056,15 +1444,35 @@ export class AgentRuntime {
             }
           }
 
-          try {
-            const classified = await this.governance.classify(call, ctx);
-            const evaluated = await this.governance.evaluate(call, ctx);
-            decision = evaluated.decision ?? classified;
-            reason = evaluated.reason;
-            gatewayApprovalId = evaluated.approvalId;
-          } catch (err) {
-            decision = 'deny';
-            reason = `governance error: ${err instanceof Error ? err.message : String(err)}`;
+          // Own-files reads (W8e): a read-only file operation inside the
+          // bot's OWN workspace/memory area is auto-allowed BEFORE any
+          // policy/approval-level evaluation — at every approval level.
+          // Governance is not even consulted (it could mint a spurious
+          // approval record). Writes and outside reads fall through to
+          // the normal governance path below, unchanged.
+          const ownFileRead =
+            opts.ownWorkspaceDirs !== undefined && isOwnWorkspaceRead(call, opts.ownWorkspaceDirs);
+          if (ownFileRead) {
+            decision = 'allow';
+            reason = 'own-file read: inside the bot\'s own workspace (auto-allowed)';
+            this.audit({
+              type: 'tool.own_file_auto_allowed',
+              sessionId,
+              botId: ctx.botId,
+              call,
+              detail: { reason },
+            });
+          } else {
+            try {
+              const classified = await this.governance.classify(call, ctx);
+              const evaluated = await this.governance.evaluate(call, ctx);
+              decision = evaluated.decision ?? classified;
+              reason = evaluated.reason;
+              gatewayApprovalId = evaluated.approvalId;
+            } catch (err) {
+              decision = 'deny';
+              reason = `governance error: ${err instanceof Error ? err.message : String(err)}`;
+            }
           }
 
           // Plan mode: block all mutating tools (write/execute/network).
@@ -1324,9 +1732,22 @@ export class AgentRuntime {
         // timed telemetry step (latency + ok/error per tool). executeTool
         // converts handler throws into `{ error }` results (never throws),
         // so detect that convention to keep error rates honest.
+        if (toExecute.length > 0) {
+          await emitStep(
+            toExecute.length === 1
+              ? `Running ${toExecute[0]!.call.name}`
+              : `Running ${toExecute.length} tools (${toExecute.map((t) => t.call.name).join(', ')})`,
+          );
+        }
         const results = await Promise.allSettled(
           toExecute.map(async ({ def, call }) => {
             const toolStep = telRunId ? this.telemetry?.startStep(telRunId, `tool:${call.name}`, 'tool') : null;
+            // W13 AUTO-INSTRUMENTATION (tool choke point): every executed
+            // tool call funnels through executeTool here, so the tool span
+            // is created at this single dispatch site. A paid tool's cost
+            // (costCents in its result, e.g. Composio actions) is attributed
+            // to the span and rolls into the run totals.
+            const toolSpanId = spanStart('tool', call.name, turnSpanId, { input: call.args });
             try {
               const { result: out, contentBefore } = await this.executeTool(def, call, ctx);
               const failed =
@@ -1335,9 +1756,19 @@ export class AgentRuntime {
                 !Array.isArray(out) &&
                 typeof (out as { error?: unknown }).error === 'string';
               toolStep?.end(failed ? { ok: false, errorKind: 'ToolError' } : { ok: true });
+              spanEnd(toolSpanId, {
+                status: failed ? 'error' : 'ok',
+                costCents: extractToolCostCents(out),
+                payload: { input: call.args, output: out },
+                error: failed ? (out as { error: string }).error : undefined,
+              });
               return { out, contentBefore };
             } catch (err) {
               toolStep?.end({ ok: false, errorKind: err instanceof Error ? err.name : 'Error' });
+              spanEnd(toolSpanId, {
+                status: 'error',
+                error: err instanceof Error ? err.message : String(err),
+              });
               throw err;
             }
           }),
@@ -1387,6 +1818,8 @@ export class AgentRuntime {
             if (tripped) {
               const failure = noProgressReport(progressGuard);
               recordTurnFailure(failure.kind, failure.message, failure.detail);
+              turnOutcome = mapTurnOutcome({ errored: true });
+              turnError = failure.message;
               await emit({ type: 'error', message: failure.message });
               this.finishTelemetryRun(telRunId, 'error', totalUsage, providerId, model, telIterations);
               return totalUsage;
@@ -1433,6 +1866,8 @@ export class AgentRuntime {
         }
       }
 
+      turnOutcome = mapTurnOutcome({ errored: true });
+      turnError = `Max iterations (${maxIterations}) reached without a final answer`;
       await emit({ type: 'error', message: `Max iterations (${maxIterations}) reached without a final answer` });
       recordTurnFailure('max_iterations', `Max iterations (${maxIterations}) reached without a final answer.`, { maxIterations });
       this.finishTelemetryRun(telRunId, 'error', totalUsage, providerId, model, telIterations);
@@ -1447,15 +1882,44 @@ export class AgentRuntime {
             this.governance.decide(id, 'denied', { note: 'Turn superseded by a newer message.' });
           } catch { /* already decided */ }
         }
+        // W13 outcome: user stop / superseded turn = cancelled.
+        turnOutcome = mapTurnOutcome({ aborted: true });
+        turnError = 'Turn superseded by a newer message.';
         await emit({ type: 'interrupted', reason: 'A newer message superseded this turn.' });
         this.finishTelemetryRun(telRunId, 'interrupted', totalUsage, providerId, model, telIterations);
         return totalUsage;
       }
       const message = err instanceof Error ? err.message : String(err);
-      recordTurnFailure(classifyTurnError(err, { aborted: opts.signal?.aborted }), message);
+      // W13 outcome: an error escaping the turn = failed.
+      turnOutcome = mapTurnOutcome({ errored: true });
+      turnError = message;
+      // Limit failures were already recorded in detail (with the resume
+      // time) at the failover gate — don't double-record them here.
+      if (!limitFailureRecorded) {
+        recordTurnFailure(classifyTurnError(err, { aborted: opts.signal?.aborted }), message);
+      }
       await emit({ type: 'error', message });
       this.finishTelemetryRun(telRunId, 'error', totalUsage, providerId, model, telIterations);
       throw err;
+    } finally {
+      // Live step line (W8a): the turn is over on every path — clear
+      // its "Now" state so busy indicators never go stale.
+      this.turnStates.finish(sessionId);
+      // W13: close the span tree, run loop detection over the recorded
+      // span stream, and finalize the run with its outcome. All isolated:
+      // observability failures never affect the turn's result.
+      if (spanStore && spanRunId) {
+        try {
+          const status = turnOutcome === 'success' ? 'ok' : 'error';
+          spanEnd(turnSpanId, { status, error: turnError });
+          spanEnd(sessionSpanId, { status, error: turnError });
+          const loops = detectLoops(spanStore.listSpans(spanRunId));
+          if (loops.length > 0) spanStore.flagLoop(spanRunId, loops);
+          spanStore.finalizeRun(spanRunId, turnOutcome);
+        } catch {
+          // Observability must never break a turn.
+        }
+      }
     }
   }
 
@@ -1854,6 +2318,18 @@ export class AgentRuntime {
       } else {
         warnings.push(`Tool "${name}" is not registered.`);
         nextActions.push(`Register tool "${name}" or remove it from the bot config.`);
+      }
+    }
+    // Per-bot extras (W9 private MCP servers) belong in the preview too.
+    if (this.extraToolsForBot) {
+      try {
+        for (const extra of this.extraToolsForBot(bot.id) ?? []) {
+          if (!tools.some((t) => t.name === extra.name)) {
+            tools.push({ name: extra.name, effect: toolEffect(extra.name) });
+          }
+        }
+      } catch {
+        // preview must never fail on the extras provider
       }
     }
 

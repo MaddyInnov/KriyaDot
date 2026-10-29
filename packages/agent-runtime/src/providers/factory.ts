@@ -15,6 +15,7 @@ import { OllamaProvider } from './ollama.js';
 import { LlamaCppProvider } from './llamacpp.js';
 import { OpenAICompatibleProvider } from './openai-compatible.js';
 import { createAgentCliProvider, parseAgentProviderId } from './agent-cli.js';
+import { createCopilotAcpProvider } from './acp-engines.js';
 import { createNativeCliDriver } from './cli-driver.js';
 
 /**
@@ -66,6 +67,10 @@ export function createProvider(providerId: string, opts?: { apiKey?: string }): 
   // observation, permission brokering, and session resume (cli-driver.ts);
   // the rest stay on the one-shot provider.
   if (parseAgentProviderId(providerId)) {
+    // ACP engines (W9): GitHub Copilot CLI speaks ACP, not a native
+    // streaming protocol — route it to the ACP-backed provider first.
+    const acpProvider = createCopilotAcpProvider(providerId);
+    if (acpProvider) return acpProvider;
     return createNativeCliDriver(providerId) ?? createAgentCliProvider(providerId);
   }
 

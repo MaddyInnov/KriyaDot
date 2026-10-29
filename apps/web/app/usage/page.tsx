@@ -355,6 +355,305 @@ function LedgerSection() {
   );
 }
 
+// ---- Purchases (W6: approval-gated purchasing) ------------------------------
+
+interface PurchaseIntentView {
+  id: string;
+  botId: string;
+  itemDescription: string;
+  merchantName: string;
+  amountCents: number;
+  currency: string;
+  totalCents: number;
+  checkoutUrl: string;
+  status: string;
+  executionMethod: string;
+  blockReason: string | null;
+  failureReason: string | null;
+  note: string | null;
+  ledgerRef: string | null;
+  createdAt: number;
+}
+
+interface PurchaseSettingsView {
+  stripeLinkEnabled: boolean;
+  stripeLinkConfigured: boolean;
+  stripeLinkRef: string | null;
+}
+
+function fmtMoney(cents: number, currency: string): string {
+  return `${currency} ${(cents / 100).toFixed(2)}`;
+}
+
+function PurchasesSection() {
+  const [intents, setIntents] = useState<PurchaseIntentView[]>([]);
+  const [settings, setSettings] = useState<PurchaseSettingsView | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [acting, setActing] = useState('');
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const [listRes, settingsRes] = await Promise.all([
+        authedFetch('/api/billing/purchases?limit=50'),
+        authedFetch('/api/billing/purchases/settings'),
+      ]);
+      if (!listRes.ok) throw new Error(`HTTP ${listRes.status}`);
+      if (!settingsRes.ok) throw new Error(`HTTP ${settingsRes.status}`);
+      setIntents((await listRes.json()) as PurchaseIntentView[]);
+      setSettings((await settingsRes.json()) as PurchaseSettingsView);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const post = async (path: string, body: Record<string, unknown>) => {
+    const res = await authedFetch(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  };
+
+  const act = async (key: string, fn: () => Promise<void>) => {
+    setActing(key);
+    setError('');
+    try {
+      await fn();
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setActing('');
+    }
+  };
+
+  const toggleStripeLink = async (enabled: boolean) => {
+    setActing('stripe-toggle');
+    setError('');
+    try {
+      const res = await authedFetch('/api/billing/purchases/settings', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ stripeLinkEnabled: enabled }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setSettings((await res.json()) as PurchaseSettingsView);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setActing('');
+    }
+  };
+
+  const statusChip = (s: string): string =>
+    s === 'completed' ? 'green' : s === 'pending-approval' || s === 'awaiting-user-confirm' ? 'amber' : s === 'blocked' || s === 'denied' || s === 'failed' ? 'red' : 'gray';
+
+  return (
+    <section className="usage-section">
+      <h2>Purchases</h2>
+      <p className="muted small">
+        Bots can request purchases with the <span className="mono">request_purchase</span> tool, but nothing is ever
+        charged without your approval: every purchase raises its own approval card (Approvals inbox) and is executed
+        only after you approve it. Securities/crypto trading and transfers between your own accounts are hard-blocked,
+        and spend caps apply. With Stripe Link off, an approved purchase opens the merchant checkout in the bot&apos;s
+        browser and stops <strong>before</strong> the pay step — you finish the payment yourself.
+      </p>
+
+      <div className="cap-editor">
+        <div className="cap-editor-row">
+          <label htmlFor="stripe-link-toggle">
+            <input
+              id="stripe-link-toggle"
+              type="checkbox"
+              checked={settings?.stripeLinkEnabled ?? false}
+              disabled={acting === 'stripe-toggle' || !settings}
+              onChange={(e) => void toggleStripeLink(e.target.checked)}
+            />{' '}
+            Pay with Stripe Link
+          </label>
+          {settings?.stripeLinkConfigured && <span className="chip green">linked</span>}
+        </div>
+        <p className="muted small">
+          When on, approved purchases can complete via Stripe Link. Your payment details stay in Stripe Link and the
+          vault — bots never see card numbers or credentials, only an opaque Link reference, and only after you
+          approve each purchase individually.
+        </p>
+      </div>
+
+      {loading && <p className="muted">Loading purchases…</p>}
+      {error && <p className="error">{error}</p>}
+      {!loading && intents.length === 0 && <p className="muted">No purchase requests yet.</p>}
+      {intents.length > 0 && (
+        <table className="usage-table">
+          <thead>
+            <tr>
+              <th>Requested</th>
+              <th>Item</th>
+              <th>Merchant</th>
+              <th>Total</th>
+              <th>Method</th>
+              <th>Status</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {intents.map((p) => (
+              <tr key={p.id}>
+                <td className="mono small">
+                  {new Date(p.createdAt).toLocaleString()}
+                  <br />
+                  <span className="muted">bot {p.botId}</span>
+                </td>
+                <td>
+                  {p.itemDescription}
+                  <br />
+                  <a href={p.checkoutUrl} target="_blank" rel="noreferrer" className="small">
+                    View item ↗
+                  </a>
+                  {p.blockReason && <div className="small error">{p.blockReason}</div>}
+                  {p.failureReason && <div className="small error">{p.failureReason}</div>}
+                  {p.note && <div className="small muted">{p.note}</div>}
+                </td>
+                <td>{p.merchantName}</td>
+                <td>{fmtMoney(p.totalCents, p.currency)}</td>
+                <td className="mono small">{p.executionMethod}</td>
+                <td>
+                  <span className={`chip ${statusChip(p.status)}`}>{p.status}</span>
+                  {p.ledgerRef && <div className="small muted mono">ledger {p.ledgerRef.slice(0, 18)}…</div>}
+                </td>
+                <td>
+                  {p.status === 'pending-approval' && (
+                    <div className="approval-actions">
+                      <button
+                        className="btn btn-primary btn-sm"
+                        disabled={acting === p.id}
+                        onClick={() => void act(p.id, () => post(`/api/billing/purchases/${p.id}/decide`, { decision: 'approved' }))}
+                      >
+                        Approve &amp; pay
+                      </button>
+                      <button
+                        className="btn btn-danger btn-sm"
+                        disabled={acting === p.id}
+                        onClick={() => void act(p.id, () => post(`/api/billing/purchases/${p.id}/decide`, { decision: 'denied' }))}
+                      >
+                        Deny
+                      </button>
+                    </div>
+                  )}
+                  {p.status === 'awaiting-user-confirm' && (
+                    <div className="approval-actions">
+                      <button
+                        className="btn btn-primary btn-sm"
+                        disabled={acting === p.id}
+                        onClick={() => void act(p.id, () => post(`/api/billing/purchases/${p.id}/confirm-completion`, { outcome: 'completed' }))}
+                      >
+                        I completed payment
+                      </button>
+                      <button
+                        className="btn btn-sm"
+                        disabled={acting === p.id}
+                        onClick={() => void act(p.id, () => post(`/api/billing/purchases/${p.id}/confirm-completion`, { outcome: 'failed' }))}
+                      >
+                        Payment failed / abandoned
+                      </button>
+                    </div>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </section>
+  );
+}
+
+// ---- Run outcomes (W13: per-bot success rates from the span store) ---------
+
+interface BotOutcomeStats {
+  botId: string;
+  total: number;
+  running: number;
+  success: number;
+  failed: number;
+  cancelled: number;
+  needsInput: number;
+  successRate: number;
+}
+
+function OutcomesSection() {
+  const [byBot, setByBot] = useState<BotOutcomeStats[] | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    authedFetch('/api/observability/outcomes')
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return (await res.json()) as { byBot: BotOutcomeStats[] };
+      })
+      .then((json) => {
+        if (!cancelled) setByBot(json.byBot);
+      })
+      .catch(() => {
+        if (!cancelled) setByBot([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (byBot === null) return null;
+  return (
+    <>
+      <h2>Run outcomes by bot</h2>
+      {byBot.length === 0 ? (
+        <p className="muted">
+          No recorded runs yet. Outcomes (success / failed / cancelled / needs-input) appear here once
+          bots complete turns — see Activity → Runs for the span traces.
+        </p>
+      ) : (
+        <table className="usage-table">
+          <thead>
+            <tr>
+              <th>Bot</th>
+              <th>Runs</th>
+              <th>Success</th>
+              <th>Failed</th>
+              <th>Cancelled</th>
+              <th>Needs input</th>
+              <th>Success rate</th>
+            </tr>
+          </thead>
+          <tbody>
+            {byBot.map((b) => (
+              <tr key={b.botId}>
+                <td className="mono">{b.botId}</td>
+                <td>{b.total}</td>
+                <td>{b.success}</td>
+                <td>{b.failed}</td>
+                <td>{b.cancelled}</td>
+                <td>{b.needsInput}</td>
+                <td>{`${Math.round(b.successRate * 100)}%`}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </>
+  );
+}
+
 // ---- Page -------------------------------------------------------------------
 
 export default function UsagePage() {
@@ -482,7 +781,9 @@ export default function UsagePage() {
         </>
       )}
 
+      <OutcomesSection />
       <SpendCapsSection bots={bots} />
+      <PurchasesSection />
       <LedgerSection />
     </div>
   );

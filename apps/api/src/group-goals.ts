@@ -67,6 +67,12 @@ export interface GroupGoal {
   groupId: string | null;
   /** Routine this goal was started from (routine-as-goal); null otherwise. */
   routineId: string | null;
+  /**
+   * W8f: 1:1 chat session this goal was started from via `/goal` in a
+   * direct chat; null for room/routine goals. Lets the chat show the
+   * goal's status inline and list goals per conversation.
+   */
+  sessionId: string | null;
   /** Final summary (completed) or stop/failure reason. */
   summary: string | null;
   createdAt: string;
@@ -103,6 +109,7 @@ interface GoalRow {
   status: string;
   group_id: string | null;
   routine_id: string | null;
+  session_id: string | null;
   summary: string | null;
   created_at: string;
   updated_at: string;
@@ -131,6 +138,7 @@ function rowToGoal(r: GoalRow): GroupGoal {
     status: isGroupGoalStatus(r.status) ? r.status : 'failed',
     groupId: r.group_id,
     routineId: r.routine_id,
+    sessionId: r.session_id ?? null,
     summary: r.summary,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
@@ -159,6 +167,8 @@ export interface CreateGoalInput {
   maxTurns?: number;
   groupId?: string;
   routineId?: string;
+  /** W8f: originating 1:1 chat session for `/goal` runs. */
+  sessionId?: string;
 }
 
 /** Persistent group goals + turns: <dataDir>/group-goals.db. */
@@ -198,6 +208,12 @@ export class GroupGoalStore {
       CREATE INDEX IF NOT EXISTS idx_goal_turns_goal ON goal_turns(goal_id, turn_number);
       CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status, updated_at DESC);
     `);
+    // W8f migration: session_id for direct-chat `/goal` runs.
+    try {
+      this.db.exec('ALTER TABLE goals ADD COLUMN session_id TEXT');
+    } catch {
+      // Column already exists.
+    }
   }
 
   createGoal(input: CreateGoalInput): GroupGoal {
@@ -214,6 +230,7 @@ export class GroupGoalStore {
       status: 'running',
       groupId: input.groupId ?? null,
       routineId: input.routineId ?? null,
+      sessionId: input.sessionId ?? null,
       summary: null,
       createdAt: now,
       updatedAt: now,
@@ -221,8 +238,8 @@ export class GroupGoalStore {
     this.db
       .prepare(
         `INSERT INTO goals (goal_id, title, description, coordinator_bot_id, worker_bot_ids,
-          max_turns, status, group_id, routine_id, summary, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          max_turns, status, group_id, routine_id, session_id, summary, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         goal.id,
@@ -234,6 +251,7 @@ export class GroupGoalStore {
         goal.status,
         goal.groupId,
         goal.routineId,
+        goal.sessionId,
         goal.summary,
         goal.createdAt,
         goal.updatedAt,
@@ -249,7 +267,13 @@ export class GroupGoalStore {
     return row ? rowToGoal(row) : null;
   }
 
-  listGoals(limit = 50): GroupGoal[] {
+  listGoals(limit = 50, filter: { sessionId?: string } = {}): GroupGoal[] {
+    if (filter.sessionId) {
+      const rows = this.db
+        .prepare(`SELECT * FROM goals WHERE session_id = ? ORDER BY updated_at DESC LIMIT ?`)
+        .all(filter.sessionId, limit) as unknown as GoalRow[];
+      return rows.map(rowToGoal);
+    }
     const rows = this.db
       .prepare(`SELECT * FROM goals ORDER BY updated_at DESC LIMIT ?`)
       .all(limit) as unknown as GoalRow[];
@@ -336,3 +360,29 @@ export class GroupGoalStore {
 }
 
 export { isGoalId, validGoalTitle };
+
+/**
+ * Build the CreateGoalInput for a `/goal` run started in a 1:1 chat
+ * (W8f): the run is scoped to that single bot — the coordinator is the
+ * chief of staff when one is set, otherwise the bot itself; when a
+ * chief coordinates, the chatted bot is the sole worker (identical
+ * machinery, statuses and control decisions as room goals).
+ */
+export function singleBotGoalInput(input: {
+  bots: Array<{ id: string; chiefOfStaff?: boolean }>;
+  botId: string;
+  title: string;
+  sessionId?: string;
+  maxTurns?: number;
+}): CreateGoalInput {
+  const chief = input.bots.find((b) => b.chiefOfStaff === true);
+  const coordinatorBotId = chief ? chief.id : input.botId;
+  return {
+    title: input.title,
+    description: input.title,
+    coordinatorBotId,
+    workerBotIds: coordinatorBotId === input.botId ? [] : [input.botId],
+    maxTurns: input.maxTurns,
+    sessionId: input.sessionId,
+  };
+}

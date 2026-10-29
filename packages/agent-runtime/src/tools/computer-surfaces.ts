@@ -27,6 +27,9 @@
 // and governance evaluates BEFORE any handler runs, whichever surface or
 // bot is active.
 
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   COMPUTER_USE_DOCKER_ENV,
   DockerComputerSandbox,
@@ -98,6 +101,74 @@ export function resolveSurfaceKind(
 /** Default idle timeout: dispose a bot's computer after 30 min unused. */
 export const DEFAULT_COMPUTER_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
+// ---------------------------------------------------------------------------
+// W4: per-bot persistent browser profiles
+// ---------------------------------------------------------------------------
+
+/**
+ * Directory name for one bot's profile under the profile root. Bot ids in
+ * the safe charset ([A-Za-z0-9_-]) are used verbatim; anything else is
+ * sanitized AND suffixed with a short hash of the raw id, so two distinct
+ * ids ("a:b" vs "a_b") can never collide into one profile — profiles hold
+ * logins, and cross-bot leakage would be a credential-isolation failure.
+ */
+export function browserProfileDirName(botId: string): string {
+  if (/^[A-Za-z0-9_-]{1,128}$/.test(botId)) return botId;
+  const sanitized = botId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 96) || 'bot';
+  const hash = createHash('sha256').update(botId).digest('hex').slice(0, 12);
+  return `${sanitized}-${hash}`;
+}
+
+/** Absolute profile directory for a bot under a profile root. */
+export function browserProfileDirFor(profileRoot: string, botId: string): string {
+  return path.join(profileRoot, browserProfileDirName(botId));
+}
+
+/** On-disk usage of a directory tree (missing dir → zeros). Best-effort. */
+export function profileDiskUsage(dir: string): { bytes: number; files: number } {
+  let bytes = 0;
+  let files = 0;
+  const walk = (d: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.isFile()) {
+        try {
+          bytes += fs.statSync(p).size;
+          files += 1;
+        } catch {
+          // Raced with a browser write/delete — skip the file.
+        }
+      }
+    }
+  };
+  walk(dir);
+  return { bytes, files };
+}
+
+export interface BrowserProfileInfo {
+  botId: string;
+  /** Absolute per-bot profile directory (the persistent-context user-data dir). */
+  profileDir: string;
+  exists: boolean;
+  bytes: number;
+  files: number;
+}
+
+export interface BrowserProfileWipeResult {
+  botId: string;
+  profileDir: string;
+  /** True when a profile directory existed (and was deleted). */
+  wiped: boolean;
+  bytesFreed: number;
+}
+
 export interface PerBotComputerManagerDeps {
   /**
    * Audit hook for real input actions (wired to governance in index.ts).
@@ -124,6 +195,25 @@ export interface PerBotComputerManagerDeps {
    * profile — the error message tells the user where to add one.
    */
   vpsLayerFor?: (botId: string) => OSScreenLayer | Promise<OSScreenLayer>;
+  /**
+   * W4: server data directory. Browser profiles live at
+   * `<dataDir>/browser-profiles/<botId>/`. Ignored when
+   * `browserProfileRoot` is set.
+   */
+  dataDir?: string;
+  /**
+   * W4: explicit browser-profile root (overrides the dataDir-derived
+   * default `<dataDir>/browser-profiles`, or `data/browser-profiles`
+   * under the process cwd when neither is given). Tests point this at a
+   * temp dir.
+   */
+  browserProfileRoot?: string;
+  /**
+   * W4: audit hook fired after a profile wipe (host wires it to
+   * governance). Receives the wipe result — metadata only, never any
+   * profile content.
+   */
+  onProfileWipe?: (result: BrowserProfileWipeResult) => void;
 }
 
 export interface ComputerInstanceStatus {
@@ -138,6 +228,12 @@ export interface ComputerInstanceStatus {
   running: boolean;
   lastUsedMs: number;
   idleMs: number;
+  /**
+   * W4: for browser-resolved instances, the bot's persistent profile
+   * directory and its current on-disk size. Absent for other surfaces.
+   */
+  profileDir?: string;
+  profileBytes?: number;
 }
 
 interface Entry {
@@ -279,6 +375,8 @@ export class PerBotComputerManager {
   private readonly onRealAction?: (action: string, detail: unknown) => void;
   private readonly createBackendOverride?: PerBotComputerManagerDeps['createBackend'];
   private readonly vpsLayerFor?: PerBotComputerManagerDeps['vpsLayerFor'];
+  private readonly profileRoot: string;
+  private readonly onProfileWipe?: PerBotComputerManagerDeps['onProfileWipe'];
 
   constructor(deps: PerBotComputerManagerDeps = {}) {
     this.idleTimeoutMs = deps.idleTimeoutMs ?? DEFAULT_COMPUTER_IDLE_TIMEOUT_MS;
@@ -286,6 +384,70 @@ export class PerBotComputerManager {
     this.onRealAction = deps.onRealAction;
     this.createBackendOverride = deps.createBackend;
     this.vpsLayerFor = deps.vpsLayerFor;
+    this.onProfileWipe = deps.onProfileWipe;
+    this.profileRoot =
+      deps.browserProfileRoot ??
+      (deps.dataDir
+        ? path.join(deps.dataDir, 'browser-profiles')
+        : path.resolve(process.cwd(), 'data', 'browser-profiles'));
+  }
+
+  // ---- W4 browser profiles --------------------------------------------------
+
+  /** Root directory holding every bot's browser profile. */
+  browserProfileRoot(): string {
+    return this.profileRoot;
+  }
+
+  /**
+   * The persistent profile directory for one bot — the keying guarantee:
+   * exactly one directory per bot id, shared by that bot's main and
+   * conversation-pinned browser instances (same bot, same logins), and
+   * never shared with another bot.
+   */
+  profileDirFor(botId: string): string {
+    return browserProfileDirFor(this.profileRoot, botId);
+  }
+
+  /** Profile existence + disk usage for status surfaces. */
+  profileInfo(botId: string): BrowserProfileInfo {
+    const profileDir = this.profileDirFor(botId);
+    const exists = fs.existsSync(profileDir);
+    const { bytes, files } = exists ? profileDiskUsage(profileDir) : { bytes: 0, files: 0 };
+    return { botId, profileDir, exists, bytes, files };
+  }
+
+  /**
+   * W4 explicit wipe: close the bot's live computer instances (contexts
+   * close, flushing nothing further) and DELETE the profile directory, so
+   * the next browser launch starts from a fresh profile. This is the ONLY
+   * operation that deletes a profile — bot deletion, surface changes,
+   * restarts and idle teardown all keep it. Conversation pins and the
+   * bot's surface choice are preserved (the bot still works on the same
+   * surface, just logged out everywhere).
+   */
+  async wipeBrowserProfile(botId: string): Promise<BrowserProfileWipeResult> {
+    const profileDir = this.profileDirFor(botId);
+    const before = this.profileInfo(botId);
+    const doomed = [...this.entries.values()].filter((e) => e.botId === botId);
+    await Promise.all(doomed.map((e) => this.killEntry(e).catch(() => undefined)));
+    let wiped = false;
+    if (before.exists) {
+      await fs.promises.rm(profileDir, { recursive: true, force: true });
+      wiped = true;
+    }
+    const result: BrowserProfileWipeResult = {
+      botId,
+      profileDir,
+      wiped,
+      bytesFreed: wiped ? before.bytes : 0,
+    };
+    try {
+      this.onProfileWipe?.(result);
+    } catch {
+      // Audit hooks must never break the wipe.
+    }
+    return result;
   }
 
   now(): number {
@@ -417,9 +579,12 @@ export class PerBotComputerManager {
       );
     }
     if (resolved === 'browser') {
-      return new PlaywrightOSScreenLayer(
-        onRealAction ? { onRealAction: (a, d) => onRealAction(a, d) } : {},
-      );
+      // W4: persistent context keyed by bot id — this bot's cookies and
+      // logins live in its own profile directory and survive restarts.
+      return new PlaywrightOSScreenLayer({
+        profileDir: this.profileDirFor(botId),
+        ...(onRealAction ? { onRealAction: (a, d) => onRealAction(a, d) } : {}),
+      });
     }
     return new LocalComputerSandbox(onRealAction ? { onRealAction } : {});
   }
@@ -459,7 +624,12 @@ export class PerBotComputerManager {
     await this.removeBot(botId);
   }
 
-  /** Tear down every instance for a bot (bot deleted). Best-effort. */
+  /**
+   * Tear down every instance for a bot (bot deleted / surface changed /
+   * restart). Best-effort. W4: closes browser contexts but deliberately
+   * KEEPS the bot's browser profile on disk — persistence is the point;
+   * only wipeBrowserProfile() deletes it.
+   */
   async removeBot(botId: string): Promise<void> {
     const doomed = [...this.entries.values()].filter((e) => e.botId === botId);
     await Promise.all(doomed.map((e) => this.killEntry(e).catch(() => undefined)));
@@ -480,26 +650,8 @@ export class PerBotComputerManager {
 
   // ---- status -------------------------------------------------------------
 
-  status(botId: string): ComputerInstanceStatus[] {
-    const at = this.now();
-    return [...this.entries.values()]
-      .filter((e) => e.botId === botId)
-      .map((e) => ({
-        botId: e.botId,
-        key: e.key,
-        pinned: e.pinned,
-        conversationId: e.conversationId,
-        surface: e.configured,
-        resolved: e.resolved,
-        running: e.running,
-        lastUsedMs: e.lastUsedMs,
-        idleMs: Math.max(0, at - e.lastUsedMs),
-      }));
-  }
-
-  statusAll(): ComputerInstanceStatus[] {
-    const at = this.now();
-    return [...this.entries.values()].map((e) => ({
+  private statusOf(e: Entry, at: number): ComputerInstanceStatus {
+    const base: ComputerInstanceStatus = {
       botId: e.botId,
       key: e.key,
       pinned: e.pinned,
@@ -509,7 +661,24 @@ export class PerBotComputerManager {
       running: e.running,
       lastUsedMs: e.lastUsedMs,
       idleMs: Math.max(0, at - e.lastUsedMs),
-    }));
+    };
+    if (e.resolved === 'browser') {
+      base.profileDir = this.profileDirFor(e.botId);
+      base.profileBytes = this.profileInfo(e.botId).bytes;
+    }
+    return base;
+  }
+
+  status(botId: string): ComputerInstanceStatus[] {
+    const at = this.now();
+    return [...this.entries.values()]
+      .filter((e) => e.botId === botId)
+      .map((e) => this.statusOf(e, at));
+  }
+
+  statusAll(): ComputerInstanceStatus[] {
+    const at = this.now();
+    return [...this.entries.values()].map((e) => this.statusOf(e, at));
   }
 
   /** Resolver for registerComputerUseTool: per-bot layer per tool call. */
@@ -541,3 +710,17 @@ export function layerIsMock(layer: OSScreenLayer): boolean {
 
 // Re-export for hosts that only import this module.
 export { LocalComputerSandbox, DockerComputerSandbox, PlaywrightOSScreenLayer };
+export {
+  createEphemeralPageBackend,
+  createPersistentPageBackend,
+  lazyPlaywrightPageFactory,
+  loadPlaywrightChromium,
+  wrapPlaywrightPage,
+} from './computer-playwright.js';
+export type {
+  PlaywrightChromiumLike,
+  PlaywrightPageBackend,
+  PlaywrightRawBrowser,
+  PlaywrightRawContext,
+  PlaywrightRawPage,
+} from './computer-playwright.js';

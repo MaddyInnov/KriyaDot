@@ -12,8 +12,11 @@ import {
   revokePeerGrant,
   getCredentialProposals,
   decideCredentialProposal,
+  getWatchItems,
+  dismissWatchItem,
+  draftWatchItem,
 } from '../../lib/api';
-import type { ApprovalRecord, PeerApprovalCard, PeerGrant, PeerDecision, CredentialProposal } from '../../lib/api';
+import type { ApprovalRecord, PeerApprovalCard, PeerGrant, PeerDecision, CredentialProposal, WatchItem } from '../../lib/api';
 import { BulkBar, ShortcutHelp, useActivityShortcuts, type TriageHandlers } from '../activity/triage';
 import { PeerOriginSecurityNote } from '../provenance-chip';
 
@@ -25,7 +28,8 @@ function peerActionVerb(action: PeerApprovalCard['actionType']): string {
   return action === 'ask' ? 'ask' : action === 'message' ? 'message' : 'delegate a subtask to';
 }
 
-function peerCountdown(expiresAt: number): string {
+function peerCountdown(expiresAt: number | null): string {
+  if (expiresAt === null) return 'No expiry';
   const ms = Math.max(0, expiresAt - Date.now());
   const min = Math.floor(ms / 60000);
   const sec = Math.floor((ms % 60000) / 1000);
@@ -49,6 +53,10 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
   const [peerGrants, setPeerGrants] = useState<PeerGrant[]>([]);
   // --- Credential proposal cards (a bot needs a secret it doesn't have) ---
   const [credPending, setCredPending] = useState<CredentialProposal[]>([]);
+  // --- Watch items (W5): proactive account watching "needs you" entries ---
+  const [watchNew, setWatchNew] = useState<WatchItem[]>([]);
+  const [watchActioned, setWatchActioned] = useState<WatchItem[]>([]);
+  const [watchOpenId, setWatchOpenId] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [acting, setActing] = useState<string>('');
   // --- Bulk triage state -------------------------------------------------
@@ -65,13 +73,15 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
 
   const refresh = useCallback(async () => {
     try {
-      const [p, all, pp, ppAll, grants, creds] = await Promise.all([
+      const [p, all, pp, ppAll, grants, creds, wNew, wActioned] = await Promise.all([
         getApprovals('pending'),
         getApprovals(),
         getPeerApprovals('pending'),
         getPeerApprovals(),
         getPeerGrants(),
         getCredentialProposals('pending'),
+        getWatchItems('new').catch(() => [] as WatchItem[]),
+        getWatchItems('actioned').catch(() => [] as WatchItem[]),
       ]);
       setPending(p);
       setDecided(all.filter((a) => a.status !== 'pending').slice(0, 20));
@@ -79,6 +89,8 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
       setPeerDecided(ppAll.filter((c) => c.status !== 'pending').slice(0, 20));
       setPeerGrants(grants);
       setCredPending(creds);
+      setWatchNew(wNew);
+      setWatchActioned(wActioned.slice(0, 10));
       setError('');
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -109,6 +121,32 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
     try {
       await allowTool(a.botId, a.toolName);
       await decideApproval(a.id, 'approved', `User chose "always allow ${a.toolName}"`);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setActing('');
+    }
+  };
+
+  /** Watch items: one-tap Draft reply (bot drafts, draft stored on the item). */
+  const draftWatch = async (id: string) => {
+    setActing(id);
+    try {
+      await draftWatchItem(id);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setActing('');
+    }
+  };
+
+  /** Watch items: Dismiss is terminal — the item never resurfaces. */
+  const dismissWatch = async (id: string) => {
+    setActing(id);
+    try {
+      await dismissWatchItem(id);
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -290,6 +328,9 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
               />{' '}
               <strong className="mono">{a.toolName}</strong>{' '}
               <span className="chip amber">pending</span>
+              {(a.neverExpire === true || a.expiresAt === null) && (
+                <span className="chip blue" title="This approval never expires">No expiry</span>
+              )}
               {a.provenance && (
                 <span className="chip small" title={`Decision provenance: ${a.provenance}`}>
                   {a.provenance === 'hard-floor-escalated' ? '🛡️ hard floor'
@@ -325,17 +366,127 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
             >
               Deny
             </button>
+            {a.toolName === 'request_purchase' ? (
+              <span className="small muted" title="Purchases are always approved individually — there is no always-allow for buying.">
+                🛒 Purchases always need individual approval
+              </span>
+            ) : (
+              <button
+                className="btn btn-sm"
+                disabled={acting === a.id}
+                onClick={() => void alwaysAllow(a)}
+                title={`Never ask for ${a.toolName} again on this bot, then approve this call.`}
+              >
+                Always allow {a.toolName}
+              </button>
+            )}
+          </div>
+        </div>
+      ))}
+
+      {/* --- Watch items (W5): flagged by proactive account watching.
+          Only items a helper-model triage flagged land here; each carries
+          one-tap Draft reply / Dismiss / Open (context) actions. ------- */}
+      <div className="row-between mt">
+        <h3 className="mt0">Needs you — watched accounts ({watchNew.length})</h3>
+        <span className="small muted" title="Items flagged by your watch rules (Activity → Watch). Manage rules there.">
+          proactive watching
+        </span>
+      </div>
+      {watchNew.length === 0 && <p className="muted">Nothing flagged by your watch rules.</p>}
+      {watchNew.map((item) => (
+        <div key={item.id} className="card triage-item" style={{ borderLeft: '3px solid var(--accent, #7c6cf0)' }}>
+          <div className="row-between">
+            <div>
+              <span className="chip" title="Watch item">👀 {item.app}</span>{' '}
+              <span className={`chip ${item.urgency === 'high' ? 'red' : item.urgency === 'medium' ? 'amber' : 'gray'}`}>
+                {item.urgency}
+              </span>{' '}
+              <strong>{item.summary}</strong>
+            </div>
+            <span className="small muted">{fmtTs(item.surfacedAt)}</span>
+          </div>
+          {item.reason && <div className="small mt">Why: {item.reason}</div>}
+          {item.suggestedAction && (
+            <div className="small muted">Suggested: {item.suggestedAction}</div>
+          )}
+          {watchOpenId === item.id && (
+            <div className="mt">
+              <div className="small muted">
+                rule <span className="mono">{item.ruleId}</span> · source{' '}
+                <span className="mono">{item.sourceItemId}</span> · kind{' '}
+                <span className="mono">{item.sourceKind}</span>
+                {item.itemTs ? ` · ${fmtTs(item.itemTs)}` : ''}
+              </div>
+              {Object.entries(item.fields).filter(([, v]) => v).length > 0 && (
+                <pre className="mono small mt" style={{ maxHeight: 160, overflow: 'auto', whiteSpace: 'pre-wrap' }}>
+                  {Object.entries(item.fields)
+                    .filter(([, v]) => v)
+                    .map(([k, v]) => `${k}: ${v}`)
+                    .join('\n')}
+                </pre>
+              )}
+              {item.draftText && (
+                <>
+                  <div className="small mt"><strong>Draft reply</strong></div>
+                  <pre className="mono small mt" style={{ maxHeight: 200, overflow: 'auto', whiteSpace: 'pre-wrap' }}>
+                    {item.draftText}
+                  </pre>
+                </>
+              )}
+            </div>
+          )}
+          <div className="approval-actions">
+            <button
+              className="btn btn-primary btn-sm"
+              disabled={acting === item.id}
+              onClick={() => void draftWatch(item.id)}
+            >
+              Draft reply
+            </button>
             <button
               className="btn btn-sm"
-              disabled={acting === a.id}
-              onClick={() => void alwaysAllow(a)}
-              title={`Never ask for ${a.toolName} again on this bot, then approve this call.`}
+              disabled={acting === item.id}
+              onClick={() => void dismissWatch(item.id)}
             >
-              Always allow {a.toolName}
+              Dismiss
+            </button>
+            <button
+              className="btn btn-sm"
+              onClick={() => setWatchOpenId(watchOpenId === item.id ? null : item.id)}
+            >
+              {watchOpenId === item.id ? 'Close' : 'Open'}
             </button>
           </div>
         </div>
       ))}
+      {watchActioned.length > 0 && (
+        <>
+          <h4 className="mt">Recently actioned watch items</h4>
+          {watchActioned.map((item) => (
+            <div key={item.id} className="card">
+              <div className="row-between">
+                <div>
+                  <span className="chip green">actioned</span>{' '}
+                  <span className="chip small">{item.app}</span>{' '}
+                  <span className="small">{item.summary}</span>
+                </div>
+                <button
+                  className="btn btn-sm"
+                  onClick={() => setWatchOpenId(watchOpenId === item.id ? null : item.id)}
+                >
+                  {watchOpenId === item.id ? 'Close' : 'Open'}
+                </button>
+              </div>
+              {watchOpenId === item.id && item.draftText && (
+                <pre className="mono small mt" style={{ maxHeight: 200, overflow: 'auto', whiteSpace: 'pre-wrap' }}>
+                  {item.draftText}
+                </pre>
+              )}
+            </div>
+          ))}
+        </>
+      )}
 
       {/* --- Peer approval cards (OpenMausBot parity) ---------------------- */}
       <div className="row-between mt">
@@ -355,7 +506,7 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
               </strong>
             </div>
             <span className="small muted">
-              expires in {peerCountdown(c.expiresAt)} · {fmtTs(c.createdAt)}
+              {c.expiresAt === null ? 'No expiry' : `expires in ${peerCountdown(c.expiresAt)}`} · {fmtTs(c.createdAt)}
             </span>
           </div>
           <div className="small muted mt">

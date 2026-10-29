@@ -28,7 +28,16 @@
 //   }));
 
 import express, { type Router } from 'express';
-import type { AcpSessionManager, AcpToolCall, AcpToolVerdict, AcpStreamEvent } from '@mvp/agent-runtime';
+import {
+  acpEngineSessionOptions,
+  detectAcpEngines,
+  getAcpEnginePreset,
+  listAcpEnginePresets,
+  type AcpSessionManager,
+  type AcpToolCall,
+  type AcpToolVerdict,
+  type AcpStreamEvent,
+} from '@mvp/agent-runtime';
 
 export interface AcpSessionsDeps {
   manager: AcpSessionManager;
@@ -84,12 +93,62 @@ export function createAcpSessionsRouter(deps: AcpSessionsDeps): Router {
     res.json({ ok: true, sessions: manager.listSessions() });
   });
 
+  /** Built-in ACP engine presets (W9) + live detection for the ACP panel. */
+  router.get('/engines', (_req, res) => {
+    const detected = new Map(detectAcpEngines().map((d) => [d.id, d] as const));
+    res.json({
+      ok: true,
+      engines: listAcpEnginePresets().map((p) => ({
+        id: p.id,
+        name: p.name,
+        command: p.command,
+        args: p.acpArgs,
+        authId: p.authId ?? null,
+        models: p.models,
+        notes: p.notes,
+        installed: detected.get(p.id)?.installed ?? false,
+      })),
+    });
+  });
+
   /** Create + connect a session. */
   router.post('/', async (req, res) => {
-    const body = (req.body ?? {}) as { command?: unknown; args?: unknown; label?: unknown };
+    const body = (req.body ?? {}) as { command?: unknown; args?: unknown; label?: unknown; engine?: unknown };
+    // W9: { engine: 'copilot' } creates a session from the built-in preset
+    // (command/args may still override the preset for non-PATH installs).
+    if (typeof body.engine === 'string' && body.engine.trim()) {
+      const engineId = body.engine.trim();
+      if (!getAcpEnginePreset(engineId)) {
+        res.status(400).json(errorBody(`Unknown ACP engine "${engineId}".`));
+        return;
+      }
+      const label = typeof body.label === 'string' ? body.label.trim().slice(0, 80) : undefined;
+      try {
+        const session = await manager.createSession(
+          acpEngineSessionOptions(engineId, {
+            cwd: deps.workspaceDir,
+            ...(label ? { label } : {}),
+            ...(typeof body.command === 'string' && body.command.trim() ? { command: body.command.trim() } : {}),
+            ...(Array.isArray(body.args)
+              ? { args: body.args.filter((a): a is string => typeof a === 'string').slice(0, 32) }
+              : {}),
+          }),
+        );
+        deps.audit('acp.session_created', {
+          actor: 'user',
+          sessionId: session.id,
+          detail: { engine: engineId, command: session.command, label: session.label, agent: session.agentName },
+        });
+        res.status(201).json({ ok: true, session });
+      } catch (err) {
+        const e = err as { kind?: string; message?: string };
+        res.status(502).json(errorBody(e?.message ?? 'Failed to start the external agent.', e?.kind));
+      }
+      return;
+    }
     const command = typeof body.command === 'string' ? body.command.trim() : '';
     if (!command) {
-      res.status(400).json(errorBody('command is required'));
+      res.status(400).json(errorBody('command is required (or name a built-in "engine", e.g. "copilot")'));
       return;
     }
     if (command.length > 500) {

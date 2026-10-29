@@ -46,6 +46,9 @@ export const MODEL_PRICES: Record<string, ModelPrice> = {
   // --- OpenRouter: popular models (OpenRouter list prices, Oct 2026) ---
   'openrouter/anthropic/claude-sonnet-4-5': { inputPer1M: 3.0, outputPer1M: 15.0, estimate: true },
   'openrouter/openai/gpt-4o': { inputPer1M: 2.5, outputPer1M: 10.0, estimate: true },
+  // --- DeepSeek direct (list prices, Oct 2026) ---
+  'deepseek/deepseek-chat': { inputPer1M: 0.27, outputPer1M: 1.1, estimate: true },
+  'deepseek/deepseek-reasoner': { inputPer1M: 0.55, outputPer1M: 2.19, estimate: true },
   'openrouter/deepseek/deepseek-chat': { inputPer1M: 0.27, outputPer1M: 1.1, estimate: true },
   'openrouter/deepseek/deepseek-r1': { inputPer1M: 0.55, outputPer1M: 2.19, estimate: true },
   'openrouter/google/gemini-2.5-flash': { inputPer1M: 0.3, outputPer1M: 2.5, estimate: true },

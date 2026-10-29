@@ -159,6 +159,10 @@ export interface Briefing {
   notes?: BriefingItem[];
   /** Recent workflow runs (feature interconnection). Same optional rule. */
   workflows?: BriefingItem[];
+  /** Connected-app signals (W14c: GitHub review/CI/mentions). Optional. */
+  signals?: BriefingItem[];
+  /** Batched phone-notifications digest (W14b). Optional. */
+  notifications?: BriefingItem[];
   summary?: string;
   /**
    * Health regression alerts (feature #5). Optional so the panel keeps
@@ -169,6 +173,35 @@ export interface Briefing {
 }
 
 export const getBriefing = (): Promise<Briefing | null> => optionalJson('/api/briefing');
+
+// ---- Global pause (W14d) ---------------------------------------------------------
+
+export interface PauseState {
+  paused: boolean;
+  pausedAt?: number | null;
+  pausedBy?: string | null;
+  reason?: string | null;
+  resumedAt?: number | null;
+  resumedBy?: string | null;
+}
+
+export const getPauseState = (): Promise<PauseState | null> => optionalJson('/api/system/pause-state');
+
+export function pauseSystem(reason?: string): Promise<PauseState> {
+  return kriyadotJson('/api/system/pause', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ actor: 'web', ...(reason ? { reason } : {}) }),
+  });
+}
+
+export function resumeSystem(): Promise<PauseState> {
+  return kriyadotJson('/api/system/resume', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ actor: 'web' }),
+  });
+}
 
 // ---- Run health: regression alerts ----------------------------------------------
 

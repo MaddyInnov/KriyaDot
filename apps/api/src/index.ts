@@ -16,7 +16,7 @@ import express from 'express';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { AgentRuntime } from '@mvp/agent-runtime';
+import { AgentRuntime, SpanStore } from '@mvp/agent-runtime';
 import type { BotConfig } from '@mvp/agent-runtime';
 import { DEFAULT_POLICY, GovernanceGateway, sanitizeTelemetry } from '@mvp/governance';
 import { TelemetryCollector } from '@mvp/agent-runtime';
@@ -31,6 +31,15 @@ import {
   requireLoopbackAuth,
 } from './loopback-auth.js';
 import { GovernanceAdapter } from './governance-adapter.js';
+import { PauseRegistry, pauseGate, registerSystemPauseRoutes } from './system-pause.js';
+import { createHubPhoneActionDispatcher, phoneActionPolicyRules, registerPhoneActionTools } from './phone-actions.js';
+import {
+  NotificationStore,
+  NotificationTriageService,
+  createRoutingNotificationTriage,
+  registerNotificationRoutes,
+} from './notification-triage.js';
+import { resolveGithubSignalsSource } from './briefing-signals.js';
 import { SEED_FILES } from './generated/seed.js';
 import { loadSeed } from './seed.js';
 import { syncProviderKeysToEnv } from './providers.js';
@@ -47,9 +56,9 @@ import { createAgentImportRouter } from './agent-import-routes.js';
 import { createAnalyticsRouter } from './analytics-routes.js';
 import { createLocalLlmRouter } from './local-llm-routes.js';
 import { LocalLlmManager } from '@mvp/agent-runtime';
-import { LazyMcpManager } from '@mvp/agent-runtime';
+import { LazyMcpManager, PerBotMcpManager } from '@mvp/agent-runtime';
 import { createSelfUpdateRouter } from './self-update-routes.js';
-import { SelfUpdateManager } from '@mvp/agent-runtime';
+import { IdleAutoUpdater, SelfUpdateManager } from '@mvp/agent-runtime';
 import { createFusionRouter, shutdownFusionRuns } from './fusion-routes.js';
 import { FusionRunStore } from './fusion.js';
 import { createEvalRouter, shutdownEvalRuns } from './eval-routes.js';
@@ -85,11 +94,23 @@ import { createMessageSearchRouter } from './message-search-routes.js';
 import { createWorkspaceBackupRouter } from './workspace-backup-routes.js';
 import { createMessageThreadsRouter } from './message-threads-routes.js';
 import { createMessageReactionsRouter } from './message-reactions-routes.js';
+import { ReactionAnswerService, SignInRequestStore } from './chat-ux.js';
+import { CliAuthManager, type CliAuthId } from '@mvp/agent-runtime';
+import { buildVoiceProviders } from './voice-call.js';
 import { MessageReactionStore } from './message-reactions.js';
 import { createAcpSessionsRouter } from './acp-sessions-routes.js';
 import { AcpSessionManager, AcpSessionStore } from '@mvp/agent-runtime';
 import { createGroupChatsRouter } from './group-chats-routes.js';
+import { PeopleStore, TeamInboxStore, createRelayToPersonTool } from '@mvp/agent-runtime';
+import {
+  applyBotOwners,
+  createPeopleService,
+  resolveExplicitPersonContext,
+  resolvePersonContext,
+} from './people.js';
+import { createPeopleRouter } from './people-routes.js';
 import { applyImportedBots, createBotRosterRouter } from './bot-roster-routes.js';
+import { createBotSetupRouter } from './bot-setup-routes.js';
 import { registerRoutineRoutes } from './bot-routines.js';
 import { createRoutineWebhookRouter } from './webhooks.js';
 import { RoutineHookStore, WebhookDeliveryWorker, createPublicHookRouter } from './routine-hooks.js';
@@ -98,6 +119,8 @@ import {
   interconnectionPolicyRules,
   registerInterconnectionTools,
 } from './interconnect-tools.js';
+import { publishPagePolicyRules, registerPublishTools } from './publish-tools.js';
+import { registerPublicPageServing } from './public-pages.js';
 import { registerWorktreeRoutes } from './worktrees-routes.js';
 import { createWorktreeTools } from '@mvp/agent-runtime/dist/worktrees.js';
 import { HookBus, loadPlugins } from '@mvp/agent-runtime/dist/hooks.js';
@@ -162,6 +185,16 @@ import type { Policy } from '@mvp/governance';
 // encrypted vault inside the tool handlers — it never reaches the model.
 import { applyComposioToolGrants, COMPOSIO_KEY_NAME } from './composio.js';
 import { composioToolPolicies, registerComposioTools } from './composio-tools.js';
+// Sign-in code tool (W4b): enter_sign_in_code reads a fresh one-time code
+// from the user's connected Gmail (Composio path) AFTER approval and types
+// it into the bot's browser. The code value never reaches the model, a
+// tool result, or an audit entry.
+import { registerSignInCodeTools, signInCodePolicyRules } from './sign-in-code-tools.js';
+// Approval-gated purchasing (W6): request_purchase tool + policy (always
+// require-approval), purchase intent service with Stripe Link / browser
+// executors, and the billing-area purchases routes (mounted via routes.ts).
+import { createPurchaseWiring, purchasePolicyRules, registerPurchaseTools } from './purchases.js';
+import { CostTracker, SpendCapStore } from '@mvp/billing';
 
 // Pipe/JSON chat mode: `mvp-server chat --bot <id> [--json]`. Parsed at the
 // very top, before boot(), so `chat` never starts the HTTP server.
@@ -339,7 +372,7 @@ async function boot(): Promise<void> {
   // so deny-by-default is preserved and extended.
   const globalPolicy: Policy = {
     ...DEFAULT_POLICY,
-    rules: [...interconnectionPolicyRules(), ...computerUsePolicyRules(), ...museModuleToolPolicies(), ...composioToolPolicies(), ...DEFAULT_POLICY.rules],
+    rules: [...publishPagePolicyRules(), ...interconnectionPolicyRules(), ...computerUsePolicyRules(), ...museModuleToolPolicies(), ...composioToolPolicies(), ...signInCodePolicyRules(), ...purchasePolicyRules(), ...phoneActionPolicyRules(), ...DEFAULT_POLICY.rules],
   };
   const governance = new GovernanceGateway({
     dbPath: `${config.dataDir}/governance.db`,
@@ -363,6 +396,34 @@ async function boot(): Promise<void> {
   const phoneStore = new PhoneStore(config.dataDir);
   const phoneHub = new PhoneSessionHub(phoneStore, (action, fields) => governance.audit(action, fields));
   const phoneAdb = new AdbPhoneProvider();
+
+  // Global pause (W14d): one persisted registry checked by chat, the
+  // schedulers/pollers and the phone-action tools.
+  const pauseRegistry = new PauseRegistry(config.dataDir);
+  const isPaused = pauseGate(pauseRegistry);
+  if (pauseRegistry.isPaused()) {
+    console.log('[system] KriyaDot is PAUSED (persisted) — new work is on hold until resumed');
+  }
+
+  // Notification triage (W14b): phone notifications stream into this
+  // store/service via the phone hub. The push dependency is attached
+  // after the PushService exists (below) through notificationPushHolder.
+  const notificationStore = new NotificationStore(config.dataDir);
+  const notificationPushHolder: { svc?: import('./push.js').PushService } = {};
+  const notificationService = new NotificationTriageService({
+    store: notificationStore,
+    triage: createRoutingNotificationTriage(),
+    push: {
+      notify: (req) =>
+        notificationPushHolder.svc
+          ? notificationPushHolder.svc.notify(req)
+          : Promise.resolve({ attempted: 0, sent: 0 }),
+    },
+    audit: (action, fields) => governance.audit(action, fields),
+  });
+  phoneHub.setNotificationHandler((deviceId, n) => {
+    void notificationService.ingest({ deviceId, ...n }).catch(() => {});
+  });
 
   // Per-bot computers (OpenMausBot parity P1 #14): every bot gets its OWN
   // computer instance (own display state, own serialized input queue) plus
@@ -400,6 +461,20 @@ async function boot(): Promise<void> {
   };
   const computerManager = new PerBotComputerManager({
     onRealAction: auditComputerAction,
+    // W4: per-bot persistent browser profiles live under
+    // <dataDir>/browser-profiles/<botId>/; wipes are audited (metadata only).
+    dataDir: config.dataDir,
+    onProfileWipe: (result) => {
+      try {
+        governance.audit('computer.browser_profile_wiped', {
+          actor: 'user',
+          toolName: 'computer',
+          detail: { botId: result.botId, wiped: result.wiped, bytesFreed: result.bytesFreed },
+        });
+      } catch {
+        // Audit must never break the wipe.
+      }
+    },
     vpsLayerFor: (botId: string) => {
       const profile = resolveVpsProfile(config.dataDir, botId);
       if (!profile) throw new VpsNotConfiguredError(botId);
@@ -430,10 +505,29 @@ async function boot(): Promise<void> {
       }),
   });
 
+  // Approval-gated purchasing (W6): the purchase service owns intents,
+  // hard blocks, spend-cap gating and execution. Its CostTracker /
+  // SpendCapStore are separate connections onto the same billing.db the
+  // billing routes use (WAL — the same multi-connection pattern as the
+  // meter/ledger instances in routes.ts). Executors drive the calling
+  // bot's own computer/browser surface; the Stripe Link reference stays
+  // in the vault and never reaches bot context.
+  const purchaseWiring = createPurchaseWiring({
+    dataDir: config.dataDir,
+    governance,
+    costTracker: new CostTracker(path.join(config.dataDir, 'billing.db')),
+    spendCaps: new SpendCapStore(path.join(config.dataDir, 'billing.db')),
+    resolveOS: (botId: string) =>
+      computerManager.getLayer(botId, { surface: botsById.get(botId)?.computerSurface }),
+  });
+
   const governanceAdapter = new GovernanceAdapter(governance, {
     getBotConfig: (id) => botsById.get(id),
     globalPolicy,
     getPreference: (botId, toolName) => preferenceStore.getPreference(botId, toolName)?.preference,
+    // W6: when evaluation mints the request_purchase approval, register
+    // the pending purchase intent against it (one card per purchase).
+    approvalObserver: purchaseWiring.onApprovalMinted,
   });
 
   const { registry: toolRegistry, connections: mcpConnections, userSkillStore, connectMcp, close: closeMcp } =
@@ -459,6 +553,14 @@ async function boot(): Promise<void> {
     pinDbPath: path.join(config.dataDir, 'mcp-pins.db'),
   });
   lazyMcpManager.syncRegistry(toolRegistry);
+  // Per-bot private MCP servers (W9): a bot's OWN servers — separate
+  // processes per bot, visible only to that bot, torn down on bot delete.
+  // They are NOT synced into the shared registry; the runtime pulls them
+  // per turn via extraToolsForBot (see AgentRuntime construction below).
+  const perBotMcpManager = new PerBotMcpManager({
+    dataDir: config.dataDir,
+    pinDbPath: path.join(config.dataDir, 'mcp-pins.db'),
+  });
   const refreshMcpStubs = (): void => {
     try {
       lazyMcpManager.syncRegistry(toolRegistry);
@@ -518,6 +620,45 @@ async function boot(): Promise<void> {
     resolveUserId: () => 'default-user',
     audit: (action, fields) => governance.audit(action, fields),
   });
+  // Sign-in codes (W4b): enter_sign_in_code — approval-gated via
+  // signInCodePolicyRules above (the approval card shows site + source;
+  // no code exists until the handler runs). The handler searches the
+  // user's connected Gmail through the same Composio path (key resolved
+  // server-side, per-bot Gmail enablement enforced) and types the code
+  // into the calling bot's own computer surface. Code values are never
+  // returned, logged, or audited.
+  registerSignInCodeTools({
+    registry: toolRegistry,
+    dataDir: config.dataDir,
+    getApiKey: (userId: string) => {
+      try {
+        return new SecureVault(config.dataDir, userId, 'composio-tool').get(COMPOSIO_KEY_NAME)?.value;
+      } catch {
+        return undefined;
+      }
+    },
+    resolveUserId: () => 'default-user',
+    resolveOS: resolveBotComputerOS,
+    audit: (action, fields) => governance.audit(action, fields),
+  });
+  // Phone-app operation (W14a): phone_* tools dispatch approved actions
+  // to the paired phone over the phone hub and await its ack. Governance
+  // forces require-approval (phoneActionPolicyRules above); the global
+  // pause gate refuses dispatch while paused.
+  {
+    const { dispatcher, resolveDeviceId } = createHubPhoneActionDispatcher(phoneHub, phoneStore);
+    registerPhoneActionTools(toolRegistry, {
+      dispatcher,
+      resolveDeviceId,
+      audit: (action, fields) => governance.audit(action, fields),
+      isPaused,
+    });
+  }
+  // Approval-gated purchasing (W6): request_purchase — require-approval
+  // ALWAYS via purchasePolicyRules above. The handler only records /
+  // claims the purchase intent; execution runs solely after the human
+  // approves the intent's card (see purchases.ts safety contract).
+  registerPurchaseTools({ registry: toolRegistry, service: purchaseWiring.service });
   // OpenCode parity: git worktree tools (per-session isolated checkouts).
   // Workspace resolves per-session: a session with an attached worktree
   // operates inside it, otherwise in the default workspace. The closure runs
@@ -623,8 +764,14 @@ async function boot(): Promise<void> {
   const credentialProposalStore = new CredentialProposalStore(config.dataDir);
   toolRegistry.set('request_credential', createRequestCredentialTool());
 
+  // W13 observability: one shared span/trace store (<dataDir>/spans.db).
+  // The runtime auto-instruments provider + tool choke points into it;
+  // the observability routes serve the same store to Activity → Runs.
+  const spanStore = new SpanStore(`${config.dataDir}/spans.db`);
+
   const agentRuntime = new AgentRuntime({
     dbPath: `${config.dataDir}/agent.db`,
+    spanStore,
     skillsDir: path.join(seedDir, 'skills'),
     additionalSkillsDirs: [path.join(config.dataDir, 'skills')],
     // OpenMausBot parity P1 #20: disabled-by-default skill gate. Seed and
@@ -633,6 +780,8 @@ async function boot(): Promise<void> {
     skillUsabilityGate: (name, botId) =>
       userSkillStore.isUserSkill(name) ? userSkillStore.isUsable(name, botId) : true,
     peerApprovalGate,
+    // W9: per-bot private MCP tools, scoped strictly to the owning bot.
+    extraToolsForBot: (botId) => perBotMcpManager.toolDefinitions(botId),
     governance: governanceAdapter,
     toolRegistry,
     hooks: hookBus,
@@ -705,6 +854,45 @@ async function boot(): Promise<void> {
     getBots: () => seed.bots,
     audit: (action, fields) => governance.audit(action, fields),
   });
+
+  // Multiplayer layer (W7): people directory + team inbox + human relay.
+  // The default person ("You") is auto-seeded; persisted bot owners are
+  // applied onto the roster. The push service is created later in boot,
+  // so the service reaches it through a late-bound holder.
+  applyBotOwners(seed.bots, config.dataDir);
+  const peopleStore = new PeopleStore(config.dataDir);
+  const teamInboxStore = new TeamInboxStore(config.dataDir);
+  const peoplePushHolder: { svc?: import('./push.js').PushService } = {};
+  const peopleService = createPeopleService({
+    dataDir: config.dataDir,
+    people: peopleStore,
+    inbox: teamInboxStore,
+    getBots: () => seed.bots,
+    governance,
+    ledger: new OnBehalfOfLedger(config.dataDir),
+    getRuntime: () => ({
+      runTurn: (opts) => agentRuntime.runTurn(opts as never),
+      sessionStore: agentRuntime.sessionStore,
+    }),
+    getPush: () =>
+      peoplePushHolder.svc
+        ? {
+            notify: async (req) => {
+              await peoplePushHolder.svc!.notify({
+                kind: req.kind,
+                botId: req.botId,
+                botName: req.botName,
+                title: req.title,
+                body: req.body,
+              });
+            },
+          }
+        : undefined,
+  });
+  // relay_to_person agent tool (approval-governed: no allow rule in the
+  // default policy, so every relay needs a human approval first).
+  const relayTool = createRelayToPersonTool({ people: peopleStore, relayService: peopleService.relayService });
+  toolRegistry.set(relayTool.name, relayTool);
   const workflowRunner = new WorkflowRunner({
     dbPath: `${config.dataDir}/workflows.db`,
     agentRuntime,
@@ -722,6 +910,11 @@ async function boot(): Promise<void> {
     workflowRunner,
     dataDir: config.dataDir,
   });
+
+  // Public page publishing (W3): publish_page / unpublish_page /
+  // page_publication_status agent tools (publish/unpublish require approval
+  // via publishPagePolicyRules above).
+  registerPublishTools({ registry: toolRegistry, dataDir: config.dataDir });
 
   // Bot routines (OpenMausBot parity): scheduled bot tasks + signed inbound
   // webhook triggers that fire a bot turn. One store instance serves both
@@ -750,6 +943,11 @@ async function boot(): Promise<void> {
       prompt: string;
     }) => Promise<string>;
   } = {};
+  // Limit-reset arming (W1): mutable holder filled once the scheduler
+  // exists (below); the executor calls it when a run is limit-blocked.
+  const limitResetHooks: {
+    arm?: (args: { routine: import('./bot-routines.js').BotRoutine; error: unknown }) => void;
+  } = {};
   const routineRunExecutor = new RoutineRunExecutor({
     runStore: routineRunStore,
     agentRuntime,
@@ -760,7 +958,17 @@ async function boot(): Promise<void> {
       if (!hook) throw new Error('group-goal engine not initialized');
       return hook(args);
     },
+    onLimitBlocked: (args) => limitResetHooks.arm?.(args),
   });
+  // Limit-reset resumes (W1): durable pending resumes for limit-blocked
+  // routines, fired by the RoutineScheduler at the provider's reset time.
+  const { LimitResetResumeStore } = await import('./limit-reset-resumes.js');
+  const limitResetResumeStore = new LimitResetResumeStore(config.dataDir);
+  // Connected-app event triggers (W2): durable poll cursors/seen-sets for
+  // `event` routine schedules. The poller itself is started below, once
+  // the routine store exists.
+  const { EventTriggerStore } = await import('./routine-events.js');
+  const routineEventStore = new EventTriggerStore(config.dataDir);
   const { routineStore, triggerStore: routineTriggerStore } = registerRoutineRoutes(
     routinesRouter,
     {
@@ -769,6 +977,8 @@ async function boot(): Promise<void> {
       hookStore: routineHookStore,
       getBaseUrls: () => ({ publicBaseUrl: config.publicBaseUrl, localPort: config.port }),
       runStore: routineRunStore,
+      resumeStore: limitResetResumeStore,
+      eventStore: routineEventStore,
     },
   );
   const routineWebhookRouter = createRoutineWebhookRouter({
@@ -994,10 +1204,28 @@ async function boot(): Promise<void> {
     routineStore,
     runStore: routineRunStore,
     runExecutor: routineRunExecutor,
+    resumeStore: limitResetResumeStore,
     agentRuntime,
     getBots: () => seed.bots,
     renderPrompt: renderRoutinePrompt,
     onScheduleAutoPaused: (routine, streak) => notifyRoutinePaused?.(routine, streak),
+    isPaused,
+    onLimitResetResume: (resume, routine) => {
+      try {
+        createTask({
+          title: `Routine resumed after provider limit reset: ${routine.name}`,
+          notes: `Limit-reset resume ${resume.id} fired for routine ${routine.id} (provider ${resume.providerId} reset at ${new Date(resume.resumeAt).toISOString()}).`,
+          dueAt: null,
+        });
+        governance.audit('routine.limit_reset_resumed', {
+          actor: 'system',
+          sessionId: resume.id,
+          detail: { routineId: routine.id, providerId: resume.providerId, resumeAt: resume.resumeAt },
+        });
+      } catch (err) {
+        console.error('[routines] failed to record limit-reset resume:', err instanceof Error ? err.message : err);
+      }
+    },
     onFire: ({ routine, at, ok, error, skipped }) => {
       try {
         createTask({
@@ -1027,6 +1255,29 @@ async function boot(): Promise<void> {
         `${missedRuns.catchUpRuns} catch-up run(s) started`,
     );
   }
+  // Arm limit-reset resumes when a limit-blocked run settles: only
+  // routines that opted in with a 'limit-reset' schedule auto-resume.
+  limitResetHooks.arm = ({ routine, error }) => {
+    if (routine.schedule?.kind !== 'limit-reset') return;
+    try {
+      const resume = routineScheduler.armLimitResetResume(routine, error);
+      governance.audit('routine.limit_reset_armed', {
+        actor: 'system',
+        sessionId: resume.id,
+        detail: { routineId: routine.id, providerId: resume.providerId, resumeAt: resume.resumeAt },
+      });
+    } catch (err) {
+      console.error('[routines] failed to arm limit-reset resume:', err instanceof Error ? err.message : err);
+    }
+  };
+  // Limit-reset resumes (W1): crash-orphaned resumes return to pending;
+  // due ones fire on the scheduler's first tick.
+  const limitResumes = routineScheduler.reconcileLimitResetResumes();
+  if (limitResumes.recovered > 0 || limitResumes.due > 0) {
+    console.log(
+      `[routines] limit-reset resumes reconciled: ${limitResumes.recovered} recovered, ${limitResumes.due} due`,
+    );
+  }
   routineScheduler.start();
 
   // Routine run history API (OpenMausBot parity P0 #7): run records,
@@ -1037,6 +1288,47 @@ async function boot(): Promise<void> {
     runStore: routineRunStore,
     scheduler: routineScheduler,
   });
+
+  // Connected-app event triggers (W2): poll connected Composio apps for
+  // routines with an `event` schedule and fire them through the same run
+  // executor/history as every other trigger. Polling reuses the
+  // server-side Composio execution path (vault key → account resolution →
+  // per-bot enable gate → executeTool); cursors persist in
+  // routine-event-triggers.db so items fire at most once across restarts,
+  // and the first poll after boot catch-up-fires a bounded set of items
+  // missed while down.
+  const { EventTriggerPoller, createComposioEventExecutor } = await import('./routine-events.js');
+  const eventTriggerPoller = new EventTriggerPoller({
+    routineStore,
+    eventStore: routineEventStore,
+    executor: createComposioEventExecutor({ dataDir: config.dataDir }),
+    runExecutor: routineRunExecutor,
+    runStore: routineRunStore,
+    agentRuntime,
+    getBots: () => seed.bots,
+    renderPrompt: renderRoutinePrompt,
+    isPaused,
+    onFire: (routine, result) => {
+      try {
+        governance.audit('routine.event_fired', {
+          actor: 'system',
+          detail: {
+            routineId: routine.id,
+            app: routine.schedule?.kind === 'event' ? routine.schedule.app : undefined,
+            firedRuns: result.firedRunIds.length,
+            skippedCatchUp: result.skippedCatchUp,
+          },
+        });
+      } catch (err) {
+        console.error('[routines] failed to audit event fire:', err instanceof Error ? err.message : err);
+      }
+    },
+  });
+  const eventReconcile = eventTriggerPoller.reconcileOnBoot();
+  if (eventReconcile.cursors > 0) {
+    console.log(`[routines] event triggers reconciled: ${eventReconcile.cursors} cursor(s) restored`);
+  }
+  eventTriggerPoller.start();
 
   // Omni rolling summary (Omni panel backend): the collector feeds the
   // store from the governance audit log, pending approvals, and workflow
@@ -1072,6 +1364,15 @@ async function boot(): Promise<void> {
     runHealth,
     // Interconnection: briefing pulls recent workflow runs + note changes.
     workflowSource: workflowRunner,
+    // W14c GitHub signals (null when GitHub/repos are not configured —
+    // the brief then simply has no Signals section) + W14b digest.
+    signalsSource:
+      resolveGithubSignalsSource({
+        dataDir: config.dataDir,
+        executor: createComposioEventExecutor({ dataDir: config.dataDir }),
+      }) ?? undefined,
+    notificationDigest: (since, now) => notificationStore.digestItems(since, now),
+    isPaused,
   });
   briefingScheduler.start();
 
@@ -1230,6 +1531,7 @@ async function boot(): Promise<void> {
       return bot?.notifications ?? 'all';
     },
   });
+  notificationPushHolder.svc = pushService;
   peerCardPush = (card) => {
     void pushService
       .notifyApprovalNeeded(
@@ -1341,6 +1643,38 @@ async function boot(): Promise<void> {
   });
   void sentinel;
 
+  // Chat UX pack (W8): pending sign-in requests settled by "done"
+  // (chat route), and reactions-as-answers (reactions router below).
+  // Reaction decisions go through the SAME paths as clicking a card:
+  // governance.decide() on the real approval record (adapter id
+  // resolution + preference learning, mirroring POST /api/approvals)
+  // and WidgetCoordinator.settle() for question widgets.
+  const chatUxSignInStore = new SignInRequestStore();
+  const chatUxCliAuth = new CliAuthManager();
+  const reactionAnswerService = new ReactionAnswerService({
+    getApprovalStatus: (id) => governance.getApproval(governanceAdapter.resolveApprovalId(id))?.status,
+    decideApproval: (id, decision, opts) => {
+      const realId = governanceAdapter.resolveApprovalId(id);
+      const existing = governance.getApproval(realId);
+      governance.decide(realId, decision, { note: opts?.note });
+      if (existing) {
+        try {
+          preferenceStore.recordDecision(existing.botId, existing.toolName, decision);
+        } catch {
+          // Preference learning must never break a decision.
+        }
+      }
+    },
+    getWidget: (id) => {
+      const w = widgetStore.get(id);
+      return w ? { status: w.status, kind: w.kind, interactive: w.interactive } : undefined;
+    },
+    settleWidget: (id, value) => {
+      widgetCoordinator.settle(id, { answered: true, value });
+    },
+    audit: (action, fields) => governance.audit(action, fields),
+  });
+
   app.use(
     '/api',
     createRouter({
@@ -1359,6 +1693,14 @@ async function boot(): Promise<void> {
       dotStore,
       preferenceStore,
       phone: { store: phoneStore, hub: phoneHub, adb: phoneAdb },
+      // Global pause (W14d): the chat route refuses new turns while paused.
+      pauseRegistry,
+      briefingSignalsSource:
+        resolveGithubSignalsSource({
+          dataDir: config.dataDir,
+          executor: createComposioEventExecutor({ dataDir: config.dataDir }),
+        }) ?? undefined,
+      briefingNotificationDigest: (since, now) => notificationStore.digestItems(since, now),
       companion: { store: companionStore, hub: companionHub },
       // Remote screen viewing (phone -> PC, Codync parity): approval-gated.
       remoteScreen: { store: companionStore, service: remoteScreenService, loopbackToken },
@@ -1375,6 +1717,7 @@ async function boot(): Promise<void> {
       mcpServers: seed.mcpServers,
       tieredMemoryStore,
       runHealth,
+      spanStore,
       omniStore,
       omniCollector,
       computerManager,
@@ -1383,9 +1726,56 @@ async function boot(): Promise<void> {
       // Lazy MCP directory (OpenMausBot parity P1 #22).
       lazyMcpManager,
       refreshMcpStubs,
+      // Per-bot private MCP servers (W9).
+      perBotMcpManager,
       // Interactive widgets (OpenMausBot parity P1 #15): the chat route
       // passes this into runTurn so ask_user_question can pause for answers.
       widgetCoordinator,
+      // Approval-gated purchasing (W6): purchases routes on the billing
+      // router + approval-decision forwarding into the purchase service.
+      purchaseWiring,
+      // Chat UX pack (W8): "done" settles pending sign-in requests
+      // (status re-checked via the cli-auth status path), and chat
+      // voice replies synthesize through the bot's TTS provider
+      // (zero-cost mock when a key-gated provider is unconfigured).
+      signInRequests: chatUxSignInStore,
+      checkCliSignIn: async (cliId) => {
+        const status = await chatUxCliAuth.getStatus(cliId as CliAuthId);
+        return { signedIn: status.signedIn };
+      },
+      chatTtsProvider: (bot) => {
+        try {
+          return buildVoiceProviders('mock', bot.voice?.ttsProvider ?? 'mock', config.dataDir).tts;
+        } catch {
+          return undefined; // routes fall back to the mock TTS
+        }
+      },
+    }),
+  );
+  // Multiplayer layer (W7): people directory, org/ownership, team inbox,
+  // relays. Mounted on /api next to the main router (no new top-level
+  // web destination — surfaces live in Bots → Teams and Activity).
+  peoplePushHolder.svc = pushService;
+  app.use(
+    '/api',
+    createPeopleRouter({
+      dataDir: config.dataDir,
+      service: peopleService,
+      getBots: () => seed.bots,
+      governance,
+      listWidgets: () =>
+        widgetStore.list().map((w) => ({
+          id: w.id,
+          botId: w.botId,
+          status: w.status,
+          title: w.title,
+          payload: w.payload as { question?: string; title?: string },
+          interactive: w.interactive,
+          createdAt: w.createdAt,
+          addresseePersonId: w.addresseePersonId,
+        })),
+      listSessions: (opts) => agentRuntime.sessionStore.listSessions(opts),
+      audit: (action, fields) => governance.audit(action, fields),
     }),
   );
   // Parity workstreams: routers. All factories; none of these existed before.
@@ -1410,6 +1800,9 @@ async function boot(): Promise<void> {
       // W2: deleting a thread clears its circuit-breaker state so a
       // deleted session can't leak breaker/denial state into a recycled id.
       onThreadDeleted: (id) => agentRuntime.clearSessionCircuitState(id),
+      // W7: when a person context is presented, list only that person's
+      // private chats; no context → unchanged (all threads).
+      resolvePersonId: (req) => resolveExplicitPersonContext(req as never),
     }),
   );
   // Full-text message search (OpenMausBot parity): FTS5 over chat sessions.
@@ -1473,6 +1866,8 @@ async function boot(): Promise<void> {
     createMessageReactionsRouter({
       store: messageReactionStore,
       audit: (action, fields) => governance.audit(action, fields),
+      // W8b: 👍/👎 on a pending question/approval resolves it.
+      reactionAnswers: reactionAnswerService,
     }),
   );
   app.use(
@@ -1483,6 +1878,40 @@ async function boot(): Promise<void> {
       audit: (action, fields) => governance.audit(action, fields),
     }),
   );
+  // "Set me up" (W12a): one-sentence bot setup. /propose runs a setup turn
+  // and returns an inert proposal; /apply (the approval action) creates
+  // the bot + suggested routines. The setup turn uses the chief's
+  // provider/model when a chief exists, else the first bot's.
+  {
+    const { createProvider, SkillLoader } = await import('@mvp/agent-runtime');
+    app.use(
+      '/api/bots/setup',
+      createBotSetupRouter({
+        dataDir: config.dataDir,
+        getBots: () => seed.bots,
+        toolNames: () => [...toolRegistry.keys()],
+        mcpServerNames: () => Object.keys(seed.mcpServers ?? {}),
+        skillNames: () => {
+          try {
+            return new SkillLoader(path.join(seedDir, 'skills')).list();
+          } catch {
+            return [];
+          }
+        },
+        routineStore,
+        resolveSetupProvider: () => {
+          const chief = seed.bots.find((b) => b.chiefOfStaff) ?? seed.bots[0];
+          if (!chief) throw new Error('No bot exists yet to run the setup turn.');
+          return {
+            provider: createProvider(chief.provider),
+            model: chief.model,
+            providerId: chief.provider,
+          };
+        },
+        audit: (action, fields) => governance.audit(action, fields),
+      }),
+    );
+  }
   // Group chats (multi-bot rooms): roster rows with room-turn orchestration.
   app.use(
     '/api/bots',
@@ -1520,6 +1949,16 @@ async function boot(): Promise<void> {
         return { text: content };
       },
       audit: (action, fields) => governance.audit(action, fields),
+      // W7: @mentions of people in a room → team-inbox items + chief/push
+      // fan-out for exactly the mentioned people.
+      onPersonMentions: async ({ group, text, req }) => {
+        await peopleService.handleRoomPersonMentions({
+          groupId: group.id,
+          groupName: group.name,
+          text,
+          authorPersonId: resolvePersonContext(req as never),
+        });
+      },
     }),
   );
   // Bot routines: management API + signed inbound webhook triggers.
@@ -1571,7 +2010,41 @@ async function boot(): Promise<void> {
     dataDir: config.dataDir,
     currentVersion: process.env.KRIYADOT_VERSION ?? '0.1.0',
   });
-  app.use('/api/updates', createSelfUpdateRouter(updater));
+  // W12: "Apply updates when idle" (default OFF in update settings). The
+  // idle applier polls every 30s and applies a pending update only after
+  // 10 continuous idle minutes — idle = no live turns (turn-state
+  // registry) and no routine runs in flight (routine scheduler). Any busy
+  // poll resets the idle clock inside the applier.
+  const idleUpdater = new IdleAutoUpdater({
+    source: updater,
+    isBusy: () => agentRuntime.turnStates.size > 0 || routineScheduler.inFlightCount() > 0,
+    onApplied: (status) => {
+      try {
+        governance.audit('update.idle_applied', {
+          actor: 'system',
+          detail: { state: status.state, latest: status.latest?.tag ?? null },
+        });
+      } catch {
+        // Audit must never break the applier.
+      }
+    },
+  });
+  idleUpdater.start();
+  app.use('/api/updates', createSelfUpdateRouter(updater, { idleUpdater }));
+
+  // Open-at-login (W12d): file-based OS autostart entry managed from
+  // Settings. The exec path defaults to this server process; desktop
+  // installs set KRIYADOT_EXEC_PATH to the app binary.
+  {
+    const { AutostartManager } = await import('./autostart.js');
+    const { createAutostartRouter } = await import('./autostart-routes.js');
+    app.use(
+      '/api/autostart',
+      createAutostartRouter(new AutostartManager(), (action, fields) =>
+        governance.audit(action, fields),
+      ),
+    );
+  }
 
   // Peer approval cards (OpenMausBot parity): per-action Allow / Deny /
   // Always-allow for bot→bot calls, 15-minute expiry, revokable per-pair
@@ -1687,11 +2160,61 @@ async function boot(): Promise<void> {
       store: chiefWiring.store,
       retryDelegation: chiefWiring.retryDelegation,
       audit: (action, fields) => governance.audit(action, fields),
+      // W9: deleting a bot tears down its private MCP servers/processes.
+      onBotDeleted: async (botId) => {
+        await perBotMcpManager.removeAllForBot(botId);
+      },
     }),
   );
 
   app.use('/api/routines', routinesRouter);
   app.use('/webhooks/routines', routineWebhookRouter);
+  // Proactive account watching (W5): watch rules poll connected Composio
+  // apps on their check interval, triage new items with the cheapest
+  // routed helper model, and surface only flagged items as "needs you"
+  // inbox entries + a push. Cursors/seen-sets persist in watch.db, so
+  // the first poll after boot catch-up-checks a bounded set of items
+  // missed while down. Execution reuses the W2 Composio path (vault key
+  // → account resolution → per-bot enable gate) via the default
+  // executor inside registerWatchRoutes.
+  const { registerWatchRoutes } = await import('./watch-routes.js');
+  const watchRouter = express.Router();
+  const { watcher: watchWatcher } = registerWatchRoutes(watchRouter, {
+    dataDir: config.dataDir,
+    audit: (action, fields) => governance.audit(action, fields),
+    getBots: () => seed.bots,
+    chiefBotId:
+      chiefWiring.store.getChiefConfig().chiefBotId ??
+      seed.bots.find((b) => b.chiefOfStaff)?.id,
+    push: pushService,
+    agentRuntime,
+    isPaused,
+  });
+  const watchReconcile = watchWatcher.reconcileOnBoot();
+  if (watchReconcile.cursors > 0) {
+    console.log(`[watch] watch rules reconciled: ${watchReconcile.cursors} cursor(s) restored`);
+  }
+  watchWatcher.start();
+  app.use('/api', watchRouter);
+  // Global pause (W14d): /api/system/pause|resume|pause-state (audited).
+  {
+    const systemRouter = express.Router();
+    registerSystemPauseRoutes(systemRouter, {
+      registry: pauseRegistry,
+      audit: (action, fields) => governance.audit(action, fields),
+    });
+    app.use('/api', systemRouter);
+  }
+  // Notification triage (W14b): settings + needs-you inbox + digest.
+  {
+    const notificationRouter = express.Router();
+    registerNotificationRoutes(notificationRouter, {
+      store: notificationStore,
+      service: notificationService,
+      audit: (action, fields) => governance.audit(action, fields),
+    });
+    app.use('/api', notificationRouter);
+  }
   // n8n workflow import/export.
   app.use('/api', createWorkflowN8nRouter({ workflowRunner }));
   // Git worktrees (OpenCode parity).
@@ -1724,6 +2247,10 @@ async function boot(): Promise<void> {
   // per-bot activity. Mounted outside /api (it is not one of the app's nav
   // destinations) and before the SPA fallback so the path isn't claimed.
   // Counts and normalized names only — never secrets or message bodies.
+  // Public page publishing (W3): GET /p/<slug> serves published pages with
+  // NO auth (non-/api paths are loopback-auth exempt by design; unknown or
+  // unpublished slugs 404). Mounted before the SPA fallback.
+  registerPublicPageServing(app, { dataDir: config.dataDir });
   app.get('/_kriyadot/', (_req, res) => {
     try {
       res.type('html').send(
@@ -1806,6 +2333,11 @@ async function boot(): Promise<void> {
       // ignore lazy MCP close errors on shutdown
     }
     try {
+      await perBotMcpManager.close();
+    } catch {
+      // ignore per-bot MCP close errors on shutdown
+    }
+    try {
       // Tear down every per-bot computer instance (P1 #14).
       for (const bot of seed.bots) {
         await computerManager.removeBot(bot.id);
@@ -1865,7 +2397,14 @@ async function boot(): Promise<void> {
       // ignore
     }
     try {
+      peopleStore.close();
+      teamInboxStore.close();
+    } catch {
+      // ignore
+    }
+    try {
       updater.stopAutoCheck();
+      idleUpdater.stop();
     } catch {
       // ignore
     }

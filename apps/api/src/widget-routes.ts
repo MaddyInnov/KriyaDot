@@ -58,6 +58,7 @@ function serializeWidget(record: WidgetRecord): Record<string, unknown> {
     status: record.status,
     createdAt: record.createdAt,
     expiresAt: record.expiresAt,
+    neverExpire: record.neverExpire,
     ...(record.value !== undefined ? { value: record.value } : {}),
     ...(record.answeredAt !== undefined ? { answeredAt: record.answeredAt } : {}),
   };

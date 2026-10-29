@@ -463,6 +463,8 @@ interface AskQuestionInput {
   options?: AskQuestionOptionInput[];
   multiSelect?: boolean;
   allowFreeText?: boolean;
+  /** W12: this question's card never expires. */
+  neverExpire?: boolean;
 }
 
 const askQuestionOptionSchema = {
@@ -482,6 +484,7 @@ const askQuestionSingleSchema = {
     options: { type: 'array', items: askQuestionOptionSchema, description: 'Clickable options' },
     multiSelect: { type: 'boolean', description: 'Allow picking several options' },
     allowFreeText: { type: 'boolean', description: 'Also accept free text from the user' },
+    neverExpire: { type: 'boolean', description: 'This question card never expires (no countdown; stays answerable)' },
   },
   required: ['question'],
   additionalProperties: false,
@@ -511,6 +514,7 @@ function normalizeQuestionInput(raw: unknown): AskQuestionInput | { error: strin
   }
   if (typeof r.multiSelect === 'boolean') out.multiSelect = r.multiSelect;
   if (typeof r.allowFreeText === 'boolean') out.allowFreeText = r.allowFreeText;
+  if (typeof r.neverExpire === 'boolean') out.neverExpire = r.neverExpire;
   return out;
 }
 
@@ -559,6 +563,7 @@ function askUserQuestionTool(): ToolDefinition {
       'Use SPARINGLY — only for genuine user decisions you cannot make yourself (preferences, direction choices, disambiguation that blocks progress).',
       `After timeoutMinutes (default ${ASK_QUESTION_TIMEOUT_DEFAULT_MIN}, clamped to ${ASK_QUESTION_TIMEOUT_MIN}-${ASK_QUESTION_TIMEOUT_MAX}) with no answer, the turn resumes with answered:false — ALWAYS have a fallback default and continue without the answer.`,
       'Batch related questions in one call via `questions` (all are shown at once, then answered in order) instead of calling repeatedly.',
+      'Set neverExpire:true (top-level, or per question in batch mode) when the question must stay answerable indefinitely: the card shows "No expiry" and never auto-expires; the turn still resumes unanswered after timeoutMinutes, and the user can answer the card later.',
     ].join(' '),
     parameters: {
       type: 'object',
@@ -579,6 +584,10 @@ function askUserQuestionTool(): ToolDefinition {
         timeoutMinutes: {
           type: 'number',
           description: `Per-question wait in minutes (default ${ASK_QUESTION_TIMEOUT_DEFAULT_MIN}, clamped to ${ASK_QUESTION_TIMEOUT_MIN}-${ASK_QUESTION_TIMEOUT_MAX})`,
+        },
+        neverExpire: {
+          type: 'boolean',
+          description: 'When true, the question card(s) never expire (expiresAt is null; shown as "No expiry"). The turn wait is still bounded by timeoutMinutes.',
         },
       },
       additionalProperties: false,
@@ -608,6 +617,7 @@ function askUserQuestionTool(): ToolDefinition {
           options: args.options,
           multiSelect: args.multiSelect,
           allowFreeText: args.allowFreeText,
+          neverExpire: args.neverExpire,
         });
         if ('error' in n) return { error: `invalid question: ${n.error}` };
         inputs = [n];
@@ -626,8 +636,17 @@ function askUserQuestionTool(): ToolDefinition {
       const timeoutMs =
         Math.min(ASK_QUESTION_TIMEOUT_MAX, Math.max(ASK_QUESTION_TIMEOUT_MIN, rawTimeout)) * 60_000;
 
+      // Top-level neverExpire applies to every question that doesn't set
+      // its own (W12).
+      const topLevelNeverExpire = typeof args.neverExpire === 'boolean' ? args.neverExpire : undefined;
+      for (const input of inputs) {
+        if (input.neverExpire === undefined && topLevelNeverExpire !== undefined) {
+          input.neverExpire = topLevelNeverExpire;
+        }
+      }
+
       // Batch: raise + emit ALL questions first, then await answers in order.
-      const raised: Array<{ input: AskQuestionInput; widgetId: string; expiresAt: number; payload: ButtonsWidgetPayload }> = [];
+      const raised: Array<{ input: AskQuestionInput; widgetId: string; expiresAt: number | null; neverExpire: boolean; payload: ButtonsWidgetPayload }> = [];
       for (let i = 0; i < inputs.length; i++) {
         const input = inputs[i]!;
         const options = (input.options ?? []).map((o, oi) => ({
@@ -646,15 +665,23 @@ function askUserQuestionTool(): ToolDefinition {
         if (!validated.ok) return { error: `invalid question ${i + 1}: ${validated.error}` };
         const payload = validated.payload as ButtonsWidgetPayload;
         let widgetId: string;
-        let expiresAt: number;
+        let expiresAt: number | null;
+        let neverExpire = false;
         try {
-          const record = await host.raise({ kind: 'buttons', payload, title: 'Question for you', interactive: true });
+          const record = await host.raise({
+            kind: 'buttons',
+            payload,
+            title: 'Question for you',
+            interactive: true,
+            ...(input.neverExpire ? { neverExpire: true } : {}),
+          });
           widgetId = record.id;
           expiresAt = record.expiresAt;
+          neverExpire = record.neverExpire;
         } catch (err) {
           return { error: `could not raise question ${i + 1}: ${err instanceof Error ? err.message : String(err)}` };
         }
-        raised.push({ input, widgetId, expiresAt, payload });
+        raised.push({ input, widgetId, expiresAt, neverExpire, payload });
         try {
           await host.emit({
             type: 'widget',
@@ -662,6 +689,7 @@ function askUserQuestionTool(): ToolDefinition {
             sessionId: ctx.sessionId,
             widget: payload,
             expiresAt,
+            ...(neverExpire ? { neverExpire: true } : {}),
             interactive: true,
           });
         } catch {
@@ -675,8 +703,9 @@ function askUserQuestionTool(): ToolDefinition {
         selected: string[];
         labels: string[];
         freeText: string | null;
+        neverExpire?: boolean;
       }> = [];
-      for (const { input, widgetId, payload } of raised) {
+      for (const { input, widgetId, payload, neverExpire } of raised) {
         let answer: WidgetAnswer;
         try {
           answer = await host.awaitAnswer(widgetId, timeoutMs);
@@ -700,7 +729,12 @@ function askUserQuestionTool(): ToolDefinition {
           // Event sinks must never break the question flow.
         }
         const interpreted = interpretQuestionAnswer(answer, payload);
-        answers.push({ question: input.question, answered: answer.answered, ...interpreted });
+        answers.push({
+          question: input.question,
+          answered: answer.answered,
+          ...interpreted,
+          ...(neverExpire ? { neverExpire: true } : {}),
+        });
       }
       return { answers, allAnswered: answers.every((a) => a.answered) };
     },

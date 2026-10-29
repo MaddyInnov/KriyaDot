@@ -144,6 +144,13 @@ export function validateCommand(p: ParsedArgs): string | null {
       return usage(`kriyadot ${p.command} list.`);
     case 'login':
       return null;
+    case 'pause':
+      if (p.subcommand === '' || p.subcommand === 'status') return null;
+      return usage('kriyadot pause [status].');
+    case 'resume':
+    case 'status':
+      if (p.subcommand === '') return null;
+      return usage(`kriyadot ${p.command}.`);
     case 'config':
       if (['', 'get', 'set', 'path'].includes(p.subcommand)) return null;
       return usage('kriyadot config [get|set|path].');

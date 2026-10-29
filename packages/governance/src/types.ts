@@ -37,6 +37,14 @@ export interface ApprovalRecord {
   decidedAt?: number;
   decidedBy?: string;
   note?: string;
+  /**
+   * W12 never-expire cards: epoch ms at which a pending approval would
+   * expire on a decision wait, or null when the approval never expires.
+   * Absent on pre-W12 records (the gateway's approval timeout applies).
+   */
+  expiresAt?: number | null;
+  /** W12: true when this approval was created with neverExpire. */
+  neverExpire?: boolean;
   /** Where the approval came from (hard floor, reviewer escalation, etc.). */
   provenance?: string;
   /**
@@ -45,6 +53,13 @@ export interface ApprovalRecord {
    * decide() throws on 'approved' (fail-closed).
    */
   relayed?: boolean;
+  /**
+   * Multiplayer layer (W7): the person this approval is addressed to —
+   * the owner of the bot that raised it (see PeopleStore in
+   * @mvp/agent-runtime). Absent on pre-W7 records and for bots with no
+   * owner recorded; consumers fall back to the bot's current owner.
+   */
+  addresseePersonId?: string;
 }
 
 /** Append-only audit entry. `detail` must NEVER contain secrets. */
@@ -70,6 +85,17 @@ export interface EvalContext {
    * with relayed=true can never be approved (fail-closed in decide()).
    */
   relayed?: boolean;
+  /**
+   * Multiplayer layer (W7): person the resulting approval is addressed
+   * to (the bot's owner). Copied onto the ApprovalRecord.
+   */
+  addresseePersonId?: string;
+  /**
+   * W12: when true, approvals minted from this evaluation never expire
+   * (ApprovalRecord.expiresAt = null; awaitDecision never marks them
+   * expired). Copied onto the ApprovalRecord.
+   */
+  neverExpire?: boolean;
 }
 
 /** Result of evaluating a proposed tool call against the policy. */

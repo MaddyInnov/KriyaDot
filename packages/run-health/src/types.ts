@@ -14,7 +14,9 @@ export type HealthSignal =
   | 'http-status'
   | 'approval'
   | 'empty-output'
-  | 'cost';
+  | 'cost'
+  /** W13: repeated near-identical tool calls / assistant text in one run. */
+  | 'loop';
 
 export type FindingSeverity = 'info' | 'warning' | 'critical';
 

@@ -35,6 +35,8 @@ export interface FakeApi extends FakeApiOptions {
   decisions: Array<{ approvalId: string; decision: string }>;
   chatRequests: ChatRequest[];
   deletedThreads: string[];
+  pauseCalls: string[];
+  pauseState: { paused: boolean; pausedAt: number | null; pausedBy: string | null };
   importedMarkdown?: string;
   exportedMarkdown?: string;
   importedManifest?: unknown;
@@ -47,6 +49,8 @@ export function makeFakeApi(opts: FakeApiOptions = {}): FakeApi {
     decisions: [],
     chatRequests: [],
     deletedThreads: [],
+    pauseCalls: [],
+    pauseState: { paused: false, pausedAt: null, pausedBy: null },
     asApi() {
       const self = this;
       return {
@@ -71,6 +75,20 @@ export function makeFakeApi(opts: FakeApiOptions = {}): FakeApi {
         importTeamManifest: async (manifest: unknown) => {
           self.importedManifest = manifest;
           return { id: 'team-2', name: 'Manifest team' };
+        },
+        getPauseState: async () => {
+          self.pauseCalls.push('GET /system/pause-state');
+          return { ok: true, ...self.pauseState };
+        },
+        pauseSystem: async () => {
+          self.pauseCalls.push('POST /system/pause');
+          self.pauseState = { paused: true, pausedAt: 1700000000000, pausedBy: 'cli' };
+          return { ok: true, ...self.pauseState };
+        },
+        resumeSystem: async () => {
+          self.pauseCalls.push('POST /system/resume');
+          self.pauseState = { paused: false, pausedAt: null, pausedBy: null };
+          return { ok: true, ...self.pauseState };
         },
         decideApproval: async (approvalId: string, decision: 'approved' | 'denied') => {
           self.decisions.push({ approvalId, decision });

@@ -71,7 +71,8 @@ export type PostHook = (
 
 interface Waiter {
   resolve: (decision: 'approved' | 'denied') => void;
-  timer: ReturnType<typeof setTimeout>;
+  /** Absent for never-expire approvals waiting without a deadline (W12). */
+  timer?: ReturnType<typeof setTimeout>;
 }
 
 /** Raw DB row shape for the approvals table. */
@@ -89,6 +90,9 @@ interface ApprovalRow {
   note: string | null;
   provenance: string | null;
   relayed: number | null;
+  addressee_person_id: string | null;
+  expires_at: number | null;
+  never_expire: number | null;
 }
 
 /** Raw DB row shape for the audit_log table. */
@@ -207,12 +211,32 @@ export class GovernanceGateway {
     } catch {
       // Column already exists.
     }
+    // Migration (W7 multiplayer): addressee person id — the bot owner's
+    // person id, recorded when the approval is minted so the approvals
+    // inbox / team inbox can route and filter by person.
+    try {
+      this.db.exec('ALTER TABLE approvals ADD COLUMN addressee_person_id TEXT');
+    } catch {
+      // Column already exists.
+    }
+    // Migration (W12 never-expire cards): stored expiry + never-expire
+    // flag. expires_at is NULL for never-expire approvals.
+    try {
+      this.db.exec('ALTER TABLE approvals ADD COLUMN expires_at INTEGER');
+    } catch {
+      // Column already exists.
+    }
+    try {
+      this.db.exec('ALTER TABLE approvals ADD COLUMN never_expire INTEGER NOT NULL DEFAULT 0');
+    } catch {
+      // Column already exists.
+    }
   }
 
   /** Release the SQLite connection. */
   close(): void {
     for (const [, waiter] of this.waiters) {
-      clearTimeout(waiter.timer);
+      if (waiter.timer) clearTimeout(waiter.timer);
     }
     this.waiters.clear();
     this.db.close();
@@ -365,6 +389,8 @@ export class GovernanceGateway {
       const approvalId = this.requestApproval(toolName, args, ctx, {
         provenance: 'hard-floor-escalated',
         relayed: ctx.relayed,
+        addresseePersonId: ctx.addresseePersonId,
+        neverExpire: ctx.neverExpire,
       });
       this.audit('tool.evaluate', {
         actor: ctx.actor,
@@ -426,7 +452,11 @@ export class GovernanceGateway {
     }
 
     // require-approval: persist a pending approval with a redacted args snapshot.
-    const approvalId = this.requestApproval(toolName, args, ctx, { relayed: ctx.relayed });
+    const approvalId = this.requestApproval(toolName, args, ctx, {
+      relayed: ctx.relayed,
+      addresseePersonId: ctx.addresseePersonId,
+      neverExpire: ctx.neverExpire,
+    });
     this.audit('approval.created', {
       actor: ctx.actor,
       sessionId: ctx.sessionId,
@@ -446,11 +476,20 @@ export class GovernanceGateway {
     toolName: string,
     args: Record<string, unknown>,
     ctx: EvalContext,
-    opts: { provenance?: string; relayed?: boolean } = {},
+    opts: {
+      provenance?: string;
+      relayed?: boolean;
+      addresseePersonId?: string;
+      /** W12: the approval never expires (expiresAt = null). */
+      neverExpire?: boolean;
+    } = {},
   ): string {
+    const addresseePersonId = opts.addresseePersonId ?? ctx.addresseePersonId;
+    const neverExpire = opts.neverExpire === true || ctx.neverExpire === true;
+    const now = Date.now();
     const record: ApprovalRecord = {
       id: randomUUID(),
-      ts: Date.now(),
+      ts: now,
       sessionId: ctx.sessionId,
       botId: ctx.botId,
       actor: ctx.actor,
@@ -458,13 +497,16 @@ export class GovernanceGateway {
       args: redactSecrets(args),
       status: 'pending',
       provenance: opts.provenance,
+      expiresAt: neverExpire ? null : now + this.approvalTimeoutMs,
+      ...(neverExpire ? { neverExpire: true } : {}),
       ...(opts.relayed === true ? { relayed: true } : {}),
+      ...(addresseePersonId ? { addresseePersonId } : {}),
     };
     this.db
       .prepare(
         `INSERT INTO approvals
-           (id, ts, session_id, bot_id, actor, tool_name, args_json, status, provenance, relayed)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (id, ts, session_id, bot_id, actor, tool_name, args_json, status, provenance, relayed, addressee_person_id, expires_at, never_expire)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         record.id,
@@ -477,6 +519,9 @@ export class GovernanceGateway {
         record.status,
         record.provenance ?? null,
         record.relayed === true ? 1 : 0,
+        record.addresseePersonId ?? null,
+        record.expiresAt ?? null,
+        neverExpire ? 1 : 0,
       );
     return record.id;
   }
@@ -498,17 +543,29 @@ export class GovernanceGateway {
     if (rec.status === 'denied' || rec.status === 'expired') return 'denied';
 
     const timeout = timeoutMs ?? this.approvalTimeoutMs;
+    // W12: a never-expire approval is NEVER marked expired. When the
+    // caller supplied an explicit wait timeout, the wait still ends
+    // (resolving 'denied' for this caller, fail-closed) but the record
+    // stays pending and decidable; with no explicit timeout the wait is
+    // unbounded and resolves only on decide().
+    const neverExpire = rec.neverExpire === true;
     return new Promise<'approved' | 'denied'>((resolve) => {
+      if (neverExpire && timeoutMs === undefined) {
+        this.waiters.set(approvalId, { resolve });
+        return;
+      }
       const timer = setTimeout(() => {
         this.waiters.delete(approvalId);
-        this.markExpired(approvalId);
-        this.audit('approval.expired', {
-          actor: rec.actor,
-          sessionId: rec.sessionId,
-          toolName: rec.toolName,
-          decision: 'expired',
-          detail: { approvalId },
-        });
+        if (!neverExpire) {
+          this.markExpired(approvalId);
+          this.audit('approval.expired', {
+            actor: rec.actor,
+            sessionId: rec.sessionId,
+            toolName: rec.toolName,
+            decision: 'expired',
+            detail: { approvalId },
+          });
+        }
         resolve('denied');
       }, timeout);
       if (typeof timer.unref === 'function') {
@@ -562,7 +619,7 @@ export class GovernanceGateway {
 
     const waiter = this.waiters.get(approvalId);
     if (waiter) {
-      clearTimeout(waiter.timer);
+      if (waiter.timer) clearTimeout(waiter.timer);
       this.waiters.delete(approvalId);
       waiter.resolve(decision);
     }
@@ -582,12 +639,32 @@ export class GovernanceGateway {
     return updated;
   }
 
-  /** List approvals, newest first, optionally filtered by status. */
-  listApprovals(status?: ApprovalStatus): ApprovalRecord[] {
-    const stmt = status
-      ? this.db.prepare(`SELECT * FROM approvals WHERE status = ? ORDER BY ts DESC`)
-      : this.db.prepare(`SELECT * FROM approvals ORDER BY ts DESC`);
-    const rows = (status ? stmt.all(status) : stmt.all()) as unknown as ApprovalRow[];
+  /**
+   * List approvals, newest first, optionally filtered by status and/or
+   * (W7) addressee person / bot. Filters combine with AND.
+   */
+  listApprovals(
+    status?: ApprovalStatus,
+    filter?: { addresseePersonId?: string; botId?: string },
+  ): ApprovalRecord[] {
+    const clauses: string[] = [];
+    const params: string[] = [];
+    if (status) {
+      clauses.push('status = ?');
+      params.push(status);
+    }
+    if (filter?.addresseePersonId) {
+      clauses.push('addressee_person_id = ?');
+      params.push(filter.addresseePersonId);
+    }
+    if (filter?.botId) {
+      clauses.push('bot_id = ?');
+      params.push(filter.botId);
+    }
+    const where = clauses.length > 0 ? ` WHERE ${clauses.join(' AND ')}` : '';
+    const rows = this.db
+      .prepare(`SELECT * FROM approvals${where} ORDER BY ts DESC`)
+      .all(...params) as unknown as ApprovalRow[];
     return rows.map(GovernanceGateway.rowToRecord);
   }
 
@@ -744,6 +821,32 @@ export class GovernanceGateway {
       .run(approvalId);
   }
 
+  /**
+   * W12 sweep: mark pending approvals whose stored expires_at has passed
+   * as 'expired' and fail their in-flight waiters closed. Never-expire
+   * approvals (expires_at NULL / flagged) and pre-W12 records (no stored
+   * expiry) never match. Returns the transitioned ids.
+   */
+  expireStaleApprovals(now = Date.now()): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id FROM approvals WHERE status = 'pending' AND expires_at IS NOT NULL AND COALESCE(never_expire, 0) = 0 AND expires_at <= ?`,
+      )
+      .all(now) as unknown as Array<{ id: string }>;
+    const expired: string[] = [];
+    for (const r of rows) {
+      this.markExpired(r.id);
+      const waiter = this.waiters.get(r.id);
+      if (waiter) {
+        if (waiter.timer) clearTimeout(waiter.timer);
+        this.waiters.delete(r.id);
+        waiter.resolve('denied');
+      }
+      expired.push(r.id);
+    }
+    return expired;
+  }
+
   private static rowToRecord(row: ApprovalRow): ApprovalRecord {
     let args: Record<string, unknown> = {};
     try {
@@ -768,6 +871,11 @@ export class GovernanceGateway {
       note: row.note ?? undefined,
       provenance: row.provenance ?? undefined,
       relayed: row.relayed === 1 ? true : undefined,
+      addresseePersonId: row.addressee_person_id ?? undefined,
+      // W12: never-expire approvals read back expiresAt: null + the flag;
+      // ordinary approvals expose their stored expiry when present.
+      expiresAt: row.never_expire === 1 ? null : (row.expires_at ?? undefined),
+      ...(row.never_expire === 1 ? { neverExpire: true } : {}),
     };
   }
 }

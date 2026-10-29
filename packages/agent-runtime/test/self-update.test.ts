@@ -85,10 +85,11 @@ describe('selectAssetForPlatform', () => {
 
 describe('sanitizeSettings', () => {
   it('coerces and clamps', () => {
-    expect(sanitizeSettings({})).toEqual({ autoCheck: true, checkIntervalHours: 24 });
+    expect(sanitizeSettings({})).toEqual({ autoCheck: true, checkIntervalHours: 24, applyWhenIdle: false });
     expect(sanitizeSettings({ autoCheck: false, checkIntervalHours: 0.2 })).toEqual({
       autoCheck: false,
       checkIntervalHours: 1,
+      applyWhenIdle: false,
     });
     expect(sanitizeSettings({ checkIntervalHours: 99999 }).checkIntervalHours).toBe(720);
     expect(sanitizeSettings({ autoCheck: 'yes' as unknown as boolean }).autoCheck).toBe(true);

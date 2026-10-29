@@ -60,7 +60,18 @@ export function AuditPanel({ hideHeader = false }: { hideHeader?: boolean }) {
                   {fmtTs(e.ts)}
                 </td>
                 <td className="mono">{e.actor}</td>
-                <td className="mono">{e.action}</td>
+                <td className="mono">
+                  {e.action}
+                  {/failover|limit_reset|usage_warning|provider_limit/.test(e.action) && (
+                    <span className="chip gray" style={{ marginLeft: 6 }} title="AI failover / provider limit event (W1)">
+                      {e.action.includes('failover')
+                        ? '🔁 failover'
+                        : e.action.includes('usage_warning')
+                          ? '⚠️ near-limit'
+                          : '⏳ limit-reset'}
+                    </span>
+                  )}
+                </td>
                 <td className="mono">{e.toolName ?? '—'}</td>
                 <td>
                   {e.decision ? (

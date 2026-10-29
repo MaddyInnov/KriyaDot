@@ -170,8 +170,10 @@ export function rememberAllowedTool(
   const bot = bots.find((b) => b.id === botId);
   if (!bot) throw new Error(`Unknown bot "${botId}"`);
   // Local-first safety: privileged tools can never be "always allow".
-  // They must pass full policy evaluation every time.
-  const blocked = /^(mcp:|run_command$|exec$|shell$|write_file$|edit_file$|create_file$|delete_file$|remove_file$)/.test(tool)
+  // They must pass full policy evaluation every time. W6: request_purchase
+  // is privileged by explicit product rule — every purchase is individually
+  // approved, with no always-allow persistence, ever.
+  const blocked = /^(mcp:|run_command$|exec$|shell$|write_file$|edit_file$|create_file$|delete_file$|remove_file$|request_purchase$)/.test(tool)
     || /delete|remove|drop|exec/.test(tool);
   if (blocked) {
     throw new Error(`Tool "${tool}" is privileged and cannot be set to always-allow. Approve each call instead.`);

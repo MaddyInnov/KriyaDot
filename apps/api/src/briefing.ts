@@ -57,6 +57,17 @@ export interface Briefing {
   notes?: BriefingItem[];
   /** Recent workflow runs (feature interconnection). */
   workflows?: BriefingItem[];
+  /**
+   * Connected-app signals (W14c): GitHub review requests, failing CI,
+   * mentions. Optional + omitted when the source is unavailable, so older
+   * payloads and not-connected setups render exactly as before.
+   */
+  signals?: BriefingItem[];
+  /**
+   * Batched phone notifications digest (W14b): non-urgent notifications
+   * accumulated since the previous briefing. Optional, same rule.
+   */
+  notifications?: BriefingItem[];
   summary?: string;
   regressions?: RegressionAlert[];
 }
@@ -271,6 +282,17 @@ export interface GenerateBriefingDeps {
     }>;
   };
   /**
+   * Connected-app signals source (W14c, briefing-signals.ts). Structural —
+   * the GitHub source satisfies it; tests inject a fake. Unset or failing
+   * → no Signals section, brief unaffected.
+   */
+  signalsSource?: { collect: () => Promise<BriefingItem[]> };
+  /**
+   * Batched-notification digest source (W14b): NotificationStore.digestItems
+   * satisfies this. Unset → no notifications section.
+   */
+  notificationDigest?: (since: number, now: number) => BriefingItem[];
+  /**
    * Summary override (tests). Defaults to the Ollama attempt with a
    * deterministic template fallback.
    */
@@ -288,6 +310,10 @@ export interface BriefingSummaryContext {
   noteCount?: number;
   /** Workflow runs in the briefing window (optional; 0/undefined → omitted). */
   workflowCount?: number;
+  /** Connected-app signals (W14c; optional, same omission rule). */
+  signalCount?: number;
+  /** Batched phone notifications (W14b; optional, same omission rule). */
+  notificationCount?: number;
 }
 
 export type SummarizeFn = (ctx: BriefingSummaryContext) => Promise<string | null>;
@@ -430,6 +456,8 @@ function buildSummaryPrompt(ctx: BriefingSummaryContext): string {
   ];
   if ((ctx.noteCount ?? 0) > 0) lines.push(`Notes changed since the last briefing: ${ctx.noteCount}.`);
   if ((ctx.workflowCount ?? 0) > 0) lines.push(`Workflow runs since the last briefing: ${ctx.workflowCount}.`);
+  if ((ctx.signalCount ?? 0) > 0) lines.push(`Connected-app signals needing attention: ${ctx.signalCount}.`);
+  if ((ctx.notificationCount ?? 0) > 0) lines.push(`Phone notifications batched for this digest: ${ctx.notificationCount}.`);
   return (
     'Write a 3-6 sentence morning briefing for the operator of a personal AI agent platform, ' +
     'based only on these facts. Plain language, no jargon, no bullet points, no markdown.\n\n' +
@@ -506,6 +534,12 @@ export function templateSummary(ctx: BriefingSummaryContext): string {
   if ((ctx.workflowCount ?? 0) > 0) {
     parts.push(`${ctx.workflowCount} workflow run${plural(ctx.workflowCount ?? 0)} since the last briefing.`);
   }
+  if ((ctx.signalCount ?? 0) > 0) {
+    parts.push(`${ctx.signalCount} connected-app signal${plural(ctx.signalCount ?? 0)} need attention — see Signals.`);
+  }
+  if ((ctx.notificationCount ?? 0) > 0) {
+    parts.push(`${ctx.notificationCount} phone notification${plural(ctx.notificationCount ?? 0)} were batched into this digest.`);
+  }
   return parts.join(' ');
 }
 
@@ -535,6 +569,28 @@ export async function generateBriefing(deps: GenerateBriefingDeps): Promise<Brie
   const notes = collectNotes(noteStore, since, now);
   const workflows = collectWorkflowRuns(deps.workflowSource, since, now);
 
+  // W14c signals + W14b notification digest: both best-effort — any
+  // failure (not connected, executor error, store error) yields an empty
+  // section and the brief still generates.
+  let signals: BriefingItem[] = [];
+  if (deps.signalsSource) {
+    try {
+      signals = (await deps.signalsSource.collect()).slice(0, 10);
+    } catch (err) {
+      console.error('[briefing] signals collection failed:', err instanceof Error ? err.message : err);
+      signals = [];
+    }
+  }
+  let notifications: BriefingItem[] = [];
+  if (deps.notificationDigest) {
+    try {
+      notifications = deps.notificationDigest(since, now).slice(0, 20);
+    } catch (err) {
+      console.error('[briefing] notification digest failed:', err instanceof Error ? err.message : err);
+      notifications = [];
+    }
+  }
+
   const ctx: BriefingSummaryContext = {
     overnightCount: overnight.length,
     botCount,
@@ -544,6 +600,8 @@ export async function generateBriefing(deps: GenerateBriefingDeps): Promise<Brie
     regressionCount: regressions.length,
     noteCount: notes.length,
     workflowCount: workflows.length,
+    signalCount: signals.length,
+    notificationCount: notifications.length,
   };
 
   const summarize = deps.summarize ?? summarizeWithOllama;
@@ -562,6 +620,8 @@ export async function generateBriefing(deps: GenerateBriefingDeps): Promise<Brie
     approvals,
     notes,
     workflows,
+    signals,
+    notifications,
     summary,
     regressions,
   };
@@ -589,6 +649,11 @@ export interface BriefingSchedulerDeps {
    * section in scheduled briefings.
    */
   workflowSource?: GenerateBriefingDeps['workflowSource'];
+  /** W14c/W14b sources, forwarded to generateBriefing. */
+  signalsSource?: GenerateBriefingDeps['signalsSource'];
+  notificationDigest?: GenerateBriefingDeps['notificationDigest'];
+  /** Global pause gate (W14d): while paused, scheduled briefings skip. */
+  isPaused?: () => boolean;
 }
 
 export class BriefingScheduler {
@@ -615,6 +680,7 @@ export class BriefingScheduler {
   /** Generate + persist the briefing when the configured time hits. Never throws. */
   async tick(now = new Date()): Promise<void> {
     if (this.running) return;
+    if (this.deps.isPaused?.()) return; // W14d global pause: skip the tick
     this.running = true;
     try {
       const cfg = this.store.getConfig();
@@ -631,6 +697,8 @@ export class BriefingScheduler {
         calendarStore: this.deps.calendarStore,
         summarize: this.deps.summarize,
         workflowSource: this.deps.workflowSource,
+        signalsSource: this.deps.signalsSource,
+        notificationDigest: this.deps.notificationDigest,
       });
       this.store.saveBriefing('scheduled', briefing);
       this.store.setSetting('last_fired_day', key);

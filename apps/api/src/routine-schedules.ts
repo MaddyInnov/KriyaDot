@@ -27,7 +27,9 @@
 // in flight) or 'queue' (fire regardless).
 
 import type { AgentRuntime, BotConfig } from '@mvp/agent-runtime';
+import { classifyProviderError, computeResumeAtMs, DEFAULT_LIMIT_BACKOFF_MS } from '@mvp/agent-runtime';
 import type { BotRoutine, RoutineStore } from './bot-routines.js';
+import type { LimitResetResume, LimitResetResumeStore } from './limit-reset-resumes.js';
 import {
   RoutineRunExecutor,
   type RoutineRunStore,
@@ -292,7 +294,7 @@ export function cronMatchesZone(parsed: ParsedCron, p: ZonedParts): boolean {
 // Schedule model
 // ---------------------------------------------------------------------------
 
-export type RoutineScheduleKind = 'once' | 'daily' | 'cron' | 'interval';
+export type RoutineScheduleKind = 'once' | 'daily' | 'cron' | 'interval' | 'limit-reset' | 'event';
 
 /** When a scheduled run fires while the previous run is still in flight. */
 export type OverlapPolicy = 'skip' | 'queue';
@@ -359,12 +361,91 @@ export interface IntervalSchedule extends ScheduleBase {
   endsAt?: string;
 }
 
-export type RoutineSchedule = OnceSchedule | DailySchedule | CronSchedule | IntervalSchedule;
+/**
+ * Limit-reset (W1): the routine is blocked by a provider usage limit and
+ * resumes when the provider's limit resets. Not a repeating schedule —
+ * it arms with a concrete `resumeAt` (computed from the limit error's
+ * reset / retry-after signal, else `defaultBackoffMinutes`) and fires
+ * once at that instant. The durable pending resume lives in
+ * LimitResetResumeStore; `resumeAt` here mirrors it for next-run display.
+ */
+export interface LimitResetSchedule extends ScheduleBase {
+  kind: 'limit-reset';
+  /** Provider whose limit blocked the work (display + arming), optional. */
+  providerId?: string;
+  /** Fallback wait when the limit error carries no reset signal. 1..10080 minutes, default 60. */
+  defaultBackoffMinutes?: number;
+  /** Armed resume instant: ISO 8601 datetime with offset. Unset = waiting for a limit event to arm it. */
+  resumeAt?: string;
+}
+
+/** Connected apps an `event` schedule can listen to (Composio toolkit slugs). */
+export type EventAppId = 'gmail' | 'slack' | 'github' | 'stripe' | 'googlecalendar';
+
+export const EVENT_APP_IDS: readonly EventAppId[] = ['gmail', 'slack', 'github', 'stripe', 'googlecalendar'];
+
+/** GitHub repo event categories an event schedule can subscribe to. */
+export type GithubEventType = 'issues' | 'pull_request' | 'push';
+/** Stripe payment outcomes an event schedule can subscribe to. */
+export type StripeEventType = 'payment_succeeded' | 'payment_failed';
+
+/** Default poll interval (minutes) per event source. */
+export const EVENT_DEFAULT_POLL_MINUTES: Record<EventAppId, number> = {
+  gmail: 15,
+  slack: 10,
+  github: 10,
+  stripe: 10,
+  googlecalendar: 10,
+};
+/** Poll intervals are clamped to at least this many minutes. */
+export const EVENT_MIN_POLL_MINUTES = 5;
+/** Default per-trigger daily fire cap for event schedules. */
+export const EVENT_DEFAULT_DAILY_CAP = 50;
+
+/**
+ * Connected-app event trigger (W2): the routine fires when a new item
+ * appears in a connected Composio app (see routine-events.ts for the
+ * polling engine). Not a time-grid schedule — `nextRuns` yields nothing;
+ * the poller compares a persisted cursor against recent items instead.
+ * Filter fields are per-app; irrelevant fields are rejected per app only
+ * when they carry the wrong type (unknown fields are ignored).
+ */
+export interface EventSchedule extends ScheduleBase {
+  kind: 'event';
+  /** Connected app (Composio toolkit slug). */
+  app: EventAppId;
+  /** Connected Composio account id (nanoid) for `app`. */
+  accountId: string;
+  /** KriyaDot user that owns the connected account. Default 'default-user'. */
+  userId?: string;
+  /** Poll interval in minutes (min EVENT_MIN_POLL_MINUTES). */
+  pollMinutes: number;
+  /** Max fires per day (schedule timezone), 1..1000. */
+  dailyCap: number;
+  // Gmail filter (also composed into the at-source search query).
+  from?: string;
+  subjectContains?: string;
+  query?: string;
+  // Slack filter.
+  channelId?: string;
+  keyword?: string;
+  // GitHub filter.
+  repo?: string;
+  eventTypes?: GithubEventType[];
+  // Stripe filter.
+  stripeEventTypes?: StripeEventType[];
+  // Calendar filter.
+  calendarId?: string;
+  /** Fire for events starting within this many minutes from the poll. */
+  windowMinutes?: number;
+}
+
+export type RoutineSchedule = OnceSchedule | DailySchedule | CronSchedule | IntervalSchedule | LimitResetSchedule | EventSchedule;
 
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
-const ONCE_WALL_RE = /^(\d{4})-(\d{2})-(\d{2})T([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?$/;
+const ONCE_WALL_RE = /^(\d{4})-(\d{2})-(\d{2})T([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d)(?:\.\d+)?)?$/;
 const ONCE_OFFSET_RE =
-  /^(\d{4})-(\d{2})-(\d{2})T([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?(Z|[+-]([01]\d|2[0-3]):?([0-5]\d))$/;
+  /^(\d{4})-(\d{2})-(\d{2})T([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d)(?:\.\d+)?)?(Z|[+-]([01]\d|2[0-3]):?([0-5]\d))$/;
 
 function validWeekdays(v: unknown): v is number[] {
   return (
@@ -421,6 +502,128 @@ export function parseScheduleInstant(s: string, timezone: string, what: string):
   throw new Error(`${what} must be ISO 8601 with offset ("...+05:30"/"Z") or wall-clock "YYYY-MM-DDTHH:mm"`);
 }
 
+const ACCOUNT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const EVENT_USER_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const SLACK_CHANNEL_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const GITHUB_REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const GITHUB_EVENT_TYPES: readonly GithubEventType[] = ['issues', 'pull_request', 'push'];
+const STRIPE_EVENT_TYPES: readonly StripeEventType[] = ['payment_succeeded', 'payment_failed'];
+
+function eventOptString(s: Record<string, unknown>, field: string, max: number): string | undefined {
+  const v = s[field];
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== 'string') throw new Error(`event ${field} must be a string`);
+  const t = v.trim();
+  if (!t) return undefined;
+  if (t.length > max) throw new Error(`event ${field} must be at most ${max} characters`);
+  return t;
+}
+
+function eventEnumList<T extends string>(
+  s: Record<string, unknown>,
+  field: string,
+  allowed: readonly T[],
+  fallback: T[],
+): T[] {
+  const v = s[field];
+  if (v === undefined || v === null) return [...fallback];
+  if (!Array.isArray(v) || v.length === 0) {
+    throw new Error(`event ${field} must be a non-empty array of: ${allowed.join(', ')}`);
+  }
+  const out: T[] = [];
+  for (const item of v) {
+    if (typeof item !== 'string' || !(allowed as readonly string[]).includes(item)) {
+      throw new Error(`event ${field} contains an unknown value "${String(item)}" (allowed: ${allowed.join(', ')})`);
+    }
+    if (!out.includes(item as T)) out.push(item as T);
+  }
+  return out;
+}
+
+/** Validate + normalize an `event` schedule (connected-app trigger, W2). */
+function validateEventSchedule(
+  s: Record<string, unknown>,
+  base: { timezone: string; enabled: boolean; overlap: OverlapPolicy; catchUp: boolean; failureStreakLimit: number },
+): EventSchedule {
+  const app = s.app;
+  if (typeof app !== 'string' || !(EVENT_APP_IDS as readonly string[]).includes(app)) {
+    throw new Error(`event app must be one of: ${EVENT_APP_IDS.join(', ')}`);
+  }
+  const appId = app as EventAppId;
+  const accountId = s.accountId;
+  if (typeof accountId !== 'string' || !ACCOUNT_ID_RE.test(accountId.trim())) {
+    throw new Error('event accountId is required (the connected Composio account id)');
+  }
+  const out: EventSchedule = {
+    kind: 'event',
+    ...base,
+    app: appId,
+    accountId: accountId.trim(),
+    pollMinutes: EVENT_DEFAULT_POLL_MINUTES[appId],
+    dailyCap: EVENT_DEFAULT_DAILY_CAP,
+  };
+  if (s.userId !== undefined) {
+    if (typeof s.userId !== 'string' || !EVENT_USER_RE.test(s.userId.trim())) {
+      throw new Error('event userId must match /^[A-Za-z0-9_-]{1,64}$/');
+    }
+    out.userId = s.userId.trim();
+  }
+  if (s.pollMinutes !== undefined) {
+    if (!Number.isInteger(s.pollMinutes) || (s.pollMinutes as number) < EVENT_MIN_POLL_MINUTES || (s.pollMinutes as number) > 1440) {
+      throw new Error(`event pollMinutes must be an integer ${EVENT_MIN_POLL_MINUTES}..1440`);
+    }
+    out.pollMinutes = s.pollMinutes as number;
+  }
+  if (s.dailyCap !== undefined) {
+    if (!Number.isInteger(s.dailyCap) || (s.dailyCap as number) < 1 || (s.dailyCap as number) > 1000) {
+      throw new Error('event dailyCap must be an integer 1..1000');
+    }
+    out.dailyCap = s.dailyCap as number;
+  }
+  // Per-source filters. Fields for other sources are type-checked when
+  // present but only the active source's required fields are enforced.
+  const from = eventOptString(s, 'from', 200);
+  const subjectContains = eventOptString(s, 'subjectContains', 200);
+  const query = eventOptString(s, 'query', 500);
+  const channelId = eventOptString(s, 'channelId', 64);
+  const keyword = eventOptString(s, 'keyword', 200);
+  const repo = eventOptString(s, 'repo', 200);
+  const calendarId = eventOptString(s, 'calendarId', 200);
+  if (from) out.from = from;
+  if (subjectContains) out.subjectContains = subjectContains;
+  if (query) out.query = query;
+  if (channelId) out.channelId = channelId;
+  if (keyword) out.keyword = keyword;
+  if (repo) out.repo = repo;
+  if (calendarId) out.calendarId = calendarId;
+  if (appId === 'slack') {
+    if (!out.channelId || !SLACK_CHANNEL_RE.test(out.channelId)) {
+      throw new Error('event channelId is required for slack (the channel id to watch)');
+    }
+  }
+  if (appId === 'github') {
+    if (!out.repo || !GITHUB_REPO_RE.test(out.repo)) {
+      throw new Error('event repo is required for github in "owner/name" form');
+    }
+    out.eventTypes = eventEnumList(s, 'eventTypes', GITHUB_EVENT_TYPES, [...GITHUB_EVENT_TYPES]);
+  }
+  if (appId === 'stripe') {
+    out.stripeEventTypes = eventEnumList(s, 'stripeEventTypes', STRIPE_EVENT_TYPES, [...STRIPE_EVENT_TYPES]);
+  }
+  if (appId === 'googlecalendar') {
+    if (s.windowMinutes !== undefined) {
+      if (!Number.isInteger(s.windowMinutes) || (s.windowMinutes as number) < 5 || (s.windowMinutes as number) > 10080) {
+        throw new Error('event windowMinutes must be an integer 5..10080');
+      }
+      out.windowMinutes = s.windowMinutes as number;
+    } else {
+      out.windowMinutes = 120;
+    }
+    if (!out.calendarId) out.calendarId = 'primary';
+  }
+  return out;
+}
+
 /**
  * Validate a schedule object (from JSON input). Returns a normalized copy
  * with defaults applied. Throws a descriptive Error on any problem.
@@ -431,8 +634,8 @@ export function validateRoutineSchedule(input: unknown): RoutineSchedule {
   }
   const s = input as Record<string, unknown>;
   const kind = s.kind;
-  if (kind !== 'once' && kind !== 'daily' && kind !== 'cron' && kind !== 'interval') {
-    throw new Error('schedule.kind must be one of: once, daily, cron, interval');
+  if (kind !== 'once' && kind !== 'daily' && kind !== 'cron' && kind !== 'interval' && kind !== 'limit-reset' && kind !== 'event') {
+    throw new Error('schedule.kind must be one of: once, daily, cron, interval, limit-reset, event');
   }
   const timezone = s.timezone;
   assertValidTimeZone(typeof timezone === 'string' ? timezone : '');
@@ -456,6 +659,36 @@ export function validateRoutineSchedule(input: unknown): RoutineSchedule {
     failureStreakLimit = s.failureStreakLimit as number;
   }
   const governance = { catchUp, failureStreakLimit };
+
+  if (kind === 'event') {
+    return validateEventSchedule(s, { timezone: timezone as string, enabled, overlap, ...governance });
+  }
+
+  if (kind === 'limit-reset') {
+    const out: LimitResetSchedule = { kind, timezone: timezone as string, enabled, overlap, ...governance };
+    if (s.providerId !== undefined) {
+      if (typeof s.providerId !== 'string' || !s.providerId.trim()) {
+        throw new Error('limit-reset providerId must be a non-empty string');
+      }
+      out.providerId = s.providerId.trim().slice(0, 128);
+    }
+    if (s.defaultBackoffMinutes !== undefined) {
+      if (!Number.isInteger(s.defaultBackoffMinutes) || (s.defaultBackoffMinutes as number) < 1 || (s.defaultBackoffMinutes as number) > 10080) {
+        throw new Error('limit-reset defaultBackoffMinutes must be an integer 1..10080');
+      }
+      out.defaultBackoffMinutes = s.defaultBackoffMinutes as number;
+    } else {
+      out.defaultBackoffMinutes = 60;
+    }
+    if (s.resumeAt !== undefined) {
+      if (typeof s.resumeAt !== 'string' || !s.resumeAt.trim()) {
+        throw new Error('limit-reset resumeAt must be a datetime string');
+      }
+      parseScheduleInstant(s.resumeAt, timezone as string, 'limit-reset resumeAt'); // validates
+      out.resumeAt = s.resumeAt.trim();
+    }
+    return out;
+  }
 
   if (kind === 'once') {
     const runAt = s.runAt;
@@ -534,6 +767,25 @@ export function describeSchedule(s: RoutineSchedule): string {
       if (s.weekdays) d += ` on ${s.weekdays.join(',')}`;
       if (s.endsAt) d += ` until ${s.endsAt}`;
       return `${d} (${tz})`;
+    }
+    case 'limit-reset': {
+      let d = 'on provider limit reset';
+      if (s.providerId) d += ` (${s.providerId})`;
+      if (s.resumeAt) d += ` — armed for ${s.resumeAt}`;
+      else d += ` — waits for a limit event (default backoff ${s.defaultBackoffMinutes ?? 60}m)`;
+      return `${d} (${tz})`;
+    }
+    case 'event': {
+      let d = `on ${s.app} event via account ${s.accountId}`;
+      if (s.app === 'gmail' && (s.from || s.subjectContains || s.query)) {
+        const f = [s.from && `from:${s.from}`, s.subjectContains && `subject:~${s.subjectContains}`, s.query].filter(Boolean).join(' ');
+        d += ` matching ${f}`;
+      }
+      if (s.app === 'slack') d += ` in channel ${s.channelId}${s.keyword ? ` matching "${s.keyword}"` : ''}`;
+      if (s.app === 'github') d += ` on ${s.repo} (${(s.eventTypes ?? []).join('/')})`;
+      if (s.app === 'stripe') d += ` (${(s.stripeEventTypes ?? []).join('/')})`;
+      if (s.app === 'googlecalendar') d += ` on ${s.calendarId ?? 'primary'} starting within ${s.windowMinutes ?? 120}m`;
+      return `${d} — polls every ${s.pollMinutes}m, cap ${s.dailyCap}/day (${tz})`;
     }
   }
 }
@@ -684,6 +936,30 @@ function nextRunsInterval(s: IntervalSchedule, n: number, fromMs: number): NextR
  * The next N run times strictly after `fromMs` (default: now).
  * Returns at most 100 runs. Throws on invalid schedules.
  */
+function nextRunsLimitReset(s: LimitResetSchedule, n: number, fromMs: number): NextRun[] {
+  if (!s.resumeAt) return []; // not armed yet — a limit event arms it
+  const at = parseScheduleInstant(s.resumeAt, s.timezone, 'resumeAt');
+  return at > fromMs ? [makeNextRun(s.timezone, at)].slice(0, n) : [];
+}
+
+/**
+ * Resume instant for a limit-blocked routine: the provider's reset time
+ * from the error when available, else retry-after, else the schedule's
+ * configured default backoff (or the global default). Pure — the single
+ * computation both the API route and the scheduler use.
+ */
+export function computeLimitResetResumeAt(
+  err: unknown,
+  opts?: { nowMs?: number; defaultBackoffMinutes?: number; providerId?: string },
+): number {
+  const classified = classifyProviderError(err, { providerId: opts?.providerId });
+  const fallback =
+    opts?.defaultBackoffMinutes !== undefined
+      ? opts.defaultBackoffMinutes * 60_000
+      : DEFAULT_LIMIT_BACKOFF_MS;
+  return computeResumeAtMs(classified, { nowMs: opts?.nowMs, defaultBackoffMs: fallback });
+}
+
 export function nextRuns(schedule: RoutineSchedule, n = 5, fromMs: number = Date.now()): NextRun[] {
   const count = Math.max(1, Math.min(MAX_NEXT_RUNS, Math.floor(n) || 5));
   switch (schedule.kind) {
@@ -695,6 +971,12 @@ export function nextRuns(schedule: RoutineSchedule, n = 5, fromMs: number = Date
       return nextRunsCron(schedule, count, fromMs);
     case 'interval':
       return nextRunsInterval(schedule, count, fromMs);
+    case 'limit-reset':
+      return nextRunsLimitReset(schedule, count, fromMs);
+    case 'event':
+      // Event triggers are poll-driven (routine-events.ts), not a time
+      // grid — there is no computable "next run" instant.
+      return [];
   }
 }
 
@@ -749,6 +1031,16 @@ export interface RoutineSchedulerDeps {
   catchUpWindowMs?: number;
   /** Called when a failure streak auto-pauses a schedule. */
   onScheduleAutoPaused?: (routine: BotRoutine, streak: number) => void;
+  /**
+   * Limit-reset resumes (W1): durable pending resumes for limit-blocked
+   * routines. When set, tick() fires due resumes and
+   * reconcileLimitResetResumes() recovers crash-orphaned ones on boot.
+   */
+  resumeStore?: LimitResetResumeStore;
+  /** Called after a limit-reset resume fires (observability / Activity). */
+  onLimitResetResume?: (resume: LimitResetResume, routine: BotRoutine) => void;
+  /** Global pause gate (W14d): while paused, ticks skip entirely. */
+  isPaused?: () => boolean;
 }
 
 /** Missed occurrences older than this are too stale to record (boot catch-up). */
@@ -811,6 +1103,7 @@ export class RoutineScheduler {
   }
 
   async tick(nowMs?: number): Promise<void> {
+    if (this.deps.isPaused?.()) return; // W14d global pause: skip the tick
     if (this.ticking) return;
     this.ticking = true;
     try {
@@ -818,15 +1111,145 @@ export class RoutineScheduler {
       for (const routine of this.deps.routineStore.list()) {
         await this.tickRoutine(routine, now);
       }
+      await this.tickLimitResetResumes(now);
       this.booted = true;
     } finally {
       this.ticking = false;
     }
   }
 
+  /**
+   * Arm a limit-reset resume for a routine blocked by a provider limit.
+   * Computes the resume instant from the error (reset / retry-after /
+   * the schedule's default backoff), persists it in the resume store
+   * (survives restart), and mirrors it onto a limit-reset schedule when
+   * the routine has one. Returns the persisted resume.
+   */
+  armLimitResetResume(
+    routine: BotRoutine,
+    err: unknown,
+    opts?: { providerId?: string; nowMs?: number },
+  ): LimitResetResume {
+    const store = this.deps.resumeStore;
+    if (!store) throw new Error('limit-reset resumes are not enabled');
+    const schedule = routine.schedule?.kind === 'limit-reset' ? routine.schedule : undefined;
+    const providerId = opts?.providerId ?? schedule?.providerId ?? 'unknown';
+    const resumeAt = computeLimitResetResumeAt(err, {
+      nowMs: opts?.nowMs,
+      defaultBackoffMinutes: schedule?.defaultBackoffMinutes,
+      providerId,
+    });
+    const classified = classifyProviderError(err, { providerId });
+    const resume = store.schedule({
+      routineId: routine.id,
+      botId: routine.botId,
+      providerId,
+      resumeAt,
+      reason: classified.message.slice(0, 300),
+    });
+    if (schedule) {
+      try {
+        this.deps.routineStore.setSchedule(routine.id, {
+          ...schedule,
+          resumeAt: new Date(resumeAt).toISOString(),
+        });
+      } catch {
+        // Mirroring is display-only; the resume store is authoritative.
+      }
+    }
+    return resume;
+  }
+
+  /**
+   * Boot reconciliation for limit-reset resumes: crash-orphaned 'firing'
+   * resumes return to 'pending'; due ones fire on the next tick.
+   */
+  reconcileLimitResetResumes(nowMs?: number): { recovered: number; due: number } {
+    const store = this.deps.resumeStore;
+    if (!store) return { recovered: 0, due: 0 };
+    return store.reconcileOnBoot(nowMs ?? this.deps.now?.() ?? Date.now());
+  }
+
+  /** Fire every due pending limit-reset resume. Called from tick(). */
+  private async tickLimitResetResumes(now: number): Promise<void> {
+    const store = this.deps.resumeStore;
+    if (!store) return;
+    for (const resume of store.duePending(now)) {
+      if (!resume.routineId) continue; // standalone resumes are host-fired
+      const routine = this.deps.routineStore.get(resume.routineId);
+      if (!routine || !routine.enabled) {
+        store.cancel(resume.id);
+        continue;
+      }
+      if (routine.schedule?.overlap === 'skip' && this.inFlight.has(routine.id)) continue;
+      if (!store.claim(resume.id)) continue;
+      try {
+        await this.fireResume(routine, resume);
+        store.markFired(resume.id);
+        try {
+          this.deps.onLimitResetResume?.(resume, routine);
+        } catch (err) {
+          console.error('[routine-scheduler] onLimitResetResume threw:', err instanceof Error ? err.message : err);
+        }
+      } catch (err) {
+        store.release(resume.id);
+        console.error('[routine-scheduler] limit-reset resume failed:', err instanceof Error ? err.message : err);
+      }
+    }
+  }
+
+  private async fireResume(routine: BotRoutine, resume: LimitResetResume): Promise<void> {
+    this.inFlight.add(routine.id);
+    try {
+      if (this.executor) {
+        await this.executor.execute({
+          routine,
+          trigger: 'schedule',
+          scheduledFor: resume.resumeAt,
+          payload: {
+            source: 'limit-reset',
+            routineId: routine.id,
+            routineName: routine.name,
+            resumeId: resume.id,
+            providerId: resume.providerId,
+            reason: resume.reason,
+          },
+          sessionId: routine.sessionId ?? `routine_${routine.id}`,
+          onSettled: () => this.checkStreak(routine),
+        });
+      } else {
+        const bot = this.deps.getBots().find((b) => b.id === routine.botId);
+        if (!bot) throw new Error(`Unknown bot "${routine.botId}"`);
+        const render = this.deps.renderPrompt ?? defaultRenderPrompt;
+        const message = render(routine.promptTemplate, {
+          source: 'limit-reset',
+          routineId: routine.id,
+          routineName: routine.name,
+          resumeId: resume.id,
+        });
+        await this.deps.agentRuntime.runTurn({
+          bot,
+          message,
+          sessionId: routine.sessionId ?? `routine_${routine.id}`,
+          taskType: 'chat',
+          onEvent: () => {},
+        });
+      }
+    } finally {
+      this.inFlight.delete(routine.id);
+    }
+  }
+
   private async tickRoutine(routine: BotRoutine, now: number): Promise<void> {
     const schedule = routine.schedule;
     if (!routine.enabled || !schedule || !schedule.enabled) return;
+    // Event schedules are fired by the EventTriggerPoller
+    // (routine-events.ts), which owns their cursors — never by this
+    // time-grid tick.
+    if (schedule.kind === 'event') return;
+    // Limit-reset schedules fire through the durable resume store (the
+    // authoritative path) when one is wired — never twice.
+    if (schedule.kind === 'limit-reset' && this.deps.resumeStore) return;
 
     let watermark = this.deps.routineStore.getLastFiredAt(routine.id);
     if (watermark === undefined) {
@@ -882,6 +1305,9 @@ export class RoutineScheduler {
     for (const routine of this.deps.routineStore.list()) {
       const schedule = routine.schedule;
       if (!routine.enabled || !schedule || !schedule.enabled) continue;
+      // Event triggers reconcile through their own cursor catch-up in
+      // the EventTriggerPoller (bounded, per routine-events.ts).
+      if (schedule.kind === 'event') continue;
       const watermark = this.deps.routineStore.getLastFiredAt(routine.id);
       if (watermark === undefined || watermark >= now) continue;
       const gap = now - watermark;

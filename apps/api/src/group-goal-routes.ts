@@ -563,9 +563,11 @@ export function registerGroupGoalRoutes(router: Router, deps: GroupGoalRouteDeps
     res.status(202).json({ ok: true, goal });
   });
 
-  router.get('/', (_req: Request, res: Response) => {
+  router.get('/', (req: Request, res: Response) => {
     const limit = 50;
-    res.json({ ok: true, goals: store.listGoals(limit) });
+    // W8f: a 1:1 chat lists just its own `/goal` runs.
+    const sessionId = typeof req.query.sessionId === 'string' && req.query.sessionId ? req.query.sessionId : undefined;
+    res.json({ ok: true, goals: store.listGoals(limit, sessionId ? { sessionId } : {}) });
   });
 
   router.get('/:id', (req: Request, res: Response) => {

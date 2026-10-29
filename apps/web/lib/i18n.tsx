@@ -25,9 +25,9 @@
 import React from 'react';
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
-import { en, fill, hi, type Strings } from './locales';
+import { en, fill, hi, it, ja, pl, ptBR, ru, type Strings } from './locales';
 
-export type LocaleId = 'en' | 'hi';
+export type LocaleId = 'en' | 'hi' | 'ru' | 'it' | 'pl' | 'ja' | 'pt-BR';
 
 export interface LocaleDef {
   id: LocaleId;
@@ -40,13 +40,18 @@ export interface LocaleDef {
 export const LOCALES: LocaleDef[] = [
   { id: 'en', label: 'English', englishLabel: 'English' },
   { id: 'hi', label: 'हिन्दी', englishLabel: 'Hindi' },
+  { id: 'ru', label: 'Русский', englishLabel: 'Russian' },
+  { id: 'it', label: 'Italiano', englishLabel: 'Italian' },
+  { id: 'pl', label: 'Polski', englishLabel: 'Polish' },
+  { id: 'ja', label: '日本語', englishLabel: 'Japanese' },
+  { id: 'pt-BR', label: 'Português (Brasil)', englishLabel: 'Brazilian Portuguese' },
 ];
 
 const STORAGE_KEY = 'mvp:locale';
-const VALID: LocaleId[] = ['en', 'hi'];
+const VALID: LocaleId[] = ['en', 'hi', 'ru', 'it', 'pl', 'ja', 'pt-BR'];
 export const DEFAULT_LOCALE: LocaleId = 'en';
 
-const DICTS: Record<LocaleId, Strings> = { en, hi };
+const DICTS: Record<LocaleId, Strings> = { en, hi, ru, it, pl, ja, 'pt-BR': ptBR };
 
 export function getStoredLocale(): LocaleId {
   try {

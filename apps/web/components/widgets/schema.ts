@@ -47,7 +47,12 @@ export interface ChartDataset {
 
 export interface ChartWidget extends WidgetBase {
   kind: 'chart';
-  chart: 'bar' | 'line';
+  /**
+   * 'bar' = grouped bars; 'stacked-bar' = datasets stacked per label
+   * (W8c — the server widget protocol's canonical chart form);
+   * 'line' = line/area (legacy web-native form).
+   */
+  chart: 'bar' | 'line' | 'stacked-bar';
   labels: string[];
   datasets: ChartDataset[];
 }
@@ -251,8 +256,12 @@ function validateTable(raw: Record<string, unknown>): WidgetValidation {
 
 function validateChart(raw: Record<string, unknown>): WidgetValidation {
   const base = baseOf(raw, 'chart');
-  const chart = raw.chart === 'bar' || raw.chart === 'line' ? raw.chart : undefined;
-  if (!chart) return fail('chart widget requires "chart": "bar" | "line"');
+  // Three accepted spellings of the chart type: the web-native `chart`
+  // field, and the server protocol's (W8c) `chartType` / `type` fields.
+  const typeRaw = raw.chart ?? raw.chartType ?? raw.type;
+  const chart =
+    typeRaw === 'bar' || typeRaw === 'line' || typeRaw === 'stacked-bar' ? typeRaw : undefined;
+  if (!chart) return fail('chart widget requires a chart type: "bar" | "stacked-bar" | "line"');
   if (!Array.isArray(raw.labels) || raw.labels.length === 0) {
     return fail('chart widget requires a non-empty "labels" array');
   }
@@ -263,14 +272,28 @@ function validateChart(raw: Record<string, unknown>): WidgetValidation {
     if (s === undefined) return fail('chart widget "labels" must be non-empty strings');
     labels.push(s);
   }
-  if (!Array.isArray(raw.datasets) || raw.datasets.length === 0) {
-    return fail('chart widget requires a non-empty "datasets" array');
+  // Dataset sources, normalized to one shape: `datasets` (web-native),
+  // `series: [{label, values}]` (server canonical), or the split form
+  // `series: string[]` + `values: number[][]` (server split form).
+  let rawDatasets: unknown[] | undefined;
+  if (Array.isArray(raw.datasets) && raw.datasets.length > 0) {
+    rawDatasets = raw.datasets;
+  } else if (Array.isArray(raw.series) && raw.series.length > 0) {
+    if (raw.series.every((s) => typeof s === 'string')) {
+      const rows = Array.isArray(raw.values) ? raw.values : [];
+      rawDatasets = (raw.series as string[]).map((label, i) => ({ label, values: rows[i] }));
+    } else {
+      rawDatasets = raw.series;
+    }
   }
-  if (raw.datasets.length > MAX_DATASETS) {
+  if (!rawDatasets || rawDatasets.length === 0) {
+    return fail('chart widget requires a non-empty "datasets" (or "series") array');
+  }
+  if (rawDatasets.length > MAX_DATASETS) {
     return fail(`chart widget allows at most ${MAX_DATASETS} datasets`);
   }
   const datasets: ChartDataset[] = [];
-  for (const d of raw.datasets) {
+  for (const d of rawDatasets) {
     if (!isRecord(d)) return fail('chart widget "datasets" must be objects');
     const label = str(d.label, 80);
     if (label === undefined) return fail('chart dataset requires a "label" string');

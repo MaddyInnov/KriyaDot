@@ -12,7 +12,23 @@ export interface SessionRecord {
   id: string;
   botId: string;
   createdAt: string;
+  /**
+   * Multiplayer layer (W7): the person who owns this private 1:1 chat.
+   * Absent/null on pre-W7 rows — those belong to the default user.
+   *
+   * TRUST MODEL (honest): KriyaDot is a local-first app. A "person
+   * context" (the `x-person-id` header / `personId` param the UI sends)
+   * is a UI-level identity selector, NOT cryptographic authentication —
+   * anyone with local API access can present any person id. Ownership
+   * filtering keeps teammates' private chats out of each other's lists
+   * in normal use; it is not a security boundary against a local
+   * attacker. (Tenancy orgs/roles govern hosted multi-tenant use.)
+   */
+  ownerPersonId?: string;
 }
+
+/** Person id that owns pre-W7 / unowned private chats: the default user. */
+export const DEFAULT_CHAT_OWNER_PERSON_ID = 'you';
 
 /** A chat session (thread) summary for thread pickers and the CLI. */
 export interface SessionSummary extends SessionRecord {
@@ -199,7 +215,14 @@ export class SessionStore {
         id TEXT PRIMARY KEY,
         bot_id TEXT NOT NULL,
         created_at TEXT NOT NULL
-      );
+      );`);
+    // W7 migration: private-chat owner person (nullable; null = default user).
+    try {
+      this.db.exec('ALTER TABLE sessions ADD COLUMN owner_person_id TEXT');
+    } catch {
+      // Column already exists.
+    }
+    this.db.exec(`
       CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL,
@@ -257,19 +280,49 @@ export class SessionStore {
     this.db.prepare('DELETE FROM messages_fts WHERE rowid NOT IN (SELECT id FROM messages)').run();
   }
 
-  createSession(botId: string): string {
+  createSession(botId: string, opts: { ownerPersonId?: string } = {}): string {
     const id = newId();
     this.db
-      .prepare('INSERT INTO sessions (id, bot_id, created_at) VALUES (?, ?, ?)')
-      .run(id, botId, new Date().toISOString());
+      .prepare('INSERT INTO sessions (id, bot_id, created_at, owner_person_id) VALUES (?, ?, ?, ?)')
+      .run(id, botId, new Date().toISOString(), opts.ownerPersonId ?? null);
     return id;
   }
 
   getSession(id: string): SessionRecord | undefined {
     const row = this.db
-      .prepare('SELECT id, bot_id AS botId, created_at AS createdAt FROM sessions WHERE id = ?')
-      .get(id) as { id: string; botId: string; createdAt: string } | undefined;
-    return row ? { id: row.id, botId: row.botId, createdAt: row.createdAt } : undefined;
+      .prepare(
+        'SELECT id, bot_id AS botId, created_at AS createdAt, owner_person_id AS ownerPersonId FROM sessions WHERE id = ?',
+      )
+      .get(id) as
+      | { id: string; botId: string; createdAt: string; ownerPersonId: string | null }
+      | undefined;
+    if (!row) return undefined;
+    return {
+      id: row.id,
+      botId: row.botId,
+      createdAt: row.createdAt,
+      ...(row.ownerPersonId ? { ownerPersonId: row.ownerPersonId } : {}),
+    };
+  }
+
+  /**
+   * W7: set (or clear, with null) a session's owner person. Used when a
+   * chat is created through a person-scoped surface after the session row
+   * already exists (client-generated session ids). Returns false when the
+   * session is unknown.
+   */
+  setSessionOwner(sessionId: string, ownerPersonId: string | null): boolean {
+    const res = this.db
+      .prepare('UPDATE sessions SET owner_person_id = ? WHERE id = ?')
+      .run(ownerPersonId, sessionId);
+    return res.changes > 0;
+  }
+
+  /** W7: the effective owner of a session (null owner = default user). */
+  sessionOwnerPersonId(sessionId: string): string | undefined {
+    const s = this.getSession(sessionId);
+    if (!s) return undefined;
+    return s.ownerPersonId ?? DEFAULT_CHAT_OWNER_PERSON_ID;
   }
 
   /**
@@ -279,25 +332,43 @@ export class SessionStore {
    * timestamp so clients can render a useful thread picker without
    * fetching every thread's messages.
    */
-  listSessions(opts: { botId?: string; limit?: number } = {}): SessionSummary[] {
+  listSessions(
+    opts: { botId?: string; limit?: number; ownerPersonId?: string } = {},
+  ): SessionSummary[] {
     const limit = Math.min(Math.max(Math.floor(opts.limit ?? 50), 1), 200);
     const botId = typeof opts.botId === 'string' && opts.botId.trim() ? opts.botId.trim() : null;
+    // W7 private-chat filtering: when an owner person is given, only that
+    // person's chats are listed. Legacy rows (owner NULL) belong to the
+    // default user, so they match only the default person's listing.
+    const owner = typeof opts.ownerPersonId === 'string' && opts.ownerPersonId.trim()
+      ? opts.ownerPersonId.trim()
+      : null;
+    const ownerClause = owner === null
+      ? ''
+      : owner === DEFAULT_CHAT_OWNER_PERSON_ID
+        ? ' AND (s.owner_person_id = ? OR s.owner_person_id IS NULL)'
+        : ' AND s.owner_person_id = ?';
+    const params: Array<string | number | null> = [botId, botId];
+    if (owner !== null) params.push(owner);
+    params.push(limit);
     const rows = this.db
       .prepare(
         `SELECT s.id AS id, s.bot_id AS botId, s.created_at AS createdAt,
+                s.owner_person_id AS ownerPersonId,
                 COUNT(m.id) AS messageCount,
                 MAX(m.ts) AS lastMessageTs
          FROM sessions s
          LEFT JOIN messages m ON m.session_id = s.id
-         WHERE (? IS NULL OR s.bot_id = ?)
+         WHERE (? IS NULL OR s.bot_id = ?)${ownerClause}
          GROUP BY s.id
          ORDER BY COALESCE(MAX(m.ts), s.created_at) DESC, MAX(m.id) DESC, s.created_at DESC
          LIMIT ?`,
       )
-      .all(botId, botId, limit) as Array<{
+      .all(...params) as Array<{
       id: string;
       botId: string;
       createdAt: string;
+      ownerPersonId: string | null;
       messageCount: number;
       lastMessageTs: string | null;
     }>;
@@ -305,6 +376,7 @@ export class SessionStore {
       id: r.id,
       botId: r.botId,
       createdAt: r.createdAt,
+      ...(r.ownerPersonId ? { ownerPersonId: r.ownerPersonId } : {}),
       messageCount: r.messageCount,
       lastMessageTs: r.lastMessageTs,
     }));
@@ -472,7 +544,9 @@ export class SessionStore {
         .get(sessionId, fromMessageId) as unknown) !== undefined;
     if (!messageExists) return { ok: false, reason: 'message-not-found' };
 
-    const newSessionId = this.createSession(session.botId);
+    const newSessionId = this.createSession(session.botId, {
+      ownerPersonId: session.ownerPersonId,
+    });
     const copied = this.db
       .prepare(
         `INSERT INTO messages (session_id, role, content, tool_name, tool_call_id, tool_calls, ts)
@@ -493,7 +567,7 @@ export class SessionStore {
   duplicateSession(sessionId: string): string | undefined {
     const session = this.getSession(sessionId);
     if (!session) return undefined;
-    const newId = this.createSession(session.botId);
+    const newId = this.createSession(session.botId, { ownerPersonId: session.ownerPersonId });
     this.db
       .prepare(
         `INSERT INTO messages (session_id, role, content, tool_name, tool_call_id, tool_calls, ts)

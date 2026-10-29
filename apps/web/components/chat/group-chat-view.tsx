@@ -16,6 +16,14 @@ import {
 } from '../../lib/group-chats';
 import { GroupRoomControls } from './group-room-controls';
 import { ProvenanceChip } from '../provenance-chip';
+import {
+  applyMention,
+  currentMentionQuery,
+  listPeople,
+  mentionCandidates,
+  type MentionCandidate,
+  type Person,
+} from '../../lib/people';
 
 interface Props {
   group: GroupChat;
@@ -60,6 +68,23 @@ export function GroupChatView({ group, botNames, onOpenThread }: Props) {
   const [liveReply, setLiveReply] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const memberNames = group.memberBotIds.map((id) => botNames.get(id) ?? id);
+  // W7 mention picker: people alongside bots. Bots picked in the room
+  // reply; people picked get a team-inbox ping (only that person).
+  const [people, setPeople] = useState<Person[]>([]);
+  const [pickerIdx, setPickerIdx] = useState(0);
+  useEffect(() => {
+    void listPeople().then(setPeople).catch(() => setPeople([]));
+  }, []);
+  const mentionQuery = currentMentionQuery(draft);
+  const pickerCandidates: MentionCandidate[] =
+    mentionQuery !== null
+      ? mentionCandidates(
+          group.memberBotIds.map((id) => ({ id, name: botNames.get(id) ?? id })),
+          people,
+          mentionQuery,
+        )
+      : [];
+  useEffect(() => setPickerIdx(0), [mentionQuery]);
 
   const load = useCallback(async () => {
     try {
@@ -192,7 +217,10 @@ export function GroupChatView({ group, botNames, onOpenThread }: Props) {
                 )}
               </div>
               <div className="msg-text">
-                <MessageBody text={m.text} memberNames={memberNames} />
+                <MessageBody
+                  text={m.text}
+                  memberNames={[...memberNames, ...people.map((p) => p.name)]}
+                />
               </div>
               {m.threadId && <div className="small muted">🧵 thread</div>}
             </div>
@@ -220,12 +248,49 @@ export function GroupChatView({ group, botNames, onOpenThread }: Props) {
       <GroupRoomControls key={group.id} groupId={group.id} onTranscriptChanged={load} />
 
       <div className="chat-input-wrap">
+        {pickerCandidates.length > 0 && (
+          <div className="card" role="listbox" aria-label="Mention picker" style={{ marginBottom: 6, padding: 4 }}>
+            {pickerCandidates.map((c, i) => (
+              <button
+                key={`${c.kind}:${c.id}`}
+                type="button"
+                role="option"
+                aria-selected={i === pickerIdx}
+                className={`btn btn-sm${i === pickerIdx ? ' btn-primary' : ' btn-ghost'}`}
+                style={{ display: 'flex', width: '100%', justifyContent: 'space-between', marginBottom: 2 }}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  setDraft((d) => applyMention(d, c));
+                }}
+              >
+                <span>{c.kind === 'person' ? '👤' : '🤖'} {c.label} <span className="mono small">{c.token}</span></span>
+                <span className="small muted">{c.detail}</span>
+              </button>
+            ))}
+          </div>
+        )}
         <div className="chat-input">
           <input
             className="input"
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
+              if (pickerCandidates.length > 0 && e.key === 'Tab') {
+                e.preventDefault();
+                const c = pickerCandidates[Math.min(pickerIdx, pickerCandidates.length - 1)]!;
+                setDraft((d) => applyMention(d, c));
+                return;
+              }
+              if (pickerCandidates.length > 0 && e.key === 'ArrowDown') {
+                e.preventDefault();
+                setPickerIdx((i) => Math.min(i + 1, pickerCandidates.length - 1));
+                return;
+              }
+              if (pickerCandidates.length > 0 && e.key === 'ArrowUp') {
+                e.preventDefault();
+                setPickerIdx((i) => Math.max(i - 1, 0));
+                return;
+              }
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 send();
@@ -248,7 +313,8 @@ export function GroupChatView({ group, botNames, onOpenThread }: Props) {
           </button>
         </div>
         <div className="small muted hint">
-          Tip: <code>@all</code> or no mentions → everyone replies, up to 3 rounds. While
+          Tip: <code>@all</code> or no mentions → every bot replies, up to 3 rounds. Mention a
+          <strong> person</strong> (👤 in the picker) to ping only them in their team inbox. While
           the room is replying, sending queues your message behind the turn.
         </div>
       </div>

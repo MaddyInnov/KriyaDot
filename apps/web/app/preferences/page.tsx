@@ -9,6 +9,7 @@ import { DetectedAgentsPanel } from '../../components/panels/detected-agents-pan
 import { AnalyticsPanel } from '../../components/panels/analytics-panel';
 import { LocalLlmPanel } from '../../components/panels/local-llm-panel';
 import { UpdatesPanel } from '../../components/panels/updates-panel';
+import { AutostartPanel } from '../../components/panels/autostart-panel';
 import { AgentImportPanel } from '../../components/panels/agent-import-panel';
 import { useUxMode } from '../../lib/ux-mode';
 import { authedFetch } from '../../lib/api';
@@ -204,6 +205,8 @@ export default function PreferencesPage() {
           MaddyInnov/KriyaDot on GitHub.
         </p>
         <UpdatesPanel />
+        <h3 style={{ marginTop: 20 }}>Startup</h3>
+        <AutostartPanel />
       </section>
 
       <section className="card">

@@ -291,3 +291,60 @@ describe('helpers', () => {
     expect(cellText({ a: 1 })).toBe('{"a":1}');
   });
 });
+
+// ---- W8c: server-protocol chart forms (stacked-bar, series/values) ----
+
+describe('validateWidget — W8c chart forms', () => {
+  it('accepts the canonical server form: type + series[{label,values}]', () => {
+    const v = validateWidget({
+      kind: 'chart',
+      type: 'stacked-bar',
+      title: 'Spend by category',
+      labels: ['Jan', 'Feb'],
+      series: [
+        { label: 'Food', values: [10, 12] },
+        { label: 'Travel', values: [3, 4] },
+      ],
+    });
+    expect(v.ok).toBe(true);
+    if (v.ok && v.widget.kind === 'chart') {
+      expect(v.widget.chart).toBe('stacked-bar');
+      expect(v.widget.datasets).toEqual([
+        { label: 'Food', values: [10, 12] },
+        { label: 'Travel', values: [3, 4] },
+      ]);
+    }
+  });
+
+  it('accepts the split form: series names + values matrix', () => {
+    const v = validateWidget({
+      kind: 'chart',
+      chartType: 'bar',
+      labels: ['Q1', 'Q2'],
+      series: ['A', 'B'],
+      values: [
+        [1, 2],
+        [3, 4],
+      ],
+    });
+    expect(v.ok).toBe(true);
+    if (v.ok && v.widget.kind === 'chart') {
+      expect(v.widget.chart).toBe('bar');
+      expect(v.widget.datasets).toEqual([
+        { label: 'A', values: [1, 2] },
+        { label: 'B', values: [3, 4] },
+      ]);
+    }
+  });
+
+  it('rejects ragged split-form values', () => {
+    const v = validateWidget({
+      kind: 'chart',
+      type: 'bar',
+      labels: ['Q1', 'Q2'],
+      series: ['A'],
+      values: [[1]],
+    });
+    expect(v.ok).toBe(false);
+  });
+});

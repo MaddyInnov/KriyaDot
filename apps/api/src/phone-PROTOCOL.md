@@ -118,7 +118,30 @@ Web UI                          API                              Phone app
 - Frames are MJPEG v1 (JPEG per frame, JSON base64). H.264/WebRTC would cut
   bandwidth ~10x but is out of scope for v1.
 
-## 5. ADB fallback endpoints
+## 6. W14 extensions: phone-app actions + notification events
+
+New-style messages use a `type` discriminator (the v1 messages above keep
+their `t` discriminator).
+
+### Server → phone
+
+| type | fields | notes |
+|------|--------|-------|
+| `action` | `id`, `action`: `open_app` \| `tap` \| `type` \| `scroll` \| `send_message` \| `call`, `params` | Dispatched ONLY after governance approval of the matching `phone_*` tool call (see phone-actions.ts). `params` carries exactly the approved arguments — for `send_message`, the exact text to send. |
+
+### Phone → server
+
+| type | fields | notes |
+|------|--------|-------|
+| `action_result` | `id`, `ok`, `error?` | Ack for one `action`. The hub resolves the pending dispatch; no ack within the timeout resolves `{ok:false, error:'timeout'}`. Unknown actions must be acked with `ok:false, error:'unknown_action'`. |
+| `notification` | `appPackage`, `appName?`, `title`, `ts` | Notification event for server-side triage. Title + app ONLY — notification bodies are never sent, accepted, or stored (the server validator drops any body field). |
+
+Every dispatched action is audit-logged server-side in plain language
+("Opened WhatsApp", "Sent message to \<contact name\>") — the audit holds
+the action and the contact NAME, never message or typed text. While the
+global pause (system-pause.ts) is active, phone tools refuse to dispatch.
+
+## 7. ADB fallback endpoints
 
 - `GET /api/phone/adb/status` → `{ available, devices[] }`
 - `GET /api/phone/adb/:serial/frame` → one PNG screencap (base64)

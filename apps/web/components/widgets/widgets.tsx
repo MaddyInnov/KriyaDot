@@ -39,8 +39,10 @@ export type WidgetAnswerHandler = (widgetId: string, value: unknown) => void | P
 export interface WidgetRuntimeProps {
   /** Server stream id — required to post an answer. */
   widgetId?: string;
-  /** Epoch ms after which answering is disabled. */
-  expiresAt?: number;
+  /** Epoch ms after which answering is disabled; null = never expires. */
+  expiresAt?: number | null;
+  /** W12: true when the card never expires — renders "No expiry". */
+  neverExpire?: boolean;
   /** false = display-only; the answer UI renders read-only. */
   interactive?: boolean;
   /** Optimistic + server-confirmed answer state. */
@@ -70,19 +72,29 @@ const KIND_LABEL: Record<WidgetKind, string> = {
  * timer flips the UI exactly at expiresAt so a widget left open in chat
  * shows the expired note without a reload.
  */
-function useExpired(expiresAt: number | undefined, answered?: WidgetAnswerState): boolean {
+function useExpired(expiresAt: number | null | undefined, answered?: WidgetAnswerState): boolean {
   const serverExpired = answered?.expired === true;
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    if (expiresAt === undefined || serverExpired) return;
+    if (expiresAt === undefined || expiresAt === null || serverExpired) return;
     const remaining = expiresAt - Date.now();
     if (remaining <= 0) return; // already expired; no timer needed
     const t = setTimeout(() => setNow(Date.now()), Math.min(remaining, 2147483647));
     return () => clearTimeout(t);
   }, [expiresAt, serverExpired]);
   if (serverExpired) return true;
-  if (expiresAt === undefined) return false;
+  if (expiresAt === undefined || expiresAt === null) return false;
   return now >= expiresAt;
+}
+
+/** W12 label shown instead of a countdown on never-expire cards. */
+export function NoExpiryNote() {
+  return (
+    <div className="widget-answered">
+      <span className="chip blue">No expiry</span>
+      <span className="muted">This question stays open — answer whenever you are ready.</span>
+    </div>
+  );
 }
 
 /** Read-only summary shown after an interactive widget is answered. */
@@ -204,7 +216,20 @@ function TableView({ widget }: { widget: TableWidget }) {
 
 /* ---------- chart (SVG, no deps) ---------- */
 
-const CHART_COLORS = ['#4f46e5', '#16a34a', '#d97706', '#dc2626', '#0ea5e9', '#8b5cf6'];
+/**
+ * Chart palette from the theme's CSS variables (globals.css defines
+ * these per theme — light/dark/midnight/…), so charts match every
+ * theme. Applied via `style` (SVG presentation attributes don't
+ * resolve var()).
+ */
+const CHART_COLORS = [
+  'var(--accent)',
+  'var(--green)',
+  'var(--amber)',
+  'var(--red)',
+  'var(--accent-to)',
+  'var(--accent-hover)',
+];
 const CW = 420;
 const CH = 240;
 const PAD = { l: 40, r: 12, t: 14, b: 34 };
@@ -225,6 +250,65 @@ function ChartView({ widget }: { widget: ChartWidget }) {
   const { x, y, iw } = chartScales(widget);
   const n = widget.labels.length;
   const slot = iw / n;
+  if (widget.chart === 'stacked-bar') {
+    // Stack each label's series cumulatively (positives up, negatives
+    // down). Scale from the per-label totals, not the raw values.
+    const totals = widget.labels.map((_, i) => {
+      let pos = 0;
+      let neg = 0;
+      for (const d of widget.datasets) {
+        const v = d.values[i] ?? 0;
+        if (v >= 0) pos += v;
+        else neg += v;
+      }
+      return { pos, neg };
+    });
+    const max = Math.max(0, ...totals.map((t) => t.pos));
+    const min = Math.min(0, ...totals.map((t) => t.neg));
+    const span = max - min || 1;
+    const ih = CH - PAD.t - PAD.b;
+    const sy = (v: number) => PAD.t + ih - ((v - min) / span) * ih;
+    const barW = Math.min(44, slot * 0.62);
+    return (
+      <>
+        <svg className="widget-chart" viewBox={`0 0 ${CW} ${CH}`} role="img" aria-label={widget.title ?? 'Stacked bar chart'}>
+          {widget.labels.map((l, i) => {
+            let posAcc = 0;
+            let negAcc = 0;
+            return (
+              <g key={i}>
+                {widget.datasets.map((d, di) => {
+                  const v = d.values[i] ?? 0;
+                  const baseAcc = v >= 0 ? posAcc : negAcc;
+                  if (v >= 0) posAcc += v;
+                  else negAcc += v;
+                  const top = sy(baseAcc + v);
+                  const bottom = sy(baseAcc);
+                  return (
+                    <rect
+                      key={di}
+                      x={x(i) - barW / 2}
+                      y={Math.min(top, bottom)}
+                      width={barW}
+                      height={Math.max(1.5, Math.abs(bottom - top))}
+                      rx="2"
+                      style={{ fill: CHART_COLORS[di % CHART_COLORS.length] }}
+                    >
+                      <title>{`${d.label} · ${l}: ${v}`}</title>
+                    </rect>
+                  );
+                })}
+                <text x={x(i)} y={CH - 10} textAnchor="middle" fontSize="10" fill="#a1a1aa">
+                  {l.length > 12 ? `${l.slice(0, 11)}…` : l}
+                </text>
+              </g>
+            );
+          })}
+        </svg>
+        <ChartLegend widget={widget} />
+      </>
+    );
+  }
   if (widget.chart === 'bar') {
     const per = Math.min(28, (slot * 0.7) / widget.datasets.length);
     const groupW = per * widget.datasets.length;
@@ -249,7 +333,7 @@ function ChartView({ widget }: { widget: ChartWidget }) {
                   width={Math.max(2, per - 3)}
                   height={Math.max(2, Math.abs(zeroY - by))}
                   rx="2"
-                  fill={CHART_COLORS[di % CHART_COLORS.length]}
+                  style={{ fill: CHART_COLORS[di % CHART_COLORS.length] }}
                 >
                   <title>{`${d.label} · ${widget.labels[i]}: ${v}`}</title>
                 </rect>
@@ -271,10 +355,10 @@ function ChartView({ widget }: { widget: ChartWidget }) {
           const area = `${PAD.l},${y(0)} ${pts} ${PAD.l + iw},${y(0)}`;
           return (
             <g key={di}>
-              <polygon points={area} fill={color} opacity="0.12" />
-              <polyline points={pts} fill="none" stroke={color} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
+              <polygon points={area} style={{ fill: color }} opacity="0.12" />
+              <polyline points={pts} fill="none" style={{ stroke: color }} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
               {d.values.map((v, i) => (
-                <circle key={i} cx={x(i)} cy={y(v)} r="3.5" fill={color} stroke="#fff" strokeWidth="1.5">
+                <circle key={i} cx={x(i)} cy={y(v)} r="3.5" style={{ fill: color }} stroke="#fff" strokeWidth="1.5">
                   <title>{`${d.label} · ${widget.labels[i]}: ${v}`}</title>
                 </circle>
               ))}
@@ -721,6 +805,7 @@ export function WidgetRenderer({
   onAction,
   widgetId,
   expiresAt,
+  neverExpire,
   interactive,
   answered,
   onAnswer,
@@ -730,11 +815,13 @@ export function WidgetRenderer({
 } & WidgetRuntimeProps) {
   const View = WIDGET_REGISTRY[widget.kind];
   if (!View) return null;
+  const noExpiry = neverExpire === true || expiresAt === null;
   return (
     <div className="widget" data-widget-kind={widget.kind}>
       <div className="widget-head">
         <span className="widget-kind">{KIND_LABEL[widget.kind]}</span>
         {widget.title && <span className="truncate">{widget.title}</span>}
+        {noExpiry && interactive && <span className="chip blue">No expiry</span>}
       </div>
       <div className="widget-body">
         <View
@@ -742,6 +829,7 @@ export function WidgetRenderer({
           onAction={onAction}
           widgetId={widgetId}
           expiresAt={expiresAt}
+          neverExpire={neverExpire}
           interactive={interactive}
           answered={answered}
           onAnswer={onAnswer}

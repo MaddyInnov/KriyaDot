@@ -60,6 +60,16 @@ export interface McpServerInfo {
   [key: string]: unknown;
 }
 
+export interface PauseState {
+  ok?: boolean;
+  paused: boolean;
+  pausedAt?: number | null;
+  pausedBy?: string | null;
+  reason?: string | null;
+  resumedAt?: number | null;
+  resumedBy?: string | null;
+}
+
 export interface TokenUsage {
   inputTokens?: number;
   outputTokens?: number;
@@ -272,6 +282,29 @@ export class KriyaDotApi {
 
   listMcpServers(): Promise<McpServerInfo[]> {
     return this.request<McpServerInfo[]>('/mcp/servers');
+  }
+
+  /** Global pause state (W14d): mirrors GET /api/system/pause-state. */
+  getPauseState(): Promise<PauseState> {
+    return this.request<PauseState>('/system/pause-state');
+  }
+
+  /** Pause all new KriyaDot work: POST /api/system/pause. */
+  pauseSystem(): Promise<PauseState> {
+    return this.request<PauseState>('/system/pause', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ actor: 'cli' }),
+    });
+  }
+
+  /** Resume after a global pause: POST /api/system/resume. */
+  resumeSystem(): Promise<PauseState> {
+    return this.request<PauseState>('/system/resume', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ actor: 'cli' }),
+    });
   }
 
   async decideApproval(approvalId: string, decision: 'approved' | 'denied'): Promise<void> {

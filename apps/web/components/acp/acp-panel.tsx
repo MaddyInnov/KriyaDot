@@ -13,9 +13,11 @@ import {
   closeAcpSession,
   createAcpSession,
   getAcpSession,
+  listAcpEngines,
   listAcpSessions,
   resumeAcpSession,
   streamAcpPrompt,
+  type AcpEngineDto,
   type AcpPromptStreamEvent,
   type AcpSessionDto,
   type AcpTranscriptEventDto,
@@ -45,6 +47,8 @@ export default function AcpPanel() {
   const [command, setCommand] = useState('opencode');
   const [args, setArgs] = useState('acp');
   const [label, setLabel] = useState('');
+  const [engines, setEngines] = useState<AcpEngineDto[]>([]);
+  const [engine, setEngine] = useState('');
   const [prompt, setPrompt] = useState('');
   const [streaming, setStreaming] = useState('');
   const [busy, setBusy] = useState(false);
@@ -63,6 +67,16 @@ export default function AcpPanel() {
 
   useEffect(() => {
     void refresh();
+    // Built-in engine presets (W9): choosing one creates the session from
+    // the preset on the server (e.g. GitHub Copilot CLI via `copilot --acp`).
+    void (async () => {
+      try {
+        const r = await listAcpEngines();
+        if (r.ok) setEngines(r.engines);
+      } catch {
+        // presets are an enhancement — the raw command form still works
+      }
+    })();
     return () => {
       streamStop.current?.();
     };
@@ -88,11 +102,15 @@ export default function AcpPanel() {
   const create = useCallback(async () => {
     setError(null);
     try {
-      const r = await createAcpSession({
-        command: command.trim(),
-        args: args.split(/\s+/).filter(Boolean),
-        ...(label.trim() ? { label: label.trim() } : {}),
-      });
+      const r = await createAcpSession(
+        engine
+          ? { engine, ...(label.trim() ? { label: label.trim() } : {}) }
+          : {
+              command: command.trim(),
+              args: args.split(/\s+/).filter(Boolean),
+              ...(label.trim() ? { label: label.trim() } : {}),
+            },
+      );
       if (r.ok) {
         await refresh();
         await select(r.session.id);
@@ -100,7 +118,7 @@ export default function AcpPanel() {
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to create session.');
     }
-  }, [command, args, label, refresh, select]);
+  }, [engine, command, args, label, refresh, select]);
 
   const send = useCallback(() => {
     if (!activeId || !prompt.trim() || busy) return;
@@ -188,8 +206,28 @@ export default function AcpPanel() {
         All agent content is <strong>untrusted</strong>; tool calls it requests need your approval in the inbox.
       </p>
       <div className="acp-new">
-        <input value={command} onChange={(e) => setCommand(e.target.value)} placeholder="command (e.g. opencode)" aria-label="Agent command" />
-        <input value={args} onChange={(e) => setArgs(e.target.value)} placeholder="args (e.g. acp)" aria-label="Agent args" />
+        <select
+          value={engine}
+          onChange={(e) => {
+            setEngine(e.target.value);
+            const preset = engines.find((en) => en.id === e.target.value);
+            if (preset) {
+              setCommand(preset.command);
+              setArgs(preset.args.join(' '));
+            }
+          }}
+          aria-label="Engine preset"
+        >
+          <option value="">Custom command…</option>
+          {engines.map((en) => (
+            <option key={en.id} value={en.id}>
+              {en.name}
+              {en.installed ? '' : ' (not installed)'}
+            </option>
+          ))}
+        </select>
+        <input value={command} onChange={(e) => { setCommand(e.target.value); setEngine(''); }} placeholder="command (e.g. opencode)" aria-label="Agent command" />
+        <input value={args} onChange={(e) => { setArgs(e.target.value); setEngine(''); }} placeholder="args (e.g. acp)" aria-label="Agent args" />
         <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="label (optional)" aria-label="Session label" />
         <button onClick={() => void create()}>New session</button>
       </div>

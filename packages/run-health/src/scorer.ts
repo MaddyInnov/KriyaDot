@@ -350,3 +350,31 @@ export function scoreTurn(t: TurnTelemetry, opts: ScoreTurnOptions = {}): TurnHe
     generatedAt: Date.now(),
   };
 }
+
+/**
+ * W13: build the health finding for a detected loop (span-store loop
+ * detector in @mvp/agent-runtime). The detector supplies the evidence —
+ * this factory only renders the plain-language diagnosis + fix, in the
+ * same template style as every other finding (no LLM).
+ */
+export function loopFinding(input: {
+  kind: 'tool' | 'text';
+  key: string;
+  count: number;
+  spanIds: string[];
+}): HealthFinding {
+  const what =
+    input.kind === 'tool'
+      ? `the "${input.key}" tool call`
+      : 'the same assistant text';
+  return {
+    signal: 'loop',
+    severity: 'warning',
+    title: `Possible loop: ${what} repeated ${input.count} times`,
+    detail:
+      `This run repeated ${what} ${input.count} times with near-identical content ` +
+      `(evidence spans: ${input.spanIds.join(', ')}). Loops burn tokens and paid tool ` +
+      `credits without making progress.`,
+    fix: 'Open the run waterfall in Activity → Runs to inspect the repeated spans; then tighten the bot prompt, add a stopping condition, or lower the tool\u2019s retry budget.',
+  };
+}

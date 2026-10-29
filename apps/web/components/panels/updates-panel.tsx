@@ -6,7 +6,7 @@
 // Download + install only happen on explicit user action; the update source
 // is pinned to MaddyInnov/KriyaDot and cannot be changed.
 
-import { useEffect, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { kriyadotFetch } from '../../lib/kriyadot-api';
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -47,6 +47,8 @@ interface UpdateStatus {
 interface UpdateSettings {
   autoCheck: boolean;
   checkIntervalHours: number;
+  /** W12: auto-apply a pending update after 10 idle minutes. Default off. */
+  applyWhenIdle?: boolean;
 }
 
 function fmtBytes(n: number): string {
@@ -234,7 +236,24 @@ export function UpdatesPanel() {
             />{' '}
             hours
           </label>
+          <label className="small" title="Off by default. When on, a downloaded (or available) update installs itself only after KriyaDot has been completely idle for 10 minutes.">
+            <input
+              type="checkbox"
+              checked={settings.applyWhenIdle === true}
+              onChange={(e) => saveSettings({ applyWhenIdle: e.target.checked })}
+            />{' '}
+            Apply updates when idle
+          </label>
         </div>
+      )}
+      {settings && settings.applyWhenIdle === true && (
+        <p className="muted small" style={{ marginTop: 8 }}>
+          When idle apply is on: if an update is pending and no bot turn or routine has run for 10
+          minutes, KriyaDot downloads it (if needed) and installs it automatically — on Windows and
+          macOS that quits and restarts KriyaDot via the installer; on Linux the package opens in
+          your software handler. Any activity resets the 10-minute clock. Turn it off to go back to
+          install-only-when-you-click.
+        </p>
       )}
       <p className="muted small" style={{ marginTop: 8 }}>
         Updates come only from the official <code>MaddyInnov/KriyaDot</code> GitHub releases.

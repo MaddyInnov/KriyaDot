@@ -71,6 +71,64 @@ export type StreamEvent =
   | { type: 'queued_turn_start'; queueId: string; message: string }
   | { type: 'notice'; kind: string; message: string }
   /**
+   * Live step line (W8a): the turn's current step, mirrored from the
+   * runtime's TurnStateRegistry on every change. Backward compatible —
+   * older clients ignore unknown event types. `stepIndex`/`stepTotal`
+   * are present when known (provider iteration / max iterations).
+   */
+  | {
+      type: 'step';
+      botId: string;
+      sessionId: string;
+      step: string;
+      stepIndex?: number;
+      stepTotal?: number;
+      startedAt: number;
+      elapsedMs: number;
+    }
+  /**
+   * Streaming TTS (W8h): one synthesized sentence of the assistant's
+   * reply, emitted in sentence order while the turn is still running
+   * when voice reply is enabled. Audio rides as base64 (SSE is text).
+   */
+  | {
+      type: 'audio_chunk';
+      seq: number;
+      text: string;
+      mimeType: string;
+      audioBase64: string;
+    }
+  /**
+   * AI failover (W1): the primary provider hit a hard usage limit and the
+   * turn switched to the backup provider/model. Emitted at most ONCE per
+   * turn; the turn then continues on the backup. Also mirrored as a
+   * `notice` with kind 'failover' for clients that only render notices,
+   * and audited as `turn.failover` (visible in Activity).
+   */
+  | {
+      type: 'failover';
+      fromProvider: string;
+      fromModel: string;
+      toProvider: string;
+      toModel: string;
+      reason: string;
+      message: string;
+    }
+  /**
+   * Near-limit warning (W1): observed usage for a provider crossed the
+   * warning threshold (rate-limit headers or spend figures). `usedPercent`
+   * is only ever set from real observed data — providers that expose no
+   * usage data never produce this event.
+   */
+  | {
+      type: 'usage_warning';
+      providerId: string;
+      providerName: string;
+      usedPercent: number;
+      source: 'rate-limit' | 'spend-cap' | 'error';
+      message: string;
+    }
+  /**
    * Live code-writing event for the code session view. Emitted AFTER a
    * write_file tool executes successfully (approval gates already passed).
    * The UI animates `after` streaming in as a diff against `before`.
@@ -101,7 +159,10 @@ export type StreamEvent =
       sessionId: string;
       /** Validated widget payload (same shapes the web client renders). */
       widget: WidgetPayload;
-      expiresAt: number;
+      /** Epoch ms expiry, or null for a never-expire card (W12). */
+      expiresAt: number | null;
+      /** W12: true when the card never expires (render "No expiry"). */
+      neverExpire?: boolean;
       /** True when the turn pauses for a human answer. */
       interactive: boolean;
     }
@@ -256,6 +317,21 @@ export interface BotConfig {
   systemPrompt: string;
   provider: string;
   model: string;
+  /**
+   * Multiplayer layer (W7): the person who owns this bot (PeopleStore id,
+   * see people.ts). The bot's approvals, questions and run results are
+   * addressed to the owner. Absent → the default user ("You",
+   * DEFAULT_PERSON_ID) — single-user installs behave exactly as before.
+   */
+  ownerId?: string;
+  /**
+   * AI failover (W1): backup provider/model used automatically when the
+   * primary provider fails with a hard usage-limit / quota error mid-turn.
+   * Unset → the runtime falls back to the next eligible provider from
+   * routing (catalog order, free-only guard respected).
+   */
+  backupProvider?: string;
+  backupModel?: string;
   /** Per-model inference options (reasoning effort, fast mode, etc.). */
   modelOptions?: ModelOptions;
   skills: string[];
@@ -279,7 +355,7 @@ export interface BotConfig {
    * stdio instead of using the built-in subagent. Example:
    * `{ command: 'opencode', args: ['acp'] }`.
    */
-  acp?: { command: string; args?: string[] };
+  acp?: { command?: string; args?: string[]; engine?: string };
   /**
    * Fast message-router keywords (message-router.ts): optional per-bot
    * persona/topic keywords that bias routeMessage() toward this bot.

@@ -29,12 +29,16 @@ import {
   type CliBridgeId,
 } from './cli-bridge.js';
 
-export type CliAuthId = 'claude' | 'codex' | 'opencode' | 'antigravity';
+export type CliAuthId = 'claude' | 'codex' | 'opencode' | 'antigravity' | 'copilot';
 
-/** Map the auth-module ids onto the bridge ids (same CLIs). Antigravity has no bridge. */
+/** Map the auth-module ids onto the bridge ids (same CLIs). Antigravity and Copilot have no bridge. */
 function toBridgeId(id: CliAuthId): CliBridgeId {
-  if (id === 'antigravity') throw new Error('antigravity has no CLI bridge');
+  if (id === 'antigravity' || id === 'copilot') throw new Error(`${id} has no CLI bridge`);
   return id;
+}
+
+function isBridgeId(id: CliAuthId): boolean {
+  return id === 'claude' || id === 'codex' || id === 'opencode';
 }
 
 /**
@@ -51,6 +55,17 @@ function toBridgeId(id: CliAuthId): CliBridgeId {
  * sign-in completion falls back to "credential file appeared/changed".
  */
 const ANTIGRAVITY_CRED_REL = join('.gemini', 'antigravity-acp', 'oauth_creds.json');
+
+/**
+ * GitHub Copilot CLI auth layout (W9): Copilot authenticates with the
+ * user's GitHub login, shared with the GitHub CLI — credentials live in
+ * `~/.config/gh/hosts.yml` (written by `gh auth login` / the Copilot CLI's
+ * own first-run login). KriyaDot does NOT implement GitHub OAuth and never
+ * returns token bytes: status detection checks only the file's SHAPE (a
+ * `user:` and/or `oauth_token:` entry with a value) and surfaces the GitHub
+ * username as the account hint.
+ */
+const COPILOT_CRED_REL = join('.config', 'gh', 'hosts.yml');
 
 export interface CliLoginStatus {
   cliId: CliAuthId;
@@ -106,6 +121,7 @@ const CLI_COMMANDS: Record<CliAuthId, string> = {
   codex: 'codex',
   opencode: 'opencode',
   antigravity: 'agy',
+  copilot: 'copilot',
 };
 
 /**
@@ -123,6 +139,8 @@ const LOGIN_ARGS: Record<CliAuthId, string[]> = {
   codex: ['login'],
   opencode: ['auth', 'login'],
   antigravity: [],
+  // A bare `copilot` run walks through the GitHub login when unauthenticated.
+  copilot: [],
 };
 
 /** Command that reports login status without starting a flow (when available). */
@@ -134,6 +152,8 @@ const STATUS_COMMAND: Record<CliAuthId, string[] | null> = {
   opencode: null,
   // No status subcommand; fall back to the ~/.gemini profile shape.
   antigravity: null,
+  // No status subcommand; fall back to the gh hosts.yml shape.
+  copilot: null,
 };
 
 const URL_RE = /https?:\/\/[^\s"'<>]+/;
@@ -206,6 +226,7 @@ export class CliAuthManager {
 
   private credentialsPath(id: CliAuthId): string {
     if (id === 'antigravity') return join(this.homeDir, ANTIGRAVITY_CRED_REL);
+    if (id === 'copilot') return join(this.homeDir, COPILOT_CRED_REL);
     const rel =
       id === 'claude'
         ? join('.claude', '.credentials.json')
@@ -222,7 +243,30 @@ export class CliAuthManager {
    */
   private hasUsableCredential(id: CliAuthId): boolean {
     if (id === 'antigravity') return this.fileExists(this.credentialsPath(id));
+    if (id === 'copilot') return this.ghHostsHasLogin();
     return bridgeHasUsableToken(toBridgeId(id), this.homeDir);
+  }
+
+  /**
+   * Copilot/GitHub login shape probe: hosts.yml counts as a usable login
+   * when a host entry carries an `oauth_token:` value or a `user:` value.
+   * The token value itself is never returned, logged, or stored — this is
+   * a boolean shape test over key names only.
+   */
+  private ghHostsHasLogin(): boolean {
+    const text = this.readText(this.credentialsPath('copilot'));
+    if (!text) return false;
+    return /^\s*(oauth_token|user):\s*\S+/m.test(text);
+  }
+
+  /** GitHub username from hosts.yml (`user:` field) — identity only, never a token. */
+  private ghAccountHint(): string | undefined {
+    const text = this.readText(this.credentialsPath('copilot'));
+    if (!text) return undefined;
+    const m = /^\s*user:\s*(\S+)\s*$/m.exec(text);
+    if (!m) return undefined;
+    const hint = redactTokenish(m[1]).slice(0, 120);
+    return hint || undefined;
   }
 
   cliPresent(id: CliAuthId): boolean {
@@ -250,7 +294,10 @@ export class CliAuthManager {
     let expired: boolean | undefined;
     let accountHint: string | undefined;
     // Antigravity tokens live in the OS keyring — no expiry/hint available.
-    if (signedIn && id !== 'antigravity') {
+    // Copilot's hint is the GitHub username from hosts.yml (no expiry data).
+    if (signedIn && id === 'copilot') {
+      accountHint = this.ghAccountHint();
+    } else if (signedIn && isBridgeId(id)) {
       const expiry = bridgeTokenExpiry(toBridgeId(id), this.homeDir);
       expired = expiry !== undefined ? expiry <= this.now() : undefined;
       accountHint = bridgeAccountHint(toBridgeId(id), this.homeDir);

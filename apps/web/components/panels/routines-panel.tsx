@@ -17,8 +17,10 @@
 import { useCallback, useEffect, useState } from 'react';
 import { kriyadotFetch } from '../../lib/kriyadot-api';
 
+type EventAppId = 'gmail' | 'slack' | 'github' | 'stripe' | 'googlecalendar';
+
 interface RoutineSchedule {
-  kind: 'once' | 'daily' | 'cron' | 'interval';
+  kind: 'once' | 'daily' | 'cron' | 'interval' | 'limit-reset' | 'event';
   timezone: string;
   enabled: boolean;
   overlap: 'skip' | 'queue';
@@ -35,13 +37,73 @@ interface RoutineSchedule {
   windowStart?: string;
   windowEnd?: string;
   endsAt?: string;
+  /** Limit-reset (W1): provider whose limit blocked the routine. */
+  providerId?: string;
+  /** Limit-reset: fallback wait when the error carries no reset time. */
+  defaultBackoffMinutes?: number;
+  /** Limit-reset: armed resume instant (ISO), set when a limit blocks the routine. */
+  resumeAt?: string;
+  /** Event (W2): connected app + Composio account to watch. */
+  app?: EventAppId;
+  accountId?: string;
+  pollMinutes?: number;
+  dailyCap?: number;
+  from?: string;
+  subjectContains?: string;
+  query?: string;
+  channelId?: string;
+  keyword?: string;
+  repo?: string;
+  eventTypes?: string[];
+  stripeEventTypes?: string[];
+  calendarId?: string;
+  windowMinutes?: number;
+}
+
+interface EventTriggerStatus {
+  cursorId: string | null;
+  cursorTs: number | null;
+  lastPollAt: number | null;
+  lastFiredAt: number | null;
+  lastError: string | null;
+  capBlocked: boolean;
+  firesToday: number;
+  dailyCap: number;
+}
+
+interface ComposioAccountView {
+  id: string;
+  toolkitSlug: string;
+  toolkitName?: string;
+  status: string;
+  label?: string;
+}
+
+const EVENT_APP_LABELS: Record<EventAppId, string> = {
+  gmail: 'Gmail — new message',
+  slack: 'Slack — new channel message',
+  github: 'GitHub — repo events',
+  stripe: 'Stripe — payment events',
+  googlecalendar: 'Google Calendar — event starting soon',
+};
+
+interface LimitResetResume {
+  id: string;
+  routineId?: string;
+  botId: string;
+  providerId: string;
+  resumeAt: number;
+  reason: string;
+  status: 'pending' | 'firing' | 'fired' | 'cancelled';
+  createdAt: number;
+  firedAt?: number;
 }
 
 interface RunRecord {
   id: string;
   routineId: string;
   routineName: string;
-  trigger: 'schedule' | 'webhook' | 'manual';
+  trigger: 'schedule' | 'webhook' | 'manual' | 'event';
   scheduledFor: number | null;
   startedAt: number | null;
   endedAt: number | null;
@@ -121,6 +183,22 @@ function describeScheduleClient(s: RoutineSchedule): string {
       if (s.anchorTime) d += ` from ${s.anchorTime}`;
       if (s.windowStart) d += `, ${s.windowStart}–${s.windowEnd}`;
       return d;
+    }
+    case 'limit-reset': {
+      let d = 'On provider limit reset';
+      if (s.providerId) d += ` (${s.providerId})`;
+      if (s.resumeAt) d += ` — resumes ${new Date(s.resumeAt).toLocaleString()}`;
+      return d;
+    }
+    case 'event': {
+      let d = `On ${s.app ?? 'app'} event`;
+      if (s.app === 'gmail' && (s.from || s.subjectContains)) {
+        d += ` matching ${[s.from && `from ${s.from}`, s.subjectContains && `subject ~${s.subjectContains}`].filter(Boolean).join(', ')}`;
+      }
+      if (s.app === 'slack') d += ` in ${s.channelId}${s.keyword ? ` matching "${s.keyword}"` : ''}`;
+      if (s.app === 'github') d += ` on ${s.repo}`;
+      if (s.app === 'googlecalendar') d += ` starting within ${s.windowMinutes ?? 120}m`;
+      return `${d} · polls every ${s.pollMinutes ?? 15}m · cap ${s.dailyCap ?? 50}/day`;
     }
   }
 }
@@ -227,15 +305,18 @@ function TimezoneField({ value, onChange }: { value: string; onChange: (v: strin
 
 function ScheduleBuilder({
   routineId,
+  botId,
   initial,
   onSaved,
   onCancel,
 }: {
   routineId: string;
+  botId: string;
   initial: RoutineSchedule | null;
   onSaved: (routine: Routine) => void;
   onCancel: () => void;
 }) {
+  void botId;
   const [kind, setKind] = useState<RoutineSchedule['kind']>(initial?.kind ?? 'daily');
   const [timezone, setTimezone] = useState(initial?.timezone ?? 'Asia/Kolkata');
   const [overlap, setOverlap] = useState<'skip' | 'queue'>(initial?.overlap ?? 'skip');
@@ -253,8 +334,46 @@ function ScheduleBuilder({
   const [endsAt, setEndsAt] = useState(initial?.endsAt?.slice(0, 16) ?? '');
   const [catchUp, setCatchUp] = useState(initial?.catchUp ?? false);
   const [streakLimit, setStreakLimit] = useState(String(initial?.failureStreakLimit ?? 3));
+  const [limitProvider, setLimitProvider] = useState(initial?.providerId ?? '');
+  const [limitBackoff, setLimitBackoff] = useState(String(initial?.defaultBackoffMinutes ?? 60));
+  // Event trigger (W2) state.
+  const [evApp, setEvApp] = useState<EventAppId>(initial?.app ?? 'gmail');
+  const [evAccountId, setEvAccountId] = useState(initial?.accountId ?? '');
+  const [evAccounts, setEvAccounts] = useState<ComposioAccountView[]>([]);
+  const [evAccountsLoaded, setEvAccountsLoaded] = useState(false);
+  const [evPoll, setEvPoll] = useState(String(initial?.pollMinutes ?? 15));
+  const [evCap, setEvCap] = useState(String(initial?.dailyCap ?? 50));
+  const [evFrom, setEvFrom] = useState(initial?.from ?? '');
+  const [evSubject, setEvSubject] = useState(initial?.subjectContains ?? '');
+  const [evQuery, setEvQuery] = useState(initial?.query ?? '');
+  const [evChannel, setEvChannel] = useState(initial?.channelId ?? '');
+  const [evKeyword, setEvKeyword] = useState(initial?.keyword ?? '');
+  const [evRepo, setEvRepo] = useState(initial?.repo ?? '');
+  const [evGithubTypes, setEvGithubTypes] = useState<string[]>(initial?.eventTypes ?? ['issues', 'pull_request', 'push']);
+  const [evStripeTypes, setEvStripeTypes] = useState<string[]>(initial?.stripeEventTypes ?? ['payment_succeeded', 'payment_failed']);
+  const [evCalendarId, setEvCalendarId] = useState(initial?.calendarId ?? 'primary');
+  const [evWindow, setEvWindow] = useState(String(initial?.windowMinutes ?? 120));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+
+  // Connected Composio accounts for the account picker (event kind only).
+  useEffect(() => {
+    if (kind !== 'event' || evAccountsLoaded) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await api<{ connected: boolean; accounts: ComposioAccountView[] }>('/api/composio/accounts');
+        if (!cancelled) setEvAccounts(res.accounts ?? []);
+      } catch {
+        if (!cancelled) setEvAccounts([]);
+      } finally {
+        if (!cancelled) setEvAccountsLoaded(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [kind, evAccountsLoaded]);
+
+  const evAccountOptions = evAccounts.filter((a) => a.toolkitSlug === evApp);
 
   const build = (): RoutineSchedule => {
     const base = { timezone: timezone.trim(), enabled: initial?.enabled ?? true, overlap };
@@ -289,6 +408,63 @@ function ScheduleBuilder({
         }
         if (endsAt) iv.endsAt = endsAt;
         s = iv;
+        break;
+      }
+      case 'limit-reset': {
+        const backoff = Number(limitBackoff);
+        if (!Number.isInteger(backoff) || backoff < 1 || backoff > 10080) {
+          throw new Error('Default backoff must be an integer 1..10080 minutes');
+        }
+        const lr: RoutineSchedule = { ...base, kind, defaultBackoffMinutes: backoff };
+        if (limitProvider.trim()) lr.providerId = limitProvider.trim();
+        if (initial?.resumeAt) lr.resumeAt = initial.resumeAt;
+        s = lr;
+        break;
+      }
+      case 'event': {
+        if (!evAccountId.trim()) throw new Error('Pick a connected account');
+        const poll = Number(evPoll);
+        if (!Number.isInteger(poll) || poll < 5 || poll > 1440) {
+          throw new Error('Poll interval must be an integer 5..1440 minutes');
+        }
+        const cap = Number(evCap);
+        if (!Number.isInteger(cap) || cap < 1 || cap > 1000) {
+          throw new Error('Daily cap must be an integer 1..1000');
+        }
+        const ev: RoutineSchedule = {
+          ...base, kind, app: evApp, accountId: evAccountId.trim(), pollMinutes: poll, dailyCap: cap,
+        };
+        if (evApp === 'gmail') {
+          if (evFrom.trim()) ev.from = evFrom.trim();
+          if (evSubject.trim()) ev.subjectContains = evSubject.trim();
+          if (evQuery.trim()) ev.query = evQuery.trim();
+        }
+        if (evApp === 'slack') {
+          if (!evChannel.trim()) throw new Error('Enter the Slack channel id to watch');
+          ev.channelId = evChannel.trim();
+          if (evKeyword.trim()) ev.keyword = evKeyword.trim();
+        }
+        if (evApp === 'github') {
+          if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(evRepo.trim())) {
+            throw new Error('Repo must be in "owner/name" form');
+          }
+          if (evGithubTypes.length === 0) throw new Error('Pick at least one GitHub event type');
+          ev.repo = evRepo.trim();
+          ev.eventTypes = evGithubTypes;
+        }
+        if (evApp === 'stripe') {
+          if (evStripeTypes.length === 0) throw new Error('Pick at least one Stripe outcome');
+          ev.stripeEventTypes = evStripeTypes;
+        }
+        if (evApp === 'googlecalendar') {
+          const win = Number(evWindow);
+          if (!Number.isInteger(win) || win < 5 || win > 10080) {
+            throw new Error('Window must be an integer 5..10080 minutes');
+          }
+          ev.calendarId = evCalendarId.trim() || 'primary';
+          ev.windowMinutes = win;
+        }
+        s = ev;
         break;
       }
     }
@@ -330,6 +506,8 @@ function ScheduleBuilder({
             <option value="daily">Daily — time + weekdays</option>
             <option value="cron">Cron — 5-field expression</option>
             <option value="interval">Interval — every N minutes</option>
+            <option value="limit-reset">Limit reset — resume when the provider limit resets</option>
+            <option value="event">Event — when something happens in a connected app</option>
           </select>
         </label>
         <label className="field-label">
@@ -413,6 +591,187 @@ function ScheduleBuilder({
             Ends at <span className="muted">(optional, in {timezone || '…'})</span>
             <input type="datetime-local" className="text-input" value={endsAt} onChange={(e) => setEndsAt(e.target.value)} />
           </label>
+        </>
+      )}
+
+      {kind === 'limit-reset' && (
+        <>
+          <p className="muted small">
+            When this routine is blocked by a provider usage limit, it resumes automatically at the
+            provider&apos;s reset time (from the limit error), or after the default backoff when the
+            error carries no reset time. Pending resumes survive restarts.
+          </p>
+          <div className="sched-row">
+            <label className="field-label">
+              Provider <span className="muted">(optional)</span>
+              <input
+                className="text-input"
+                value={limitProvider}
+                onChange={(e) => setLimitProvider(e.target.value)}
+                placeholder="groq"
+                spellCheck={false}
+              />
+            </label>
+            <label className="field-label">
+              Default backoff (minutes)
+              <input
+                type="number"
+                className="text-input"
+                min={1}
+                max={10080}
+                value={limitBackoff}
+                onChange={(e) => setLimitBackoff(e.target.value)}
+              />
+            </label>
+          </div>
+          {initial?.resumeAt && (
+            <p className="muted small">
+              Currently armed to resume at {new Date(initial.resumeAt).toLocaleString()}.
+            </p>
+          )}
+        </>
+      )}
+
+      {kind === 'event' && (
+        <>
+          <p className="muted small">
+            KriyaDot polls the connected app and fires this routine when a new matching item
+            appears. Each item fires at most once; after downtime the 5 most recent missed
+            items fire as a catch-up. The app must be enabled for this bot in Accounts → Composio.
+          </p>
+          <div className="sched-row">
+            <label className="field-label">
+              App
+              <select
+                className="text-input"
+                value={evApp}
+                onChange={(e) => { setEvApp(e.target.value as EventAppId); setEvAccountId(''); }}
+              >
+                {(Object.keys(EVENT_APP_LABELS) as EventAppId[]).map((a) => (
+                  <option key={a} value={a}>{EVENT_APP_LABELS[a]}</option>
+                ))}
+              </select>
+            </label>
+            <label className="field-label">
+              Connected account
+              {evAccountOptions.length > 0 ? (
+                <select className="text-input" value={evAccountId} onChange={(e) => setEvAccountId(e.target.value)}>
+                  <option value="">— pick an account —</option>
+                  {evAccountOptions.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.label ?? a.toolkitName ?? a.toolkitSlug} ({a.id}) · {a.status}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  className="text-input"
+                  value={evAccountId}
+                  onChange={(e) => setEvAccountId(e.target.value)}
+                  placeholder={evAccountsLoaded ? `No ${evApp} account connected — paste its account id` : 'Loading accounts…'}
+                  spellCheck={false}
+                />
+              )}
+            </label>
+          </div>
+
+          {evApp === 'gmail' && (
+            <>
+              <div className="sched-row">
+                <label className="field-label">
+                  From contains <span className="muted">(optional)</span>
+                  <input className="text-input" value={evFrom} onChange={(e) => setEvFrom(e.target.value)} placeholder="alice@example.com" spellCheck={false} />
+                </label>
+                <label className="field-label">
+                  Subject contains <span className="muted">(optional)</span>
+                  <input className="text-input" value={evSubject} onChange={(e) => setEvSubject(e.target.value)} placeholder="invoice" spellCheck={false} />
+                </label>
+              </div>
+              <label className="field-label">
+                Search query <span className="muted">(optional, Gmail search syntax)</span>
+                <input className="text-input" value={evQuery} onChange={(e) => setEvQuery(e.target.value)} placeholder="has:attachment newer_than:1d" spellCheck={false} />
+              </label>
+            </>
+          )}
+
+          {evApp === 'slack' && (
+            <div className="sched-row">
+              <label className="field-label">
+                Channel id
+                <input className="text-input" value={evChannel} onChange={(e) => setEvChannel(e.target.value)} placeholder="C0123ABC" spellCheck={false} />
+              </label>
+              <label className="field-label">
+                Keyword <span className="muted">(optional)</span>
+                <input className="text-input" value={evKeyword} onChange={(e) => setEvKeyword(e.target.value)} placeholder="deploy" spellCheck={false} />
+              </label>
+            </div>
+          )}
+
+          {evApp === 'github' && (
+            <>
+              <label className="field-label">
+                Repository <span className="muted">(owner/name)</span>
+                <input className="text-input" value={evRepo} onChange={(e) => setEvRepo(e.target.value)} placeholder="octo/repo" spellCheck={false} />
+              </label>
+              <label className="field-label">Event types</label>
+              <div className="weekday-picker">
+                {(['issues', 'pull_request', 'push'] as const).map((t) => (
+                  <button
+                    key={t}
+                    type="button"
+                    className={`weekday-chip${evGithubTypes.includes(t) ? ' on' : ''}`}
+                    aria-pressed={evGithubTypes.includes(t)}
+                    onClick={() => setEvGithubTypes(evGithubTypes.includes(t) ? evGithubTypes.filter((x) => x !== t) : [...evGithubTypes, t])}
+                  >
+                    {t === 'issues' ? 'Issues opened' : t === 'pull_request' ? 'PR opened/merged' : 'Push'}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+
+          {evApp === 'stripe' && (
+            <>
+              <label className="field-label">Payment outcomes</label>
+              <div className="weekday-picker">
+                {(['payment_succeeded', 'payment_failed'] as const).map((t) => (
+                  <button
+                    key={t}
+                    type="button"
+                    className={`weekday-chip${evStripeTypes.includes(t) ? ' on' : ''}`}
+                    aria-pressed={evStripeTypes.includes(t)}
+                    onClick={() => setEvStripeTypes(evStripeTypes.includes(t) ? evStripeTypes.filter((x) => x !== t) : [...evStripeTypes, t])}
+                  >
+                    {t === 'payment_succeeded' ? 'Payment succeeded' : 'Payment failed'}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+
+          {evApp === 'googlecalendar' && (
+            <div className="sched-row">
+              <label className="field-label">
+                Calendar id
+                <input className="text-input" value={evCalendarId} onChange={(e) => setEvCalendarId(e.target.value)} placeholder="primary" spellCheck={false} />
+              </label>
+              <label className="field-label">
+                Starts within (minutes)
+                <input type="number" className="text-input" min={5} max={10080} value={evWindow} onChange={(e) => setEvWindow(e.target.value)} />
+              </label>
+            </div>
+          )}
+
+          <div className="sched-row">
+            <label className="field-label">
+              Poll every (minutes, min 5)
+              <input type="number" className="text-input" min={5} max={1440} value={evPoll} onChange={(e) => setEvPoll(e.target.value)} />
+            </label>
+            <label className="field-label">
+              Daily fire cap
+              <input type="number" className="text-input" min={1} max={1000} value={evCap} onChange={(e) => setEvCap(e.target.value)} />
+            </label>
+          </div>
         </>
       )}
 
@@ -518,6 +877,7 @@ function ScheduleSection({ routine, onChanged }: { routine: Routine; onChanged: 
     return (
       <ScheduleBuilder
         routineId={routine.id}
+        botId={routine.botId}
         initial={routine.schedule ?? null}
         onSaved={(r) => {
           onChanged(r);
@@ -564,7 +924,7 @@ function ScheduleSection({ routine, onChanged }: { routine: Routine; onChanged: 
           </ul>
         </div>
       )}
-      {runs && runs.length === 0 && (
+      {runs && runs.length === 0 && s.kind !== 'event' && (
         <p className="muted small">No upcoming runs (a one-shot schedule in the past, or past its end).</p>
       )}
       {error && <p className="error">{error}</p>}
@@ -596,6 +956,7 @@ const TRIGGER_LABEL: Record<RunRecord['trigger'], string> = {
   schedule: '⏰ schedule',
   webhook: '🔗 webhook',
   manual: '👆 manual',
+  event: '⚡ event',
 };
 
 function formatDuration(run: RunRecord): string {
@@ -813,6 +1174,145 @@ function FragmentRow({
   );
 }
 
+/** Limit-reset resumes (W1): pending resumes for a limit-blocked routine. */
+function LimitResetSection({ routine }: { routine: Routine }) {
+  const [resumes, setResumes] = useState<LimitResetResume[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const load = useCallback(async () => {
+    try {
+      const res = await api<{ resumes: LimitResetResume[] }>(
+        `/api/routines/${encodeURIComponent(routine.id)}/limit-resets`,
+      );
+      setResumes(res.resumes);
+    } catch {
+      setResumes([]);
+    }
+  }, [routine.id]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const armNow = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      await api(`/api/routines/${encodeURIComponent(routine.id)}/limit-reset`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ errorMessage: 'usage limit reached' }),
+      });
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to arm resume');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const cancel = async (resumeId: string) => {
+    try {
+      await api(`/api/routines/${encodeURIComponent(routine.id)}/limit-resets/${encodeURIComponent(resumeId)}`, {
+        method: 'DELETE',
+      });
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Cancel failed');
+    }
+  };
+
+  const pending = resumes.filter((r) => r.status === 'pending' || r.status === 'firing');
+  return (
+    <div className="limit-reset-section">
+      <div className="deliveries-head">
+        <label className="field-label">Limit-reset resumes</label>
+        <button type="button" className="btn-ghost small" onClick={() => void armNow()} disabled={busy}>
+          Arm resume now
+        </button>
+      </div>
+      <p className="muted small">
+        Armed automatically when a run is blocked by a provider usage limit; fires at the
+        provider&apos;s reset time and survives restarts.
+      </p>
+      {error && <p className="error">{error}</p>}
+      {pending.length === 0 ? (
+        <p className="muted small">No pending resumes.</p>
+      ) : (
+        <ul>
+          {pending.map((r) => (
+            <li key={r.id} className="small">
+              ⏳ {r.providerId} — resumes {new Date(r.resumeAt).toLocaleString()}
+              <button type="button" className="btn-ghost small" onClick={() => void cancel(r.id)}>
+                Cancel
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {resumes.some((r) => r.status === 'fired') && (
+        <p className="muted small">
+          Last resumed {new Date(Math.max(...resumes.filter((r) => r.firedAt).map((r) => r.firedAt as number))).toLocaleString()}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** Connected-app event trigger (W2): cursor + last-fired status for an event schedule. */
+function EventTriggerSection({ routine }: { routine: Routine }) {
+  const [status, setStatus] = useState<EventTriggerStatus | null>(null);
+  const [error, setError] = useState('');
+
+  const load = useCallback(async () => {
+    try {
+      const res = await api<{ status: EventTriggerStatus }>(
+        `/api/routines/${encodeURIComponent(routine.id)}/event-trigger`,
+      );
+      setStatus(res.status);
+      setError('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load event status');
+    }
+  }, [routine.id]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const s = routine.schedule;
+  return (
+    <div className="event-trigger-section">
+      <div className="deliveries-head">
+        <label className="field-label">Event trigger status</label>
+        <button type="button" className="btn-ghost small" onClick={() => void load()}>
+          Refresh
+        </button>
+      </div>
+      {error && <p className="error">{error}</p>}
+      {!status ? (
+        <p className="muted small">No polls yet — the first poll only sets the baseline; new items after that fire the routine.</p>
+      ) : (
+        <>
+          <p className="muted small">
+            Account <code>{s?.accountId}</code>
+            {' · '}last poll {status.lastPollAt ? new Date(status.lastPollAt).toLocaleString() : 'never'}
+            {' · '}last fired {status.lastFiredAt ? new Date(status.lastFiredAt).toLocaleString() : 'never'}
+            {' · '}fired today {status.firesToday}/{status.dailyCap}
+          </p>
+          <p className="muted small">
+            Cursor {status.cursorId ? <code>{status.cursorId}</code> : '—'}
+            {status.cursorTs ? ` (${new Date(status.cursorTs).toLocaleString()})` : ''}
+            {status.capBlocked ? ' · daily cap reached — remaining items fire tomorrow' : ''}
+          </p>
+          {status.lastError && <p className="error small">Last poll error: {status.lastError}</p>}
+        </>
+      )}
+    </div>
+  );
+}
+
 function RoutineRow({ routine, botId, onChanged }: { routine: Routine; botId: string; onChanged: (r: Routine) => void }) {
   const [open, setOpen] = useState(false);
   const [hook, setHook] = useState<HookInfo | null>(null);
@@ -923,6 +1423,18 @@ function RoutineRow({ routine, botId, onChanged }: { routine: Routine; botId: st
           {busy && !hook && <p className="muted">Loading…</p>}
           {error && <p className="error">{error}</p>}
           <ScheduleSection routine={routine} onChanged={onChanged} />
+          {routine.schedule?.kind === 'limit-reset' && (
+            <>
+              <hr className="section-sep" />
+              <LimitResetSection routine={routine} />
+            </>
+          )}
+          {routine.schedule?.kind === 'event' && (
+            <>
+              <hr className="section-sep" />
+              <EventTriggerSection routine={routine} />
+            </>
+          )}
           <hr className="section-sep" />
           <RunHistorySection routine={routine} />
           <hr className="section-sep" />

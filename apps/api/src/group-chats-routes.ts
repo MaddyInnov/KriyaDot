@@ -90,6 +90,13 @@ export interface GroupChatsDeps {
   /** Create a reply thread anchored to a group message; returns thread info. */
   createMessageThread?: (groupId: string, messageId: string) => Promise<{ threadId: string; threadSessionId: string } | null>;
   audit: (action: string, fields: { actor?: string; detail?: unknown }) => void;
+  /**
+   * W7 (optional): fired after a user message is persisted in the room —
+   * the people layer turns @mentions of PEOPLE into inbox items + push
+   * for exactly the mentioned people. Fire-and-forget; errors are the
+   * handler's own concern and never fail the room post.
+   */
+  onPersonMentions?: (args: { group: GroupChat; text: string; req: express.Request }) => Promise<void> | void;
 }
 
 function errorBody(message: string, detail?: unknown): Record<string, unknown> {
@@ -316,6 +323,14 @@ export function createGroupChatsRouter(deps: GroupChatsDeps): Router {
       queue,
       timeoutMin: timeoutOverride,
     });
+    if (posted.ok && deps.onPersonMentions) {
+      // W7: @mentions of people → inbox items for exactly those people.
+      try {
+        await deps.onPersonMentions({ group, text: text.trim(), req });
+      } catch {
+        // Mention fan-out must never fail the room post.
+      }
+    }
     if (!posted.ok) {
       res.status(posted.status).json(
         errorBody(posted.error, {

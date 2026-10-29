@@ -111,6 +111,11 @@ export interface BotConfig {
   systemPrompt: string;
   provider: string;
   model: string;
+  /** Multiplayer layer (W7): owning person id; unset = the default user. */
+  ownerId?: string;
+  /** AI failover (W1): backup provider/model for hard usage-limit failures. */
+  backupProvider?: string;
+  backupModel?: string;
   modelOptions?: ModelOptions;
   skills: string[];
   tools: string[];
@@ -243,9 +248,50 @@ export type StreamEvent =
    * Non-fatal informational notice from the server (e.g. "queued behind an
    * in-flight turn"). Rendered inline; never aborts the turn.
    */
-  | { type: 'notice'; message: string }
+  | { type: 'notice'; kind?: string; message: string }
+  /** AI failover (W1): primary provider hit a hard limit; turn continues on the backup. Once per turn. */
+  | {
+      type: 'failover';
+      fromProvider: string;
+      fromModel: string;
+      toProvider: string;
+      toModel: string;
+      reason: string;
+      message: string;
+    }
+  /** Near-limit warning (W1): observed usage crossed the warning threshold. */
+  | {
+      type: 'usage_warning';
+      providerId: string;
+      providerName: string;
+      usedPercent: number;
+      source: 'rate-limit' | 'spend-cap' | 'error';
+      message: string;
+    }
   /** A queued message started its turn on this stream (queue-at-boundary). */
   | { type: 'queued_turn_start'; queueId?: string }
+  /**
+   * Live step line (W8a): the running turn's current step. Rendered as a
+   * slim line under the streaming message; also mirrored server-side in
+   * the turn-state registry behind GET /api/chat/now.
+   */
+  | {
+      type: 'step';
+      botId: string;
+      sessionId: string;
+      step: string;
+      stepIndex?: number;
+      stepTotal?: number;
+      startedAt: number;
+      elapsedMs: number;
+    }
+  /**
+   * Streaming TTS (W8h): one synthesized sentence of the reply, in
+   * sentence order, while the turn is still running (voice reply on).
+   */
+  | { type: 'audio_chunk'; seq: number; text: string; mimeType: string; audioBase64: string }
+  /** A `/goal` run was started from this chat (W8f). */
+  | { type: 'goal_started'; goal: GroupGoalSummary }
   /**
    * Rich inline card. `widget` is validated client-side against the widget
    * schema (components/widgets) — invalid payloads render as an error block,
@@ -259,7 +305,8 @@ export type StreamEvent =
       widgetId: string;
       sessionId: string;
       widget: unknown;
-      expiresAt: number;
+      expiresAt: number | null;
+      neverExpire?: boolean;
       interactive: boolean;
     }
   /**
@@ -304,6 +351,10 @@ export interface ApprovalRecord {
   decidedBy?: string;
   note?: string;
   provenance?: string;
+  /** W12: epoch ms expiry, null for never-expire approvals. */
+  expiresAt?: number | null;
+  /** W12: true when the approval never expires ("No expiry"). */
+  neverExpire?: boolean;
 }
 
 export interface AuditEntry {
@@ -350,6 +401,8 @@ export interface ProviderInfo {
   models: ModelInfo[];
   /** Latest rate-limit/quota snapshot from response headers (null when unknown). */
   rateLimit: RateLimitSnapshot | null;
+  /** Near-limit warning (W1): only when observed usage crosses the threshold; null otherwise / no data. */
+  usageWarning?: { usedPercent: number; message: string; source: 'rate-limit' } | null;
   /** Subscription/CLI bridge: 'claude' | 'codex'. Set only on bridge presets. */
   bridge?: 'claude' | 'codex';
   /** Bridge only: a matching CLI or credential file was detected on this machine. */
@@ -674,17 +727,104 @@ export interface MessageReaction {
 /** Common emoji options for the reaction picker. */
 export const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏'] as const;
 
-/** Toggle a reaction on a message (adds if absent, removes if present). */
+/** What a reaction resolved, when it decided a pending card (W8b). */
+export interface ReactionResolution {
+  kind: 'approval' | 'widget';
+  id: string;
+  verdict: 'approved' | 'denied';
+  source: 'reaction';
+}
+
+/**
+ * Toggle a reaction on a message (adds if absent, removes if present).
+ * W8b: pass `target` ({approvalId} or {widgetId}) when the message
+ * carries a pending question/approval card — an added 👍/👎 then
+ * resolves the card through the same decision path as clicking it,
+ * and the response carries `resolved`.
+ */
 export const toggleMessageReaction = (
   sessionId: string,
   messageId: string | number,
   emoji: string,
-): Promise<{ ok: boolean; reactions: MessageReaction[]; added: boolean }> =>
+  target?: { approvalId?: string; widgetId?: string },
+): Promise<{ ok: boolean; reactions: MessageReaction[]; added: boolean; resolved?: ReactionResolution }> =>
   apiJson(`/api/chat/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(String(messageId))}/reactions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ emoji }),
+    body: JSON.stringify({ emoji, ...(target ?? {}) }),
   });
+
+// ---- Chat "Now", sign-in requests, direct-chat goals (W8) ------------------
+
+/** One bot's live turn state (W8a) — what it is doing right now. */
+export interface CurrentTurnState {
+  botId: string;
+  botName?: string;
+  sessionId: string;
+  step: string;
+  stepIndex?: number;
+  stepTotal?: number;
+  startedAt: number;
+  updatedAt: number;
+  elapsedMs: number;
+}
+
+/** GET /api/chat/now — live turn state for every busy bot (or one bot). */
+export const fetchChatNow = (botId?: string): Promise<{ ok: boolean; turns: CurrentTurnState[] }> =>
+  apiJson(`/api/chat/now${botId ? `?botId=${encodeURIComponent(botId)}` : ''}`);
+
+/** A pending sign-in request card in a bot's chat (W8d). */
+export interface SignInRequest {
+  id: string;
+  botId: string;
+  sessionId: string;
+  cliId: string;
+  url?: string;
+  status: 'pending' | 'completed' | 'failed' | 'cancelled';
+  createdAt: number;
+  settledAt?: number;
+}
+
+export const createSignInRequest = (input: {
+  botId: string;
+  sessionId: string;
+  cliId: string;
+  url?: string;
+}): Promise<{ ok: boolean; request: SignInRequest }> =>
+  apiJson('/api/chat/sign-in-requests', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+
+export const listSignInRequests = (filter: {
+  botId?: string;
+  sessionId?: string;
+}): Promise<{ ok: boolean; requests: SignInRequest[] }> => {
+  const qs = new URLSearchParams();
+  if (filter.botId) qs.set('botId', filter.botId);
+  if (filter.sessionId) qs.set('sessionId', filter.sessionId);
+  const suffix = qs.toString() ? `?${qs.toString()}` : '';
+  return apiJson(`/api/chat/sign-in-requests${suffix}`);
+};
+
+/** Minimal group-goal shape the chat renders (full record: Teams → Goals). */
+export interface GroupGoalSummary {
+  id: string;
+  title: string;
+  status: string;
+  coordinatorBotId: string;
+  workerBotIds: string[];
+  maxTurns: number;
+  summary?: string | null;
+  sessionId?: string | null;
+}
+
+/** GET /api/group-goals/:id — status of one goal run (W8f chat card). */
+export const fetchGroupGoal = (
+  goalId: string,
+): Promise<{ ok: boolean; goal: GroupGoalSummary; turns: Array<{ turnNumber: number; decision: string }> }> =>
+  apiJson(`/api/group-goals/${encodeURIComponent(goalId)}`);
 
 /** Batch-fetch reactions for a list of message ids. */
 export const getMessageReactions = (
@@ -774,10 +914,18 @@ export const setBotModel = (
   botId: string,
   model: string | null,
   modelOptions: ModelOptions | null,
-): Promise<{ ok: boolean; botId: string; model?: string; modelOptions?: ModelOptions }> =>
+  backup?: { backupProvider?: string | null; backupModel?: string | null },
+): Promise<{
+  ok: boolean;
+  botId: string;
+  model?: string;
+  modelOptions?: ModelOptions;
+  backupProvider?: string;
+  backupModel?: string;
+}> =>
   apiJson(`/api/bots/${encodeURIComponent(botId)}/model`, {
     method: 'PUT',
-    body: JSON.stringify({ model, modelOptions }),
+    body: JSON.stringify({ model, modelOptions, ...(backup ?? {}) }),
   });
 
 export const setBotVoice = (
@@ -891,7 +1039,8 @@ export interface PeerApprovalCard {
   sessionId: string;
   status: 'pending' | 'allowed' | 'denied' | 'expired' | 'dismissed';
   createdAt: number;
-  expiresAt: number;
+  expiresAt: number | null;
+  neverExpire?: boolean;
   decidedAt?: number;
   decidedBy?: string;
   /** Origin chain of the sender's turn (P1 #13) — shown as a security note. */
@@ -917,7 +1066,8 @@ export interface CredentialProposal {
   reason: string;
   status: 'pending' | 'fulfilled' | 'denied' | 'expired';
   createdAt: number;
-  expiresAt: number;
+  expiresAt: number | null;
+  neverExpire?: boolean;
 }
 
 /** Credential proposal cards: a bot needs a secret it doesn't have. */
@@ -980,6 +1130,164 @@ export function revokePeerGrant(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ senderBotId, targetBotId, actionType }),
   });
+}
+
+// ---- Proactive account watching (W5) ---------------------------------------
+// Watch rules poll a connected app, triage new items with a cheap helper
+// model, and surface only flagged items as "needs you" inbox entries.
+
+export type WatchAppId = 'gmail' | 'slack' | 'github' | 'stripe' | 'googlecalendar';
+export type WatchKind =
+  | 'needs-reply'
+  | 'payment-failed'
+  | 'review-requested'
+  | 'meeting-conflict'
+  | 'mention'
+  | 'custom';
+export type WatchItemStatus = 'new' | 'actioned' | 'dismissed';
+
+export interface WatchRuleState {
+  ruleId: string;
+  cursorId: string | null;
+  cursorTs: number | null;
+  lastPollAt: number | null;
+  lastSurfacedAt: number | null;
+  lastError: string | null;
+  capBlocked: boolean;
+  updatedAt: number;
+}
+
+export interface WatchRule {
+  id: string;
+  name: string;
+  botId: string;
+  userId: string;
+  app: WatchAppId;
+  accountId: string;
+  kind: WatchKind;
+  instruction: string;
+  intervalMinutes: number;
+  enabled: boolean;
+  dailyCap: number;
+  timezone: string;
+  channelId?: string;
+  repo?: string;
+  calendarId?: string;
+  createdAt: number;
+  updatedAt: number;
+  state?: WatchRuleState | null;
+}
+
+export interface WatchItem {
+  id: string;
+  ruleId: string;
+  sourceItemId: string;
+  app: WatchAppId;
+  sourceKind: string;
+  summary: string;
+  fields: Record<string, string>;
+  urgency: 'low' | 'medium' | 'high';
+  reason: string;
+  suggestedAction: string;
+  status: WatchItemStatus;
+  draftText?: string;
+  draftRef?: string;
+  itemTs: number | null;
+  surfacedAt: number;
+  updatedAt: number;
+}
+
+export interface WatchRun {
+  id: number;
+  ruleId: string;
+  startedAt: number;
+  listed: number;
+  checked: number;
+  surfaced: number;
+  skippedCatchUp: number;
+  capBlocked: number;
+  note?: string;
+  error?: string;
+}
+
+export interface WatchRuleInput {
+  name?: string;
+  botId?: string;
+  app: WatchAppId;
+  accountId: string;
+  kind: WatchKind;
+  instruction?: string;
+  intervalMinutes?: number;
+  enabled?: boolean;
+  dailyCap?: number;
+  timezone?: string;
+  channelId?: string;
+  repo?: string;
+  calendarId?: string;
+}
+
+const watchJsonInit = (method: string, body?: unknown): RequestInit => ({
+  method,
+  headers: { 'Content-Type': 'application/json' },
+  body: body === undefined ? undefined : JSON.stringify(body),
+});
+
+export async function getWatchRules(): Promise<WatchRule[]> {
+  const res = await apiJson<{ rules: WatchRule[] }>('/api/watch-rules');
+  return res.rules;
+}
+
+export async function createWatchRule(input: WatchRuleInput): Promise<WatchRule> {
+  const res = await apiJson<{ rule: WatchRule }>('/api/watch-rules', watchJsonInit('POST', input));
+  return res.rule;
+}
+
+export async function updateWatchRule(id: string, patch: Partial<WatchRuleInput>): Promise<WatchRule> {
+  const res = await apiJson<{ rule: WatchRule }>(
+    `/api/watch-rules/${encodeURIComponent(id)}`,
+    watchJsonInit('PATCH', patch),
+  );
+  return res.rule;
+}
+
+export async function deleteWatchRule(id: string): Promise<void> {
+  await apiJson(`/api/watch-rules/${encodeURIComponent(id)}`, watchJsonInit('DELETE'));
+}
+
+export async function runWatchRuleNow(id: string): Promise<{ checked: number; surfaced: number }> {
+  const res = await apiJson<{ result: { checked: number; surfaced: number } }>(
+    `/api/watch-rules/${encodeURIComponent(id)}/run-now`,
+    watchJsonInit('POST'),
+  );
+  return res.result;
+}
+
+export async function getWatchItems(status?: WatchItemStatus): Promise<WatchItem[]> {
+  const q = status ? `?status=${encodeURIComponent(status)}` : '';
+  const res = await apiJson<{ items: WatchItem[] }>(`/api/watch-items${q}`);
+  return res.items;
+}
+
+export async function dismissWatchItem(id: string): Promise<WatchItem> {
+  const res = await apiJson<{ item: WatchItem }>(
+    `/api/watch-items/${encodeURIComponent(id)}/dismiss`,
+    watchJsonInit('POST'),
+  );
+  return res.item;
+}
+
+export async function draftWatchItem(id: string): Promise<WatchItem> {
+  const res = await apiJson<{ item: WatchItem }>(
+    `/api/watch-items/${encodeURIComponent(id)}/draft`,
+    watchJsonInit('POST'),
+  );
+  return res.item;
+}
+
+export async function getWatchRuns(ruleId?: string): Promise<WatchRun[]> {
+  const q = ruleId ? `?ruleId=${encodeURIComponent(ruleId)}` : '';
+  const res = await apiJson<{ runs: WatchRun[] }>(`/api/watch-runs${q}`);
+  return res.runs;
 }
 
 // ---- Custom slash commands --------------------------------------------------
@@ -1135,6 +1443,28 @@ export function addPageMention(
     body: JSON.stringify(input),
   });
 }
+
+// ---- Public page publishing (W3) ---------------------------------------------
+
+export interface PagePublicationStatus {
+  published: boolean;
+  slug?: string;
+  /** Public URL path on this KriyaDot server, e.g. /p/<slug>. */
+  path?: string;
+  publishedAt?: number;
+  views?: number;
+}
+
+export function publishPage(id: string): Promise<PagePublicationStatus & { title?: string }> {
+  return apiJson(`/api/pages/${encodeURIComponent(id)}/publish`, { method: 'POST' });
+}
+
+export function unpublishPage(id: string): Promise<{ published: boolean }> {
+  return apiJson(`/api/pages/${encodeURIComponent(id)}/publish`, { method: 'DELETE' });
+}
+
+export const getPagePublication = (id: string): Promise<PagePublicationStatus> =>
+  apiJson(`/api/pages/${encodeURIComponent(id)}/publication`);
 
 export function saveProviderKey(
   providerId: string,
@@ -1315,6 +1645,8 @@ export interface ChatRequest {
   queueMode?: 'interrupt' | 'queue';
   /** Session auto-approve: skip approval cards for this turn (audited). */
   autoApprove?: boolean;
+  /** Streaming TTS (W8h): synthesize the reply sentence-by-sentence while it streams. */
+  voiceReply?: boolean;
   /** Plan mode: read-only exploration, mutating tools denied. */
   planMode?: boolean;
   /** Fail-closed max spend in USD for this turn. */
@@ -2011,7 +2343,22 @@ export type AcpPromptStreamEvent =
 export const listAcpSessions = (): Promise<{ ok: boolean; sessions: AcpSessionDto[] }> =>
   apiJson('/api/acp');
 
-export const createAcpSession = (input: { command: string; args?: string[]; label?: string }): Promise<{ ok: boolean; session: AcpSessionDto }> =>
+export interface AcpEngineDto {
+  id: string;
+  name: string;
+  command: string;
+  args: string[];
+  authId: string | null;
+  models: Array<{ id: string; name: string; default?: boolean }>;
+  notes: string;
+  installed: boolean;
+}
+
+/** Built-in ACP engine presets (W9: GitHub Copilot CLI, OpenCode) + detection. */
+export const listAcpEngines = (): Promise<{ ok: boolean; engines: AcpEngineDto[] }> =>
+  apiJson('/api/acp/engines');
+
+export const createAcpSession = (input: { command?: string; args?: string[]; label?: string; engine?: string }): Promise<{ ok: boolean; session: AcpSessionDto }> =>
   apiJson('/api/acp', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

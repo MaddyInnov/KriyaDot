@@ -31,7 +31,12 @@ import {
   deleteUploadedFile,
   fileTypeIcon,
   decidePeerApproval,
+  fetchChatNow,
+  listSignInRequests,
+  toggleMessageReaction,
+  type CurrentTurnState,
   type FusionStreamEvent,
+  type SignInRequest,
   type MessageReaction,
   type PeerDecision,
 } from '../lib/api';
@@ -66,7 +71,12 @@ import { VOICE_NOTE_PERSIST_LIMIT, type VoiceNote } from '../lib/voice-notes';
 import { CallPanel, VoiceNoteBubble, VoiceNoteRecorder } from '../components/voice';
 import { NoteAttachButton } from '../components/chat/note-attach-button';
 import { BotConversationSheet, BotNoticeRow, type BotNoticeData } from '../components/chat/bot-notice';
+import { PublishedPageCard, publishedPageFromToolResult } from '../components/chat/published-page-card';
 import { MessageReactions } from '../components/chat/message-reactions';
+import { NowCards, StepLine } from '../components/chat/step-line';
+import { applyStepEvent, type StepLineState } from '../components/chat/step-state';
+import { GaplessAudioQueue } from '../components/chat/audio-queue';
+import { GoalStatusCard } from '../components/chat/goal-card';
 import { BranchPicker, MessageSearchBox } from '../components/chat/message-search';
 import { useCodeSession } from '../components/code/useCodeSession';
 import { CodeSessionView } from '../components/code/CodeSessionView';
@@ -74,7 +84,9 @@ import { CodingSessionStrip } from '../components/code/CodingSessionStrip';
 
 type ChatBlock =
   | { kind: 'user'; id: string; text: string; ts: number }
-  | { kind: 'assistant'; id: string; text: string; streaming: boolean; usage?: TokenUsage; costUsd?: number; ts: number; botName?: string }
+  | { kind: 'assistant'; id: string; text: string; streaming: boolean; usage?: TokenUsage; costUsd?: number; ts: number; botName?: string; step?: StepLineState }
+  /** A `/goal` run started in this chat (W8f) — status polls the goal record. */
+  | { kind: 'goal'; id: string; goalId: string; title: string }
   | { kind: 'tool'; id: string; call: ToolCall; result?: unknown; denied?: boolean }
   | {
       kind: 'approval';
@@ -109,7 +121,8 @@ type ChatBlock =
       id: string;
       widgetId: string;
       widget: Widget;
-      expiresAt: number;
+      expiresAt: number | null;
+      neverExpire?: boolean;
       interactive: boolean;
       answered?: WidgetAnswerState;
     }
@@ -535,6 +548,48 @@ function ChatPageInner() {
   // Message reactions (Codync parity): per-message emoji reactions,
   // keyed by client message id.
   const [messageReactions, setMessageReactions] = useState<Record<string, MessageReaction[]>>({});
+  // Live "Now" state (W8a): what every busy bot is doing right now,
+  // polled from GET /api/chat/now while the chat is open.
+  const [nowTurns, setNowTurns] = useState<CurrentTurnState[]>([]);
+  // Pending sign-in request cards for this chat (W8d).
+  const [signInRequests, setSignInRequests] = useState<SignInRequest[]>([]);
+  // Streaming TTS voice replies (W8h): synthesize the reply sentence by
+  // sentence while it streams, played through a gapless queue.
+  const [voiceReply, setVoiceReply] = useState(false);
+  const voiceReplyRef = useRef(voiceReply);
+  voiceReplyRef.current = voiceReply;
+  const audioQueueRef = useRef<GaplessAudioQueue | null>(null);
+
+  // Poll the "Now" registry + this chat's pending sign-in requests.
+  useEffect(() => {
+    let alive = true;
+    const tick = async (): Promise<void> => {
+      try {
+        const res = await fetchChatNow();
+        if (alive && res.ok) setNowTurns(res.turns);
+      } catch {
+        // Now state is best-effort; the step line still streams inline.
+      }
+      const botId = botIdRef.current;
+      const cid = botId ? activeConvoRef.current[botId] : undefined;
+      if (botId && cid) {
+        try {
+          const res = await listSignInRequests({ botId, sessionId: cid });
+          if (alive && res.ok) setSignInRequests(res.requests);
+        } catch {
+          // Sign-in cards are best-effort.
+        }
+      } else if (alive) {
+        setSignInRequests([]);
+      }
+    };
+    void tick();
+    const t = setInterval(() => void tick(), 3000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, []);
   // Slack-style reply threads: the open thread panel, its messages, and
   // per-root summaries (reply counts + unread flags) for the active convo.
   const [openThread, setOpenThread] = useState<{
@@ -1016,6 +1071,46 @@ function ChatPageInner() {
   };
 
   /**
+   * Reactions-as-answers (W8b): a 👍/👎 on a pending approval card or
+   * question widget resolves it through the same decision path as
+   * clicking the card (the server audits it as reaction-sourced). The
+   * local block updates from the server's `resolved` verdict.
+   */
+  const reactAsAnswer = async (opts: {
+    blockId: string;
+    emoji: '👍' | '👎';
+    approvalId?: string;
+    widgetId?: string;
+  }): Promise<void> => {
+    const botId = botIdRef.current;
+    const cid = botId ? activeConvoRef.current[botId] : undefined;
+    if (!cid) return;
+    try {
+      const res = await toggleMessageReaction(
+        cid,
+        opts.approvalId ?? opts.widgetId ?? opts.blockId,
+        opts.emoji,
+        { approvalId: opts.approvalId, widgetId: opts.widgetId },
+      );
+      if (res.resolved) {
+        const verdict = res.resolved.verdict;
+        setBlocks((prev) =>
+          prev.map((b) => {
+            if (b.id !== opts.blockId) return b;
+            if (b.kind === 'approval') return { ...b, status: verdict };
+            if (b.kind === 'widget') {
+              return { ...b, answered: { answered: true, value: { confirmed: verdict === 'approved' }, answeredAt: Date.now() } };
+            }
+            return b;
+          }),
+        );
+      }
+    } catch {
+      // Reactions are additive; failures must not break the chat.
+    }
+  };
+
+  /**
    * Open the reply thread anchored to a message block: create the thread
    * (forking the session) if needed, then load its messages into the panel.
    */
@@ -1158,6 +1253,32 @@ function ChatPageInner() {
     if (event.type === 'code_write' && !dismissedThisTurn.current) {
       setCodeViewOpen(true);
     }
+    if (event.type === 'audio_chunk') {
+      // Streaming TTS (W8h): queue the sentence audio for gapless playback.
+      if (!audioQueueRef.current) audioQueueRef.current = new GaplessAudioQueue();
+      audioQueueRef.current.enqueue({ seq: event.seq, audioBase64: event.audioBase64, mimeType: event.mimeType });
+      return;
+    }
+    if (event.type === 'goal_started') {
+      setBlocks((prev) => [...prev, { kind: 'goal', id: nextId(), goalId: event.goal.id, title: event.goal.title }]);
+      return;
+    }
+    if (event.type === 'step') {
+      // Live step line (W8a): attach the current step to the streaming
+      // assistant block (searching back past any tool blocks).
+      setBlocks((prev) => {
+        const next = [...prev];
+        for (let i = next.length - 1; i >= 0; i--) {
+          const b = next[i];
+          if (b && b.kind === 'assistant') {
+            next[i] = { ...b, step: applyStepEvent(b.step, event) };
+            break;
+          }
+        }
+        return next;
+      });
+      return;
+    }
     if (event.type === 'done') {
       const bid = botIdRef.current;
       const usage = event.usage;
@@ -1184,7 +1305,7 @@ function ChatPageInner() {
         for (let i = next.length - 1; i >= 0; i--) {
           const b = next[i];
           if (b && b.kind === 'assistant') {
-            next[i] = { ...b, streaming: false, usage: event.usage ?? undefined, costUsd };
+            next[i] = { ...b, streaming: false, step: undefined, usage: event.usage ?? undefined, costUsd };
             break;
           }
         }
@@ -1273,6 +1394,17 @@ function ChatPageInner() {
           next.push({ kind: 'notice', id: nextId(), text: event.message });
           break;
         }
+        case 'failover': {
+          // AI failover (W1): the primary provider hit its usage limit and
+          // the turn continues on the backup — shown once per turn.
+          next.push({ kind: 'notice', id: nextId(), text: `🔁 ${event.message}` });
+          break;
+        }
+        case 'usage_warning': {
+          // Near-limit warning (W1): observed usage only, e.g. "Claude: 92% used".
+          next.push({ kind: 'notice', id: nextId(), text: `⚠️ ${event.message} — approaching the provider limit.` });
+          break;
+        }
         case 'error': {
           next.push({ kind: 'error', id: nextId(), text: event.message });
           break;
@@ -1286,6 +1418,7 @@ function ChatPageInner() {
               widgetId: event.widgetId,
               widget: validated.widget,
               expiresAt: event.expiresAt,
+              neverExpire: event.neverExpire,
               interactive: event.interactive,
             });
           } else {
@@ -1381,6 +1514,7 @@ function ChatPageInner() {
         queueMode: queueModeRef.current,
         autoApprove: autoApproveRef.current,
         planMode: planModeRef.current,
+        voiceReply: voiceReplyRef.current || undefined,
         maxBudgetUsd: Number.isFinite(budget) && budget >= 0 ? budget : undefined,
         signal: controller.signal,
       })) {
@@ -2028,6 +2162,23 @@ function ChatPageInner() {
               ⏳ {queuedCount} queued
             </span>
           )}
+          {/* "Now" cards (W8a): what each busy bot is doing right now. */}
+          <NowCards turns={nowTurns} />
+          {/* Pending sign-in request cards (W8d): finish signing in, then say "done". */}
+          {signInRequests.map((r) => (
+            <span key={r.id} className="queued-badge" title={`Sign-in pending for ${r.cliId}`}>
+              🔑 Sign in to {r.cliId}
+              {r.url && (
+                <>
+                  {' '}
+                  <a href={r.url} target="_blank" rel="noreferrer">
+                    Open sign-in page
+                  </a>
+                </>
+              )}{' '}
+              — then say “done”
+            </span>
+          ))}
           <div
             className="mode-toggle"
             role="group"
@@ -2349,6 +2500,7 @@ function ChatPageInner() {
                         </>
                       )}
                     </div>
+                    {b.streaming && b.step && <StepLine state={b.step} />}
                     {!b.streaming && (
                       <MessageReactions
                         reactions={messageReactions[b.id] ?? []}
@@ -2362,18 +2514,44 @@ function ChatPageInner() {
                   </div>
                 );
               }
+              case 'goal':
+                return (
+                  <div key={b.id} className="msg-row assistant">
+                    <GoalStatusCard goalId={b.goalId} title={b.title} />
+                  </div>
+                );
               case 'widget':
                 return (
-                  <WidgetRenderer
-                    key={b.id}
-                    widget={b.widget}
-                    widgetId={b.widgetId}
-                    expiresAt={b.expiresAt}
-                    interactive={b.interactive}
-                    answered={b.answered}
-                    onAction={(a, w) => void handleWidgetAction(a, w)}
-                    onAnswer={(wid, value) => void handleWidgetAnswer(wid, value)}
-                  />
+                  <div key={b.id}>
+                    <WidgetRenderer
+                      widget={b.widget}
+                      widgetId={b.widgetId}
+                      expiresAt={b.expiresAt}
+                      neverExpire={b.neverExpire}
+                      interactive={b.interactive}
+                      answered={b.answered}
+                      onAction={(a, w) => void handleWidgetAction(a, w)}
+                      onAnswer={(wid, value) => void handleWidgetAnswer(wid, value)}
+                    />
+                    {b.interactive && !b.answered?.answered && (
+                      <div className="approval-actions" style={{ marginTop: 4 }}>
+                        <button
+                          className="btn btn-sm"
+                          title="React 👍 — answer yes / approve"
+                          onClick={() => void reactAsAnswer({ blockId: b.id, emoji: '👍', widgetId: b.widgetId })}
+                        >
+                          👍 Yes
+                        </button>
+                        <button
+                          className="btn btn-sm"
+                          title="React 👎 — answer no / deny"
+                          onClick={() => void reactAsAnswer({ blockId: b.id, emoji: '👎', widgetId: b.widgetId })}
+                        >
+                          👎 No
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 );
               case 'fusion':
                 return (
@@ -2398,6 +2576,15 @@ function ChatPageInner() {
                       bots={bots.map((x) => ({ id: x.id, name: x.name }))}
                       onOpenSheet={(peerId) => setConvSheetPeer(peerId)}
                     />
+                  );
+                }
+                const publishedPage =
+                  b.result !== undefined ? publishedPageFromToolResult(b.call.name, b.result) : null;
+                if (publishedPage) {
+                  return (
+                    <div key={b.id} className="msg-row assistant">
+                      <PublishedPageCard data={publishedPage} />
+                    </div>
                   );
                 }
                 return (
@@ -2454,6 +2641,20 @@ function ChatPageInner() {
                             {b.remembering ? 'Saving…' : `Always allow ${b.call.name}`}
                           </button>
                         )}
+                        <button
+                          className="btn btn-sm"
+                          title="React 👍 — same as Approve (recorded as a reaction)"
+                          onClick={() => void reactAsAnswer({ blockId: b.id, emoji: '👍', approvalId: b.approvalId })}
+                        >
+                          👍
+                        </button>
+                        <button
+                          className="btn btn-sm"
+                          title="React 👎 — same as Deny (recorded as a reaction)"
+                          onClick={() => void reactAsAnswer({ blockId: b.id, emoji: '👎', approvalId: b.approvalId })}
+                        >
+                          👎
+                        </button>
                       </div>
                     ) : (
                       <div className="small muted mt">
@@ -2693,6 +2894,26 @@ function ChatPageInner() {
               onClick={() => setFusionMode((v) => !v)}
             >
               ⚡ Fusion{fusionMode ? ' on' : ''}
+            </button>
+            <button
+              type="button"
+              className={`fusion-toggle${voiceReply ? ' on' : ''}`}
+              title="Voice reply: hear the reply spoken sentence-by-sentence while it streams (streaming TTS)"
+              aria-pressed={voiceReply}
+              onClick={() => setVoiceReply((v) => !v)}
+            >
+              🔊 Voice reply{voiceReply ? ' on' : ''}
+            </button>
+            <button
+              type="button"
+              className="fusion-toggle"
+              title="Start a goal run with this bot: type the goal after /goal and send (e.g. /goal Research the top 3 competitors)"
+              onClick={() => {
+                setInput('/goal ');
+                inputRef.current?.focus();
+              }}
+            >
+              🎯 Goal
             </button>
             <a className="fusion-history-link" href="/fusion" title="Past fusion runs">
               history

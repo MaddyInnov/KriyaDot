@@ -24,11 +24,12 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import type { AgentRuntime, BotConfig } from '@mvp/agent-runtime';
+import { classifyProviderError } from '@mvp/agent-runtime';
 import type { BotRoutine } from './bot-routines.js';
 
 import { openDb as openSqliteDb } from '@mvp/agent-runtime';
 
-export type RunTrigger = 'schedule' | 'webhook' | 'manual';
+export type RunTrigger = 'schedule' | 'webhook' | 'manual' | 'event';
 export type RunStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'missed' | 'cancelled';
 
 /** Terminal statuses — no further transitions allowed. */
@@ -171,13 +172,14 @@ export class RoutineRunStore {
     routineName: string,
     scheduledFor: number,
     note?: string,
+    trigger: RunTrigger = 'schedule',
   ): RoutineRun {
     const now = Date.now();
     const run: RoutineRun = {
       id: randomUUID(),
       routineId,
       routineName,
-      trigger: 'schedule',
+      trigger,
       scheduledFor,
       startedAt: null,
       endedAt: now,
@@ -192,9 +194,9 @@ export class RoutineRunStore {
       .prepare(
         `INSERT INTO routine_runs
            (id, routine_id, routine_name, trigger, scheduled_for, status, error, ended_at, created_at)
-         VALUES (?, ?, ?, 'schedule', ?, 'missed', ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, 'missed', ?, ?, ?)`,
       )
-      .run(run.id, run.routineId, run.routineName, run.scheduledFor, run.error, run.endedAt, run.createdAt);
+      .run(run.id, run.routineId, run.routineName, run.trigger, run.scheduledFor, run.error, run.endedAt, run.createdAt);
     return run;
   }
 
@@ -389,6 +391,13 @@ export interface RoutineRunExecutorDeps {
     routine: BotRoutine;
     prompt: string;
   }) => Promise<string>;
+  /**
+   * Limit-reset (W1): called when a run fails with a hard provider usage
+   * limit, so the host can arm a resume at the provider's reset time
+   * (routines whose schedule kind is 'limit-reset'). Never throws into
+   * the executor.
+   */
+  onLimitBlocked?: (args: { routine: BotRoutine; error: unknown }) => void;
 }
 
 const OUTPUT_EXCERPT_LIMIT = 2000;
@@ -539,6 +548,15 @@ export class RoutineRunExecutor {
       if (this.cancelled.has(runId) || signal.aborted) {
         settle({ status: 'cancelled', error: 'cancelled by user' });
       } else {
+        // Limit-reset (W1): a hard provider limit arms a resume hook so
+        // the routine can continue at the provider's reset time.
+        try {
+          if (this.deps.onLimitBlocked && classifyProviderError(err).isLimit) {
+            this.deps.onLimitBlocked({ routine: opts.routine, error: err });
+          }
+        } catch (hookErr) {
+          console.error('[routine-runs] onLimitBlocked threw:', hookErr instanceof Error ? hookErr.message : hookErr);
+        }
         settle({ status: 'failed', error: err instanceof Error ? err.message : String(err), tokens });
       }
     }

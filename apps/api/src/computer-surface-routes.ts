@@ -2,8 +2,13 @@
 // Per-bot "Works on" computer surface API (OpenMausBot parity P1 #14).
 //
 //   GET    /api/bots/:id/computer          — surface + resolved backend + instance status
+//                                            (+ W4 browserProfile info: dir, exists, bytes)
 //   PUT    /api/bots/:id/computer          — { surface } (persists, drops cached instances)
 //   POST   /api/bots/:id/computer/restart  — drop the bot's instances (fresh on next use)
+//   POST   /api/bots/:id/computer/wipe-browser-profile
+//                                          — W4: delete the bot's persistent browser
+//                                            profile (audited; the ONLY way a profile
+//                                            is deleted — restarts/deletes keep it)
 //   GET    /api/bots/:id/computer/pins     — per-conversation surface pins
 //   PUT    /api/bots/:id/computer/pin      — { conversationId, surface|null }
 
@@ -22,6 +27,11 @@ export interface ComputerSurfaceRouteDeps {
   computerManager: PerBotComputerManager;
   /** routes.ts's errorBody(error, detail?) shape. */
   errorBody: (error: string, detail?: string) => { error: string; detail?: string };
+  /** Optional audit sink (profile wipes are audited — metadata only). */
+  audit?: (
+    action: string,
+    fields: { actor?: string; toolName?: string; detail?: unknown },
+  ) => void;
 }
 
 const BOT_ID_RE = /^[A-Za-z0-9_:-]{1,128}$/;
@@ -33,12 +43,21 @@ function botOf(deps: ComputerSurfaceRouteDeps, id: string): BotConfig | undefine
 function surfaceSummary(deps: ComputerSurfaceRouteDeps, bot: BotConfig) {
   const surface: ComputerSurface = bot.computerSurface ?? 'auto';
   const resolved = resolveSurfaceKind(surface);
+  // W4: the bot's persistent browser profile (dir + disk usage), so the
+  // Computer tab can show it and offer the wipe action.
+  const profile = deps.computerManager.profileInfo(bot.id);
   return {
     botId: bot.id,
     surface,
     resolved: resolved === 'off' ? null : resolved,
     off: resolved === 'off',
     instances: deps.computerManager.status(bot.id),
+    browserProfile: {
+      profileDir: profile.profileDir,
+      exists: profile.exists,
+      bytes: profile.bytes,
+      files: profile.files,
+    },
   };
 }
 
@@ -90,6 +109,35 @@ export function registerComputerSurfaceRoutes(router: Router, deps: ComputerSurf
     }
     await deps.computerManager.restart(id);
     res.json({ ok: true, ...surfaceSummary(deps, bot) });
+  });
+
+  // W4: explicit browser-profile wipe. Deletes the bot's persistent
+  // profile directory (cookies/logins gone; next browser launch starts
+  // fresh). This is a deliberate user action from the Computer tab —
+  // bot deletion, surface changes, restarts and idle teardown all KEEP
+  // the profile. Audited with metadata only.
+  router.post('/bots/:id/computer/wipe-browser-profile', async (req: Request, res: Response) => {
+    const id = req.params.id;
+    if (!BOT_ID_RE.test(id)) {
+      res.status(400).json(deps.errorBody('Invalid bot id'));
+      return;
+    }
+    const bot = botOf(deps, id);
+    if (!bot) {
+      res.status(404).json(deps.errorBody('Unknown bot', `No bot with id "${id}"`));
+      return;
+    }
+    const result = await deps.computerManager.wipeBrowserProfile(id);
+    try {
+      deps.audit?.('computer.browser_profile_wiped', {
+        actor: 'user',
+        toolName: 'computer',
+        detail: { botId: id, wiped: result.wiped, bytesFreed: result.bytesFreed },
+      });
+    } catch {
+      // Audit must never break the wipe response.
+    }
+    res.json({ ok: true, ...result, ...surfaceSummary(deps, bot) });
   });
 
   router.get('/bots/:id/computer/pins', (req: Request, res: Response) => {

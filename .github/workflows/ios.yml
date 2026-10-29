@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+name: iOS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ios-companion/**'
+      - '.github/workflows/ios.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'ios-companion/**'
+      - '.github/workflows/ios.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build debug app (unsigned, simulator)
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project ios-companion/KriyaDotCompanion.xcodeproj \
+            -scheme KriyaDotCompanion \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath ios-companion/build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            | tee ios-companion/build.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kriyadot-companion-ios-build-log
+          path: ios-companion/build.log
+          if-no-files-found: ignore
+
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: kriyadot-companion-ios-debug
+          path: ios-companion/build/DerivedData/Build/Products/Debug-iphonesimulator/KriyaDotCompanion.app
+          if-no-files-found: error

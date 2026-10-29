@@ -8,6 +8,7 @@ import './pet.css';
 import Nav from './nav';
 import PwaInstallBanner from '../components/pwa-install';
 import RemoteScreenBanner from '../components/remote-screen-banner';
+import { PauseControl, PausedBanner } from '../components/pause-control';
 import { BrandPet } from '../components/pet/BrandPet';
 import { I18nProvider } from '../lib/i18n';
 
@@ -66,7 +67,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               KriyaDot
             </Link>
             <Nav />
+            <PauseControl />
           </header>
+          <PausedBanner />
           <main className="main">{children}</main>
         </div>
         <PwaInstallBanner />

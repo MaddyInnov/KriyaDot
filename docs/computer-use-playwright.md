@@ -58,6 +58,42 @@ foreground layer:
   `apps/api/src/index.ts`) so every real click/type/key/scroll/drag/move lands in the
   governance audit trail.
 
+## Per-bot persistent profiles (W4)
+
+When the browser surface is driven through `PerBotComputerManager` (the
+normal API wiring), each bot's Playwright layer launches a **persistent
+context** (`chromium.launchPersistentContext`) whose user-data directory
+is per bot:
+
+```
+<dataDir>/browser-profiles/<botId>/
+```
+
+Cookies, localStorage and logins therefore survive browser restarts, API
+restarts, and the manager's 30-minute idle teardown. Teardown (surface
+change, restart, bot deletion) closes the context but **keeps** the
+profile. The only way to delete one is the explicit wipe:
+`POST /api/bots/:id/computer/wipe-browser-profile` (also the "Wipe browser
+profile" button in Bots → Computer → "Works on"), which closes the bot's
+instances, deletes the directory, and is audit-logged. Profile directory
+and disk usage are reported in `GET /api/bots/:id/computer`
+(`browserProfile`) and in per-instance computer status (`profileDir`,
+`profileBytes`). Profiles are keyed strictly by bot id — one bot can
+never launch with another bot's directory.
+
+## Sign-in codes (W4b)
+
+The `enter_sign_in_code` agent tool handles sites that ask for a one-time
+code sent to the user's email. It is require-approval by governance (the
+approval card shows the site and the code source — a code cannot appear
+there because it is fetched only after approval). The handler searches
+the user's connected Gmail via the Composio path (per-bot enablement
+enforced), extracts a single fresh (default ≤10 min), unambiguous code,
+types it into the bot's focused browser field, and returns only
+`{ entered, outcome, site, sources }` — the code value never appears in
+tool results, logs, or audit entries. Ambiguous/stale/missing codes fail
+closed with no typing.
+
 ## Notes and limits
 
 - Coordinates are **viewport CSS pixels**, not physical screen pixels.

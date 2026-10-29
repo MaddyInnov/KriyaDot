@@ -41,7 +41,10 @@ export interface CredentialProposal {
   reason: string;
   status: CredentialProposalStatus;
   createdAt: number;
-  expiresAt: number;
+  /** Epoch ms expiry, or null when the card never expires (W12). */
+  expiresAt: number | null;
+  /** W12: true when the card was raised with neverExpire. */
+  neverExpire: boolean;
   decidedAt: number | null;
 }
 
@@ -51,6 +54,8 @@ export interface ProposeCredentialInput {
   key: string;
   label?: string;
   reason?: string;
+  /** W12: when true the card never expires (expiresAt = null). */
+  neverExpire?: boolean;
 }
 
 function sanitizeKey(key: string): string {
@@ -79,16 +84,24 @@ export class CredentialProposalStore {
         reason TEXT NOT NULL,
         status TEXT NOT NULL,
         created_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL,
+        expires_at INTEGER,
         decided_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_credprop_status ON credential_proposals (status, expires_at);
     `);
+    // W12: never-expire flag for existing databases (legacy tables keep
+    // expires_at NOT NULL; propose() stores a far-future sentinel there).
+    try {
+      this.db.exec('ALTER TABLE credential_proposals ADD COLUMN never_expire INTEGER NOT NULL DEFAULT 0');
+    } catch {
+      // Column already exists.
+    }
   }
 
   private rowToProposal(row: {
     id: string; bot_id: string; session_id: string; key: string; label: string;
-    reason: string; status: string; created_at: number; expires_at: number; decided_at: number | null;
+    reason: string; status: string; created_at: number; expires_at: number | null; decided_at: number | null;
+    never_expire?: number | null;
   }): CredentialProposal {
     return {
       id: row.id,
@@ -99,7 +112,8 @@ export class CredentialProposalStore {
       reason: row.reason,
       status: row.status as CredentialProposalStatus,
       createdAt: row.created_at,
-      expiresAt: row.expires_at,
+      expiresAt: row.never_expire === 1 ? null : (row.expires_at ?? null),
+      neverExpire: row.never_expire === 1 || row.expires_at === null,
       decidedAt: row.decided_at,
     };
   }
@@ -114,6 +128,7 @@ export class CredentialProposalStore {
       .get(input.botId, key, 'pending') as Parameters<CredentialProposalStore['rowToProposal']>[0] | undefined;
     if (existing) return this.rowToProposal(existing);
     const now = Date.now();
+    const neverExpire = input.neverExpire === true;
     const proposal: CredentialProposal = {
       id: randomUUID(),
       botId: input.botId,
@@ -123,17 +138,26 @@ export class CredentialProposalStore {
       reason: (input.reason ?? '').slice(0, 1000),
       status: 'pending',
       createdAt: now,
-      expiresAt: now + CREDENTIAL_PROPOSAL_TTL_MS,
+      expiresAt: neverExpire ? null : now + CREDENTIAL_PROPOSAL_TTL_MS,
+      neverExpire,
       decidedAt: null,
     };
-    this.db
-      .prepare(
-        'INSERT INTO credential_proposals (id, bot_id, session_id, key, label, reason, status, created_at, expires_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      )
-      .run(
+    const insert = this.db.prepare(
+      'INSERT INTO credential_proposals (id, bot_id, session_id, key, label, reason, status, created_at, expires_at, decided_at, never_expire) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    );
+    try {
+      insert.run(
         proposal.id, proposal.botId, proposal.sessionId, proposal.key, proposal.label,
-        proposal.reason, proposal.status, proposal.createdAt, proposal.expiresAt, null,
+        proposal.reason, proposal.status, proposal.createdAt, proposal.expiresAt, null, neverExpire ? 1 : 0,
       );
+    } catch (err) {
+      if (!neverExpire) throw err;
+      // Legacy NOT NULL expires_at: far-future sentinel (see widgets.ts).
+      insert.run(
+        proposal.id, proposal.botId, proposal.sessionId, proposal.key, proposal.label,
+        proposal.reason, proposal.status, proposal.createdAt, 253402300799999, null, 1,
+      );
+    }
     return proposal;
   }
 
@@ -184,8 +208,11 @@ export class CredentialProposalStore {
 
   /** Transition past-TTL pending cards to 'expired'. Returns the expired ids. */
   expireStale(now = Date.now()): string[] {
+    // W12: never-expire cards never match (NULL expiry / flag guard).
     const rows = this.db
-      .prepare("SELECT id FROM credential_proposals WHERE status = 'pending' AND expires_at <= ?")
+      .prepare(
+        "SELECT id FROM credential_proposals WHERE status = 'pending' AND expires_at IS NOT NULL AND COALESCE(never_expire, 0) = 0 AND expires_at <= ?",
+      )
       .all(now) as Array<{ id: string }>;
     for (const r of rows) {
       this.db.prepare("UPDATE credential_proposals SET status = 'expired', decided_at = ? WHERE id = ?").run(now, r.id);
@@ -249,6 +276,7 @@ export function createRequestCredentialTool(): ToolDefinition {
         key: { type: 'string', description: 'Vault secret name to store the value under (e.g. "acme_api_key").' },
         label: { type: 'string', description: 'Human label for the card (e.g. "API key for Acme CRM").' },
         reason: { type: 'string', description: 'Why the bot needs it (shown on the card).' },
+        neverExpire: { type: 'boolean', description: 'When true, the proposal card never expires (shown as "No expiry").' },
       },
       required: ['key'],
     },
@@ -268,6 +296,7 @@ export function createRequestCredentialTool(): ToolDefinition {
         key: key.trim(),
         label: typeof args.label === 'string' ? args.label : undefined,
         reason: typeof args.reason === 'string' ? args.reason : undefined,
+        neverExpire: args.neverExpire === true ? true : undefined,
       });
       if (result.ok) {
         return { ok: true, stored: true, key: key.trim(), note: 'Credential stored in the vault. Proceed.' };

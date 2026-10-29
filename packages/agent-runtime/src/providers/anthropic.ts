@@ -130,9 +130,25 @@ export class AnthropicProvider implements LLMProvider {
     });
     if (!res.ok) {
       const body = await res.text().catch(() => '');
-      throw new Error(
+      const errSnap = parseAnthropicRateLimitHeaders(res.headers);
+      if (errSnap) recordRateLimit(this.providerId, errSnap);
+      const err = new Error(
         `Anthropic request failed: ${res.status} ${res.statusText}${body ? ` — ${body.slice(0, 300)}` : ''}`,
-      );
+      ) as Error & { status?: number; code?: string; retryAfterMs?: number; resetAt?: string };
+      err.status = res.status;
+      const retryAfter = res.headers.get('retry-after');
+      if (retryAfter) {
+        const secs = Number(retryAfter);
+        if (Number.isFinite(secs)) err.retryAfterMs = secs * 1000;
+      }
+      if (errSnap?.resetAt) err.resetAt = errSnap.resetAt;
+      try {
+        const parsed = JSON.parse(body) as { error?: { type?: string } };
+        if (typeof parsed.error?.type === 'string' && parsed.error.type) err.code = parsed.error.type;
+      } catch {
+        // Non-JSON body: message text still carries the semantics.
+      }
+      throw err;
     }
     // Capture the provider's rate-limit/quota headers. Missing headers → no snapshot.
     const rateLimit = parseAnthropicRateLimitHeaders(res.headers);

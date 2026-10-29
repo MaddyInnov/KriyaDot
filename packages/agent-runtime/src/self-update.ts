@@ -79,6 +79,14 @@ export interface UpdateStatus {
 export interface UpdateSettings {
   autoCheck: boolean;
   checkIntervalHours: number;
+  /**
+   * W12: "Apply updates when idle" (default OFF). When true, a pending
+   * update (available or downloaded-ready) is downloaded + installed
+   * automatically once the system has been idle — no running turns or
+   * routines — for IDLE_APPLY_THRESHOLD_MS. This is the ONLY automatic
+   * install path, and it exists only because the user opted in here.
+   */
+  applyWhenIdle: boolean;
 }
 
 export interface UpdateProgressEvent {
@@ -213,6 +221,7 @@ interface PersistedState {
 const DEFAULT_SETTINGS: UpdateSettings = {
   autoCheck: true,
   checkIntervalHours: DEFAULT_CHECK_INTERVAL_HOURS,
+  applyWhenIdle: false,
 };
 
 export class SelfUpdateManager {
@@ -617,6 +626,7 @@ export class SelfUpdateManager {
 
 export function sanitizeSettings(s: Partial<UpdateSettings>): UpdateSettings {
   const autoCheck = typeof s.autoCheck === 'boolean' ? s.autoCheck : DEFAULT_SETTINGS.autoCheck;
+  const applyWhenIdle = typeof s.applyWhenIdle === 'boolean' ? s.applyWhenIdle : DEFAULT_SETTINGS.applyWhenIdle;
   const raw = s.checkIntervalHours;
   let checkIntervalHours = DEFAULT_SETTINGS.checkIntervalHours;
   if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
@@ -624,9 +634,189 @@ export function sanitizeSettings(s: Partial<UpdateSettings>): UpdateSettings {
     const floored = Math.floor(raw) || MIN_CHECK_INTERVAL_HOURS;
     checkIntervalHours = Math.max(MIN_CHECK_INTERVAL_HOURS, Math.min(24 * 30, floored));
   }
-  return { autoCheck, checkIntervalHours };
+  return { autoCheck, checkIntervalHours, applyWhenIdle };
 }
 
 export function defaultUpdateSettings(): UpdateSettings {
   return { ...DEFAULT_SETTINGS };
+}
+
+// ---------------------------------------------------------------------------
+// W12: idle-gated automatic apply ("Apply updates when idle")
+// ---------------------------------------------------------------------------
+
+/** Idle time required before a pending update may auto-apply: 10 minutes. */
+export const IDLE_APPLY_THRESHOLD_MS = 10 * 60 * 1000;
+
+/** The slice of SelfUpdateManager the idle applier needs (mockable). */
+export interface IdleUpdateSource {
+  getSettings(): Promise<UpdateSettings>;
+  getStatus(): Promise<UpdateStatus>;
+  download(): Promise<UpdateStatus>;
+  install(): Promise<UpdateStatus>;
+}
+
+export interface IdleAutoUpdaterDeps {
+  source: IdleUpdateSource;
+  /** True while any turn or routine run is in flight. Polled every tick. */
+  isBusy: () => boolean;
+  /** Clock override for tests. */
+  now?: () => number;
+  /** Idle threshold override (tests); default IDLE_APPLY_THRESHOLD_MS. */
+  idleThresholdMs?: number;
+  /** Called after an automatic apply completes (observability). */
+  onApplied?: (status: UpdateStatus) => void;
+}
+
+export type IdleTickResult =
+  | { applied: true; status: UpdateStatus }
+  | {
+      applied: false;
+      reason: 'disabled' | 'busy' | 'not-idle-yet' | 'no-pending-update' | 'apply-in-flight' | 'apply-failed';
+      idleMs: number;
+      busy: boolean;
+      error?: string;
+    };
+
+/**
+ * Applies a pending update only at a quiet moment: the setting is ON, an
+ * update is pending ('available' or 'ready'), and the system has been
+ * continuously idle (not busy, no recorded activity) for the threshold.
+ * Any observed activity — a busy poll or an explicit recordActivity() —
+ * resets the idle clock. Fully deterministic under an injected clock.
+ */
+export class IdleAutoUpdater {
+  private readonly source: IdleUpdateSource;
+  private readonly isBusyFn: () => boolean;
+  private readonly nowFn: () => number;
+  private readonly thresholdMs: number;
+  private readonly onApplied?: (status: UpdateStatus) => void;
+  /** Last instant the system was observed active (busy or explicit). */
+  private lastActivityAt: number;
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private applying = false;
+
+  constructor(deps: IdleAutoUpdaterDeps) {
+    this.source = deps.source;
+    this.isBusyFn = deps.isBusy;
+    this.nowFn = deps.now ?? (() => Date.now());
+    this.thresholdMs = deps.idleThresholdMs ?? IDLE_APPLY_THRESHOLD_MS;
+    this.onApplied = deps.onApplied;
+    // The idle clock starts at construction: a freshly booted server must
+    // still be quiet for the full threshold before anything auto-applies.
+    this.lastActivityAt = this.nowFn();
+  }
+
+  /** Feed an explicit activity signal (e.g. a turn started). Resets idle. */
+  recordActivity(at?: number): void {
+    this.lastActivityAt = at ?? this.nowFn();
+  }
+
+  /** Current idle duration in ms (busy counts as zero idle). */
+  idleMs(at?: number): number {
+    const now = at ?? this.nowFn();
+    if (this.isBusyFn()) return 0;
+    return Math.max(0, now - this.lastActivityAt);
+  }
+
+  /** Snapshot for settings/status surfaces. */
+  async getIdleStatus(): Promise<{
+    applyWhenIdle: boolean;
+    busy: boolean;
+    idleMs: number;
+    idleThresholdMs: number;
+    pendingUpdate: boolean;
+  }> {
+    const [settings, status] = await Promise.all([this.source.getSettings(), this.source.getStatus()]);
+    const busy = this.isBusyFn();
+    return {
+      applyWhenIdle: settings.applyWhenIdle,
+      busy,
+      idleMs: this.idleMs(),
+      idleThresholdMs: this.thresholdMs,
+      pendingUpdate: status.state === 'available' || status.state === 'ready',
+    };
+  }
+
+  /**
+   * One gating evaluation. Applies the pending update iff every gate
+   * passes; otherwise reports exactly which gate held. Safe to call on a
+   * timer — concurrent ticks collapse onto the in-flight apply.
+   */
+  async tick(): Promise<IdleTickResult> {
+    const now = this.nowFn();
+    const busy = this.isBusyFn();
+    if (busy) this.lastActivityAt = now;
+    const idle = busy ? 0 : Math.max(0, now - this.lastActivityAt);
+
+    const settings = await this.source.getSettings();
+    if (!settings.applyWhenIdle) {
+      return { applied: false, reason: 'disabled', idleMs: idle, busy };
+    }
+    if (this.applying) {
+      return { applied: false, reason: 'apply-in-flight', idleMs: idle, busy };
+    }
+    if (busy) {
+      return { applied: false, reason: 'busy', idleMs: 0, busy: true };
+    }
+    if (idle < this.thresholdMs) {
+      return { applied: false, reason: 'not-idle-yet', idleMs: idle, busy: false };
+    }
+    const status = await this.source.getStatus();
+    if (status.state !== 'available' && status.state !== 'ready') {
+      return { applied: false, reason: 'no-pending-update', idleMs: idle, busy: false };
+    }
+    this.applying = true;
+    try {
+      let current = status;
+      if (current.state === 'available') {
+        current = await this.source.download();
+      }
+      if (current.state === 'ready') {
+        current = await this.source.install();
+      }
+      // install() lands in 'installing' on success; a failed download or
+      // install leaves 'error'/'available' — that is NOT an apply.
+      if (current.state === 'installing') {
+        try {
+          this.onApplied?.(current);
+        } catch {
+          // Observability must never break the applier.
+        }
+        return { applied: true, status: current };
+      }
+      return { applied: false, reason: 'no-pending-update', idleMs: idle, busy: false };
+    } catch (err) {
+      return {
+        applied: false,
+        reason: 'apply-failed',
+        idleMs: idle,
+        busy: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    } finally {
+      this.applying = false;
+      // Applying is itself activity: the next update needs a fresh quiet
+      // window (and on win32/darwin install() exits the process anyway).
+      this.lastActivityAt = this.nowFn();
+    }
+  }
+
+  /** Poll tick() on an interval (unref'd; never keeps the process alive). */
+  start(intervalMs = 30_000): void {
+    if (this.timer) return;
+    this.timer = setInterval(() => {
+      void this.tick().catch(() => undefined);
+    }, intervalMs);
+    if (typeof (this.timer as unknown as { unref?: () => void }).unref === 'function') {
+      (this.timer as unknown as { unref: () => void }).unref();
+    }
+  }
+
+  stop(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  }
 }

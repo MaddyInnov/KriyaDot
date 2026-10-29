@@ -26,7 +26,28 @@ class WsClient(
     private val scope: CoroutineScope,
 ) {
     var onCommand: ((JSONObject) -> Unit)? = null
+    /** W14: server-dispatched phone-app actions ({type:'action', ...}). */
+    var onAction: ((JSONObject) -> Unit)? = null
     var onStatus: ((connected: Boolean, detail: String) -> Unit)? = null
+
+    companion object {
+        /**
+         * The live client, so components that are not wired through
+         * ScreenCaptureService (the notification listener) can stream
+         * events over the same authenticated socket.
+         */
+        @Volatile var shared: WsClient? = null
+
+        /** Forward one notification event via the shared client, if live. */
+        fun sendNotificationEvent(appPackage: String, appName: String?, title: String, ts: Long): Boolean {
+            val client = shared ?: return false
+            return client.sendNotification(appPackage, appName, title, ts)
+        }
+    }
+
+    init {
+        shared = this
+    }
 
     private val client = OkHttpClient.Builder()
         .pingInterval(20, TimeUnit.SECONDS)
@@ -44,6 +65,7 @@ class WsClient(
     fun disconnect() {
         wantConnected = false
         authed = false
+        if (shared === this) shared = null
         try { ws?.close(1000, "client stop") } catch (_: Exception) { }
         ws = null
     }
@@ -79,6 +101,12 @@ class WsClient(
                     "tap", "swipe", "text", "key" -> {
                         if (authed) onCommand?.invoke(msg)
                     }
+                    else -> {
+                        // W14 action messages use a `type` discriminator.
+                        if (msg.optString("type") == "action" && authed) {
+                            onAction?.invoke(msg)
+                        }
+                    }
                 }
             }
 
@@ -107,6 +135,34 @@ class WsClient(
             try { Thread.sleep(delay) } catch (_: InterruptedException) { return@launch }
             if (wantConnected) doConnect()
         }
+    }
+
+    /** W14: ack a dispatched action back to the server. */
+    fun sendActionResult(id: String, ok: Boolean, error: String?): Boolean {
+        val s = ws ?: return false
+        if (!authed) return false
+        val msg = JSONObject()
+            .put("type", "action_result")
+            .put("id", id)
+            .put("ok", ok)
+        if (!ok && !error.isNullOrEmpty()) msg.put("error", error)
+        return try { s.send(msg.toString()) } catch (_: Exception) { false }
+    }
+
+    /**
+     * W14: stream one notification event to the server for triage.
+     * Title + app only — the notification body is never read or sent.
+     */
+    fun sendNotification(appPackage: String, appName: String?, title: String, ts: Long): Boolean {
+        val s = ws ?: return false
+        if (!authed) return false
+        val msg = JSONObject()
+            .put("type", "notification")
+            .put("appPackage", appPackage)
+            .put("title", title.take(300))
+            .put("ts", ts)
+        if (!appName.isNullOrEmpty()) msg.put("appName", appName.take(64))
+        return try { s.send(msg.toString()) } catch (_: Exception) { false }
     }
 
     /** Send one MJPEG frame. Drops the frame if the socket is busy (backpressure). */

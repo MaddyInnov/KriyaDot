@@ -38,6 +38,12 @@ export interface ChatRequestBody {
    */
   queueMode?: 'interrupt' | 'queue';
   /**
+   * Streaming TTS (W8h): when true, the assistant's reply is synthesized
+   * sentence-by-sentence while it streams and `audio_chunk` events are
+   * emitted on this stream in sentence order.
+   */
+  voiceReply?: boolean;
+  /**
    * Space to run in (Spaces feature). Alternative to the `X-KriyaDot-Space`
    * request header. The space's model/workspace overrides apply to the
    * run; paused spaces reject the request with 423.
@@ -65,6 +71,13 @@ export interface ProviderInfo {
   models: ModelInfo[];
   /** Latest rate-limit/quota snapshot captured from response headers (null when unknown). */
   rateLimit: RateLimitSnapshot | null;
+  /**
+   * Near-limit warning (W1): set only when observed usage data (rate-limit
+   * headers) crosses the warning threshold — e.g. "Anthropic: 92% used".
+   * Null when usage is below threshold or the provider exposes no usage
+   * data (never fabricated).
+   */
+  usageWarning?: { usedPercent: number; message: string; source: 'rate-limit' } | null;
   /**
    * Subscription/CLI bridge (MausBot parity): 'claude' | 'codex' | 'opencode'. Set only on
    * bridge presets (claude-subscription / codex-subscription / opencode-subscription).

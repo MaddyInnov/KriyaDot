@@ -56,7 +56,10 @@ export interface PeerApprovalCard {
   sessionId: string;
   status: PeerCardStatus;
   createdAt: number;
-  expiresAt: number;
+  /** Epoch ms expiry, or null when the card never expires (W12). */
+  expiresAt: number | null;
+  /** W12: true when the card was raised with neverExpire. */
+  neverExpire: boolean;
   decidedAt?: number;
   decidedBy?: string;
   /**
@@ -84,6 +87,8 @@ export interface RaisePeerCardInput {
   actionType: PeerActionType;
   preview: string;
   sessionId: string;
+  /** W12: when true the card never expires (expiresAt = null). */
+  neverExpire?: boolean;
   /** Origin chain of the sender's turn (P1 #13) — shown on the card. */
   provenance?: ProvenanceNote;
 }
@@ -105,10 +110,11 @@ interface PeerCardRow {
   session_id: string;
   status: string;
   created_at: number;
-  expires_at: number;
+  expires_at: number | null;
   decided_at: number | null;
   decided_by: string | null;
   provenance_json: string | null;
+  never_expire: number | null;
 }
 
 interface PeerGrantRow {
@@ -139,7 +145,8 @@ function rowToCard(r: PeerCardRow): PeerApprovalCard {
     sessionId: r.session_id,
     status: r.status as PeerCardStatus,
     createdAt: r.created_at,
-    expiresAt: r.expires_at,
+    expiresAt: r.never_expire === 1 ? null : (r.expires_at ?? null),
+    neverExpire: r.never_expire === 1 || r.expires_at === null,
     decidedAt: r.decided_at ?? undefined,
     decidedBy: r.decided_by ?? undefined,
     provenance,
@@ -184,7 +191,7 @@ export class PeerApprovalStore {
         session_id TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'pending',
         created_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL,
+        expires_at INTEGER,
         decided_at INTEGER,
         decided_by TEXT
       );
@@ -205,6 +212,14 @@ export class PeerApprovalStore {
     } catch {
       // Column already exists (or DB is read-only in a test) — safe to ignore.
     }
+    // W12: never-expire flag. Legacy tables keep expires_at NOT NULL, so
+    // raiseCard stores a far-future sentinel for never-expire cards on
+    // those DBs (reads map it back to null via this flag).
+    try {
+      this.db.exec('ALTER TABLE peer_cards ADD COLUMN never_expire INTEGER NOT NULL DEFAULT 0');
+    } catch {
+      // Column already exists — safe to ignore.
+    }
   }
 
   /** Card TTL in ms (for the broker's await timeout). */
@@ -214,6 +229,7 @@ export class PeerApprovalStore {
 
   raiseCard(input: RaisePeerCardInput): PeerApprovalCard {
     const now = Date.now();
+    const neverExpire = input.neverExpire === true;
     const card: PeerApprovalCard = {
       id: randomUUID(),
       senderBotId: input.senderBotId,
@@ -225,30 +241,38 @@ export class PeerApprovalStore {
       sessionId: input.sessionId,
       status: 'pending',
       createdAt: now,
-      expiresAt: now + this.ttlMs,
+      expiresAt: neverExpire ? null : now + this.ttlMs,
+      neverExpire,
       provenance: input.provenance,
     };
-    this.db
-      .prepare(
-        `INSERT INTO peer_cards
-           (id, sender_bot_id, sender_bot_name, target_bot_id, target_bot_name,
-            action_type, preview, session_id, status, created_at, expires_at, provenance_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        card.id,
-        card.senderBotId,
-        card.senderBotName,
-        card.targetBotId,
-        card.targetBotName,
-        card.actionType,
-        card.preview,
-        card.sessionId,
-        card.status,
-        card.createdAt,
-        card.expiresAt,
-        input.provenance ? serializeProvenanceNote(input.provenance) : null,
-      );
+    const insert = this.db.prepare(
+      `INSERT INTO peer_cards
+         (id, sender_bot_id, sender_bot_name, target_bot_id, target_bot_name,
+          action_type, preview, session_id, status, created_at, expires_at, provenance_json, never_expire)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const values = [
+      card.id,
+      card.senderBotId,
+      card.senderBotName,
+      card.targetBotId,
+      card.targetBotName,
+      card.actionType,
+      card.preview,
+      card.sessionId,
+      card.status,
+      card.createdAt,
+      card.expiresAt,
+      input.provenance ? serializeProvenanceNote(input.provenance) : null,
+      neverExpire ? 1 : 0,
+    ] as const;
+    try {
+      insert.run(...values);
+    } catch (err) {
+      if (!neverExpire) throw err;
+      // Legacy NOT NULL expires_at: far-future sentinel (see widgets.ts).
+      insert.run(...values.slice(0, 10), 253402300799999, values[11], values[12]);
+    }
     return card;
   }
 
@@ -297,8 +321,11 @@ export class PeerApprovalStore {
    * that transitioned (so the host can settle in-flight waiters).
    */
   expireStale(now = Date.now()): string[] {
+    // W12: never-expire cards never match (NULL expiry / flag guard).
     const rows = this.db
-      .prepare("SELECT id FROM peer_cards WHERE status = 'pending' AND expires_at <= ?")
+      .prepare(
+        "SELECT id FROM peer_cards WHERE status = 'pending' AND expires_at IS NOT NULL AND COALESCE(never_expire, 0) = 0 AND expires_at <= ?",
+      )
       .all(now) as unknown as Array<{ id: string }>;
     if (rows.length === 0) return [];
     const stmt = this.db.prepare(
@@ -582,7 +609,10 @@ export function createPeerApprovalGate(opts: PeerApprovalGateOpts): PeerApproval
       // Event sinks must never break the gate.
     }
 
-    const remaining = Math.max(1000, card.expiresAt - Date.now());
+    // W12: never-expire cards wait on the broker's own long default; the
+    // card itself never times out in the store.
+    const remaining =
+      card.expiresAt === null ? 24 * 60 * 60 * 1000 : Math.max(1000, card.expiresAt - Date.now());
     let verdict: 'allowed' | 'denied' | 'expired';
     try {
       verdict = await awaitDecisionAbortable(opts.broker, card.id, remaining, gateOpts?.signal);

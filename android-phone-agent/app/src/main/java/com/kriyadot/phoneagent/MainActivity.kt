@@ -85,6 +85,7 @@ class MainActivity : AppCompatActivity() {
         shareButton = Button(this).apply { text = "Start sharing screen" }
         val stopButton = Button(this).apply { text = "Stop sharing" }
         val accessButton = Button(this).apply { text = "Open Accessibility settings (for input)" }
+        val notifButton = Button(this).apply { text = "Open Notification access (for triage)" }
         val unpairButton = Button(this).apply { text = "Unpair this phone" }
 
         layout.addView(title)
@@ -95,6 +96,7 @@ class MainActivity : AppCompatActivity() {
         layout.addView(shareButton)
         layout.addView(stopButton)
         layout.addView(accessButton)
+        layout.addView(notifButton)
         layout.addView(unpairButton)
         setContentView(layout)
 
@@ -103,6 +105,10 @@ class MainActivity : AppCompatActivity() {
         stopButton.setOnClickListener { onStopSharing() }
         accessButton.setOnClickListener {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        }
+        notifButton.setOnClickListener {
+            // Notification-listener access has its own system settings page.
+            startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
         }
         unpairButton.setOnClickListener { onUnpairClicked() }
     }

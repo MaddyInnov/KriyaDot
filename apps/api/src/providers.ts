@@ -31,6 +31,7 @@ import {
   listProviderPresets,
   resolveApiKey,
   revokeBridgeConsent,
+  usageWarningFromSnapshot,
 } from '@mvp/agent-runtime';
 import type { CliBridgeId, ModelInfo } from '@mvp/agent-runtime';
 import type { ProviderInfo } from './types.js';
@@ -466,6 +467,10 @@ export async function listProviders(dataDir: string): Promise<ProviderInfo[]> {
       // (null until the provider has served at least one request, or when it
       // sends no headers).
       rateLimit: getRateLimit(preset.id),
+      usageWarning: (() => {
+        const w = usageWarningFromSnapshot(preset.id, getRateLimit(preset.id));
+        return w ? { usedPercent: w.usedPercent, message: w.message, source: 'rate-limit' as const } : null;
+      })(),
       local: preset.local === true,
     };
     if (preset.bridge) {
@@ -487,6 +492,10 @@ export async function listProviders(dataDir: string): Promise<ProviderInfo[]> {
       configured: isConfigured(id),
       models: await resolveModels(id),
       rateLimit: getRateLimit(id),
+      usageWarning: (() => {
+        const w = usageWarningFromSnapshot(id, getRateLimit(id));
+        return w ? { usedPercent: w.usedPercent, message: w.message, source: 'rate-limit' as const } : null;
+      })(),
     });
   }
   return infos;

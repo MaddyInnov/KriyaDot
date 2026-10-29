@@ -297,11 +297,44 @@ export class AcpClient {
 }
 
 /** Parse a bot's ACP config into client options. Returns null when not configured. */
-export function acpOptionsFromBot(bot: { acp?: { command?: string; args?: string[] } } | undefined): Omit<AcpClientOptions, 'cwd'> | null {
+export function acpOptionsFromBot(
+  bot: { acp?: { command?: string; args?: string[]; engine?: string } } | undefined,
+): Omit<AcpClientOptions, 'cwd'> | null {
+  // W9: a named ACP engine preset (e.g. { engine: 'copilot' }) resolves to
+  // the preset's command/args; an explicit command/args on the bot wins.
+  const engine = bot?.acp?.engine?.trim();
+  if (engine) {
+    // Lazy import cycle guard: acp-engines imports AcpClient from this
+    // module, so resolve the preset through a dynamic lookup table filled
+    // by registerAcpEngineResolver() at module init (see bottom of file).
+    const resolved = acpEngineResolver?.(engine);
+    if (resolved) {
+      const command = bot?.acp?.command?.trim() || resolved.command;
+      const args =
+        Array.isArray(bot?.acp?.args) && bot!.acp!.args.length > 0
+          ? bot!.acp!.args.filter((a) => typeof a === 'string')
+          : resolved.args;
+      return { command, args };
+    }
+  }
   const command = bot?.acp?.command?.trim();
   if (!command) return null;
   return {
     command,
     args: Array.isArray(bot!.acp!.args) ? bot!.acp!.args.filter((a) => typeof a === 'string') : [],
   };
+}
+
+let acpEngineResolver: ((engineId: string) => { command: string; args: string[] } | undefined) | null = null;
+
+/**
+ * Wire the ACP engine preset registry into acpOptionsFromBot without a
+ * circular import (acp-engines.ts imports AcpClient from this module).
+ * Called once from acp-engines.ts at module load; hosts that import
+ * acp-engines (directly or via the package index) get engine resolution.
+ */
+export function registerAcpEngineResolver(
+  resolver: (engineId: string) => { command: string; args: string[] } | undefined,
+): void {
+  acpEngineResolver = resolver;
 }

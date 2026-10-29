@@ -31,11 +31,19 @@ interface InstanceStatus {
   idleMs: number;
 }
 
+interface BrowserProfileInfo {
+  profileDir: string;
+  exists: boolean;
+  bytes: number;
+  files: number;
+}
+
 interface SurfaceState {
   surface: string;
   resolved: string | null;
   off: boolean;
   instances: InstanceStatus[];
+  browserProfile?: BrowserProfileInfo;
 }
 
 interface Pin {
@@ -60,6 +68,15 @@ function idleLabel(ms: number): string {
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
+function bytesLabel(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb.toFixed(1)} MB`;
+  return `${(mb / 1024).toFixed(2)} GB`;
+}
+
 export default function ComputerSurfaceSection({ botId }: { botId: string }) {
   const [state, setState] = useState<SurfaceState | null>(null);
   const [pins, setPins] = useState<Pin[]>([]);
@@ -67,6 +84,7 @@ export default function ComputerSurfaceSection({ botId }: { botId: string }) {
   const [saving, setSaving] = useState(false);
   const [pinConv, setPinConv] = useState('');
   const [pinSurface, setPinSurface] = useState<string>('browser');
+  const [wipeConfirm, setWipeConfirm] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -76,8 +94,15 @@ export default function ComputerSurfaceSection({ botId }: { botId: string }) {
         resolved: string | null;
         off: boolean;
         instances: InstanceStatus[];
+        browserProfile?: BrowserProfileInfo;
       };
-      setState({ surface: s.surface, resolved: s.resolved, off: s.off, instances: s.instances });
+      setState({
+        surface: s.surface,
+        resolved: s.resolved,
+        off: s.off,
+        instances: s.instances,
+        browserProfile: s.browserProfile,
+      });
       const p = (await api(`/api/bots/${encodeURIComponent(botId)}/computer/pins`)) as {
         ok: boolean;
         pins: Pin[];
@@ -92,6 +117,7 @@ export default function ComputerSurfaceSection({ botId }: { botId: string }) {
   useEffect(() => {
     setState(null);
     setPins([]);
+    setWipeConfirm(false);
     void refresh();
   }, [botId, refresh]);
 
@@ -115,6 +141,24 @@ export default function ComputerSurfaceSection({ botId }: { botId: string }) {
     setSaving(true);
     try {
       await api(`/api/bots/${encodeURIComponent(botId)}/computer/restart`, { method: 'POST' });
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // W4: explicit wipe of the bot's persistent browser profile. Two-step
+  // (button → inline confirm) because it deletes saved logins/cookies.
+  // Restarts and surface changes never do this — only this action does.
+  const wipeProfile = async () => {
+    setSaving(true);
+    try {
+      await api(`/api/bots/${encodeURIComponent(botId)}/computer/wipe-browser-profile`, {
+        method: 'POST',
+      });
+      setWipeConfirm(false);
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -196,6 +240,47 @@ export default function ComputerSurfaceSection({ botId }: { botId: string }) {
       <div className="muted computer-surface-note">
         Each bot gets its own computer — no shared cursors. Idle computers are
         shut down after 30 minutes and recreated on next use.
+      </div>
+
+      <div className="computer-surface-row" aria-label="Browser profile">
+        <span>
+          <strong>Browser profile</strong>
+        </span>
+        <span className="muted">
+          {state?.browserProfile ? (
+            state.browserProfile.exists ? (
+              <>
+                <code className="mono">{state.browserProfile.profileDir}</code>
+                {' · '}
+                {bytesLabel(state.browserProfile.bytes)} · {state.browserProfile.files} files ·
+                cookies &amp; logins persist across restarts
+              </>
+            ) : (
+              <>no profile yet — created on first browser use, then cookies &amp; logins persist across restarts</>
+            )
+          ) : (
+            'Loading profile…'
+          )}
+        </span>
+        {state?.browserProfile?.exists &&
+          (wipeConfirm ? (
+            <>
+              <span className="muted">
+                Delete this bot&apos;s saved cookies &amp; logins? The bot is logged out
+                everywhere in its browser. This cannot be undone.
+              </span>
+              <button className="btn" onClick={() => void wipeProfile()} disabled={saving}>
+                Confirm wipe
+              </button>
+              <button className="btn" onClick={() => setWipeConfirm(false)} disabled={saving}>
+                Cancel
+              </button>
+            </>
+          ) : (
+            <button className="btn" onClick={() => setWipeConfirm(true)} disabled={saving}>
+              Wipe browser profile
+            </button>
+          ))}
       </div>
 
       {error && (

@@ -31,8 +31,15 @@
 //   COMPUTER_PLAYWRIGHT_VIEWPORT   — "WIDTHxHEIGHT", default "1280x720"
 //   COMPUTER_PLAYWRIGHT_URL        — optional page to open at startup
 //   COMPUTER_PLAYWRIGHT_HEADLESS   — "1" (default) or "0" (visible window)
+//
+// W4: when the host supplies a per-bot `profileDir` (PerBotComputerManager
+// does, keyed by bot id), the layer launches a PERSISTENT context
+// (chromium.launchPersistentContext) bound to that directory, so a bot's
+// cookies/localStorage/logins survive browser restarts, API restarts and
+// idle teardown. Without a profileDir the launch stays ephemeral.
 
 import { createRequire } from 'node:module';
+import { mkdirSync } from 'node:fs';
 import type {
   ClickOptions,
   DisplaySize,
@@ -128,13 +135,79 @@ export interface PlaywrightPageBackend {
   close(): Promise<void>;
 }
 
+/** Raw Playwright page shape the backend wrapper consumes (structural). */
+export interface PlaywrightRawPage {
+  viewportSize(): { width: number; height: number } | null;
+  goto(url: string): Promise<void>;
+  screenshot(opts: { type: 'png' }): Promise<Buffer>;
+  mouse: {
+    click(
+      x: number,
+      y: number,
+      opts?: { button?: 'left' | 'right' | 'middle'; clickCount?: number },
+    ): Promise<void>;
+    move(x: number, y: number): Promise<void>;
+    wheel(deltaX: number, deltaY: number): Promise<void>;
+    down(opts?: { button?: 'left' | 'right' | 'middle' }): Promise<void>;
+    up(opts?: { button?: 'left' | 'right' | 'middle' }): Promise<void>;
+  };
+  keyboard: {
+    type(text: string): Promise<void>;
+    press(key: string): Promise<void>;
+    down(key: string): Promise<void>;
+    up(key: string): Promise<void>;
+  };
+}
+
+/** Raw Playwright browser-context shape (ephemeral or persistent). */
+export interface PlaywrightRawContext {
+  newPage(): Promise<PlaywrightRawPage>;
+  close(): Promise<void>;
+}
+
+/** Raw Playwright browser shape. */
+export interface PlaywrightRawBrowser {
+  newContext(opts: { viewport: { width: number; height: number } }): Promise<PlaywrightRawContext>;
+  close(): Promise<void>;
+}
+
+/**
+ * The slice of Playwright's `chromium` launcher this module uses.
+ * `launchPersistentContext` is the W4 persistence path: the returned
+ * context is bound to a per-bot user-data directory on disk, so cookies,
+ * localStorage and logins survive context/browser/process restarts.
+ * Tests inject a file-backed fake implementing this shape — the real
+ * `playwright` package is never loaded in tests.
+ */
+export interface PlaywrightChromiumLike {
+  launch(opts: { headless: boolean }): Promise<PlaywrightRawBrowser>;
+  launchPersistentContext(
+    userDataDir: string,
+    opts: { headless: boolean; viewport: { width: number; height: number } },
+  ): Promise<PlaywrightRawContext>;
+}
+
 export interface PlaywrightOSLayerOptions {
   /**
    * Page factory. Defaults to a lazy Playwright Chromium launch on first
    * use (so construction is cheap and side-effect free). Tests inject a
    * fake; hosts may inject a page attached to an existing browser.
+   * When set, it wins over `profileDir`/`chromium`.
    */
   pageFactory?: () => Promise<PlaywrightPageBackend>;
+  /**
+   * W4: persistent browser profile directory (per bot). When set (and no
+   * pageFactory is injected), the browser launches via
+   * `launchPersistentContext(profileDir)` so cookies/localStorage/logins
+   * persist across restarts. Closing the layer closes the context but
+   * KEEPS this directory — only an explicit profile wipe deletes it.
+   */
+  profileDir?: string;
+  /**
+   * Chromium launcher override (tests inject a fake). Defaults to the
+   * lazily-required real `playwright` package's chromium.
+   */
+  chromium?: PlaywrightChromiumLike;
   /**
    * Page to open once at startup. Defaults to COMPUTER_PLAYWRIGHT_URL.
    * Skipped when the injected pageFactory is used without wanting it —
@@ -163,95 +236,129 @@ export function parsePlaywrightViewport(raw: string | undefined): { width: numbe
   return { ...DEFAULT_VIEWPORT };
 }
 
+/** Load the real Playwright chromium launcher (lazy; clear error if absent). */
+export function loadPlaywrightChromium(): PlaywrightChromiumLike {
+  try {
+    const playwright = requireOptional('playwright') as { chromium: PlaywrightChromiumLike };
+    return playwright.chromium;
+  } catch (err) {
+    throw new Error(
+      'COMPUTER_USE_PLAYWRIGHT=1 is set but the "playwright" package is not installed. ' +
+        'Install it and a browser build: npm install playwright && npx playwright install chromium. ' +
+        `Original error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/** Wrap a raw Playwright page + a close function as a PlaywrightPageBackend. */
+export function wrapPlaywrightPage(
+  page: PlaywrightRawPage,
+  close: () => Promise<void>,
+): PlaywrightPageBackend {
+  return {
+    viewportSize: () => page.viewportSize(),
+    goto: (url) => page.goto(url),
+    screenshot: async () => new Uint8Array(await page.screenshot({ type: 'png' })),
+    mouseClick: (x, y, opts) =>
+      page.mouse.click(x, y, {
+        button: opts?.button ?? 'left',
+        clickCount: opts?.clickCount ?? 1,
+      }),
+    mouseMove: (x, y) => page.mouse.move(x, y),
+    mouseDown: (button) => page.mouse.down({ button: button ?? 'left' }),
+    mouseUp: (button) => page.mouse.up({ button: button ?? 'left' }),
+    mouseWheel: (x, y, deltaX, deltaY) => page.mouse.move(x, y).then(() => page.mouse.wheel(deltaX, deltaY)),
+    keyboardType: (text) => page.keyboard.type(text),
+    keyboardPress: (key) => page.keyboard.press(key),
+    keyboardChord: async (modifiers, key) => {
+      const mappedMods = modifiers.map((m) => PLAYWRIGHT_MODIFIER_MAP[m]);
+      const mappedKey = mapPlaywrightChordKey(key);
+      // Explicit down/up sequencing: modifiers down in order, press
+      // the key, modifiers up in reverse. Never leave one held.
+      for (const m of mappedMods) await page.keyboard.down(m);
+      try {
+        await page.keyboard.press(mappedKey);
+      } finally {
+        for (const m of [...mappedMods].reverse()) await page.keyboard.up(m);
+      }
+    },
+    close,
+  };
+}
+
+function launchOpts(): { headless: boolean; viewport: { width: number; height: number } } {
+  return {
+    headless: process.env[COMPUTER_PLAYWRIGHT_HEADLESS_ENV] !== '0',
+    viewport: parsePlaywrightViewport(process.env[COMPUTER_PLAYWRIGHT_VIEWPORT_ENV]),
+  };
+}
+
+/** Ephemeral backend: launch() + newContext() — nothing survives close. */
+export async function createEphemeralPageBackend(
+  chromium: PlaywrightChromiumLike,
+): Promise<PlaywrightPageBackend> {
+  const { headless, viewport } = launchOpts();
+  const browser = await chromium.launch({ headless });
+  try {
+    const context = await browser.newContext({ viewport });
+    const page = await context.newPage();
+    return wrapPlaywrightPage(page, () => browser.close());
+  } catch (err) {
+    await browser.close().catch(() => undefined);
+    throw err;
+  }
+}
+
+/**
+ * W4 persistent backend: launchPersistentContext(profileDir). The context
+ * owns its browser; closing the backend closes the CONTEXT (flushing
+ * cookies/localStorage to the profile directory) and deliberately keeps
+ * the directory on disk — persistence is the point. Only an explicit
+ * profile wipe (PerBotComputerManager.wipeBrowserProfile) deletes it.
+ */
+export async function createPersistentPageBackend(
+  chromium: PlaywrightChromiumLike,
+  profileDir: string,
+): Promise<PlaywrightPageBackend> {
+  if (!profileDir) throw new Error('createPersistentPageBackend: profileDir is required');
+  mkdirSync(profileDir, { recursive: true });
+  const { headless, viewport } = launchOpts();
+  const context = await chromium.launchPersistentContext(profileDir, { headless, viewport });
+  try {
+    const page = await context.newPage();
+    return wrapPlaywrightPage(page, () => context.close());
+  } catch (err) {
+    await context.close().catch(() => undefined);
+    throw err;
+  }
+}
+
 /**
  * Default lazy page factory: launches Playwright Chromium on first use.
  * require('playwright') happens lazily, so the module loads fine without
- * the package installed.
+ * the package installed. With `profileDir` set, every (re)launch is a
+ * persistent context bound to that directory (W4 per-bot profiles);
+ * without it, launches are ephemeral (pre-W4 behavior). The cached
+ * backend is dropped when it is closed, so a close → reuse cycle
+ * relaunches instead of handing back a dead page.
  */
-export function lazyPlaywrightPageFactory(): () => Promise<PlaywrightPageBackend> {
+export function lazyPlaywrightPageFactory(
+  opts: { profileDir?: string; chromium?: PlaywrightChromiumLike } = {},
+): () => Promise<PlaywrightPageBackend> {
   let cached: PlaywrightPageBackend | null = null;
   return async () => {
     if (cached) return cached;
-    let playwright: {
-      chromium: {
-        launch(opts: { headless: boolean }): Promise<{
-          newContext(opts: { viewport: { width: number; height: number } }): Promise<{
-            newPage(): Promise<{
-              viewportSize(): { width: number; height: number } | null;
-              goto(url: string): Promise<void>;
-              screenshot(opts: { type: 'png' }): Promise<Buffer>;
-              mouse: {
-                click(
-                  x: number,
-                  y: number,
-                  opts?: { button?: 'left' | 'right' | 'middle'; clickCount?: number },
-                ): Promise<void>;
-                move(x: number, y: number): Promise<void>;
-                wheel(deltaX: number, deltaY: number): Promise<void>;
-                down(opts?: { button?: 'left' | 'right' | 'middle' }): Promise<void>;
-                up(opts?: { button?: 'left' | 'right' | 'middle' }): Promise<void>;
-              };
-              keyboard: {
-                type(text: string): Promise<void>;
-                press(key: string): Promise<void>;
-                down(key: string): Promise<void>;
-                up(key: string): Promise<void>;
-              };
-            }>;
-          }>;
-          close(): Promise<void>;
-        }>;
-      };
+    const chromium = opts.chromium ?? loadPlaywrightChromium();
+    const backend = opts.profileDir
+      ? await createPersistentPageBackend(chromium, opts.profileDir)
+      : await createEphemeralPageBackend(chromium);
+    const innerClose = backend.close.bind(backend);
+    backend.close = async () => {
+      if (cached === backend) cached = null;
+      await innerClose();
     };
-    try {
-      playwright = requireOptional('playwright') as typeof playwright;
-    } catch (err) {
-      throw new Error(
-        'COMPUTER_USE_PLAYWRIGHT=1 is set but the "playwright" package is not installed. ' +
-          'Install it and a browser build: npm install playwright && npx playwright install chromium. ' +
-          `Original error: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-    const headless = process.env[COMPUTER_PLAYWRIGHT_HEADLESS_ENV] !== '0';
-    const viewport = parsePlaywrightViewport(process.env[COMPUTER_PLAYWRIGHT_VIEWPORT_ENV]);
-    const browser = await playwright.chromium.launch({ headless });
-    try {
-      const context = await browser.newContext({ viewport });
-      const page = await context.newPage();
-      cached = {
-        viewportSize: () => page.viewportSize(),
-        goto: (url) => page.goto(url),
-        screenshot: async () => new Uint8Array(await page.screenshot({ type: 'png' })),
-        mouseClick: (x, y, opts) =>
-          page.mouse.click(x, y, {
-            button: opts?.button ?? 'left',
-            clickCount: opts?.clickCount ?? 1,
-          }),
-        mouseMove: (x, y) => page.mouse.move(x, y),
-        mouseDown: (button) => page.mouse.down({ button: button ?? 'left' }),
-        mouseUp: (button) => page.mouse.up({ button: button ?? 'left' }),
-        mouseWheel: (x, y, deltaX, deltaY) => page.mouse.move(x, y).then(() => page.mouse.wheel(deltaX, deltaY)),
-        keyboardType: (text) => page.keyboard.type(text),
-        keyboardPress: (key) => page.keyboard.press(key),
-        keyboardChord: async (modifiers, key) => {
-          const mappedMods = modifiers.map((m) => PLAYWRIGHT_MODIFIER_MAP[m]);
-          const mappedKey = mapPlaywrightChordKey(key);
-          // Explicit down/up sequencing: modifiers down in order, press
-          // the key, modifiers up in reverse. Never leave one held.
-          for (const m of mappedMods) await page.keyboard.down(m);
-          try {
-            await page.keyboard.press(mappedKey);
-          } finally {
-            for (const m of [...mappedMods].reverse()) await page.keyboard.up(m);
-          }
-        },
-        close: () => browser.close(),
-      };
-      return cached;
-    } catch (err) {
-      await browser.close().catch(() => undefined);
-      throw err;
-    }
+    cached = backend;
+    return cached;
   };
 }
 
@@ -264,21 +371,64 @@ export class PlaywrightOSScreenLayer implements OSScreenLayer {
   private readonly pageFactory: () => Promise<PlaywrightPageBackend>;
   private readonly startUrl?: string;
   private readonly onRealAction?: PlaywrightOSLayerOptions['onRealAction'];
+  /** W4: persistent profile directory for this layer, when configured. */
+  readonly profileDir?: string;
   private started = false;
+  private backendPromise: Promise<PlaywrightPageBackend> | null = null;
+  private backend: PlaywrightPageBackend | null = null;
 
   constructor(opts: PlaywrightOSLayerOptions = {}) {
-    this.pageFactory = opts.pageFactory ?? lazyPlaywrightPageFactory();
+    this.profileDir = opts.profileDir;
+    this.pageFactory =
+      opts.pageFactory ??
+      lazyPlaywrightPageFactory({ profileDir: opts.profileDir, chromium: opts.chromium });
     this.startUrl = opts.startUrl ?? process.env[COMPUTER_PLAYWRIGHT_URL_ENV];
     this.onRealAction = opts.onRealAction;
   }
 
   private async page(): Promise<PlaywrightPageBackend> {
-    const p = await this.pageFactory();
+    if (!this.backendPromise) {
+      this.backendPromise = (async () => {
+        const p = await this.pageFactory();
+        this.backend = p;
+        return p;
+      })();
+    }
+    let p: PlaywrightPageBackend;
+    try {
+      p = await this.backendPromise;
+    } catch (err) {
+      // A failed launch must not poison the layer; the next call retries.
+      this.backendPromise = null;
+      throw err;
+    }
     if (!this.started) {
       this.started = true;
       if (this.startUrl) await p.goto(this.startUrl);
     }
     return p;
+  }
+
+  /**
+   * Close the browser/context. For a persistent profile this flushes
+   * state to `profileDir` and KEEPS the directory (W4) — the next layer
+   * for the same bot relaunches against the same profile. Safe to call
+   * when never launched (no-op) and idempotent. The layer may be reused
+   * after close: the next action relaunches.
+   */
+  async close(): Promise<void> {
+    const pending = this.backendPromise;
+    this.backendPromise = null;
+    this.backend = null;
+    this.started = false;
+    if (!pending) return;
+    const p = await pending.catch(() => null);
+    if (p) await p.close().catch(() => undefined);
+  }
+
+  /** Alias for close() — PerBotComputerManager's teardown checks kill() first. */
+  async kill(): Promise<void> {
+    await this.close();
   }
 
   async displaySize(): Promise<DisplaySize> {

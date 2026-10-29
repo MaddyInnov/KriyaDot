@@ -11,6 +11,10 @@ import {
   authedFetch,
   getBots,
   getPage,
+  getPagePublication,
+  publishPage,
+  unpublishPage,
+  type PagePublicationStatus,
   listPageVersions,
   listPages,
   resolvePageComment,
@@ -115,6 +119,10 @@ export function PagesPanel() {
   const [live, setLive] = useState(false);
   const [remoteBanner, setRemoteBanner] = useState<string | null>(null);
 
+  const [publication, setPublication] = useState<PagePublicationStatus>({ published: false });
+  const [publishing, setPublishing] = useState(false);
+  const [linkCopied, setLinkCopied] = useState(false);
+
   const dirtyRef = useRef(false);
   dirtyRef.current = dirty;
   const selectedRef = useRef<string | null>(null);
@@ -149,6 +157,7 @@ export function PagesPanel() {
       setComments(detail.comments);
       setMentions(detail.mentions);
       setVersions(await listPageVersions(p.id));
+      setPublication(await getPagePublication(p.id));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -267,8 +276,42 @@ export function PagesPanel() {
     setComments([]);
     setMentions([]);
     setVersions([]);
+    setPublication({ published: false });
     setRemoteBanner(null);
     setError('');
+  };
+
+  const togglePublish = async () => {
+    if (!selectedId) return;
+    setPublishing(true);
+    setError('');
+    try {
+      if (publication.published) {
+        await unpublishPage(selectedId);
+        setPublication({ published: false });
+      } else {
+        setPublication(await publishPage(selectedId));
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPublishing(false);
+    }
+  };
+
+  const publicUrl =
+    publication.published && publication.path
+      ? `${typeof window !== 'undefined' ? window.location.origin : ''}${publication.path}`
+      : '';
+
+  const copyPublicLink = async () => {
+    try {
+      await navigator.clipboard.writeText(publicUrl);
+      setLinkCopied(true);
+      setTimeout(() => setLinkCopied(false), 2000);
+    } catch {
+      // Clipboard unavailable; the link text is selectable by hand.
+    }
   };
 
   const save = async () => {
@@ -545,6 +588,41 @@ export function PagesPanel() {
               </button>
             </div>
           </div>
+
+          {selectedId ? (
+            <div className="mt" style={{ borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+              <div className="row-between">
+                <strong className="small">Publish</strong>
+                <button className="btn btn-sm" onClick={() => void togglePublish()} disabled={publishing}>
+                  {publishing ? 'Working…' : publication.published ? 'Unpublish' : 'Publish page'}
+                </button>
+              </div>
+              <p className="small muted" style={{ margin: '6px 0' }}>
+                Anyone with this link can view this page. Reachability depends on how your KriyaDot
+                server is exposed (LAN, tunnel, or public host).
+              </p>
+              {publication.published && publication.path ? (
+                <div>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <a href={publication.path} target="_blank" rel="noreferrer" className="mono small">
+                      {publicUrl}
+                    </a>
+                    <button className="btn btn-sm" onClick={() => void copyPublicLink()}>
+                      {linkCopied ? 'Copied!' : 'Copy link'}
+                    </button>
+                  </div>
+                  <p className="small muted" style={{ margin: '6px 0 0' }}>
+                    {publication.views ?? 0} view{(publication.views ?? 0) === 1 ? '' : 's'}
+                    {publication.publishedAt ? ` · published ${fmtTs(publication.publishedAt)}` : ''}
+                  </p>
+                </div>
+              ) : (
+                <p className="small muted" style={{ margin: 0 }}>
+                  Not published — only people signed in to this KriyaDot server can see this page.
+                </p>
+              )}
+            </div>
+          ) : null}
 
           {previewVersion ? (
             <div className="mt" style={{ borderTop: '1px solid var(--border)', paddingTop: 12 }}>

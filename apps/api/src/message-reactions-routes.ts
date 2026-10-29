@@ -12,10 +12,18 @@
 
 import express from 'express';
 import { MessageReactionStore } from './message-reactions.js';
+import type { ReactionAnswerService, ReactionResolution } from './chat-ux.js';
 
 export interface MessageReactionsRouterDeps {
   store: MessageReactionStore;
   audit?: (action: string, fields: Record<string, unknown>) => void;
+  /**
+   * Reactions-as-answers (W8b): when set, a 👍/👎 reaction that names a
+   * pending target (approvalId / widgetId in the POST body) resolves it
+   * through the same decision path as clicking the card. Reactions on
+   * ordinary messages (no target) are stored/displayed only.
+   */
+  reactionAnswers?: ReactionAnswerService;
 }
 
 function errorBody(message: string, detail?: string) {
@@ -45,9 +53,9 @@ export function createMessageReactionsRouter(deps: MessageReactionsRouterDeps): 
     res.json({ ok: true, reactions: deps.store.list(sessionId, messageId) });
   });
 
-  router.post('/:messageId/reactions', (req, res) => {
+  router.post('/:messageId/reactions', async (req, res) => {
     const { sessionId, messageId } = req.params as { sessionId: string; messageId: string };
-    const body = (req.body ?? {}) as { emoji?: unknown; userId?: unknown };
+    const body = (req.body ?? {}) as { emoji?: unknown; userId?: unknown; approvalId?: unknown; widgetId?: unknown };
     if (typeof body.emoji !== 'string' || !body.emoji) {
       res.status(400).json(errorBody('body.emoji is required'));
       return;
@@ -59,7 +67,24 @@ export function createMessageReactionsRouter(deps: MessageReactionsRouterDeps): 
         actor: userId,
         detail: { sessionId, messageId, emoji: body.emoji, added },
       });
-      res.json({ ok: true, reactions, added });
+      // W8b: an ADDED 👍/👎 on a message carrying a pending question or
+      // approval resolves it (same decision path as the card). Toggling
+      // a reaction OFF never un-decides anything.
+      let resolved: ReactionResolution | null = null;
+      if (added && deps.reactionAnswers) {
+        try {
+          resolved = await deps.reactionAnswers.resolve({
+            sessionId,
+            messageId,
+            emoji: body.emoji,
+            approvalId: typeof body.approvalId === 'string' && body.approvalId ? body.approvalId : undefined,
+            widgetId: typeof body.widgetId === 'string' && body.widgetId ? body.widgetId : undefined,
+          });
+        } catch {
+          resolved = null; // Reaction storage already succeeded; resolution is best-effort on top.
+        }
+      }
+      res.json({ ok: true, reactions, added, ...(resolved ? { resolved } : {}) });
     } catch (err) {
       res.status(400).json(errorBody('Failed to toggle reaction', err instanceof Error ? err.message : String(err)));
     }

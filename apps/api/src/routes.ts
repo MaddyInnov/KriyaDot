@@ -10,10 +10,11 @@
 
 import express from 'express';
 import { BotMemoryStore, SpaceStore, getProviderPreset, isFreeModel, listProviderPresets, readModelsDevCache, resolveApiKey, resolveBotWorkspaceDir, routeMessage, RouterDecisionLog, loadRouterWeights, routeMessageLogged } from '@mvp/agent-runtime';
-import type { AgentRuntime, BotConfig, StreamEvent, TokenUsage, WidgetCoordinator } from '@mvp/agent-runtime';
+import type { AgentRuntime, BotConfig, SpanStore, StreamEvent, TokenUsage, WidgetCoordinator } from '@mvp/agent-runtime';
 import type { PerBotComputerManager } from '@mvp/agent-runtime';
 import type { VpsConnectionPool } from '@mvp/agent-runtime';
 import type { LazyMcpManager } from '@mvp/agent-runtime';
+import type { PerBotMcpManager } from '@mvp/agent-runtime';
 // pricing.ts is not re-exported from the agent-runtime index (index untouched);
 // import the built subpath directly.
 import { priceOfModel } from '@mvp/agent-runtime/dist/pricing.js';
@@ -22,9 +23,11 @@ import { EgressGate } from '@mvp/governance';
 import type { TieredItem } from '@mvp/governance';
 import type { WorkflowRun, WorkflowRunner } from '@mvp/workflows';
 import { createHealthScoring, registerHealthRoutes } from './health-routes.js';
+import { registerObservabilityRoutes } from './observability-routes.js';
 import { registerOmniRoutes } from './omni-routes.js';
 import type { OmniCollector, OmniStore } from './omni.js';
 import { registerBriefingRoutes } from './briefing-routes.js';
+import { PAUSED_MESSAGE, type PauseRegistry } from './system-pause.js';
 import type { RunHealthStore } from '@mvp/run-health';
 import type { AppConfig } from './config.js';
 import type { GovernanceAdapter } from './governance-adapter.js';
@@ -59,6 +62,7 @@ import {
 import { registerOAuthRoutes } from './oauth.js';
 import { registerMcpOAuthRoutes } from './mcp-oauth.js';
 import { registerMcpDirectoryRoutes } from './mcp-directory-routes.js';
+import { registerMcpPrivateRoutes } from './mcp-private-routes.js';
 import { registerModelsDevRoutes } from './models-dev-routes.js';
 import type { McpServerConfig } from './seed.js';
 import { registerMessagingRoutes } from './messaging.js';
@@ -75,9 +79,20 @@ import { attachNoteContextProvider, registerNoteAttachmentRoutes } from './note-
 import { attachSpendCapGate } from './spend-caps.js';
 import { registerTasksRoutes } from './tasks.js';
 import { registerPagesRoutes } from './pages.js';
+import { registerPagePublicationRoutes } from './public-pages.js';
 import { registerTerminalRoutes } from './terminal-routes.js';
 import { registerTeamRoutes } from './teams-routes.js';
+import { resolvePersonContext } from './people.js';
 import { registerGroupGoalRoutes } from './group-goal-routes.js';
+import {
+  SignInRequestStore,
+  isDoneMessage,
+  isSignInCliId,
+  settleSignInOnDone,
+} from './chat-ux.js';
+import { StreamingTtsPipeline } from './chat-streaming-tts.js';
+import { singleBotGoalInput } from './group-goals.js';
+import { MockTTSProvider, type TTSProvider } from '@mvp/voice';
 import { registerSpaceRoutes, resolveSpaceForRun, SpaceHttpError, type SpaceRunContext } from './spaces-routes.js';
 import { registerPhoneRoutes } from './phone-routes.js';
 import type { AdbPhoneProvider } from './phone-adb.js';
@@ -102,6 +117,8 @@ import { saveBotModel } from './bot-models.js';
 // Phase 4: marketplace + billing + tenancy/vault + protocols/voice + muse modules.
 import { registerMarketplaceRoutes } from './marketplace.js';
 import { registerBillingRoutes } from './billing.js';
+import { registerPurchaseRoutes } from './purchases.js';
+import type { PurchaseWiring } from './purchases.js';
 import { registerTenancyRoutes } from './tenancy.js';
 import { registerVaultRoutes } from './vault.js';
 import { registerComposioRoutes } from './composio.js';
@@ -201,6 +218,11 @@ export interface RouteDeps {
   turnTracker?: TurnTracker;
   /** Run health scores + metric samples (features #2/#5). */
   runHealth: RunHealthStore;
+  /**
+   * W13 observability: span/trace store (Activity → Runs). Optional —
+   * when absent the /api/observability/* routes are not registered.
+   */
+  spanStore?: SpanStore;
   /** Omni rolling-summary store (Omni panel backend, <dataDir>/omni.db). */
   omniStore: OmniStore;
   /** Omni collector (feeds the store from audit/approvals/workflow runs). */
@@ -212,6 +234,11 @@ export interface RouteDeps {
   lazyMcpManager?: LazyMcpManager;
   /** Re-sync lazy MCP stubs into the tool registry (owned by index.ts). */
   refreshMcpStubs?: () => void;
+  /**
+   * Per-bot private MCP servers (W9). Created by index.ts; a bot's own
+   * servers spawn only for that bot and are torn down on bot deletion.
+   */
+  perBotMcpManager?: PerBotMcpManager;
   /**
    * Per-bot computers (OpenMausBot parity P1 #14). Created by index.ts; the
    * computer-surface routes (computer-surface-routes.ts) read instance
@@ -233,6 +260,17 @@ export interface RouteDeps {
     hub: PhoneSessionHub;
     adb: AdbPhoneProvider;
   };
+  /**
+   * Global pause registry (W14d). Created by index.ts; when set, the chat
+   * route refuses new turns while paused. Optional in tests.
+   */
+  pauseRegistry?: PauseRegistry;
+  /**
+   * W14c/W14b briefing sources (GitHub signals + notification digest),
+   * forwarded to the briefing routes. Optional in tests.
+   */
+  briefingSignalsSource?: { collect: () => Promise<import('./briefing.js').BriefingItem[]> };
+  briefingNotificationDigest?: (since: number, now: number) => import('./briefing.js').BriefingItem[];
   /**
    * Companion app module (phone → PC remote control). Created by index.ts
    * so the WebSocket upgrade handler shares the same hub instance as the
@@ -293,6 +331,27 @@ export interface RouteDeps {
    * exercise widgets.
    */
   widgetCoordinator?: WidgetCoordinator;
+  /**
+   * Approval-gated purchasing (W6). Created by index.ts; the purchases
+   * routes mount on the billing router and the approvals route forwards
+   * decisions for `request_purchase` cards into the purchase service.
+   * Optional: omitted in tests that don't exercise purchases.
+   */
+  purchaseWiring?: PurchaseWiring;
+  /**
+   * W8d: pending sign-in request cards (native CLI driver sign-in).
+   * When set (with checkCliSignIn), a chat message that is exactly
+   * "done" in a bot's chat settles the pending request for that
+   * bot+session. Optional: omitted in tests that don't exercise it.
+   */
+  signInRequests?: SignInRequestStore;
+  /** W8d: re-check a CLI's sign-in status (the cli-auth status path). */
+  checkCliSignIn?: (cliId: string) => Promise<{ signedIn: boolean }>;
+  /**
+   * W8h: TTS provider factory for chat voice replies (bot voice
+   * settings → provider). Unset → the zero-cost mock TTS is used.
+   */
+  chatTtsProvider?: (bot: BotConfig) => TTSProvider | undefined;
 }
 
 const TERMINAL_RUN_STATUSES: ReadonlySet<WorkflowRun['status']> = new Set(['succeeded', 'failed']);
@@ -473,6 +532,7 @@ export function createRouter(deps: RouteDeps): express.Router {
     dataDir: config.dataDir,
     computerManager: deps.computerManager,
     errorBody,
+    audit: (action, fields) => governance.audit(action, fields),
   });
 
   // ---- BYO VPS (OpenMausBot parity P1 #24) -------------------------------
@@ -1227,9 +1287,17 @@ export function createRouter(deps: RouteDeps): express.Router {
   // Persisted to <dataDir>/bot-models.json and applied to the in-memory
   // bot immediately; also applied at boot (see bot-models.ts).
   router.put('/bots/:id/model', (req, res) => {
-    const body = (req.body ?? {}) as { model?: unknown; modelOptions?: unknown };
+    const body = (req.body ?? {}) as {
+      model?: unknown;
+      modelOptions?: unknown;
+      backupProvider?: unknown;
+      backupModel?: unknown;
+    };
     try {
-      const sel = saveBotModel(config.dataDir, bots, req.params.id, body.model, body.modelOptions);
+      const sel = saveBotModel(config.dataDir, bots, req.params.id, body.model, body.modelOptions, {
+        backupProvider: body.backupProvider,
+        backupModel: body.backupModel,
+      });
       res.json({ ok: true, botId: req.params.id, ...sel });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -1427,6 +1495,93 @@ export function createRouter(deps: RouteDeps): express.Router {
     const sessionKey = typeof body.sessionId === 'string' && body.sessionId ? body.sessionId : null;
     const queueMode = body.queueMode === 'queue' ? 'queue' : 'interrupt';
 
+    // One-shot SSE reply helper for the W8 interceptions below (they
+    // settle work without running an agent turn).
+    const sseReply = (text: string, extra?: Record<string, unknown>): void => {
+      sseHeaders(res);
+      res.write(`data: ${JSON.stringify({ type: 'token', content: text })}\n\n`);
+      if (extra) res.write(`data: ${JSON.stringify(extra)}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'done', usage: null })}\n\n`);
+      res.end();
+    };
+
+    // W14d global pause: while paused, new bot turns are refused with a
+    // clear paused notice (an SSE reply, like the other interceptions —
+    // no turn runs, nothing is queued).
+    if (deps.pauseRegistry?.isPaused()) {
+      sseReply(`⏸ ${PAUSED_MESSAGE}`);
+      return;
+    }
+
+    // W8f: `/goal <title>` in a 1:1 chat starts a group-goal run scoped
+    // to this single bot (coordinator = chief when set, else the bot
+    // itself). Intercepted before slash-template expansion — `/goal` is
+    // a command, not a prompt template.
+    const goalMatch = /^\/goal(?:\s+([\s\S]+))?$/.exec(body.message.trim());
+    if (goalMatch) {
+      const title = (goalMatch[1] ?? '').trim();
+      if (!title) {
+        res.status(400).json(errorBody('Usage: /goal <what you want this bot to achieve>'));
+        return;
+      }
+      try {
+        const goal = groupGoals.store.createGoal(
+          singleBotGoalInput({ bots, botId: bot.id, title, sessionId: sessionKey ?? undefined }),
+        );
+        groupGoals.engine.start(goal.id);
+        governance.audit('group-goal.created', {
+          actor: 'api',
+          detail: { goalId: goal.id, via: 'direct-chat-/goal', botId: bot.id, sessionId: sessionKey },
+        });
+        sseReply(
+          `🎯 Goal started: "${goal.title}" — ${bot.name} is on it (up to ${goal.maxTurns} turns). Status shows below and under Teams → Goals.`,
+          { type: 'goal_started', goal },
+        );
+      } catch (err) {
+        res.status(400).json(errorBody(err instanceof Error ? err.message : 'Failed to start goal'));
+      }
+      return;
+    }
+
+    // W8d: a message that is exactly "done" settles a pending sign-in
+    // request card for this bot+session (native CLI driver sign-in).
+    // The sign-in status is re-checked through the cli-auth status
+    // path; not signed in → the request stays pending and the user is
+    // told it didn't take. No pending request → "done" is a normal
+    // message and falls through to the turn below.
+    if (deps.signInRequests && deps.checkCliSignIn && sessionKey && isDoneMessage(body.message)) {
+      const pending = deps.signInRequests.pendingFor(bot.id, sessionKey);
+      if (pending) {
+        try {
+          const outcome = await settleSignInOnDone({
+            store: deps.signInRequests,
+            request: pending,
+            checkStatus: deps.checkCliSignIn,
+          });
+          governance.audit('chat.sign_in_done', {
+            actor: 'api',
+            detail: {
+              requestId: pending.id,
+              botId: bot.id,
+              sessionId: sessionKey,
+              cliId: pending.cliId,
+              settled: outcome.settled,
+            },
+          });
+          sseReply(
+            outcome.settled
+              ? `✅ Sign-in confirmed for ${pending.cliId} — you're signed in. The pending sign-in request is complete.`
+              : `That sign-in didn't take — ${pending.cliId} still shows as signed out. Finish the sign-in in your browser, then say "done" again.`,
+          );
+        } catch (err) {
+          sseReply(
+            `I couldn't verify the ${pending.cliId} sign-in just now (${err instanceof Error ? err.message : String(err)}). The request is still pending — say "done" again once you've finished signing in.`,
+          );
+        }
+        return;
+      }
+    }
+
     // Custom slash commands: expand `/name args` before the agent sees it.
     // Done before the queue check so queued messages are stored expanded.
     // Unknown `/command` → 400 with the list of known commands.
@@ -1539,11 +1694,21 @@ export function createRouter(deps: RouteDeps): express.Router {
     // chat request (outside onEvent) so it survives across events.
     let spendCapPushSent = false;
 
+    // Streaming TTS (W8h): when the client enabled voice reply for this
+    // turn, assistant tokens feed a sentence-chunk pipeline that emits
+    // `audio_chunk` events in order — sentence 1 is synthesized while
+    // the model is still generating the rest. Assigned after onEvent.
+    let ttsPipeline: StreamingTtsPipeline | null = null;
+
     const onEvent = async (event: StreamEvent): Promise<void> => {
       if (closed) return;
       if (event.type === 'done' || event.type === 'error' || event.type === 'interrupted') terminalEmitted = true;
       // Tiered memory: accumulate this turn's assistant text + tool calls for L0.
-      if (event.type === 'token') turnAssistantText += event.content;
+      if (event.type === 'token') {
+        turnAssistantText += event.content;
+        // W8h: feed the streaming-TTS sentence pipeline (never blocks).
+        ttsPipeline?.push(event.content);
+      }
       else if (event.type === 'tool_call') turnToolCalls.push(event.call.name);
       // Encrypted push (Codync parity): "needs you" on approval requests,
       // "done"/"failed" on terminal turn outcomes. Best-effort, never blocks.
@@ -1586,6 +1751,32 @@ export function createRouter(deps: RouteDeps): express.Router {
       }
       res.write(`data: ${serializeEvent(event)}\n\n`);
     };
+
+    // W8h: build the streaming-TTS pipeline for this request when the
+    // client asked for a voice reply. Provider comes from the host's
+    // factory (bot voice settings); the zero-cost mock is the fallback.
+    if (body.voiceReply === true) {
+      try {
+        const tts = deps.chatTtsProvider?.(bot) ?? new MockTTSProvider();
+        ttsPipeline = new StreamingTtsPipeline({
+          tts,
+          emit: (e) => onEvent(e as unknown as StreamEvent),
+          voice: bot.voice?.ttsVoice,
+          onError: (err) => {
+            try {
+              governance.audit('chat.tts_chunk_failed', {
+                actor: 'api',
+                detail: { botId: bot.id, error: err instanceof Error ? err.message : String(err) },
+              });
+            } catch {
+              // Audit must never break chat.
+            }
+          },
+        });
+      } catch {
+        ttsPipeline = null; // TTS must never break the chat turn.
+      }
+    }
 
     // Abort any in-flight turn on this session before starting the new one.
     // (queueMode 'queue' with an active turn returned early above, so reaching
@@ -1725,6 +1916,11 @@ export function createRouter(deps: RouteDeps): express.Router {
           bot,
           message: messageWithFiles,
           sessionId: body.sessionId,
+          // W7: a new private chat created by this turn is owned by the
+          // acting person (x-person-id header / body personId; UI-level
+          // identity, see people.ts trust model). Existing sessions keep
+          // their recorded owner.
+          ownerPersonId: resolvePersonContext(req),
           // Per-bot computers (P1 #14): this chat's conversation id, so a
           // pinned "Works on" surface for this conversation applies.
           conversationId: body.sessionId,
@@ -1751,6 +1947,17 @@ export function createRouter(deps: RouteDeps): express.Router {
           // Interactive widgets (OpenMausBot parity P1 #15): lets
           // ask_user_question pause the turn for a human answer.
           widgetCoordinator: deps.widgetCoordinator,
+          // Own-files reads (W8e): reads inside the bot's OWN effective
+          // workspace (its per-bot workspace, or the shared workspace it
+          // is confined to when it has none) never trigger approval, at
+          // any approval level.
+          ownWorkspaceDirs: (() => {
+            try {
+              return [botWorkspaceRoot(bot.id)];
+            } catch {
+              return undefined;
+            }
+          })(),
           onEvent,
         });
       } catch (err) {
@@ -1875,11 +2082,83 @@ export function createRouter(deps: RouteDeps): express.Router {
         res.write(`data: ${JSON.stringify({ type: 'error', message })}\n\n`);
       }
     } finally {
+      // W8h: flush the streaming-TTS pipeline (last partial sentence +
+      // drain queued chunks) before the stream closes.
+      if (ttsPipeline) {
+        try {
+          await ttsPipeline.finish();
+        } catch {
+          // TTS must never break stream teardown.
+        }
+      }
       if (sessionKey && activeTurns.get(sessionKey)?.controller === turnController) {
         activeTurns.delete(sessionKey);
       }
       finish();
     }
+  });
+
+  // ---- Chat "Now" + sign-in requests (W8a/W8d) ----------------------------
+  // What every busy bot is doing right now (live turn-state registry).
+  router.get('/chat/now', (req, res) => {
+    const botId = typeof req.query.botId === 'string' && req.query.botId ? req.query.botId : undefined;
+    const turns = botId ? agentRuntime.turnStates.listForBot(botId) : agentRuntime.turnStates.list();
+    res.json({ ok: true, turns });
+  });
+
+  // Pending sign-in request cards for a bot's chat (native CLI sign-in).
+  router.post('/chat/sign-in-requests', (req, res) => {
+    if (!deps.signInRequests) {
+      res.status(501).json(errorBody('Sign-in requests are not wired on this server'));
+      return;
+    }
+    const body = (req.body ?? {}) as { botId?: unknown; sessionId?: unknown; cliId?: unknown; url?: unknown };
+    if (typeof body.botId !== 'string' || !bots.some((b) => b.id === body.botId)) {
+      res.status(400).json(errorBody('botId must name an existing bot'));
+      return;
+    }
+    if (typeof body.sessionId !== 'string' || !body.sessionId) {
+      res.status(400).json(errorBody('sessionId is required'));
+      return;
+    }
+    if (!isSignInCliId(body.cliId)) {
+      res.status(400).json(errorBody(`cliId must be one of claude, codex, opencode, antigravity`));
+      return;
+    }
+    const request = deps.signInRequests.create({
+      botId: body.botId,
+      sessionId: body.sessionId,
+      cliId: body.cliId,
+      url: typeof body.url === 'string' ? body.url.slice(0, 2000) : undefined,
+    });
+    governance.audit('chat.sign_in_requested', {
+      actor: 'api',
+      detail: { requestId: request.id, botId: request.botId, sessionId: request.sessionId, cliId: request.cliId },
+    });
+    res.status(201).json({ ok: true, request });
+  });
+
+  router.get('/chat/sign-in-requests', (req, res) => {
+    if (!deps.signInRequests) {
+      res.json({ ok: true, requests: [] });
+      return;
+    }
+    const botId = typeof req.query.botId === 'string' && req.query.botId ? req.query.botId : undefined;
+    const sessionId = typeof req.query.sessionId === 'string' && req.query.sessionId ? req.query.sessionId : undefined;
+    res.json({ ok: true, requests: deps.signInRequests.listPending({ botId, sessionId }) });
+  });
+
+  router.delete('/chat/sign-in-requests/:id', (req, res) => {
+    if (!deps.signInRequests) {
+      res.status(501).json(errorBody('Sign-in requests are not wired on this server'));
+      return;
+    }
+    const settled = deps.signInRequests.settle(req.params.id, 'cancelled');
+    if (!settled) {
+      res.status(404).json(errorBody(`Unknown or settled sign-in request "${req.params.id}"`));
+      return;
+    }
+    res.json({ ok: true, request: settled });
   });
 
   // ---- Chat queue ---------------------------------------------------------
@@ -1910,13 +2189,23 @@ export function createRouter(deps: RouteDeps): express.Router {
         );
         return;
       }
-      res.json(governance.listApprovals(statusParam as ApprovalStatus | undefined));
+      const all = governance.listApprovals(statusParam as ApprovalStatus | undefined);
+      // W7: ?personId= filters to approvals addressed to that person —
+      // the recorded addressee wins; pre-W7 records fall back to the
+      // bot's current owner (default user when unowned).
+      const personId = typeof req.query.personId === 'string' && req.query.personId ? req.query.personId : undefined;
+      if (!personId) {
+        res.json(all);
+        return;
+      }
+      const ownerOf = new Map(bots.map((b) => [b.id, b.ownerId ?? 'you']));
+      res.json(all.filter((a) => (a.addresseePersonId ?? ownerOf.get(a.botId) ?? 'you') === personId));
     } catch (err) {
       res.status(500).json(errorBody('Failed to list approvals', err instanceof Error ? err.message : String(err)));
     }
   });
 
-  router.post('/approvals/:id', (req, res) => {
+  router.post('/approvals/:id', async (req, res) => {
     const body = (req.body ?? {}) as Partial<DecideApprovalBody>;
     if (body.decision !== 'approved' && body.decision !== 'denied') {
       res.status(400).json(errorBody('decision must be "approved" or "denied"'));
@@ -1934,6 +2223,17 @@ export function createRouter(deps: RouteDeps): express.Router {
         return;
       }
       const decided = governance.decide(realId, body.decision, { note: body.note });
+      // W6 purchases: a decided `request_purchase` card drives its purchase
+      // intent (approved → execute via the purchase executors; denied →
+      // terminal). Awaited so the intent state is settled when the inbox
+      // refreshes; failures never break the approval decision itself.
+      if (existing.toolName === 'request_purchase' && deps.purchaseWiring) {
+        try {
+          await deps.purchaseWiring.service.handleApprovalDecisionByApprovalId(realId, body.decision);
+        } catch {
+          // Intent may be blocked/terminal already — the card decision stands.
+        }
+      }
       // Preference learning: record the decision. If the user consistently
       // denies (or approves) a tool, a preference is learned.
       try {
@@ -2378,6 +2678,12 @@ export function createRouter(deps: RouteDeps): express.Router {
   // that feed the 7-day regression detector.
   registerHealthRoutes(router, { workflowRunner, runHealth });
 
+  // ---- W13 observability: recorded runs, span waterfall data, tags,
+  // per-bot outcome analytics (Activity → Runs + Usage outcomes section).
+  if (deps.spanStore) {
+    registerObservabilityRoutes(router, { spanStore: deps.spanStore });
+  }
+
   // ---- Omni rolling summary (Omni panel backend) --------------------------
   // Four temporal layers + pins + time-travel versions; the store is fed by
   // the OmniCollector (wired in index.ts). Empty store → 404, which the web
@@ -2392,7 +2698,7 @@ export function createRouter(deps: RouteDeps): express.Router {
   // The web UI's briefing panel is coded against GET /api/briefing.
   // Feature interconnection: the digest also pulls from notes and recent
   // workflow runs (the live runner satisfies the structural source type).
-  registerBriefingRoutes(router, { dataDir: config.dataDir, governance, runHealth, workflowSource: workflowRunner });
+  registerBriefingRoutes(router, { dataDir: config.dataDir, governance, runHealth, workflowSource: workflowRunner, signalsSource: deps.briefingSignalsSource, notificationDigest: deps.briefingNotificationDigest });
 
   // Learning-from-corrections routing (feature #4): corrections recorded
   // here are learned locally (pattern → rule template) and reloaded by the
@@ -2497,6 +2803,13 @@ export function createRouter(deps: RouteDeps): express.Router {
       manager: deps.lazyMcpManager,
       governance,
       refreshStubs: deps.refreshMcpStubs ?? (() => undefined),
+    });
+  }
+  if (deps.perBotMcpManager) {
+    registerMcpPrivateRoutes(router, {
+      manager: deps.perBotMcpManager,
+      governance,
+      botExists: (botId) => bots.some((b) => b.id === botId),
     });
   }
   registerModelsDevRoutes(router, { dataDir: config.dataDir });
@@ -2625,6 +2938,11 @@ export function createRouter(deps: RouteDeps): express.Router {
     agentRuntime,
     getBots: () => bots,
   });
+  // Public publishing management (W3): POST/DELETE /:id/publish,
+  // GET /:id/publication, POST /publish-artifact — authenticated (this
+  // router sits behind loopback auth). The public GET /p/<slug> serving
+  // route itself is mounted on the app in index.ts (outside /api = no auth).
+  registerPagePublicationRoutes(pagesRouter, { dataDir: config.dataDir });
   router.use('/pages', pagesRouter);
 
   // ---- MCP tool scopes (settings API for the sibling web panel) --------
@@ -2673,6 +2991,16 @@ export function createRouter(deps: RouteDeps): express.Router {
     costTracker,
     spendCaps: spendCapStore,
   });
+  // W6: approval-gated purchasing routes share the billing router
+  // (/api/billing/purchases*) — purchases live in the billing area, not a
+  // new top-level destination.
+  if (deps.purchaseWiring) {
+    registerPurchaseRoutes(billingRouter, {
+      service: deps.purchaseWiring.service,
+      settings: deps.purchaseWiring.settings,
+      decideApproval: (approvalId, decision) => governance.decide(approvalId, decision),
+    });
+  }
   router.use('/billing', billingRouter);
 
   // ---- Phase 4: tenancy + vault (mounted at /api) ----------------------
@@ -2769,7 +3097,7 @@ export function createRouter(deps: RouteDeps): express.Router {
   // coordinator/worker runs with explicit completion decisions. Mounted
   // next to teams (no new top-level API surface beyond /group-goals).
   const groupGoalsRouter = express.Router();
-  registerGroupGoalRoutes(groupGoalsRouter, {
+  const groupGoals = registerGroupGoalRoutes(groupGoalsRouter, {
     dataDir: config.dataDir,
     agentRuntime,
     getBots: () => bots,

@@ -147,6 +147,24 @@ export function BriefingPanel() {
         <h4>Needs your approval</h4>
         <ItemList items={briefing.approvals ?? []} />
       </div>
+      {/* W14c Signals: GitHub review requests, failing CI, mentions. */}
+      {(briefing.signals?.length ?? 0) > 0 && (
+        <div className="card">
+          <h4>
+            Signals <span className="chip">{briefing.signals?.length ?? 0}</span>
+          </h4>
+          <ItemList items={briefing.signals ?? []} />
+        </div>
+      )}
+      {/* W14b: batched phone notifications accumulated for this digest. */}
+      {(briefing.notifications?.length ?? 0) > 0 && (
+        <div className="card">
+          <h4>
+            Phone notifications <span className="chip">{briefing.notifications?.length ?? 0}</span>
+          </h4>
+          <ItemList items={briefing.notifications ?? []} />
+        </div>
+      )}
       {/* Feature interconnection: notes + workflow runs in the digest. */}
       {(briefing.notes?.length ?? 0) > 0 || (briefing.workflows?.length ?? 0) > 0 ? (
         <div className="grid-2">

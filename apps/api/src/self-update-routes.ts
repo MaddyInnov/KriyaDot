@@ -6,7 +6,9 @@
 //   POST /api/updates/download   → { ok, status } (explicit consent; requires 'available')
 //   POST /api/updates/install    → { ok, status } (explicit consent; requires 'ready')
 //   GET  /api/updates/settings   → { ok, settings }
-//   PUT  /api/updates/settings   → { ok, settings } ({autoCheck?, checkIntervalHours?})
+//   PUT  /api/updates/settings   → { ok, settings } ({autoCheck?, checkIntervalHours?, applyWhenIdle?})
+//   GET  /api/updates/idle       → { ok, idle } (W12 idle auto-apply status;
+//                                 only when the host wired an IdleAutoUpdater)
 //
 // The update source is pinned to MaddyInnov/KriyaDot GitHub releases inside
 // the manager — the client cannot point it at arbitrary URLs. Download and
@@ -20,7 +22,7 @@
 //   app.use('/api/updates', createSelfUpdateRouter(updater));
 
 import express, { type Router } from 'express';
-import type { SelfUpdateManager, UpdateSettings } from '@mvp/agent-runtime';
+import type { IdleAutoUpdater, SelfUpdateManager, UpdateSettings } from '@mvp/agent-runtime';
 
 function errorBody(message: string): Record<string, unknown> {
   return { ok: false, error: message };
@@ -32,7 +34,10 @@ function clientError(err: unknown): string {
   return msg.replace(/[A-Za-z]:\\[^\s"']+|\/[^\s"']+/g, (p) => p.split(/[\\/]/).pop() ?? p);
 }
 
-export function createSelfUpdateRouter(updater: SelfUpdateManager): Router {
+export function createSelfUpdateRouter(
+  updater: SelfUpdateManager,
+  opts: { idleUpdater?: IdleAutoUpdater } = {},
+): Router {
   const router = express.Router();
 
   router.get('/status', async (_req, res) => {
@@ -82,8 +87,23 @@ export function createSelfUpdateRouter(updater: SelfUpdateManager): Router {
       const settings = await updater.saveSettings({
         autoCheck: body.autoCheck,
         checkIntervalHours: body.checkIntervalHours,
+        applyWhenIdle: body.applyWhenIdle,
       });
       res.json({ ok: true, settings });
+    } catch (err) {
+      res.status(500).json(errorBody(clientError(err)));
+    }
+  });
+
+  // W12: idle auto-apply status (setting state, live idle time, whether an
+  // update is pending). 404 when the host didn't wire an idle updater.
+  router.get('/idle', async (_req, res) => {
+    if (!opts.idleUpdater) {
+      res.status(404).json(errorBody('Idle auto-apply is not wired on this server.'));
+      return;
+    }
+    try {
+      res.json({ ok: true, idle: await opts.idleUpdater.getIdleStatus() });
     } catch (err) {
       res.status(500).json(errorBody(clientError(err)));
     }

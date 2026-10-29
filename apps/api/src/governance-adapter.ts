@@ -29,12 +29,28 @@ import { checkHardFloor } from '@mvp/governance';
 // (index untouched); import the built subpath directly.
 import { mergeBotPolicy } from '@mvp/governance/dist/bot-policy.js';
 
-function toEvalContext(ctx: ToolContext): { sessionId: string; botId: string; actor: string; relayed?: boolean } {
+function toEvalContext(
+  ctx: ToolContext,
+  addresseePersonId?: string,
+): {
+  sessionId: string;
+  botId: string;
+  actor: string;
+  relayed?: boolean;
+  addresseePersonId?: string;
+} {
   // Guarded external messages: turns triggered by a relayed external
   // message (webhook / external origin) mint relayed approvals, which can
   // never be approved (fail-closed in the governance gateway).
   const relayed = isRelayedOrigin(ctx.provenance?.origin) || ctx.provenance?.relayed === true ? true : undefined;
-  return { sessionId: ctx.sessionId, botId: ctx.botId, actor: ctx.botId, ...(relayed ? { relayed } : {}) };
+  return {
+    sessionId: ctx.sessionId,
+    botId: ctx.botId,
+    actor: ctx.botId,
+    ...(relayed ? { relayed } : {}),
+    // W7: approvals are addressed to the bot's owner person.
+    ...(addresseePersonId ? { addresseePersonId } : {}),
+  };
 }
 
 export interface GovernanceAdapterOptions {
@@ -60,6 +76,20 @@ export interface GovernanceAdapterOptions {
    * When 'allow', it returns 'allow'. Checked before the policy.
    */
   getPreference?: (botId: string, toolName: string) => 'deny' | 'allow' | undefined;
+  /**
+   * W6 purchases: observer fired whenever evaluation mints a REAL gateway
+   * approval (require-approval). The purchase wiring uses it to register
+   * the pending purchase intent against the gateway's approval, so the
+   * gateway card IS the purchase card (one card per purchase). Observers
+   * must never throw into evaluation — the adapter swallows errors.
+   */
+  approvalObserver?: (info: {
+    toolName: string;
+    args: Record<string, unknown>;
+    botId: string;
+    sessionId: string;
+    realApprovalId: string;
+  }) => void;
 }
 
 export class GovernanceAdapter implements RuntimeGovernanceGateway {
@@ -67,6 +97,7 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
   private readonly getBotConfig?: (botId: string) => BotConfig | undefined;
   private readonly globalPolicy: Policy;
   private readonly getPreference?: (botId: string, toolName: string) => 'deny' | 'allow' | undefined;
+  private readonly approvalObserver?: GovernanceAdapterOptions['approvalObserver'];
   /** Runtime-facing approval id → real gateway approval id. */
   private readonly idMap = new Map<string, string>();
 
@@ -75,6 +106,23 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
     this.getBotConfig = opts.getBotConfig;
     this.globalPolicy = opts.globalPolicy ?? DEFAULT_POLICY;
     this.getPreference = opts.getPreference;
+    this.approvalObserver = opts.approvalObserver;
+  }
+
+  /** Notify the approval observer (W6 intent registration). Never throws. */
+  private notifyApprovalMinted(call: ToolCall, ctx: ToolContext, realApprovalId: string): void {
+    if (!this.approvalObserver) return;
+    try {
+      this.approvalObserver({
+        toolName: call.name,
+        args: call.args,
+        botId: ctx.botId,
+        sessionId: ctx.sessionId,
+        realApprovalId,
+      });
+    } catch {
+      // Observers must never break evaluation.
+    }
   }
 
   /** Translate a runtime-issued approval id to the real gateway id. */
@@ -107,7 +155,13 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
         fromBot: args.fromBotId,
         policy: args.policy,
       },
-      { sessionId: args.sessionId, botId: args.botId, actor: args.fromBotId },
+      {
+        sessionId: args.sessionId,
+        botId: args.botId,
+        actor: args.fromBotId,
+        // W7: addressed to the requesting bot's owner person.
+        addresseePersonId: this.getBotConfig?.(args.botId)?.ownerId,
+      },
       { provenance: 'team-peer-delegation' },
     );
     const runtimeId = randomUUID();
@@ -127,6 +181,11 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
     return this.real.classify(call.name) === 'read' ? 'allow' : 'require-approval';
   }
 
+  /** W7: the addressee for approvals raised by this bot = its owner person. */
+  private evalContext(ctx: ToolContext) {
+    return toEvalContext(ctx, this.getBotConfig?.(ctx.botId)?.ownerId);
+  }
+
   async evaluate(call: ToolCall, ctx: ToolContext): Promise<GovernanceEvaluation> {
     // Hard floors FIRST — before learned preferences, policy, always-allow.
     // No mode can bypass these.
@@ -134,7 +193,7 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
     if (floorHit) {
       // Delegate to the real gateway so the approval is minted + audited
       // with hard-floor-escalated provenance (gateway checks floors first).
-      const res = await this.real.evaluate(call.name, call.args, toEvalContext(ctx));
+      const res = await this.real.evaluate(call.name, call.args, this.evalContext(ctx));
       if (res.effect === 'require-approval' && res.approvalId) {
         const runtimeId = randomUUID();
         this.idMap.set(runtimeId, res.approvalId);
@@ -142,6 +201,7 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
           const first = this.idMap.keys().next();
           if (!first.done) this.idMap.delete(first.value);
         }
+        this.notifyApprovalMinted(call, ctx, res.approvalId);
         return { decision: 'require-approval', approvalId: runtimeId, reason: floorHit.reason };
       }
       return { decision: res.effect, reason: floorHit.reason };
@@ -156,7 +216,9 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
         return { decision: 'deny', reason: 'Learned preference: you have denied this tool multiple times.' };
       }
       if (pref === 'allow') {
-        const privileged = /^(mcp:|run_command$|exec$|shell$|write_file$|edit_file$|create_file$|delete_file$|remove_file$)/.test(call.name)
+        // W6: request_purchase is privileged — purchases are ALWAYS
+        // individually approved; a learned allow must never skip the card.
+        const privileged = /^(mcp:|run_command$|exec$|shell$|write_file$|edit_file$|create_file$|delete_file$|remove_file$|request_purchase$)/.test(call.name)
           || /delete|remove|drop|exec/.test(call.name);
         if (!privileged) {
           this.audit({ type: 'policy', botId: ctx.botId, sessionId: ctx.sessionId, call, detail: 'Learned preference allow (audited)', ts: new Date().toISOString() });
@@ -173,10 +235,10 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
         ? await this.real.evaluateWithPolicy(
             call.name,
             call.args,
-            toEvalContext(ctx),
+            this.evalContext(ctx),
             mergeBotPolicy(this.globalPolicy, botPolicy),
           )
-        : await this.real.evaluate(call.name, call.args, toEvalContext(ctx));
+        : await this.real.evaluate(call.name, call.args, this.evalContext(ctx));
     if (res.effect === 'require-approval' && res.approvalId) {
       const runtimeId = randomUUID();
       this.idMap.set(runtimeId, res.approvalId);
@@ -185,6 +247,7 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
         const first = this.idMap.keys().next();
         if (!first.done) this.idMap.delete(first.value);
       }
+      this.notifyApprovalMinted(call, ctx, res.approvalId);
       return { decision: res.effect, approvalId: runtimeId };
     }
     return { decision: res.effect };
@@ -236,10 +299,10 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
   }
 
   async runPreHooks(call: ToolCall, ctx: ToolContext): Promise<void> {
-    await this.real.runPreHooks(call.name, call.args, toEvalContext(ctx));
+    await this.real.runPreHooks(call.name, call.args, this.evalContext(ctx));
   }
 
   async runPostHooks(call: ToolCall, result: unknown, ctx: ToolContext): Promise<void> {
-    await this.real.runPostHooks(call.name, call.args, result, toEvalContext(ctx));
+    await this.real.runPostHooks(call.name, call.args, result, this.evalContext(ctx));
   }
 }

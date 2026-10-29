@@ -11,13 +11,19 @@ import { CostPanel } from '../../components/activity/cost-panel';
 import { useUxMode } from '../../lib/ux-mode';
 
 import { RulesPanel } from '../../components/activity/rules-panel';
+import { WatchPanel } from '../../components/activity/watch-panel';
+import { NotificationPanel } from '../../components/activity/notification-panel';
 import { HealthPanel } from '../../components/activity/health-panel';
 import { RoutingPanel } from '../../components/activity/routing-panel';
 import { RecoveryPanel } from '../../components/activity/recovery-panel';
+import { RunsPanel } from '../../components/activity/runs-panel';
 
 const TABS = [
   { id: 'briefing', label: 'Briefing', pro: false },
+  { id: 'watch', label: 'Watch', pro: false },
+  { id: 'notifications', label: 'Notifications', pro: false },
   { id: 'approvals', label: 'Approvals', pro: false },
+  { id: 'runs', label: 'Runs', pro: false },
   { id: 'spaces', label: 'Spaces', pro: false },
   { id: 'summary', label: 'Summary', pro: false },
   { id: 'rules', label: 'Rules', pro: false },
@@ -58,7 +64,10 @@ export default function ActivityPage() {
       </div>
       <div className="tab-panel page-enter" key={activeTab} role="tabpanel">
         {activeTab === "briefing" && <BriefingPanel />}
+        {activeTab === "watch" && <WatchPanel />}
+        {activeTab === "notifications" && <NotificationPanel />}
         {activeTab === "approvals" && <ApprovalsPanel hideHeader />}
+        {activeTab === "runs" && <RunsPanel />}
         {activeTab === "spaces" && <SpacePanel />}
         {activeTab === "summary" && <OmniPanel />}
         {activeTab === "rules" && <RulesPanel />}

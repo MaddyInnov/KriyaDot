@@ -10,6 +10,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <!-- POST_NOTIFICATIONS for the foreground-service notification on API 33+ -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- W14: phone_call action places calls via ACTION_CALL (user-approved
+         on the server before dispatch; the permission is requested in-app) -->
+    <uses-permission android:name="android.permission.CALL_PHONE" />
 
     <application
         android:label="KriyaDot Phone Agent"
@@ -43,6 +46,18 @@
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- W14 notification triage: the user must grant notification
+             access manually in Settings; the app cannot grant it itself. -->
+        <service
+            android:name=".PhoneNotificationListener"
+            android:label="KriyaDot notification triage"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
         </service>
     </application>
 </manifest>

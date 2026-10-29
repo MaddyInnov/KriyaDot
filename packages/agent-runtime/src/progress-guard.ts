@@ -17,6 +17,7 @@ export type TurnFailureKind =
   | 'no_progress'
   | 'budget_exceeded'
   | 'spend_cap_exceeded'
+  | 'provider_limit'
   | 'model_error'
   | 'timeout'
   | 'interrupted'
@@ -28,6 +29,7 @@ export const TURN_FAILURE_KINDS: readonly TurnFailureKind[] = [
   'no_progress',
   'budget_exceeded',
   'spend_cap_exceeded',
+  'provider_limit',
   'model_error',
   'timeout',
   'interrupted',
@@ -40,6 +42,7 @@ export const TURN_FAILURE_DESCRIPTIONS: Record<TurnFailureKind, string> = {
   no_progress: 'The agent made repeated tool calls without producing new information.',
   budget_exceeded: 'The turn exceeded its spending cap.',
   spend_cap_exceeded: 'A global or per-bot spend cap blocked the next model call.',
+  provider_limit: 'The model provider hit a hard usage limit / quota and no backup could take over.',
   model_error: 'The model provider returned an error.',
   timeout: 'The turn timed out waiting for a response.',
   interrupted: 'The turn was superseded by a newer message.',
@@ -182,6 +185,7 @@ export function noProgressReport(guard: ProgressGuard): TurnFailure {
 export function classifyTurnError(err: unknown, opts?: { aborted?: boolean }): TurnFailureKind {
   if (opts?.aborted) return 'interrupted';
   const msg = err instanceof Error ? err.message : String(err);
+  if (/insufficient_quota|quota (?:exceeded|reached|exhausted)|usage limit (?:reached|exceeded|hit)/i.test(msg)) return 'provider_limit';
   if (/budget cap|budget exceeded/i.test(msg)) return 'budget_exceeded';
   if (/timed? ?out|abort/i.test(msg)) return 'timeout';
   if (/denied|not approved/i.test(msg)) return 'approval_denied';

@@ -123,7 +123,9 @@ export function corsOriginFn(
  *                           gated — that would be a chicken-and-egg)
  *   - any path outside /api and /worktrees: the bundled web UI's static
  *     assets (the page must load so the browser can call /api/auth/bootstrap),
- *     /_kriyadot/ (read-only meter), /webhooks (per-trigger secret auth).
+ *     /_kriyadot/ (read-only meter), /webhooks (per-trigger secret auth),
+ *     /p/<slug> (W3 public page publishing — serves ONLY content the user
+ *     explicitly published, under an unguessable slug; see public-pages.ts).
  *     /worktrees stays protected.
  *   - WebSocket upgrade paths below: browsers can't send Authorization
  *     headers on WS handshakes. They authenticate in-protocol (device token

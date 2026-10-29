@@ -21,6 +21,9 @@ export function botModelsPath(dataDir: string): string {
 export interface BotModelSelection {
   model?: string;
   modelOptions?: ModelOptions;
+  /** AI failover (W1): backup provider/model for hard-limit failures. */
+  backupProvider?: string;
+  backupModel?: string;
 }
 
 type ModelsFile = Record<string, BotModelSelection>;
@@ -73,6 +76,12 @@ export function applyBotModels(bots: BotConfig[], dataDir: string): void {
     if (!sel) continue;
     if (typeof sel.model === 'string' && sel.model.trim()) bot.model = sel.model.trim();
     if (sel.modelOptions) bot.modelOptions = sanitizeOptions(sel.modelOptions);
+    if (typeof sel.backupProvider === 'string' && sel.backupProvider.trim()) {
+      bot.backupProvider = sel.backupProvider.trim();
+    }
+    if (typeof sel.backupModel === 'string' && sel.backupModel.trim()) {
+      bot.backupModel = sel.backupModel.trim();
+    }
   }
 }
 
@@ -86,6 +95,7 @@ export function saveBotModel(
   botId: string,
   model: unknown,
   modelOptions: unknown,
+  backup?: { backupProvider?: unknown; backupModel?: unknown },
 ): BotModelSelection {
   const bot = bots.find((b) => b.id === botId);
   if (!bot) throw new Error(`Unknown bot: ${botId}`);
@@ -94,6 +104,23 @@ export function saveBotModel(
   if (typeof model === 'string' && model.trim()) {
     sel.model = model.trim();
     bot.model = sel.model;
+  }
+  // AI failover (W1): backup provider/model. Explicit null/empty clears.
+  if (backup && backup.backupProvider !== undefined) {
+    if (typeof backup.backupProvider === 'string' && backup.backupProvider.trim()) {
+      sel.backupProvider = backup.backupProvider.trim().slice(0, 128);
+      bot.backupProvider = sel.backupProvider;
+    } else if (backup.backupProvider === null || backup.backupProvider === '') {
+      bot.backupProvider = undefined;
+    }
+  }
+  if (backup && backup.backupModel !== undefined) {
+    if (typeof backup.backupModel === 'string' && backup.backupModel.trim()) {
+      sel.backupModel = backup.backupModel.trim().slice(0, 256);
+      bot.backupModel = sel.backupModel;
+    } else if (backup.backupModel === null || backup.backupModel === '') {
+      bot.backupModel = undefined;
+    }
   }
   const opts = sanitizeOptions(modelOptions);
   if (Object.keys(opts).length > 0) {
@@ -107,6 +134,9 @@ export function saveBotModel(
   const file = readFile(dataDir);
   const existing = file[botId] ?? {};
   file[botId] = { ...existing, ...sel };
+  // Explicit backup clears must also drop the persisted keys.
+  if (backup?.backupProvider === null || backup?.backupProvider === '') delete file[botId].backupProvider;
+  if (backup?.backupModel === null || backup?.backupModel === '') delete file[botId].backupModel;
   if (Object.keys(file[botId]).length === 0) delete file[botId];
   writeFile(dataDir, file);
   return file[botId] ?? {};

@@ -123,6 +123,13 @@ class ScreenCaptureService : Service() {
             // InputService is a separate component; route via a static hook.
             InputService.dispatchCommand(msg)
         }
+        client.onAction = { msg ->
+            // W14 phone-app actions: executed by the accessibility service;
+            // the result is acked back to the server exactly once.
+            InputService.dispatchAction(msg) { id, ok, error ->
+                client.sendActionResult(id, ok, error)
+            }
+        }
         client.connect()
 
         // Frame pump: grab latest image, JPEG-encode, send.

@@ -48,6 +48,13 @@ import {
   untrustedCliPrefix,
 } from './agent-cli.js';
 import { isCatastrophicCommand } from '../tools/builtin.js';
+import {
+  CliLazyMcpBridge,
+  MCP_DESCRIBE_TOOL_NAME,
+  MCP_SEARCH_TOOL_NAME,
+  isMcpToolName,
+} from './cli-lazy-mcp.js';
+import type { ToolContext } from '../types.js';
 import type {
   ApprovalMode,
   ChatMessage,
@@ -667,6 +674,13 @@ export interface NativeCliDriverOptions {
    */
   preflightAuthCheck?: (() => Promise<string | null>) | null;
   homeDir?: string;
+  /**
+   * Lazy MCP loading (W9): when true (default), MCP tools handed to chat()
+   * are presented to the CLI through the lazy bridge (cli-lazy-mcp.ts) —
+   * names + one-line descriptions in the prompt, full schemas only after a
+   * search/describe loads them — instead of being silently dropped.
+   */
+  lazyMcp?: boolean;
 }
 
 const NATIVE_DEFAULT_TIMEOUT_MS = 600_000;
@@ -684,6 +698,9 @@ export class NativeCliDriver implements LLMProvider {
   private readonly spawnFn: SpawnFn;
   private readonly preflightAuthCheck: (() => Promise<string | null>) | null;
   private readonly homeDir: string;
+  private readonly lazyMcpEnabled: boolean;
+  private lazyMcpBridge: CliLazyMcpBridge | null = null;
+  private lazyMcpKey = '';
 
   constructor(opts: NativeCliDriverOptions) {
     const spec = getNativeCliSpec(opts.cliId);
@@ -698,6 +715,66 @@ export class NativeCliDriver implements LLMProvider {
     this.preflightAuthCheck =
       opts.preflightAuthCheck !== undefined ? opts.preflightAuthCheck : () => this.defaultPreflightAuthCheck();
     this.providerId = `agent/${this.cliId}/${this.model}`;
+    this.lazyMcpEnabled = opts.lazyMcp ?? true;
+  }
+
+  // -- Lazy MCP (W9) --------------------------------------------------------
+
+  /** The lazy MCP bridge for this driver instance (null until a turn carries MCP tools). */
+  getLazyMcpBridge(): CliLazyMcpBridge | null {
+    return this.lazyMcpBridge;
+  }
+
+  /** Host-driven search between turns: loads matching MCP tools for the next turn. */
+  searchMcpTools(query: string): ReturnType<CliLazyMcpBridge['searchTools']> {
+    if (!this.lazyMcpBridge) return [];
+    return this.lazyMcpBridge.searchTools(query);
+  }
+
+  /** Host-driven describe between turns: loads one MCP tool's full schema. */
+  describeMcpTool(name: string): ToolDefinition | undefined {
+    return this.lazyMcpBridge?.describeTool(name);
+  }
+
+  /** Route a call to a loaded MCP tool (fails closed when not loaded). */
+  async callLoadedMcpTool(call: ToolCall, ctx: ToolContext): Promise<unknown> {
+    if (!this.lazyMcpBridge) throw new Error('This driver has no MCP tools.');
+    return this.lazyMcpBridge.callTool(call, ctx);
+  }
+
+  /**
+   * Refresh the bridge from a turn's tools and return the prompt section
+   * to append ('' when the bot has no MCP tools or lazy mode is off). The
+   * bridge is rebuilt when the MCP tool set changes (config change), which
+   * resets loaded state; otherwise loaded state persists across turns.
+   */
+  private lazyMcpPromptSection(tools: ToolDefinition[]): string {
+    if (!this.lazyMcpEnabled) return '';
+    const mcpTools = tools.filter((t) => isMcpToolName(t.name));
+    if (mcpTools.length === 0) return '';
+    const key = mcpTools.map((t) => t.name).sort().join('');
+    if (!this.lazyMcpBridge || key !== this.lazyMcpKey) {
+      this.lazyMcpBridge = new CliLazyMcpBridge(mcpTools);
+      this.lazyMcpKey = key;
+    }
+    return this.lazyMcpBridge.promptSection();
+  }
+
+  /** Observe affordance tool events from the CLI and load tools accordingly. */
+  private noteLazyMcpToolEvent(e: CliToolStreamEvent): void {
+    if (!this.lazyMcpBridge || e.kind !== 'tool_call') return;
+    const bare = e.call.name.includes('.') ? e.call.name.slice(e.call.name.indexOf('.') + 1) : e.call.name;
+    try {
+      if (bare === MCP_SEARCH_TOOL_NAME) {
+        const q = typeof e.call.args.query === 'string' ? e.call.args.query : '';
+        this.lazyMcpBridge.searchTools(q);
+      } else if (bare === MCP_DESCRIBE_TOOL_NAME) {
+        const n = typeof e.call.args.name === 'string' ? e.call.args.name : '';
+        if (n) this.lazyMcpBridge.describeTool(n);
+      }
+    } catch {
+      // observation must never break the turn
+    }
   }
 
   /**
@@ -752,7 +829,7 @@ export class NativeCliDriver implements LLMProvider {
 
   async chat(
     messages: ChatMessage[],
-    _tools: ToolDefinition[],
+    tools: ToolDefinition[],
     opts: {
       model: string;
       onToken?: (t: string) => void;
@@ -765,7 +842,13 @@ export class NativeCliDriver implements LLMProvider {
     const spec = getNativeCliSpec(this.cliId);
     if (!spec) throw new Error(`No native driver for CLI "${this.cliId}".`);
     const model = opts.model || this.model;
-    const prompt = flattenMessagesForCli(messages);
+    // Lazy MCP (W9): MCP tools are presented through the lazy bridge —
+    // a lightweight directory section appended to the prompt; full schemas
+    // appear only for tools loaded in earlier turns. Non-MCP KriyaDot
+    // tools remain the CLI's own concern (it executes its own toolset).
+    const lazySection = this.lazyMcpPromptSection(tools);
+    const basePrompt = flattenMessagesForCli(messages);
+    const prompt = lazySection ? `${basePrompt}\n\n${lazySection}` : basePrompt;
     const approvalMode: ApprovalMode = opts.approvalMode ?? 'auto';
 
     // Fail fast when the CLI is definitely signed out (an unauthenticated
@@ -786,7 +869,10 @@ export class NativeCliDriver implements LLMProvider {
     let latestSessionId: string | undefined;
     const cbs: CliParseCallbacks = {
       onToken: (t) => opts.onToken?.(t),
-      onToolEvent: (e) => opts.onCliToolEvent?.(e),
+      onToolEvent: (e) => {
+        this.noteLazyMcpToolEvent(e);
+        opts.onCliToolEvent?.(e);
+      },
       onSessionId: (id) => {
         latestSessionId = id;
       },
@@ -910,6 +996,7 @@ export function createNativeCliDriver(
     spawnFn?: SpawnFn;
     preflightAuthCheck?: (() => Promise<string | null>) | null;
     homeDir?: string;
+    lazyMcp?: boolean;
   } = {},
 ): NativeCliDriver | null {
   const parsed = parseAgentProviderId(providerId);

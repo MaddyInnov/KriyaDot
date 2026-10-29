@@ -132,9 +132,29 @@ export class OpenAICompatibleProvider implements LLMProvider {
       if (res.ok) return res;
       if (!isRetryable(res.status) || attempt === MAX_RETRIES) {
         const body = await res.text().catch(() => '');
-        throw new Error(
+        // Rate-limit headers ride along on error responses too — record
+        // the snapshot so near-limit warnings + failover reset times work
+        // even when the call itself was refused.
+        const errSnap = parseOpenAIRateLimitHeaders(res.headers);
+        if (errSnap) recordRateLimit(this.providerId, errSnap);
+        const err = new Error(
           `Provider request failed: ${res.status} ${res.statusText}${body ? ` — ${body.slice(0, 300)}` : ''}`,
-        );
+        ) as Error & { status?: number; code?: string; retryAfterMs?: number; resetAt?: string };
+        err.status = res.status;
+        const retryAfter = res.headers.get('retry-after');
+        if (retryAfter) {
+          const secs = Number(retryAfter);
+          if (Number.isFinite(secs)) err.retryAfterMs = secs * 1000;
+        }
+        if (errSnap?.resetAt) err.resetAt = errSnap.resetAt;
+        try {
+          const parsed = JSON.parse(body) as { error?: { code?: string; type?: string } };
+          const code = parsed.error?.code ?? parsed.error?.type;
+          if (typeof code === 'string' && code) err.code = code;
+        } catch {
+          // Non-JSON body: the message text still carries the semantics.
+        }
+        throw err;
       }
       lastError = new Error(`Provider request failed: ${res.status}`);
       if (attempt < MAX_RETRIES) {

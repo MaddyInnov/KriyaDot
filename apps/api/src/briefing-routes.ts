@@ -37,6 +37,9 @@ export interface BriefingRouteDeps {
    * section. routes.ts passes the live runner.
    */
   workflowSource?: GenerateBriefingDeps['workflowSource'];
+  /** W14c signals source + W14b notification digest (forwarded). */
+  signalsSource?: GenerateBriefingDeps['signalsSource'];
+  notificationDigest?: GenerateBriefingDeps['notificationDigest'];
 }
 
 /** Mount the /api/briefing/* routes. */
@@ -80,6 +83,8 @@ export function registerBriefingRoutes(router: express.Router, deps: BriefingRou
         calendarStore,
         noteStore,
         workflowSource: deps.workflowSource,
+        signalsSource: deps.signalsSource,
+        notificationDigest: deps.notificationDigest,
       });
       const saved = store.saveBriefing('manual', briefing);
       res.status(201).json(saved.payload);

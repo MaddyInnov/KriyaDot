@@ -51,6 +51,12 @@ export interface ChiefRoutesDeps {
     threadId: string,
   ) => Promise<{ incidentId: string; attempts: number; text?: string; exhausted?: boolean } | undefined>;
   audit: (action: string, fields: { actor?: string; detail?: unknown }) => void;
+  /**
+   * Bot-deletion teardown hook (W9: per-bot private MCP servers). Called
+   * after a bot is removed by an approved delete op. Optional; failures are
+   * swallowed so a teardown error can never resurrect or block the delete.
+   */
+  onBotDeleted?: (botId: string) => void | Promise<void>;
 }
 
 function errorBody(message: string, detail?: unknown): Record<string, unknown> {
@@ -401,6 +407,14 @@ export function createChiefRouter(deps: ChiefRoutesDeps): Router {
         }
         const idx = bots.findIndex((b) => b.id === target.id);
         if (idx !== -1) bots.splice(idx, 1);
+        // W9 teardown hook (per-bot private MCP processes/configs, etc.).
+        if (deps.onBotDeleted) {
+          try {
+            void Promise.resolve(deps.onBotDeleted(target.id)).catch(() => undefined);
+          } catch {
+            // teardown must never block the delete
+          }
+        }
         if (!removeRosterImport(target.id, deps.dataDir)) {
           // Seed bot (or otherwise not from imports): record the deletion.
           store.addDeletedBotId(target.id);

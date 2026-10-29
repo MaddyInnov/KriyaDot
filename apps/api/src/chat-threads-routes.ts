@@ -42,12 +42,15 @@ export interface ChatThreadsDeps {
   listThreads: (opts?: {
     botId?: string;
     limit?: number;
+    /** W7: restrict to one person's private chats (owner filter). */
+    ownerPersonId?: string;
   }) => Array<{
     id: string;
     botId: string;
     createdAt: string;
     messageCount: number;
     lastMessageTs: string | null;
+    ownerPersonId?: string;
   }> | Promise<
     Array<{
       id: string;
@@ -55,8 +58,16 @@ export interface ChatThreadsDeps {
       createdAt: string;
       messageCount: number;
       lastMessageTs: string | null;
+      ownerPersonId?: string;
     }>
   >;
+  /**
+   * W7 (optional): resolve the person context for a list request
+   * (x-person-id header / ?personId=). When it returns a person id, the
+   * thread list is filtered to that person's private chats. When the dep
+   * is absent, listing behaves exactly as before (all threads).
+   */
+  resolvePersonId?: (req: express.Request) => string | undefined;
   /** Branch implementation — AgentRuntime.branchSession in production. */
   branchSession: (
     sessionId: string,
@@ -234,8 +245,14 @@ export function createChatThreadsRouter(deps: ChatThreadsDeps): Router {
     const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : NaN;
     const limit = Number.isSafeInteger(rawLimit) ? rawLimit : undefined;
     const includeHidden = req.query.includeHidden === '1' || req.query.includeHidden === 'true';
+    // W7: person-scoped listing — only that person's private chats.
+    const ownerPersonId = deps.resolvePersonId?.(req);
     try {
-      const sessions = await deps.listThreads({ ...(botId ? { botId } : {}), ...(limit !== undefined ? { limit } : {}) });
+      const sessions = await deps.listThreads({
+        ...(botId ? { botId } : {}),
+        ...(limit !== undefined ? { limit } : {}),
+        ...(ownerPersonId ? { ownerPersonId } : {}),
+      });
       const threads = sessions
         .map((s) => ({
           id: s.id,
@@ -245,6 +262,7 @@ export function createChatThreadsRouter(deps: ChatThreadsDeps): Router {
           createdAt: s.createdAt,
           messageCount: s.messageCount,
           lastMessageTs: s.lastMessageTs,
+          ...(s.ownerPersonId ? { ownerPersonId: s.ownerPersonId } : {}),
         }))
         .filter((t) => includeHidden || !t.flags.hidden)
         .sort((a, b) => Number(b.flags.pinned) - Number(a.flags.pinned));

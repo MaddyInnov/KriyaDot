@@ -219,8 +219,12 @@ export function createPeerApprovalBroker(
       if (card.status === 'denied') return 'denied';
       if (card.status === 'expired' || card.status === 'dismissed') return 'expired';
 
-      // Never wait past the card's own expiry.
-      const remaining = Math.min(Math.max(timeoutMs, 1000), Math.max(card.expiresAt - Date.now(), 1000));
+      // Never wait past the card's own expiry — except never-expire cards
+      // (W12), which are bounded only by the caller's timeout.
+      const remaining =
+        card.expiresAt === null
+          ? Math.max(timeoutMs, 1000)
+          : Math.min(Math.max(timeoutMs, 1000), Math.max(card.expiresAt - Date.now(), 1000));
       return new Promise<'allowed' | 'denied' | 'expired'>((resolve) => {
         const timer = setTimeout(() => {
           waiters.delete(cardId);
@@ -232,6 +236,13 @@ export function createPeerApprovalBroker(
             return;
           }
           if (current?.status === 'denied') {
+            resolve('denied');
+            return;
+          }
+          // W12: a never-expire card outlives the wait — resolve the wait
+          // as denied (fail closed for this call) but leave the card
+          // pending; it can still be decided later in the inbox.
+          if (current?.neverExpire && current.status === 'pending') {
             resolve('denied');
             return;
           }

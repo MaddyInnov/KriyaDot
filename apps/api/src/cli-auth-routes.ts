@@ -23,7 +23,7 @@ import {
   type CliAuthId,
 } from '@mvp/agent-runtime';
 
-const CLI_IDS: CliAuthId[] = ['claude', 'codex', 'opencode', 'antigravity'];
+const CLI_IDS: CliAuthId[] = ['claude', 'codex', 'opencode', 'antigravity', 'copilot'];
 
 function errorBody(message: string): Record<string, unknown> {
   return { ok: false, error: message };

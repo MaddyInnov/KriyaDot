@@ -16,7 +16,7 @@ export type {
   TurnHealth,
   TurnTelemetry,
 } from './types.js';
-export { scoreWorkflowRun, scoreTurn, scoreFromFindings, healthPoints, classifyError } from './scorer.js';
+export { scoreWorkflowRun, scoreTurn, scoreFromFindings, healthPoints, classifyError, loopFinding } from './scorer.js';
 export type { ScoreRunOptions, ScoreTurnOptions } from './scorer.js';
 export { detectRegressions } from './regressions.js';
 export type { RegressionOptions } from './regressions.js';

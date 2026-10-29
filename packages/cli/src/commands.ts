@@ -116,6 +116,37 @@ async function oneShotTurn(deps: CommandDeps, o: ChatRunOpts): Promise<number> {
   return result.failed ? 1 : 0;
 }
 
+function printPauseState(
+  deps: CommandDeps,
+  state: { paused: boolean; pausedAt?: number | null; pausedBy?: string | null; reason?: string | null },
+  format: OutputFormat,
+): void {
+  if (format === 'json') {
+    printJson(deps, state);
+    return;
+  }
+  if (state.paused) {
+    const at = state.pausedAt ? new Date(state.pausedAt).toISOString() : 'unknown time';
+    out(deps, `paused (since ${at}${state.pausedBy ? `, by ${state.pausedBy}` : ''}${state.reason ? ` — ${state.reason}` : ''})\n`);
+  } else {
+    out(deps, 'not paused — KriyaDot is running normally\n');
+  }
+}
+
+/** `kriyadot pause [status]` / `kriyadot resume` / `kriyadot status` (W14d). */
+async function doPauseCommand(deps: CommandDeps, p: ParsedArgs): Promise<number> {
+  if (p.command === 'resume') {
+    printPauseState(deps, await deps.api.resumeSystem(), p.global.format);
+    return 0;
+  }
+  if (p.command === 'status' || p.subcommand === 'status') {
+    printPauseState(deps, await deps.api.getPauseState(), p.global.format);
+    return 0;
+  }
+  printPauseState(deps, await deps.api.pauseSystem(), p.global.format);
+  return 0;
+}
+
 async function doChat(deps: CommandDeps, p: ParsedArgs): Promise<number> {
   // `chat <bot> [message...]` — subcommand slot holds the bot ref.
   let botRef = p.subcommand;
@@ -566,6 +597,10 @@ export async function runCommand(p: ParsedArgs, deps: CommandDeps): Promise<numb
         return await doMcp(deps, p);
       case 'login':
         return await doLogin(deps, p);
+      case 'pause':
+      case 'resume':
+      case 'status':
+        return await doPauseCommand(deps, p);
       case 'config':
         return await doConfig(deps, p);
       default:

@@ -21,6 +21,12 @@
 //
 // Widgets expire after WIDGET_TTL_MS (15 minutes): an unanswered widget
 // auto-expires and the turn resumes with answered:false.
+//
+// W12 never-expire cards: a widget raised with `neverExpire: true` stores
+// expiresAt = null, is skipped by every expiry sweep, and renders with a
+// "No expiry" label. Its turn-side wait is still bounded by the caller's
+// timeout — on timeout the turn resumes with answered:false (NOT expired)
+// and the card stays pending so it can still be answered later.
 
 import { randomUUID } from 'node:crypto';
 
@@ -41,7 +47,8 @@ export type WidgetKind =
   | 'confirm'
   | 'progress'
   | 'table'
-  | 'image-view';
+  | 'image-view'
+  | 'chart';
 
 export const WIDGET_KINDS: readonly WidgetKind[] = [
   'buttons',
@@ -51,6 +58,7 @@ export const WIDGET_KINDS: readonly WidgetKind[] = [
   'progress',
   'table',
   'image-view',
+  'chart',
 ] as const;
 
 export function isWidgetKind(v: unknown): v is WidgetKind {
@@ -122,6 +130,27 @@ export interface ImageViewWidgetPayload {
   dataUrl?: string;
 }
 
+export interface ChartSeries {
+  label: string;
+  values: number[];
+}
+
+/**
+ * Chart widget (W8c): a structured bar-chart spec rendered as inline
+ * SVG in chat. Canonical shape: `series` is a list of {label, values}
+ * with exactly one value per label. The validator also accepts the
+ * split form {series: string[], values: number[][]} and normalizes it
+ * into the canonical shape.
+ */
+export interface ChartWidgetPayload {
+  kind: 'chart';
+  title?: string;
+  /** Chart type: grouped bars, or bars stacked per label. */
+  chartType: 'bar' | 'stacked-bar';
+  labels: string[];
+  series: ChartSeries[];
+}
+
 export type WidgetPayload =
   | ButtonsWidgetPayload
   | SelectWidgetPayload
@@ -129,7 +158,8 @@ export type WidgetPayload =
   | ConfirmWidgetPayload
   | ProgressWidgetPayload
   | TableWidgetPayload
-  | ImageViewWidgetPayload;
+  | ImageViewWidgetPayload
+  | ChartWidgetPayload;
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -147,6 +177,9 @@ export const WIDGET_CAPS = {
   rows: 500,
   url: 2000,
   dataUrl: 2_000_000,
+  chartLabels: 50,
+  chartSeries: 8,
+  chartLabel: 200,
 } as const;
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -347,6 +380,76 @@ export function validateWidgetPayload(payload: unknown): ValidationResult {
       if (dataUrl !== undefined) out.dataUrl = dataUrl;
       return { ok: true, payload: out };
     }
+    case 'chart': {
+      const chartType = payload.type ?? payload.chartType;
+      if (chartType !== 'bar' && chartType !== 'stacked-bar') {
+        return invalid('chart type must be "bar" or "stacked-bar"');
+      }
+      const rawLabels = payload.labels;
+      if (!Array.isArray(rawLabels) || rawLabels.length === 0) {
+        return invalid('chart labels must be a non-empty array of strings');
+      }
+      if (rawLabels.length > WIDGET_CAPS.chartLabels) {
+        return invalid(`chart labels exceeds the cap of ${WIDGET_CAPS.chartLabels}`);
+      }
+      const labels: string[] = [];
+      for (let i = 0; i < rawLabels.length; i++) {
+        if (!str(rawLabels[i]) || (rawLabels[i] as string).length > WIDGET_CAPS.chartLabel) {
+          return invalid(`chart labels[${i}] must be a string of at most ${WIDGET_CAPS.chartLabel} characters`);
+        }
+        labels.push(rawLabels[i] as string);
+      }
+      // Two accepted input shapes, one canonical output:
+      //  A) series: [{label, values}]            (canonical)
+      //  B) series: string[] + values: number[][] (split form)
+      const rawSeries = payload.series;
+      if (!Array.isArray(rawSeries) || rawSeries.length === 0) {
+        return invalid('chart series must be a non-empty array');
+      }
+      if (rawSeries.length > WIDGET_CAPS.chartSeries) {
+        return invalid(`chart series exceeds the cap of ${WIDGET_CAPS.chartSeries}`);
+      }
+      const series: ChartSeries[] = [];
+      const checkValues = (vals: unknown, who: string): { ok: true; values: number[] } | Invalid => {
+        if (!Array.isArray(vals) || vals.length !== labels.length) {
+          return invalid(`chart ${who} must have exactly ${labels.length} values (one per label)`);
+        }
+        const values: number[] = [];
+        for (const v of vals) {
+          if (typeof v !== 'number' || !Number.isFinite(v)) {
+            return invalid(`chart ${who} values must be finite numbers`);
+          }
+          values.push(v);
+        }
+        return { ok: true, values };
+      };
+      if (rawSeries.every((s) => typeof s === 'string')) {
+        const rawValues = payload.values;
+        if (!Array.isArray(rawValues) || rawValues.length !== rawSeries.length) {
+          return invalid('chart values must be an array with one row per series');
+        }
+        for (let i = 0; i < rawSeries.length; i++) {
+          const label = rawSeries[i] as string;
+          if (label.length > WIDGET_CAPS.chartLabel) {
+            return invalid(`chart series[${i}] label exceeds ${WIDGET_CAPS.chartLabel} characters`);
+          }
+          const checked = checkValues(rawValues[i], `series "${label}"`);
+          if (!checked.ok) return checked;
+          series.push({ label, values: checked.values });
+        }
+      } else {
+        for (let i = 0; i < rawSeries.length; i++) {
+          const s = rawSeries[i];
+          if (!isRecord(s)) return invalid(`chart series[${i}] must be an object {label, values}`);
+          const label = reqStr(s.label, WIDGET_CAPS.chartLabel, `series[${i}].label`);
+          if (!label.ok) return label;
+          const checked = checkValues(s.values, `series "${label.value}"`);
+          if (!checked.ok) return checked;
+          series.push({ label: label.value, values: checked.values });
+        }
+      }
+      return { ok: true, payload: { kind: 'chart', ...base, chartType, labels, series } };
+    }
   }
 }
 
@@ -388,10 +491,19 @@ export interface WidgetRecord {
   interactive: boolean;
   status: WidgetStatus;
   createdAt: number;
-  expiresAt: number;
+  /** Epoch ms expiry, or null when the card never expires (W12). */
+  expiresAt: number | null;
+  /** W12: true when the card was raised with neverExpire (expiresAt null). */
+  neverExpire: boolean;
   /** Parsed answer value (only when status === 'answered'). */
   value?: unknown;
   answeredAt?: number;
+  /**
+   * Multiplayer layer (W7): the person this question is addressed to —
+   * the raising bot's owner. Absent on pre-W7 records; consumers fall
+   * back to the bot's current owner.
+   */
+  addresseePersonId?: string;
 }
 
 export interface RaiseWidgetInput {
@@ -402,10 +514,21 @@ export interface RaiseWidgetInput {
   title?: string;
   interactive: boolean;
   ttlMs?: number;
+  /** W12: when true the card never expires (expiresAt = null). Wins over ttlMs. */
+  neverExpire?: boolean;
+  /** W7: person the question is addressed to (the bot's owner). */
+  addresseePersonId?: string;
 }
 
 /** Default widget time-to-live: 15 minutes (OpenMausBot parity). */
 export const WIDGET_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * W12: far-future sentinel stored for never-expire cards only when a
+ * legacy DB still enforces expires_at NOT NULL (9999-12-31 in epoch ms).
+ * Reads never surface it — rowToRecord maps never_expire rows to null.
+ */
+export const NEVER_EXPIRE_SENTINEL_MS = 253402300799999;
 
 interface WidgetRow {
   id: string;
@@ -417,9 +540,11 @@ interface WidgetRow {
   interactive: number;
   status: string;
   created_at: number;
-  expires_at: number;
+  expires_at: number | null;
   answer_json: string | null;
   answered_at: number | null;
+  addressee_person_id: string | null;
+  never_expire: number | null;
 }
 
 function parseStoredPayload(json: string): WidgetPayload {
@@ -450,9 +575,13 @@ function rowToRecord(r: WidgetRow): WidgetRecord {
     interactive: r.interactive === 1,
     status: r.status as WidgetStatus,
     createdAt: r.created_at,
-    expiresAt: r.expires_at,
+    // A never-expire card always reads back expiresAt: null, even on a
+    // legacy-schema DB where a far-future sentinel had to be stored.
+    expiresAt: r.never_expire === 1 ? null : (r.expires_at ?? null),
+    neverExpire: r.never_expire === 1 || r.expires_at === null,
     value,
     answeredAt: r.answered_at ?? undefined,
+    addresseePersonId: r.addressee_person_id ?? undefined,
   };
 }
 
@@ -487,13 +616,65 @@ export class WidgetStore {
         interactive INTEGER NOT NULL DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'pending',
         created_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL,
+        expires_at INTEGER,
         answer_json TEXT,
         answered_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_widgets_session ON widgets (session_id, status);
       CREATE INDEX IF NOT EXISTS idx_widgets_status ON widgets (status, expires_at);
     `);
+    // W7 migration: addressee person id (the raising bot's owner).
+    try {
+      this.db.exec('ALTER TABLE widgets ADD COLUMN addressee_person_id TEXT');
+    } catch {
+      // Column already exists.
+    }
+    // W12 migration: never-expire flag + nullable expires_at. SQLite cannot
+    // drop a NOT NULL constraint in place, so a legacy table (expires_at
+    // NOT NULL) is rebuilt once: copy rows into a fresh table, swap, and
+    // recreate the indexes. New tables already have the nullable column.
+    try {
+      this.db.exec('ALTER TABLE widgets ADD COLUMN never_expire INTEGER NOT NULL DEFAULT 0');
+    } catch {
+      // Column already exists.
+    }
+    try {
+      const cols = this.db.prepare('PRAGMA table_info(widgets)').all() as unknown as Array<{
+        name: string;
+        notnull: number;
+      }>;
+      const expiresCol = cols.find((c) => c.name === 'expires_at');
+      if (expiresCol && expiresCol.notnull === 1) {
+        this.db.exec(`
+          CREATE TABLE widgets_w12 (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            bot_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            title TEXT,
+            interactive INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER,
+            answer_json TEXT,
+            answered_at INTEGER,
+            addressee_person_id TEXT,
+            never_expire INTEGER NOT NULL DEFAULT 0
+          );
+          INSERT INTO widgets_w12 SELECT id, session_id, bot_id, kind, payload_json, title,
+            interactive, status, created_at, expires_at, answer_json, answered_at,
+            addressee_person_id, never_expire FROM widgets;
+          DROP TABLE widgets;
+          ALTER TABLE widgets_w12 RENAME TO widgets;
+          CREATE INDEX IF NOT EXISTS idx_widgets_session ON widgets (session_id, status);
+          CREATE INDEX IF NOT EXISTS idx_widgets_status ON widgets (status, expires_at);
+        `);
+      }
+    } catch {
+      // Migration is best-effort: a failure leaves the legacy schema, and
+      // raise() falls back to a far-future expiry for never-expire cards.
+    }
   }
 
   /** Widget TTL in ms (for the coordinator's await timeout). */
@@ -505,6 +686,7 @@ export class WidgetStore {
     const v = validateWidgetPayload({ ...input.payload, kind: input.kind });
     if (!v.ok) throw new Error(`invalid widget payload: ${v.error}`);
     const now = Date.now();
+    const neverExpire = input.neverExpire === true;
     const record: WidgetRecord = {
       id: randomUUID(),
       sessionId: input.sessionId,
@@ -515,16 +697,18 @@ export class WidgetStore {
       interactive: input.interactive,
       status: 'pending',
       createdAt: now,
-      expiresAt: now + (input.ttlMs ?? this.ttlMs),
+      expiresAt: neverExpire ? null : now + (input.ttlMs ?? this.ttlMs),
+      neverExpire,
+      addresseePersonId: input.addresseePersonId,
     };
-    this.db
-      .prepare(
-        `INSERT INTO widgets
-           (id, session_id, bot_id, kind, payload_json, title, interactive,
-            status, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+    const insert = this.db.prepare(
+      `INSERT INTO widgets
+         (id, session_id, bot_id, kind, payload_json, title, interactive,
+          status, created_at, expires_at, addressee_person_id, never_expire)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    try {
+      insert.run(
         record.id,
         record.sessionId,
         record.botId,
@@ -535,7 +719,29 @@ export class WidgetStore {
         record.status,
         record.createdAt,
         record.expiresAt,
+        record.addresseePersonId ?? null,
+        neverExpire ? 1 : 0,
       );
+    } catch (err) {
+      // Legacy schema fallback: expires_at still NOT NULL (the rebuild
+      // migration above failed) — store a far-future sentinel; reads map
+      // it back to null via the never_expire flag.
+      if (!neverExpire) throw err;
+      insert.run(
+        record.id,
+        record.sessionId,
+        record.botId,
+        record.kind,
+        JSON.stringify(record.payload),
+        record.title ?? null,
+        record.interactive ? 1 : 0,
+        record.status,
+        record.createdAt,
+        NEVER_EXPIRE_SENTINEL_MS,
+        record.addresseePersonId ?? null,
+        1,
+      );
+    }
     return record;
   }
 
@@ -597,8 +803,11 @@ export class WidgetStore {
    * that transitioned (so the host can settle in-flight waiters).
    */
   expireStale(now = Date.now()): string[] {
+    // W12: never-expire cards (expires_at NULL, or flagged) never match.
     const rows = this.db
-      .prepare("SELECT id FROM widgets WHERE status = 'pending' AND expires_at <= ?")
+      .prepare(
+        "SELECT id FROM widgets WHERE status = 'pending' AND expires_at IS NOT NULL AND COALESCE(never_expire, 0) = 0 AND expires_at <= ?",
+      )
       .all(now) as unknown as Array<{ id: string }>;
     if (rows.length === 0) return [];
     const stmt = this.db.prepare(
@@ -700,8 +909,12 @@ export class WidgetCoordinator {
     if (signal?.aborted) {
       return Promise.reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
     }
-    // Never wait past the widget's own expiry.
-    const remaining = Math.min(Math.max(timeoutMs, 1), Math.max(record.expiresAt - Date.now(), 1));
+    // Never wait past the widget's own expiry — except never-expire cards
+    // (W12), whose wait is bounded only by the caller's timeout.
+    const remaining =
+      record.expiresAt === null
+        ? Math.max(timeoutMs, 1)
+        : Math.min(Math.max(timeoutMs, 1), Math.max(record.expiresAt - Date.now(), 1));
     return new Promise<WidgetAnswer>((resolve, reject) => {
       const cleanup = (): void => {
         const w = this.waiters.get(widgetId);
@@ -722,6 +935,12 @@ export class WidgetCoordinator {
         }
         if (current && current.status !== 'pending') {
           resolve({ answered: false, expired: current.status === 'expired', answeredAt: current.answeredAt });
+          return;
+        }
+        // W12: a never-expire card outlives the wait — the turn resumes
+        // unanswered but the card stays pending (NOT expired).
+        if (current?.neverExpire) {
+          resolve({ answered: false, expired: false, answeredAt: Date.now() });
           return;
         }
         // Fail closed: mark expired (only if still pending) and audit.
@@ -813,6 +1032,8 @@ export interface WidgetRaiseInput {
   title?: string;
   interactive: boolean;
   ttlMs?: number;
+  /** W12: when true the card never expires (expiresAt = null). */
+  neverExpire?: boolean;
 }
 
 /**

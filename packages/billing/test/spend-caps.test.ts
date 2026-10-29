@@ -11,6 +11,7 @@ import {
   checkSpendCaps,
   formatSpendCapMessage,
   spendCapStatuses,
+  spendUsageWarnings,
   SpendCapStore,
 } from '../src/spend-caps.js';
 import type { SpendCapConfig, SpendLookup } from '../src/spend-caps.js';
@@ -263,5 +264,21 @@ describe('CostTracker.listEvents / spentCents (usage ledger)', () => {
     expect(tracker.spentCents({ since: 0, until: now + 1, botId: 'a' })).toBe(120);
     expect(tracker.spentCents({ since: now + 1000, until: now + 2000 })).toBe(0);
     tracker.close();
+  });
+});
+
+describe('spendUsageWarnings (W1 near-limit)', () => {
+  it('warns at >=80% of a cap and stays silent below / without caps', () => {
+    const caps: SpendCapConfig = {
+      global: { dailyCents: 500, monthlyCents: null },
+      bots: { scout: { dailyCents: 1000, monthlyCents: null } },
+    };
+    const lookup: SpendLookup = (since, _until, botId) => (botId === 'scout' ? 400 : 460);
+    const statuses = spendCapStatuses({ caps, spentLookup: lookup, now: Date.now() });
+    const warnings = spendUsageWarnings(statuses);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({ scope: 'global', usedPercent: 92 });
+    expect(warnings[0]!.message).toContain('92% used');
+    expect(spendUsageWarnings([])).toEqual([]);
   });
 });

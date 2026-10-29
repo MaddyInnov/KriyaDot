@@ -305,3 +305,46 @@ export function formatSpendCapMessage(result: SpendCheckResult): string {
 export function newSpendCapId(): string {
   return `sc_${randomUUID()}`;
 }
+
+// ---- Near-limit warnings (W1) ----------------------------------------------
+
+/** Default usage percentage at/above which a spend cap warns. */
+export const NEAR_LIMIT_WARN_PCT = 80;
+
+export interface SpendUsageWarning {
+  scope: SpendCapScope;
+  botId: string | null;
+  period: SpendCapPeriod;
+  /** Percentage of the cap consumed (0..100, 1 decimal). */
+  usedPercent: number;
+  /** Human line, e.g. "Global daily spend: 92% used". */
+  message: string;
+}
+
+/**
+ * Near-limit warnings from spend-cap statuses (usage ledger vs caps).
+ * Only statuses with a real cap produce warnings — no cap, no warning,
+ * never a fabricated figure.
+ */
+export function spendUsageWarnings(
+  statuses: SpendCapStatus[],
+  threshold = NEAR_LIMIT_WARN_PCT,
+): SpendUsageWarning[] {
+  const out: SpendUsageWarning[] = [];
+  for (const s of statuses) {
+    if (s.capCents === null || s.capCents <= 0) continue;
+    const used = (s.spentCents / s.capCents) * 100;
+    if (!Number.isFinite(used) || used < threshold) continue;
+    const usedPercent = Math.round(Math.min(100, used) * 10) / 10;
+    const who = s.scope === 'global' ? 'Global' : `Bot "${s.botId}"`;
+    const per = s.period === 'day' ? 'daily' : 'monthly';
+    out.push({
+      scope: s.scope,
+      botId: s.botId,
+      period: s.period,
+      usedPercent,
+      message: `${who} ${per} spend: ${usedPercent}% used`,
+    });
+  }
+  return out;
+}

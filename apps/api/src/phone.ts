@@ -318,7 +318,15 @@ export type ValidatedMessage =
   | { t: 'tap'; x: number; y: number }
   | { t: 'swipe'; x1: number; y1: number; x2: number; y2: number; ms: number }
   | { t: 'text'; text: string }
-  | { t: 'key'; key: 'back' | 'home' | 'wake' };
+  | { t: 'key'; key: 'back' | 'home' | 'wake' }
+  // W14 phone-app operation: the phone acks a server-dispatched action.
+  // New-style messages use a `type` discriminator on the wire (see
+  // phone-actions.ts); the validated shape carries both discriminators so
+  // the existing `t`-based narrowing in the hub/routes keeps working.
+  | { t: 'action_result'; type: 'action_result'; id: string; ok: boolean; error?: string }
+  // W14 notification triage: a phone notification event. Title + app only —
+  // notification bodies are sensitive and are never accepted here.
+  | { t: 'notification'; type: 'notification'; appPackage: string; appName?: string; title: string; ts: number };
 
 function validDeviceId(v: unknown): v is string {
   return typeof v === 'string' && v.length > 0 && v.length <= 128 && /^[A-Za-z0-9_:-]+$/.test(v);
@@ -328,6 +336,28 @@ function validDeviceId(v: unknown): v is string {
 export function validateMessage(raw: unknown): { ok: true; msg: ValidatedMessage } | { ok: false; error: string } {
   if (typeof raw !== 'object' || raw === null) return { ok: false, error: 'not_an_object' };
   const m = raw as Record<string, unknown>;
+  // W14 new-style messages carry a `type` discriminator instead of `t`.
+  const newType = typeof m.type === 'string' ? m.type : m.t === 'action_result' || m.t === 'notification' ? m.t : undefined;
+  if (newType === 'action_result') {
+    if (typeof m.id !== 'string' || m.id.length === 0 || m.id.length > 128) return { ok: false, error: 'bad_action_id' };
+    if (typeof m.ok !== 'boolean') return { ok: false, error: 'bad_action_ok' };
+    const error = typeof m.error === 'string' ? m.error.slice(0, 300) : undefined;
+    return { ok: true, msg: { t: 'action_result', type: 'action_result', id: m.id, ok: m.ok, ...(error ? { error } : {}) } };
+  }
+  if (newType === 'notification') {
+    if (typeof m.appPackage !== 'string' || m.appPackage.length === 0 || m.appPackage.length > 128 || !/^[A-Za-z0-9_.:-]+$/.test(m.appPackage)) {
+      return { ok: false, error: 'bad_notification_app' };
+    }
+    // Title only, bounded. A `body`/`text` field, if a client sends one, is
+    // deliberately dropped here — bodies never enter the server pipeline.
+    if (typeof m.title !== 'string' || m.title.length > 300) return { ok: false, error: 'bad_notification_title' };
+    if (!isFiniteNum(m.ts)) return { ok: false, error: 'bad_notification_ts' };
+    const appName = typeof m.appName === 'string' ? m.appName.slice(0, 64) : undefined;
+    return {
+      ok: true,
+      msg: { t: 'notification', type: 'notification', appPackage: m.appPackage, ...(appName ? { appName } : {}), title: m.title, ts: m.ts as number },
+    };
+  }
   switch (m.t) {
     case 'hello':
       if (!validDeviceId(m.deviceId)) return { ok: false, error: 'bad_device_id' };
@@ -554,15 +584,81 @@ interface ViewerConn {
   watching: string | null;
 }
 
+export interface PhoneActionResult {
+  ok: boolean;
+  error?: string;
+}
+
+interface PendingAction {
+  deviceId: string;
+  resolve: (r: PhoneActionResult) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 export class PhoneSessionHub {
   private readonly phones = new Map<string, PhoneConn>(); // deviceId → connection
   private readonly viewers = new Set<ViewerConn>();
   private readonly latestFrames = new Map<string, { jpg: string; w: number; h: number; ts: number }>();
+  /** W14: in-flight server→phone actions awaiting an action_result ack. */
+  private readonly pendingActions = new Map<string, PendingAction>();
+  /** W14: notification events from phones (set by the triage wiring). */
+  private notificationHandler: ((deviceId: string, n: { appPackage: string; appName?: string; title: string; ts: number }) => void) | null = null;
 
   constructor(
     private readonly store: PhoneStore,
     private readonly audit: PhoneAudit,
   ) {}
+
+  /** W14: register the notification-triage intake for phone notifications. */
+  setNotificationHandler(
+    fn: ((deviceId: string, n: { appPackage: string; appName?: string; title: string; ts: number }) => void) | null,
+  ): void {
+    this.notificationHandler = fn;
+  }
+
+  /**
+   * W14: dispatch one phone-app action to a connected phone and await its
+   * ack. Wire shape: { type:'action', id, action, params }. Resolves
+   * { ok:false, error:'device_offline' } when the phone is not connected
+   * and { ok:false, error:'timeout' } when no ack arrives in time — it
+   * never rejects, so tool handlers can surface a clean result.
+   */
+  dispatchAction(
+    deviceId: string,
+    action: string,
+    params: Record<string, unknown>,
+    timeoutMs = 15_000,
+  ): Promise<PhoneActionResult> {
+    const phone = this.phones.get(deviceId);
+    if (!phone) return Promise.resolve({ ok: false, error: 'device_offline' });
+    const id = `act_${randomBytes(8).toString('hex')}`;
+    return new Promise<PhoneActionResult>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingActions.delete(id);
+        resolve({ ok: false, error: 'timeout' });
+      }, Math.max(100, Math.min(60_000, timeoutMs)));
+      if (typeof timer === 'object' && 'unref' in timer) timer.unref();
+      this.pendingActions.set(id, { deviceId, resolve, timer });
+      phone.inputs += 1;
+      try {
+        phone.socket.sendText(JSON.stringify({ type: 'action', id, action, params }));
+      } catch {
+        clearTimeout(timer);
+        this.pendingActions.delete(id);
+        resolve({ ok: false, error: 'send_failed' });
+      }
+    });
+  }
+
+  /** Resolve every pending action for a device (on disconnect). */
+  private failPendingForDevice(deviceId: string, error: string): void {
+    for (const [id, p] of this.pendingActions) {
+      if (p.deviceId !== deviceId) continue;
+      clearTimeout(p.timer);
+      this.pendingActions.delete(id);
+      p.resolve({ ok: false, error });
+    }
+  }
 
   /** Latest cached frame per device (for the polling fallback / ADB stills). */
   latestFrame(deviceId: string): { jpg: string; w: number; h: number; ts: number } | undefined {
@@ -621,6 +717,7 @@ export class PhoneSessionHub {
 
     const cleanup = (): void => {
       if (phoneConn) {
+        this.failPendingForDevice(phoneConn.deviceId, 'device_disconnected');
         this.phones.delete(phoneConn.deviceId);
         // L1: drop the cached frame — a stale last-frame must not survive
         // the session (privacy: the next viewer/poll would see a dead
@@ -726,6 +823,28 @@ export class PhoneSessionHub {
       }
 
       if (role === 'phone' && phoneConn) {
+        if ('type' in msg && msg.type === 'action_result') {
+          const pending = this.pendingActions.get(msg.id);
+          if (pending && pending.deviceId === phoneConn.deviceId) {
+            clearTimeout(pending.timer);
+            this.pendingActions.delete(msg.id);
+            pending.resolve(msg.ok ? { ok: true } : { ok: false, error: msg.error ?? 'action_failed' });
+          }
+          return;
+        }
+        if ('type' in msg && msg.type === 'notification') {
+          try {
+            this.notificationHandler?.(phoneConn.deviceId, {
+              appPackage: msg.appPackage,
+              ...(msg.appName ? { appName: msg.appName } : {}),
+              title: msg.title,
+              ts: msg.ts,
+            });
+          } catch {
+            // Triage intake must never break the phone session.
+          }
+          return;
+        }
         if (msg.t === 'frame') {
           phoneConn.frames += 1;
           this.latestFrames.set(phoneConn.deviceId, { jpg: msg.jpg, w: msg.w, h: msg.h, ts: msg.ts });

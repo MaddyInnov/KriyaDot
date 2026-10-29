@@ -30,10 +30,16 @@ import type { DatabaseSync } from 'node:sqlite';
 import express, { type Request, type Response, type Router } from 'express';
 import type { BotConfig } from '@mvp/agent-runtime';
 import {
+  computeLimitResetResumeAt,
   nextRuns,
   validateRoutineSchedule,
+  type EventSchedule,
   type RoutineSchedule,
 } from './routine-schedules.js';
+import type { LimitResetResumeStore } from './limit-reset-resumes.js';
+import { composioCallerOf } from './composio.js';
+import { readAccountCache } from './composio-accounts.js';
+import { eventDayKey, type EventTriggerStore } from './routine-events.js';
 
 import { openDb as openSqliteDb } from '@mvp/agent-runtime';
 
@@ -438,6 +444,21 @@ export interface RoutineRouteDeps {
   getBaseUrls: () => { publicBaseUrl?: string; localPort: number };
   /** Run-record store (routine-runs.ts). When set, deleting a routine also deletes its run history. */
   runStore?: import('./routine-runs.js').RoutineRunStore;
+  /** Limit-reset resume store (W1). When set, limit-reset resume routes are enabled. */
+  resumeStore?: LimitResetResumeStore;
+  /** Event-trigger state store (W2). When set, event status is exposed and routine deletion cascades to cursors. */
+  eventStore?: EventTriggerStore;
+  /**
+   * Event-schedule account checker (W2): returns an error message when
+   * the schedule's connected account is not usable, null when it is.
+   * Defaults to the local Composio account cache (toolkit must match).
+   */
+  eventAccountChecker?: (args: {
+    accountId: string;
+    app: EventSchedule['app'];
+    userId: string;
+    botId: string;
+  }) => string | null;
 }
 
 function errorBody(message: string, detail?: string): Record<string, unknown> {
@@ -485,6 +506,41 @@ export function registerRoutineRoutes(
   const routineStore = new RoutineStore(deps.dataDir);
   const triggerStore = new RoutineWebhookTriggerStore(deps.dataDir);
 
+  /**
+   * Event-schedule gate (W2): when the effective schedule is an `event`
+   * schedule, its connected account must exist for the schedule's app.
+   * Returns an error message (→ 400) or null. Structural problems are
+   * reported by validateRoutineSchedule inside the store; this adds the
+   * account-existence check the store cannot do.
+   */
+  const checkEventSchedule = (
+    req: Request,
+    rawSchedule: unknown,
+    botId: string,
+  ): string | null => {
+    if (typeof rawSchedule !== 'object' || rawSchedule === null) return null;
+    if ((rawSchedule as { kind?: unknown }).kind !== 'event') return null;
+    let schedule: RoutineSchedule;
+    try {
+      schedule = validateRoutineSchedule(rawSchedule);
+    } catch (err) {
+      return err instanceof Error ? err.message : 'invalid event schedule';
+    }
+    if (schedule.kind !== 'event') return null;
+    const userId = schedule.userId ?? composioCallerOf(req);
+    if (deps.eventAccountChecker) {
+      return deps.eventAccountChecker({ accountId: schedule.accountId, app: schedule.app, userId, botId });
+    }
+    const record = readAccountCache(deps.dataDir, userId)[schedule.accountId];
+    if (!record) {
+      return `unknown connected account "${schedule.accountId}" — connect it in Accounts → Composio first`;
+    }
+    if (record.toolkitSlug !== schedule.app) {
+      return `connected account "${schedule.accountId}" is a ${record.toolkitSlug} account, not ${schedule.app}`;
+    }
+    return null;
+  };
+
   const requireRoutine = (res: Response, id: string): BotRoutine | undefined => {
     if (!validId(id)) {
       res.status(400).json(errorBody('Invalid routine id'));
@@ -510,6 +566,11 @@ export function registerRoutineRoutes(
     const botId = typeof body.botId === 'string' ? body.botId : '';
     if (!deps.getBots().some((b) => b.id === botId)) {
       res.status(400).json(errorBody(`Unknown bot "${botId}"`));
+      return;
+    }
+    const eventError = checkEventSchedule(req, body.schedule, botId);
+    if (eventError) {
+      res.status(400).json(errorBody(eventError));
       return;
     }
     try {
@@ -556,6 +617,21 @@ export function registerRoutineRoutes(
       res.status(400).json(errorBody(`Unknown bot "${String(body.botId)}"`));
       return;
     }
+    // Only a newly-set schedule is account-checked here; unrelated
+    // patches (rename, enable toggle) must not fail because an account
+    // cache aged out — the poller re-validates at fire time regardless.
+    const eventError =
+      body.schedule === undefined || body.schedule === null
+        ? null
+        : checkEventSchedule(
+            req,
+            body.schedule,
+            typeof body.botId === 'string' ? body.botId : routine.botId,
+          );
+    if (eventError) {
+      res.status(400).json(errorBody(eventError));
+      return;
+    }
     try {
       const updated = routineStore.update(routine.id, {
         name: typeof body.name === 'string' ? body.name : undefined,
@@ -595,6 +671,8 @@ export function registerRoutineRoutes(
     // Cascade: the routine's run history goes with it.
     try {
       deps.runStore?.deleteByRoutine(id);
+      deps.resumeStore?.deleteByRoutine(id);
+      deps.eventStore?.deleteByRoutine(id);
     } catch (err) {
       console.error('[routines] failed to delete run history:', err instanceof Error ? err.message : err);
     }
@@ -640,6 +718,153 @@ export function registerRoutineRoutes(
     }
     const updated = routineStore.setScheduleEnabled(routine.id, false);
     res.json({ ok: true, routine: updated ? withNextRun(updated) : updated });
+  });
+
+  // --- Limit-reset resumes (W1) -------------------------------------------
+  // A routine blocked by a provider usage limit can be scheduled to resume
+  // at the provider's reset time. The resume is persisted (survives
+  // restart) and fired by RoutineScheduler; see limit-reset-resumes.ts.
+
+  router.post('/:id/limit-reset', (req: Request, res: Response) => {
+    const routine = requireRoutine(res, req.params.id);
+    if (!routine) return;
+    if (!deps.resumeStore) {
+      res.status(501).json(errorBody('Limit-reset resumes are not enabled on this server'));
+      return;
+    }
+    const body = (req.body ?? {}) as {
+      providerId?: unknown;
+      errorMessage?: unknown;
+      resetAt?: unknown;
+      retryAfterMs?: unknown;
+      defaultBackoffMinutes?: unknown;
+    };
+    const providerId =
+      typeof body.providerId === 'string' && body.providerId.trim()
+        ? body.providerId.trim().slice(0, 128)
+        : routine.schedule?.kind === 'limit-reset'
+          ? (routine.schedule.providerId ?? 'unknown')
+          : 'unknown';
+    // Rebuild a classifiable error shape from the reported limit failure.
+    const synthetic = Object.assign(
+      new Error(
+        typeof body.errorMessage === 'string' && body.errorMessage.trim()
+          ? body.errorMessage.trim().slice(0, 500)
+          : 'usage limit reached',
+      ),
+      {
+        status: 429,
+        ...(typeof body.resetAt === 'string' ? { resetAt: body.resetAt } : {}),
+        ...(typeof body.retryAfterMs === 'number' && Number.isFinite(body.retryAfterMs)
+          ? { retryAfterMs: body.retryAfterMs }
+          : {}),
+      },
+    );
+    const defaultBackoffMinutes =
+      typeof body.defaultBackoffMinutes === 'number' && Number.isFinite(body.defaultBackoffMinutes)
+        ? body.defaultBackoffMinutes
+        : routine.schedule?.kind === 'limit-reset'
+          ? routine.schedule.defaultBackoffMinutes
+          : undefined;
+    const resumeAt = computeLimitResetResumeAt(synthetic, { providerId, defaultBackoffMinutes });
+    try {
+      const resume = deps.resumeStore.schedule({
+        routineId: routine.id,
+        botId: routine.botId,
+        providerId,
+        resumeAt,
+        reason: synthetic.message,
+      });
+      // Mirror onto a limit-reset schedule so next-run display agrees.
+      if (routine.schedule?.kind === 'limit-reset') {
+        try {
+          routineStore.setSchedule(routine.id, {
+            ...routine.schedule,
+            resumeAt: new Date(resumeAt).toISOString(),
+          });
+        } catch {
+          // Display mirror only; the resume store is authoritative.
+        }
+      }
+      res.status(201).json({ ok: true, resume });
+    } catch (err) {
+      res.status(400).json(errorBody(err instanceof Error ? err.message : 'Failed to schedule limit-reset resume'));
+    }
+  });
+
+  router.get('/:id/limit-resets', (req: Request, res: Response) => {
+    const routine = requireRoutine(res, req.params.id);
+    if (!routine) return;
+    if (!deps.resumeStore) {
+      res.status(501).json(errorBody('Limit-reset resumes are not enabled on this server'));
+      return;
+    }
+    res.json({ ok: true, resumes: deps.resumeStore.listByRoutine(routine.id) });
+  });
+
+  router.delete('/:id/limit-resets/:resumeId', (req: Request, res: Response) => {
+    const routine = requireRoutine(res, req.params.id);
+    if (!routine) return;
+    if (!deps.resumeStore) {
+      res.status(501).json(errorBody('Limit-reset resumes are not enabled on this server'));
+      return;
+    }
+    const resumeId = req.params.resumeId;
+    if (!validId(resumeId)) {
+      res.status(400).json(errorBody('Invalid resume id'));
+      return;
+    }
+    const resume = deps.resumeStore.get(resumeId);
+    if (!resume || resume.routineId !== routine.id) {
+      res.status(404).json(errorBody(`Unknown resume "${resumeId}" for this routine`));
+      return;
+    }
+    const cancelled = deps.resumeStore.cancel(resumeId);
+    res.json({ ok: true, cancelled });
+  });
+
+  // --- Connected-app event triggers (W2) ----------------------------------
+  // Status for an event schedule: persisted cursor, last poll/fire times,
+  // last poll error, and today's fire count against the daily cap. The
+  // polling engine itself lives in routine-events.ts.
+
+  router.get('/:id/event-trigger', (req: Request, res: Response) => {
+    const routine = requireRoutine(res, req.params.id);
+    if (!routine) return;
+    const schedule = routine.schedule;
+    if (!schedule || schedule.kind !== 'event') {
+      res.status(400).json(errorBody('Routine has no event trigger'));
+      return;
+    }
+    const state = deps.eventStore?.getState(routine.id);
+    const today = eventDayKey(schedule.timezone, Date.now());
+    const firesToday = deps.eventStore?.firesOn(routine.id, today) ?? 0;
+    res.json({
+      ok: true,
+      routineId: routine.id,
+      schedule,
+      status: state
+        ? {
+            cursorId: state.cursorId,
+            cursorTs: state.cursorTs,
+            lastPollAt: state.lastPollAt,
+            lastFiredAt: state.lastFiredAt,
+            lastError: state.lastError,
+            capBlocked: state.capBlocked,
+            firesToday,
+            dailyCap: schedule.dailyCap,
+          }
+        : {
+            cursorId: null,
+            cursorTs: null,
+            lastPollAt: null,
+            lastFiredAt: null,
+            lastError: null,
+            capBlocked: false,
+            firesToday,
+            dailyCap: schedule.dailyCap,
+          },
+    });
   });
 
   router.post('/:id/triggers', (req: Request, res: Response) => {
