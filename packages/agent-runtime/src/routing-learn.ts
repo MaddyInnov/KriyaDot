@@ -68,6 +68,20 @@ export interface LearnedRoutingRuleWhen {
   messagePattern?: string;
 }
 
+export type RoutingRuleStatus = 'shadow' | 'active' | 'retired';
+
+/** Shadow-trial evidence for a candidate rule (Octomind parity, Tier 3). */
+export interface ShadowTrialStats {
+  /** Corrections the rule matched while in shadow. */
+  trials: number;
+  /** Trials where the rule's pick equalled the user's corrected pick. */
+  agreements: number;
+  /** Trials where the rule matched but picked something else. */
+  disagreements: number;
+  /** ISO timestamp the shadow trial started. */
+  since: string;
+}
+
 export interface LearnedRoutingRule {
   /** Stable id, e.g. "rr-20261009-0001". */
   id: string;
@@ -78,6 +92,22 @@ export interface LearnedRoutingRule {
   /** How many user corrections support this rule. */
   count: number;
   updatedAt: string;
+  /**
+   * Evolution lifecycle (shadow-trial pipeline): absent = 'active'
+   * (rules learned before the pipeline existed stay live). Candidate
+   * rules start 'shadow' — scored against incoming corrections but
+   * never routed — and are promoted to 'active' only when their
+   * trial record beats the bar (or a human promotes them). 'retired'
+   * is the rollback state: kept for audit, never matched.
+   */
+  status?: RoutingRuleStatus;
+  shadow?: ShadowTrialStats;
+  promotedAt?: string;
+}
+
+/** A rule's effective lifecycle status (legacy rules are active). */
+export function ruleStatus(rule: LearnedRoutingRule): RoutingRuleStatus {
+  return rule.status ?? 'active';
 }
 
 export interface MatchInput {
@@ -260,6 +290,8 @@ export function matchLearnedRule(
 ): LearnedRoutingRule | undefined {
   for (const wantPattern of [true, false]) {
     for (const rule of rules) {
+      // Shadow candidates are scored, never routed; retired rules are dead.
+      if (ruleStatus(rule) !== 'active') continue;
       if ((rule.when.messagePattern !== undefined) !== wantPattern) continue;
       if (rule.when.taskType !== undefined && rule.when.taskType !== input.taskType) continue;
       if (rule.when.messagePattern !== undefined) {
@@ -333,6 +365,153 @@ export function recordRoutingCorrection(dataDir: string, correction: RoutingCorr
   const rules = learnFromCorrection(correction, loadRoutingRules(dataDir));
   saveRoutingRules(dataDir, rules);
   return rules;
+}
+
+// ---------------------------------------------------------------------------
+// Shadow-trial evolution pipeline (Octomind parity, Tier 3).
+//
+// New candidate rules do NOT go live on the strength of one correction.
+// They enter 'shadow': every subsequent correction is a trial — if the
+// shadow rule matches the correction's input, its pick is compared
+// against the user's corrected pick (the control outcome: the routed
+// pick was wrong by definition). A rule is promoted to 'active' only
+// when it has enough trials and its agreement rate clears the bar —
+// it must demonstrably beat the control. Humans can also promote or
+// roll back (retire) any rule through the API surface.
+// ---------------------------------------------------------------------------
+
+export interface ShadowPromotionBar {
+  /** Minimum matched corrections before promotion is considered. */
+  minTrials: number;
+  /** agreements / trials must reach this rate (0..1). */
+  minAgreementRate: number;
+}
+
+export const DEFAULT_SHADOW_BAR: ShadowPromotionBar = { minTrials: 3, minAgreementRate: 0.8 };
+
+/** Does this rule's scope match a correction's input (ignoring status)? */
+function ruleMatchesInput(rule: LearnedRoutingRule, input: MatchInput): boolean {
+  if (rule.when.taskType !== undefined && rule.when.taskType !== input.taskType) return false;
+  if (rule.when.messagePattern !== undefined) {
+    if (!input.message) return false;
+    try {
+      return new RegExp(rule.when.messagePattern, 'i').test(input.message);
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Learn from a correction as CANDIDATE rules: anything newly created
+ * or whose target changed enters shadow with fresh trial stats;
+ * rules merely strengthened by the correction keep their status.
+ */
+export function proposeFromCorrection(
+  correction: RoutingCorrection,
+  existing: LearnedRoutingRule[] = [],
+): LearnedRoutingRule[] {
+  const learned = learnFromCorrection(correction, existing);
+  const before = new Map(existing.map((r) => [r.id, r]));
+  const at = correction.at ?? new Date().toISOString();
+  return learned.map((rule) => {
+    const prev = before.get(rule.id);
+    if (prev && sameTarget(prev.then, rule.then) && ruleStatus(prev) !== 'retired') {
+      return rule; // strengthened or untouched — status unchanged
+    }
+    return {
+      ...rule,
+      status: 'shadow' as const,
+      shadow: { trials: 0, agreements: 0, disagreements: 0, since: at },
+      promotedAt: undefined,
+    };
+  });
+}
+
+/**
+ * Score every shadow rule against one correction (mutates a clone).
+ * The creating correction counts as the rule's first trial — it
+ * trivially agrees with it, which is honest: one data point, and the
+ * bar demands more.
+ */
+export function scoreShadowRules(
+  rules: LearnedRoutingRule[],
+  correction: RoutingCorrection,
+): LearnedRoutingRule[] {
+  const corrected = { providerId: correction.correctedProviderId, modelId: correction.correctedModelId };
+  const input: MatchInput = { taskType: correction.taskType, message: correction.message };
+  return rules.map((rule) => {
+    if (ruleStatus(rule) !== 'shadow') return rule;
+    if (!ruleMatchesInput(rule, input)) return rule;
+    const stats = rule.shadow ?? { trials: 0, agreements: 0, disagreements: 0, since: correction.at ?? new Date().toISOString() };
+    const agree = sameTarget(rule.then, corrected);
+    return {
+      ...rule,
+      shadow: {
+        ...stats,
+        trials: stats.trials + 1,
+        agreements: stats.agreements + (agree ? 1 : 0),
+        disagreements: stats.disagreements + (agree ? 0 : 1),
+      },
+    };
+  });
+}
+
+/** Promotion eligibility under a bar (default DEFAULT_SHADOW_BAR). */
+export function eligibleForPromotion(
+  rule: LearnedRoutingRule,
+  bar: ShadowPromotionBar = DEFAULT_SHADOW_BAR,
+): boolean {
+  if (ruleStatus(rule) !== 'shadow' || !rule.shadow) return false;
+  if (rule.shadow.trials < bar.minTrials) return false;
+  return rule.shadow.agreements / rule.shadow.trials >= bar.minAgreementRate;
+}
+
+/** Promote every shadow rule that clears the bar. Returns promoted ids. */
+export function applyShadowPromotions(
+  rules: LearnedRoutingRule[],
+  bar: ShadowPromotionBar = DEFAULT_SHADOW_BAR,
+  at: string = new Date().toISOString(),
+): { rules: LearnedRoutingRule[]; promoted: string[] } {
+  const promoted: string[] = [];
+  const out = rules.map((rule) => {
+    if (!eligibleForPromotion(rule, bar)) return rule;
+    promoted.push(rule.id);
+    return { ...rule, status: 'active' as const, promotedAt: at };
+  });
+  return { rules: out, promoted };
+}
+
+/** Human promote (bypasses the bar). Unknown id → rules unchanged. */
+export function promoteRule(rules: LearnedRoutingRule[], id: string, at: string = new Date().toISOString()): LearnedRoutingRule[] {
+  return rules.map((rule) =>
+    rule.id === id && ruleStatus(rule) !== 'retired'
+      ? { ...rule, status: 'active' as const, promotedAt: at }
+      : rule,
+  );
+}
+
+/** Rollback: retire a rule (kept for audit; never matched again). */
+export function retireRule(rules: LearnedRoutingRule[], id: string): LearnedRoutingRule[] {
+  return rules.map((rule) => (rule.id === id ? { ...rule, status: 'retired' as const } : rule));
+}
+
+/**
+ * The shadow-pipeline correction entry point: propose candidates,
+ * score all shadow rules against the correction, auto-promote those
+ * clearing the bar, persist. Returns the rules + promoted rule ids.
+ */
+export function recordShadowCorrection(
+  dataDir: string,
+  correction: RoutingCorrection,
+  bar: ShadowPromotionBar = DEFAULT_SHADOW_BAR,
+): { rules: LearnedRoutingRule[]; promoted: string[] } {
+  const proposed = proposeFromCorrection(correction, loadRoutingRules(dataDir));
+  const scored = scoreShadowRules(proposed, correction);
+  const { rules, promoted } = applyShadowPromotions(scored, bar, correction.at ?? new Date().toISOString());
+  saveRoutingRules(dataDir, rules);
+  return { rules, promoted };
 }
 
 // ---------------------------------------------------------------------------

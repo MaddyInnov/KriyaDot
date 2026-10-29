@@ -5,7 +5,8 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import matter from 'gray-matter';
 import type { SchemaDriftApprovalBroker } from './mcp.js';
-import type { ToolDefinition } from './types.js';
+import type { ToolDefinition, TurnValidatorSpec } from './types.js';
+import { parseValidatorSpecs } from './validators.js';
 
 // vitest (Vite 5.4.21) cannot statically resolve the `node:sqlite` specifier,
 // so load it at runtime via the builtin-module API instead of a top-level import.
@@ -32,6 +33,8 @@ export interface LoadedSkill {
   content: string;
   /** sha256 of the trimmed content, for provenance pinning. */
   sha256: string;
+  /** End-of-turn validators declared in frontmatter (Octomind parity). */
+  validators?: TurnValidatorSpec[];
 }
 
 export interface SkillPin {
@@ -128,6 +131,8 @@ interface RawSkill {
   name: string;
   description: string;
   content: string;
+  /** End-of-turn validators declared in frontmatter (Octomind parity). */
+  validators: TurnValidatorSpec[];
 }
 
 /**
@@ -265,7 +270,53 @@ export class SkillLoader {
       name: typeof data.name === 'string' && data.name ? data.name : name,
       description: typeof data.description === 'string' ? data.description : '',
       content: parsed.content.trim(),
+      validators: parseValidatorSpecs(data.validators),
     };
+  }
+
+  /**
+   * Validators a skill declares in its frontmatter (`validators:`),
+   * parsed into turn-validator specs. The runtime runs these at end of
+   * turn for bots that loaded the skill. Sync + gate-free by design: it
+   * only reads the declarations, never the gated content path.
+   */
+  getValidators(name: string): TurnValidatorSpec[] {
+    try {
+      return this.readSkill(name).validators;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Skill packs (Octomind parity): a directory skill (`<name>/SKILL.md`)
+   * may carry `scripts/`, `references/` and `assets/` subdirectories.
+   * Returns the pack directory (null for single-file skills) so hosts
+   * can resolve pack resources.
+   */
+  getPackDir(name: string): string | null {
+    const file = this.skillFile(name);
+    if (!file || !file.endsWith('SKILL.md')) return null;
+    return join(file, '..');
+  }
+
+  /** List a pack's resource files by kind (empty for single-file skills). */
+  listPackResources(name: string): { scripts: string[]; references: string[]; assets: string[] } {
+    const out = { scripts: [] as string[], references: [] as string[], assets: [] as string[] };
+    const dir = this.getPackDir(name);
+    if (!dir) return out;
+    for (const kind of ['scripts', 'references', 'assets'] as const) {
+      const sub = join(dir, kind);
+      try {
+        out[kind] = readdirSync(sub, { withFileTypes: true })
+          .filter((e) => e.isFile())
+          .map((e) => e.name)
+          .sort();
+      } catch {
+        // Missing subdir = no resources of that kind.
+      }
+    }
+    return out;
   }
 
   private async checkPin(name: string, sha256: string): Promise<void> {

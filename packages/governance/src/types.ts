@@ -14,6 +14,22 @@ export interface PolicyRule {
   actionClass?: ActionClass;
   effect: Effect;
   reason?: string;
+  /**
+   * Guardrails as code (Octomind parity): argument matching — the rule
+   * only matches when the named argument's value matches `pattern`
+   * (case-sensitive RegExp against the string value, or JSON for
+   * non-strings). A missing argument or an invalid pattern never
+   * matches (fail-closed).
+   */
+  argPattern?: { arg: string; pattern: string };
+  /**
+   * Guardrails as code (Octomind parity): session-history condition —
+   * the rule only matches when at least `minCount` (default 1) tools
+   * matching `toolPattern` (case-insensitive RegExp) have already run
+   * in this session. Needs EvalContext.sessionToolHistory; without it
+   * the rule never matches (fail-closed).
+   */
+  requiresHistory?: { toolPattern: string; minCount?: number };
 }
 
 /** A deny-by-default policy: `defaultEffect` applies when no rule matches. */
@@ -96,6 +112,14 @@ export interface EvalContext {
    * expired). Copied onto the ApprovalRecord.
    */
   neverExpire?: boolean;
+  /**
+   * Guardrails as code (Octomind parity): names of tools that have
+   * already executed in this session (in order). Policy rules with
+   * `requiresHistory` conditions match against this list. Supplied by
+   * the runtime's tool context; absent for out-of-session evaluations
+   * (simulations), where history-conditioned rules never match.
+   */
+  sessionToolHistory?: string[];
 }
 
 /** Result of evaluating a proposed tool call against the policy. */

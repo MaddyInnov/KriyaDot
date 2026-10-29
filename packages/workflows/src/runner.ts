@@ -12,14 +12,25 @@ import type { GovernanceGateway } from '@mvp/governance';
 import { WorkflowStore } from './store.js';
 import { renderTemplate, type TemplateContext } from './template.js';
 import { evaluateCode, evaluateCondition, type CodeSandboxContext } from './code-sandbox.js';
-import type {
-  NodeState,
-  NodeStatus,
-  RunStatus,
-  WorkflowDefinition,
-  WorkflowNode,
-  WorkflowRun,
+import { extractCostUsd } from './cost.js';
+import {
+  buildExecutionPlan,
+  computeReachableNodeIds,
+  computeTopologicalLevels,
+  subordinateIdsOf,
+  type DryRunPlan,
+} from './plan.js';
+import {
+  isNodeType,
+  type NodeState,
+  type NodeStatus,
+  type RunStatus,
+  type WorkflowDefinition,
+  type WorkflowNode,
+  type WorkflowRun,
 } from './types.js';
+
+export type { DryRunPlan, DryRunLevel, DryRunPlanNode } from './plan.js';
 
 export interface WorkflowRunnerOptions {
   dbPath: string;
@@ -49,6 +60,32 @@ function asRecord(value: unknown): Record<string, unknown> {
     return value as Record<string, unknown>;
   }
   return {};
+}
+
+/**
+ * Extra context for a sub-execution: a node driven directly by a `loop`
+ * or `match` node instead of by the DAG. `nodes` replaces the template /
+ * sandbox node-output map (so the body sees the latest loop outputs);
+ * `item` / `index` / `iteration` feed `{{item}}`, `{{index}}`,
+ * `{{iteration}}` and the code sandbox variables of the same names.
+ */
+interface SubExecutionContext {
+  nodes?: Record<string, unknown>;
+  item?: unknown;
+  index?: number;
+  iteration?: number;
+}
+
+/** Dot-path lookup (`a.b.0.c`) into a JSON-like value; undefined on miss. */
+function getPathValue(root: unknown, path: string): unknown {
+  let current: unknown = root;
+  for (const segment of path.split('.')) {
+    if (current === null || current === undefined || typeof current !== 'object') {
+      return undefined;
+    }
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
 }
 
 /**
@@ -88,6 +125,14 @@ export class WorkflowRunner {
   private readonly telemetryRuns = new Map<string, string>();
   private readonly telemetry?: TelemetryCollector;
 
+  /**
+   * Accumulated USD cost per in-flight run (sum of extractCostUsd over
+   * completed node outputs), for workflow budget enforcement. Entries
+   * live only while a run executes; node-level costs are durable on the
+   * node states themselves (`costUsd`).
+   */
+  private readonly runCosts = new Map<string, number>();
+
   constructor(opts: WorkflowRunnerOptions) {
     this.store = new WorkflowStore(opts.dbPath);
     this.agentRuntime = opts.agentRuntime;
@@ -106,6 +151,18 @@ export class WorkflowRunner {
   register(def: WorkflowDefinition): void {
     this.validateDefinition(def);
     this.store.saveWorkflow(def);
+  }
+
+  /**
+   * Dry run: validate a definition and return its execution plan
+   * (topological levels with node ids/types, subordinate loop/match
+   * nodes, unreachable nodes) WITHOUT executing anything — the agent
+   * runtime, tools, governance and the store are never touched, and the
+   * definition does not need to be registered first.
+   */
+  dryRun(def: WorkflowDefinition): DryRunPlan {
+    this.validateDefinition(def);
+    return buildExecutionPlan(def);
   }
 
   listWorkflows(): WorkflowDefinition[] {
@@ -137,14 +194,58 @@ export class WorkflowRunner {
 
   private validateDefinition(def: WorkflowDefinition): void {
     if (!def.id) throw new Error('workflow must have an id');
+    if (def.budget !== undefined) {
+      const max = def.budget.maxCostUsd;
+      if (typeof max !== 'number' || !Number.isFinite(max) || max < 0) {
+        throw new Error('workflow budget.maxCostUsd must be a non-negative number');
+      }
+    }
     const ids = new Set<string>();
     const byId = new Map<string, WorkflowNode>();
     for (const node of def.nodes) {
       if (!node.id) throw new Error('workflow node must have an id');
       if (ids.has(node.id)) throw new Error(`duplicate node id: ${node.id}`);
+      if (!isNodeType(node.type)) {
+        throw new Error(`node ${node.id}: unknown node type: ${String(node.type)}`);
+      }
       ids.add(node.id);
       byId.set(node.id, node);
       this.validateNodeConfig(node);
+      if (node.retry !== undefined) {
+        const { maxAttempts, backoffMs } = node.retry;
+        if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+          throw new Error(`node ${node.id}: retry.maxAttempts must be a positive integer`);
+        }
+        if (backoffMs !== undefined && (typeof backoffMs !== 'number' || backoffMs < 0)) {
+          throw new Error(`node ${node.id}: retry.backoffMs must be a non-negative number`);
+        }
+      }
+      if (node.timeoutMs !== undefined && (typeof node.timeoutMs !== 'number' || !(node.timeoutMs > 0))) {
+        throw new Error(`node ${node.id}: timeoutMs must be a positive number`);
+      }
+    }
+    // loop/match subordinate references must exist and not be self-refs.
+    for (const node of def.nodes) {
+      for (const ref of subordinateIdsOf(node)) {
+        if (!ids.has(ref)) {
+          throw new Error(`node ${node.id} (${node.type}) references unknown node: ${ref}`);
+        }
+        if (ref === node.id) {
+          throw new Error(`node ${node.id} (${node.type}) must not reference itself as its body/evaluator`);
+        }
+      }
+      if (node.type === 'loop') {
+        const config = asRecord(node.config);
+        if (config['bodyNodeId'] === config['evaluatorNodeId']) {
+          throw new Error(`loop node ${node.id}: bodyNodeId and evaluatorNodeId must differ`);
+        }
+      }
+      if (node.type === 'match') {
+        const config = asRecord(node.config);
+        if (config['sourceNodeId'] === node.id) {
+          throw new Error(`match node ${node.id}: sourceNodeId must not be the match node itself`);
+        }
+      }
     }
     for (const edge of def.edges) {
       const [from, to, branch] = edge;
@@ -213,6 +314,42 @@ export class WorkflowRunner {
       const code = config['code'];
       if (typeof code !== 'string' || code.trim().length === 0) {
         throw new Error(`code node ${node.id}: config.code must be a non-empty string`);
+      }
+    }
+    if (node.type === 'loop') {
+      const bodyNodeId = config['bodyNodeId'];
+      const evaluatorNodeId = config['evaluatorNodeId'];
+      if (typeof bodyNodeId !== 'string' || bodyNodeId.length === 0) {
+        throw new Error(`loop node ${node.id}: config.bodyNodeId is required`);
+      }
+      if (typeof evaluatorNodeId !== 'string' || evaluatorNodeId.length === 0) {
+        throw new Error(`loop node ${node.id}: config.evaluatorNodeId is required`);
+      }
+      const maxIterations = config['maxIterations'];
+      if (maxIterations !== undefined && (!Number.isInteger(maxIterations) || (maxIterations as number) < 1)) {
+        throw new Error(`loop node ${node.id}: config.maxIterations must be a positive integer`);
+      }
+      const acceptPath = config['acceptPath'];
+      if (acceptPath !== undefined && (typeof acceptPath !== 'string' || acceptPath.length === 0)) {
+        throw new Error(`loop node ${node.id}: config.acceptPath must be a non-empty string`);
+      }
+    }
+    if (node.type === 'match') {
+      const sourceNodeId = config['sourceNodeId'];
+      const bodyNodeId = config['bodyNodeId'];
+      if (typeof sourceNodeId !== 'string' || sourceNodeId.length === 0) {
+        throw new Error(`match node ${node.id}: config.sourceNodeId is required`);
+      }
+      if (typeof bodyNodeId !== 'string' || bodyNodeId.length === 0) {
+        throw new Error(`match node ${node.id}: config.bodyNodeId is required`);
+      }
+      const sourcePath = config['sourcePath'];
+      if (sourcePath !== undefined && (typeof sourcePath !== 'string' || sourcePath.length === 0)) {
+        throw new Error(`match node ${node.id}: config.sourcePath must be a non-empty string`);
+      }
+      const maxParallel = config['maxParallel'];
+      if (maxParallel !== undefined && (!Number.isInteger(maxParallel) || (maxParallel as number) < 1)) {
+        throw new Error(`match node ${node.id}: config.maxParallel must be a positive integer`);
       }
     }
   }
@@ -373,6 +510,17 @@ export class WorkflowRunner {
     // re-assembling the run from SQLite (2 queries per call).
     const primed = this.store.getRun(runId);
     if (primed) this.runCache.set(runId, primed);
+    // Budget accounting: seed from costs already recorded on completed
+    // node states (crash-resume must not reset the spend meter).
+    if (primed && !this.runCosts.has(runId)) {
+      let seed = 0;
+      for (const state of Object.values(primed.nodeStates)) {
+        if (state.status === 'succeeded' && typeof state.costUsd === 'number') {
+          seed += state.costUsd;
+        }
+      }
+      this.runCosts.set(runId, seed);
+    }
     // Runtime telemetry: one record per workflow run, keyed by runId so a
     // paused-then-resumed run reuses its record instead of double-counting.
     // Only metadata-tier fields are recorded; the ingestion guard runs.
@@ -444,6 +592,7 @@ export class WorkflowRunner {
         // Telemetry must never break execution.
       }
       this.runCache.delete(runId);
+      this.runCosts.delete(runId);
       this.executing.delete(runId);
     }
   }
@@ -466,9 +615,40 @@ export class WorkflowRunner {
       startedAt: Date.now(),
       attempts: priorAttempts + 1,
     });
+    let lastCostUsd = 0;
     try {
-      const output = await this.runNodeLogic(runId, node);
-      this.updateNodeState(runId, nodeId, { status: 'succeeded', output, endedAt: Date.now() });
+      const output = await this.runNodeWithPolicy(runId, node, undefined, {
+        onAttempt: (attempt) => {
+          if (attempt > 1) {
+            this.updateNodeState(runId, nodeId, {
+              status: 'running',
+              attempts: priorAttempts + attempt,
+            });
+          }
+        },
+      });
+      // Budget: sum the cost signal on the output; exceeding the
+      // workflow's cap fails this node (and therefore the run) with a
+      // budget error, and later levels never start.
+      const costUsd = extractCostUsd(output);
+      lastCostUsd = costUsd;
+      if (costUsd > 0) {
+        const total = (this.runCosts.get(runId) ?? 0) + costUsd;
+        this.runCosts.set(runId, total);
+        const maxCostUsd = def.budget?.maxCostUsd;
+        if (maxCostUsd !== undefined && total > maxCostUsd) {
+          throw new Error(
+            `budget exceeded: workflow ${def.id} spent $${total.toFixed(4)} which exceeds its budget of $${maxCostUsd.toFixed(4)} (maxCostUsd) at node ${nodeId}`,
+          );
+        }
+      }
+      const patch: Partial<NodeState> & { status: NodeStatus } = {
+        status: 'succeeded',
+        output,
+        endedAt: Date.now(),
+      };
+      if (costUsd > 0) patch.costUsd = costUsd;
+      this.updateNodeState(runId, nodeId, patch);
       this.checkpoint(runId);
       nodeStep?.end({ ok: true });
       // A node that paused for approval resumes the run once its decision lands.
@@ -477,18 +657,77 @@ export class WorkflowRunner {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       nodeStep?.end({ ok: false, errorKind: err instanceof Error ? err.name : 'Error' });
-      this.updateNodeState(runId, nodeId, {
+      const patch: Partial<NodeState> & { status: NodeStatus } = {
         status: 'failed',
         error: message,
         endedAt: Date.now(),
-      });
+      };
+      // Keep the cost of a node that tripped the budget on its state.
+      if (lastCostUsd > 0) patch.costUsd = lastCostUsd;
+      this.updateNodeState(runId, nodeId, patch);
       this.checkpoint(runId);
     }
   }
 
-  private async runNodeLogic(runId: string, node: WorkflowNode): Promise<unknown> {
+  /**
+   * Run a node's logic under its retry policy and per-attempt timeout.
+   * Retry: `node.retry.maxAttempts` total tries (default 1), sleeping
+   * `node.retry.backoffMs` (default 0) between tries. Timeout:
+   * `node.timeoutMs` caps each attempt via Promise.race — the same style
+   * as the code sandbox; the underlying work is not cancelled (JS cannot
+   * preempt it), only the wait is abandoned and the attempt fails.
+   */
+  private async runNodeWithPolicy(
+    runId: string,
+    node: WorkflowNode,
+    override?: SubExecutionContext,
+    hooks?: { onAttempt?: (attempt: number) => void },
+  ): Promise<unknown> {
+    const maxAttempts = node.retry?.maxAttempts ?? 1;
+    const backoffMs = node.retry?.backoffMs ?? 0;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      hooks?.onAttempt?.(attempt);
+      try {
+        return await this.withNodeTimeout(runId, node, override);
+      } catch (err) {
+        lastError = err;
+        if (attempt < maxAttempts && backoffMs > 0) await sleep(backoffMs);
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
+  private async withNodeTimeout(
+    runId: string,
+    node: WorkflowNode,
+    override?: SubExecutionContext,
+  ): Promise<unknown> {
+    const work = this.runNodeLogic(runId, node, override);
+    const timeoutMs = node.timeoutMs;
+    if (timeoutMs === undefined) return work;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`node ${node.id} timed out after ${timeoutMs}ms`)),
+        timeoutMs,
+      );
+      (timer as unknown as { unref?: () => void }).unref?.();
+    });
+    try {
+      return await Promise.race([work, deadline]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private async runNodeLogic(
+    runId: string,
+    node: WorkflowNode,
+    override?: SubExecutionContext,
+  ): Promise<unknown> {
     const run = this.getRunOrThrow(runId);
-    const ctx = this.buildTemplateContext(run);
+    const ctx = this.buildTemplateContext(run, override);
 
     switch (node.type) {
       case 'trigger':
@@ -603,7 +842,7 @@ export class WorkflowRunner {
           throw new Error(`if node ${node.id}: config.condition must be a non-empty string`);
         }
         const rendered = renderTemplate(rawCondition, ctx);
-        const sandboxCtx = this.buildCodeSandboxContext(run);
+        const sandboxCtx = this.buildCodeSandboxContext(run, override);
         const condition = await this.evaluateConditionValue(node.id, rendered, sandboxCtx);
         return { condition };
       }
@@ -630,7 +869,7 @@ export class WorkflowRunner {
         const timeoutMs =
           typeof config['timeoutMs'] === 'number' ? config['timeoutMs'] : undefined;
         try {
-          return await evaluateCode(code, this.buildCodeSandboxContext(run), timeoutMs);
+          return await evaluateCode(code, this.buildCodeSandboxContext(run, override), timeoutMs);
         } catch (err) {
           throw new Error(
             `code node ${node.id} failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -671,9 +910,192 @@ export class WorkflowRunner {
         return { text, sessionId };
       }
 
+      case 'loop': {
+        const config = asRecord(node.config);
+        const bodyNodeId = config['bodyNodeId'];
+        const evaluatorNodeId = config['evaluatorNodeId'];
+        if (typeof bodyNodeId !== 'string' || bodyNodeId.length === 0) {
+          throw new Error(`loop node ${node.id}: config.bodyNodeId is required`);
+        }
+        if (typeof evaluatorNodeId !== 'string' || evaluatorNodeId.length === 0) {
+          throw new Error(`loop node ${node.id}: config.evaluatorNodeId is required`);
+        }
+        const maxIterations =
+          typeof config['maxIterations'] === 'number' && config['maxIterations'] >= 1
+            ? Math.floor(config['maxIterations'])
+            : 5;
+        const acceptPath =
+          typeof config['acceptPath'] === 'string' && config['acceptPath'].length > 0
+            ? config['acceptPath']
+            : 'accept';
+        const def = this.getWorkflow(run.workflowId);
+        // Working output map: starts from the run's current node outputs
+        // and is updated with each iteration's body/evaluator outputs so
+        // both see the latest values via nodes.<id>.output.
+        const outputs: Record<string, unknown> = { ...(override?.nodes ?? {}) };
+        if (!override?.nodes) {
+          for (const [id, state] of Object.entries(run.nodeStates)) {
+            outputs[id] = state.output;
+          }
+        }
+        const history: {
+          iteration: number;
+          bodyOutput: unknown;
+          evaluatorOutput: unknown;
+          accepted: boolean;
+        }[] = [];
+        let totalCostUsd = 0;
+        let lastBodyOutput: unknown;
+        let lastEvaluatorOutput: unknown;
+        for (let iteration = 1; iteration <= maxIterations; iteration++) {
+          const bodyOutput = await this.executeSubNode(runId, def, bodyNodeId, {
+            nodes: { ...outputs },
+            iteration,
+            item: override?.item,
+            index: override?.index,
+          });
+          outputs[bodyNodeId] = bodyOutput;
+          lastBodyOutput = bodyOutput;
+          totalCostUsd += extractCostUsd(bodyOutput);
+          const evaluatorOutput = await this.executeSubNode(runId, def, evaluatorNodeId, {
+            nodes: { ...outputs },
+            iteration,
+            item: override?.item,
+            index: override?.index,
+          });
+          outputs[evaluatorNodeId] = evaluatorOutput;
+          lastEvaluatorOutput = evaluatorOutput;
+          totalCostUsd += extractCostUsd(evaluatorOutput);
+          const accepted = this.loopAccepted(evaluatorOutput, acceptPath);
+          history.push({ iteration, bodyOutput, evaluatorOutput, accepted });
+          if (accepted) {
+            this.markSubNodeSucceeded(runId, bodyNodeId, bodyOutput);
+            this.markSubNodeSucceeded(runId, evaluatorNodeId, evaluatorOutput);
+            const out: Record<string, unknown> = {
+              accepted: true,
+              iterations: iteration,
+              bodyOutput,
+              evaluatorOutput,
+              history,
+            };
+            if (totalCostUsd > 0) out['costUsd'] = totalCostUsd;
+            return out;
+          }
+        }
+        // Exhausted: body/evaluator themselves ran fine — record their
+        // last outputs — but the loop node fails with a clear error.
+        this.markSubNodeSucceeded(runId, bodyNodeId, lastBodyOutput);
+        this.markSubNodeSucceeded(runId, evaluatorNodeId, lastEvaluatorOutput);
+        throw new Error(
+          `loop node ${node.id}: evaluator did not accept after ${maxIterations} iteration(s) (maxIterations exhausted)`,
+        );
+      }
+
+      case 'match': {
+        const config = asRecord(node.config);
+        const sourceNodeId = config['sourceNodeId'];
+        const bodyNodeId = config['bodyNodeId'];
+        if (typeof sourceNodeId !== 'string' || sourceNodeId.length === 0) {
+          throw new Error(`match node ${node.id}: config.sourceNodeId is required`);
+        }
+        if (typeof bodyNodeId !== 'string' || bodyNodeId.length === 0) {
+          throw new Error(`match node ${node.id}: config.bodyNodeId is required`);
+        }
+        const maxParallel =
+          typeof config['maxParallel'] === 'number' && config['maxParallel'] >= 1
+            ? Math.floor(config['maxParallel'])
+            : 4;
+        const sourcePath =
+          typeof config['sourcePath'] === 'string' && config['sourcePath'].length > 0
+            ? config['sourcePath']
+            : undefined;
+        const def = this.getWorkflow(run.workflowId);
+        const outputs: Record<string, unknown> = { ...(override?.nodes ?? {}) };
+        if (!override?.nodes) {
+          for (const [id, state] of Object.entries(run.nodeStates)) {
+            outputs[id] = state.output;
+          }
+        }
+        const sourceOutput = outputs[sourceNodeId];
+        const itemsRaw = sourcePath ? getPathValue(sourceOutput, sourcePath) : sourceOutput;
+        if (!Array.isArray(itemsRaw)) {
+          throw new Error(
+            `match node ${node.id}: source ${sourceNodeId}${sourcePath ? `.${sourcePath}` : ''} did not produce an array`,
+          );
+        }
+        const items = itemsRaw as unknown[];
+        const results: unknown[] = new Array(items.length);
+        const costs: number[] = new Array(items.length).fill(0);
+        let cursor = 0;
+        const worker = async (): Promise<void> => {
+          for (;;) {
+            const index = cursor++;
+            if (index >= items.length) return;
+            const out = await this.executeSubNode(runId, def, bodyNodeId, {
+              nodes: { ...outputs },
+              item: items[index],
+              index,
+              iteration: override?.iteration,
+            });
+            results[index] = out;
+            costs[index] = extractCostUsd(out);
+          }
+        };
+        const workerCount = Math.min(maxParallel, items.length);
+        await Promise.all(Array.from({ length: workerCount }, () => worker()));
+        const totalCostUsd = costs.reduce((a, b) => a + b, 0);
+        if (items.length > 0) {
+          this.markSubNodeSucceeded(runId, bodyNodeId, results);
+        } else {
+          this.updateNodeState(runId, bodyNodeId, { status: 'skipped' });
+        }
+        const out: Record<string, unknown> = { results, count: items.length };
+        if (totalCostUsd > 0) out['costUsd'] = totalCostUsd;
+        return out;
+      }
+
       default:
         throw new Error(`unsupported node type: ${(node as WorkflowNode).type}`);
     }
+  }
+
+  /** Acceptance rule for a loop evaluator output (see LoopNodeConfig). */
+  private loopAccepted(evaluatorOutput: unknown, acceptPath: string): boolean {
+    if (typeof evaluatorOutput === 'boolean') return evaluatorOutput;
+    const value = getPathValue(evaluatorOutput, acceptPath);
+    return Boolean(value);
+  }
+
+  /**
+   * Execute a subordinate node (loop/match body or evaluator) directly,
+   * under its own retry/timeout policy. Sub-executions do not get their
+   * own level in the DAG; their final outputs are recorded on their node
+   * states by the driving node via markSubNodeSucceeded.
+   */
+  private async executeSubNode(
+    runId: string,
+    def: WorkflowDefinition,
+    targetId: string,
+    ctx: SubExecutionContext,
+  ): Promise<unknown> {
+    const target = def.nodes.find((n) => n.id === targetId);
+    if (!target) throw new Error(`unknown subordinate node ${targetId} in workflow ${def.id}`);
+    return this.runNodeWithPolicy(runId, target, ctx);
+  }
+
+  /** Record a subordinate node's final output as a succeeded state. */
+  private markSubNodeSucceeded(runId: string, nodeId: string, output: unknown): void {
+    const run = this.getRunOrThrow(runId);
+    const priorAttempts = run.nodeStates[nodeId]?.attempts ?? 0;
+    const patch: Partial<NodeState> & { status: NodeStatus } = {
+      status: 'succeeded',
+      output,
+      endedAt: Date.now(),
+      attempts: priorAttempts + 1,
+    };
+    const costUsd = extractCostUsd(output);
+    if (costUsd > 0 && !Array.isArray(output)) patch.costUsd = costUsd;
+    this.updateNodeState(runId, nodeId, patch);
   }
 
   /**
@@ -754,58 +1176,18 @@ export class WorkflowRunner {
   }
 
   private reachableFromTrigger(def: WorkflowDefinition): Set<string> {
-    const adjacency = new Map<string, string[]>();
-    for (const node of def.nodes) adjacency.set(node.id, []);
-    for (const [from, to] of def.edges) adjacency.get(from)!.push(to);
-    const trigger = def.nodes.find((n) => n.type === 'trigger')!;
-    const seen = new Set<string>();
-    const stack = [trigger.id];
-    while (stack.length > 0) {
-      const id = stack.pop()!;
-      if (seen.has(id)) continue;
-      seen.add(id);
-      for (const next of adjacency.get(id)!) stack.push(next);
-    }
-    return seen;
+    return computeReachableNodeIds(def);
   }
 
   /**
    * Level-by-level topological order of the trigger-reachable subgraph.
    * Nodes in the same level have no dependencies on each other (fan-out);
-   * every level waits for all previous levels (join).
+   * every level waits for all previous levels (join). Subordinate
+   * (loop/match-driven) nodes are excluded — they execute inside their
+   * driving node, not as standalone steps.
    */
   private topologicalLevels(def: WorkflowDefinition): string[][] {
-    const reachable = this.reachableFromTrigger(def);
-    const adjacency = new Map<string, string[]>();
-    const indegree = new Map<string, number>();
-    for (const id of reachable) {
-      adjacency.set(id, []);
-      indegree.set(id, 0);
-    }
-    for (const [from, to] of def.edges) {
-      if (!reachable.has(from) || !reachable.has(to)) continue;
-      adjacency.get(from)!.push(to);
-      indegree.set(to, indegree.get(to)! + 1);
-    }
-    const levels: string[][] = [];
-    let frontier = [...reachable].filter((id) => indegree.get(id) === 0);
-    const emitted = new Set<string>();
-    while (frontier.length > 0) {
-      levels.push(frontier);
-      for (const id of frontier) emitted.add(id);
-      const next: string[] = [];
-      for (const id of frontier) {
-        for (const dep of adjacency.get(id)!) {
-          indegree.set(dep, indegree.get(dep)! - 1);
-          if (indegree.get(dep) === 0) next.push(dep);
-        }
-      }
-      frontier = next;
-    }
-    if (emitted.size !== reachable.size) {
-      throw new Error('workflow graph has a cycle in the trigger-reachable subgraph');
-    }
-    return levels;
+    return computeTopologicalLevels(def);
   }
 
   // -- state helpers ----------------------------------------------------------
@@ -824,20 +1206,41 @@ export class WorkflowRunner {
    * reference syntax (`{{nodes.<id>.output…}}`) so the same paths work in
    * both places.
    */
-  private buildCodeSandboxContext(run: WorkflowRun): CodeSandboxContext {
+  private buildCodeSandboxContext(
+    run: WorkflowRun,
+    override?: SubExecutionContext,
+  ): CodeSandboxContext {
     const nodes: Record<string, unknown> = {};
-    for (const [id, state] of Object.entries(run.nodeStates)) {
-      nodes[id] = { output: state.output };
+    if (override?.nodes) {
+      for (const [id, output] of Object.entries(override.nodes)) {
+        nodes[id] = { output };
+      }
+    } else {
+      for (const [id, state] of Object.entries(run.nodeStates)) {
+        nodes[id] = { output: state.output };
+      }
     }
-    return { input: run.input, nodes };
+    const ctx: CodeSandboxContext = { input: run.input, nodes };
+    if (override?.item !== undefined) ctx.item = override.item;
+    if (override?.index !== undefined) ctx.index = override.index;
+    if (override?.iteration !== undefined) ctx.iteration = override.iteration;
+    return ctx;
   }
 
-  private buildTemplateContext(run: WorkflowRun): TemplateContext {
+  private buildTemplateContext(run: WorkflowRun, override?: SubExecutionContext): TemplateContext {
     const nodes: Record<string, unknown> = {};
-    for (const [id, state] of Object.entries(run.nodeStates)) {
-      nodes[id] = state.output;
+    if (override?.nodes) {
+      Object.assign(nodes, override.nodes);
+    } else {
+      for (const [id, state] of Object.entries(run.nodeStates)) {
+        nodes[id] = state.output;
+      }
     }
-    return { input: run.input, nodes };
+    const ctx: TemplateContext = { input: run.input, nodes };
+    if (override?.item !== undefined) ctx.item = override.item;
+    if (override?.index !== undefined) ctx.index = override.index;
+    if (override?.iteration !== undefined) ctx.iteration = override.iteration;
+    return ctx;
   }
 
   private updateNodeState(runId: string, nodeId: string, patch: Partial<NodeState> & { status: NodeStatus }): void {

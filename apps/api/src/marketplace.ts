@@ -31,10 +31,16 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import {
+  bootstrapFirstRun,
+  getBundle,
+  installBundle,
   isMcpInstallApprovalRequired,
+  listBundles,
   MarketplaceInstaller,
   MCP_INSTALL_TOOL,
+  scaffoldSkill,
 } from '@mvp/marketplace';
+import { join } from 'node:path';
 import type { MarketplaceKind } from '@mvp/marketplace';
 import { MarketplaceRegistry } from '@mvp/marketplace';
 import { RevenueLedger } from '@mvp/marketplace';
@@ -68,6 +74,55 @@ export function registerMarketplaceRoutes(router: Router, deps: MarketplaceDeps)
       res.json(entries);
     } catch (err) {
       res.status(500).json({ error: errMessage(err, 'failed to list marketplace entries') });
+    }
+  });
+
+  // -- Specialist packaging (Octomind parity): bundles, first-run
+  // bootstrap, and the skill authoring scaffold. Registered before
+  // the /:id routes so 'bundles'/'bootstrap' are not captured as ids.
+  router.get('/bundles', (_req: Request, res: Response) => {
+    res.json({ ok: true, bundles: listBundles() });
+  });
+
+  router.post('/bundles/:id/install', (req: Request, res: Response) => {
+    const bundle = getBundle(req.params.id);
+    if (!bundle) {
+      res.status(404).json({ error: `Unknown bundle "${req.params.id}"` });
+      return;
+    }
+    try {
+      const result = installBundle(bundle, registry, installer);
+      res.status(201).json({ ok: true, ...result });
+    } catch (err) {
+      res.status(500).json({ error: errMessage(err, 'bundle install failed') });
+    }
+  });
+
+  router.post('/bootstrap', (_req: Request, res: Response) => {
+    try {
+      const result = bootstrapFirstRun({ dataDir: deps.dataDir, registry, installer });
+      res.status(result.alreadyBootstrapped ? 200 : 201).json({ ok: true, ...result });
+    } catch (err) {
+      res.status(500).json({ error: errMessage(err, 'bootstrap failed') });
+    }
+  });
+
+  router.post('/scaffold-skill', (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as { slug?: unknown; name?: unknown; description?: unknown };
+    try {
+      if (typeof body.slug !== 'string' || typeof body.name !== 'string' || typeof body.description !== 'string') {
+        throw new Error('Body must be { slug, name, description } (strings)');
+      }
+      // The runtime loads user skills from <dataDir>/skills — the
+      // scaffold lands exactly where the loader will pick it up.
+      const path = scaffoldSkill(join(deps.dataDir, 'skills'), {
+        slug: body.slug,
+        name: body.name,
+        description: body.description,
+      });
+      res.status(201).json({ ok: true, path });
+    } catch (err) {
+      res.status(400).json({ error: errMessage(err, 'scaffold failed') });
     }
   });
 

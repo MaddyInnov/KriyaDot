@@ -45,7 +45,7 @@ export type PrivateMcpConnectFn = (server: PrivateMcpServer) => Promise<LazyMcpC
 
 function defaultConnectFn(pinDbPath?: string): PrivateMcpConnectFn {
   return async (server: PrivateMcpServer): Promise<LazyMcpConnector> => {
-    const client = new MCPClient({ serverName: server.label, pinDbPath });
+    const client = new MCPClient({ serverName: server.label, pinDbPath, elicitation: 'widget' });
     if (server.config.kind === 'http') {
       await client.connectHttp(server.config.url as string);
     } else {

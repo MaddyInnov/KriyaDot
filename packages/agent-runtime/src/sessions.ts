@@ -152,6 +152,42 @@ export interface SessionStoreOptions {
    * integer.
    */
   compactThreshold?: number;
+  /**
+   * Adaptive compression (Octomind parity): instead of a fixed message
+   * count, the fold depth is COMPUTED from measured growth — the
+   * verbatim tail is sized by estimated tokens against
+   * `contextBudgetTokens`, so a session of short messages keeps more
+   * verbatim history than a session of huge tool outputs. Default off
+   * (fixed-count behavior unchanged).
+   */
+  adaptiveCompaction?: boolean;
+  /** Token budget for the adaptive tail + summary (default 60_000). */
+  contextBudgetTokens?: number;
+  /**
+   * Background folds (Octomind parity): when a fold is due and a prior
+   * summary exists, getMessages returns the current view immediately
+   * and folds in the background; the next read sees the extended
+   * summary. The first fold for a session is always synchronous (there
+   * is no summary to serve yet). Default off.
+   */
+  backgroundCompaction?: boolean;
+}
+
+/** One archived (lossless) compacted range, dereferenceable via recall. */
+export interface CompactionArchiveEntry {
+  id: string;
+  sessionId: string;
+  fromId: number;
+  toId: number;
+  messageCount: number;
+  summary: string;
+  createdAt: string;
+}
+
+/** Rough token estimate (≈4 chars/token) for one stored message row. */
+function estimateRowTokens(row: MessageRow): number {
+  let chars = row.content.length + (row.tool_calls?.length ?? 0);
+  return Math.ceil(chars / 4) + 8;
 }
 
 function parsePositiveInt(raw: string | number | undefined): number | undefined {
@@ -199,8 +235,13 @@ export class SessionStore {
   private readonly historyLimit: number;
   private readonly summarizer?: SessionSummarizer;
   private readonly compactThreshold: number;
+  private readonly adaptiveCompaction: boolean;
+  private readonly contextBudgetTokens: number;
+  private readonly backgroundCompaction: boolean;
   /** sessionId → { summary, upToId }: already-compacted watermark cache. */
   private readonly compactionCache = new Map<string, { summary: string; upToId: number }>();
+  /** Sessions with a background fold currently in flight. */
+  private readonly foldsInFlight = new Set<string>();
 
   constructor(dbPath: string, opts: SessionStoreOptions = {}) {
     this.db = openDb(dbPath);
@@ -210,6 +251,9 @@ export class SessionStore {
       DEFAULT_HISTORY_LIMIT;
     this.summarizer = opts.summarizer;
     this.compactThreshold = parsePositiveInt(opts.compactThreshold) ?? DEFAULT_COMPACT_THRESHOLD;
+    this.adaptiveCompaction = opts.adaptiveCompaction === true;
+    this.contextBudgetTokens = parsePositiveInt(opts.contextBudgetTokens) ?? 60_000;
+    this.backgroundCompaction = opts.backgroundCompaction === true;
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY,
@@ -240,6 +284,17 @@ export class SessionStore {
         up_to_id INTEGER NOT NULL,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS compaction_archive (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        from_id INTEGER NOT NULL,
+        to_id INTEGER NOT NULL,
+        message_count INTEGER NOT NULL,
+        messages_json TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_compaction_archive_session ON compaction_archive (session_id, from_id);
       CREATE TABLE IF NOT EXISTS session_worktrees (
         session_id TEXT PRIMARY KEY,
         worktree_path TEXT NOT NULL,
@@ -437,15 +492,181 @@ export class SessionStore {
     this.compactionCache.set(sessionId, { summary, upToId });
   }
 
-  async getMessages(sessionId: string): Promise<ChatMessage[]> {
-    const rows = this.db
+  private allRows(sessionId: string): MessageRow[] {
+    return this.db
       .prepare(
         'SELECT id, role, content, tool_name, tool_call_id, tool_calls FROM messages WHERE session_id = ? ORDER BY id ASC',
       )
       .all(sessionId) as unknown as MessageRow[];
+  }
+
+  /**
+   * Decide the verbatim tail and the range to fold, or null when no
+   * fold is due. Fixed mode: fold when total > keepN + threshold.
+   * Adaptive mode: the tail is sized by estimated tokens against the
+   * context budget (at least 20 messages, at most keepN), and a fold is
+   * due when the context exceeds the budget (with a minimum chunk) or
+   * the count backstop trips.
+   */
+  private planCompaction(
+    rows: MessageRow[],
+    keepN: number,
+  ): { compactRange: MessageRow[]; kept: MessageRow[] } | null {
+    if (!this.adaptiveCompaction) {
+      if (rows.length <= keepN + this.compactThreshold) return null;
+      return { compactRange: rows.slice(0, rows.length - keepN), kept: rows.slice(-keepN) };
+    }
+    const totalTokens = rows.reduce((sum, r) => sum + estimateRowTokens(r), 0);
+    let keep = 0;
+    let tailTokens = 0;
+    const tailBudget = Math.floor(this.contextBudgetTokens * 0.7);
+    for (let i = rows.length - 1; i >= 0; i--) {
+      tailTokens += estimateRowTokens(rows[i]!);
+      keep += 1;
+      // Floor of 8 verbatim messages (the most recent exchanges are
+      // never folded); beyond it the token budget rules.
+      if (keep >= 8 && tailTokens >= tailBudget) break;
+      if (keep >= keepN) break;
+    }
+    keep = Math.min(keep, rows.length);
+    const foldCount = rows.length - keep;
+    const countBackstop = rows.length > keepN + this.compactThreshold;
+    if (foldCount <= 0) return null;
+    if (!countBackstop && !(totalTokens > this.contextBudgetTokens && foldCount >= 10)) return null;
+    return { compactRange: rows.slice(0, foldCount), kept: rows.slice(foldCount) };
+  }
+
+  /** Archive a raw range losslessly BEFORE it folds into the summary. */
+  private archiveRange(sessionId: string, range: MessageRow[], summary: string): string {
+    const fromId = range[0]!.id;
+    const toId = range[range.length - 1]!.id;
+    const id = `arc-${sessionId.slice(0, 12)}-${fromId}-${toId}`;
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO compaction_archive (id, session_id, from_id, to_id, message_count, messages_json, summary, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(id, sessionId, fromId, toId, range.length, JSON.stringify(range.map(mapRow)), summary, new Date().toISOString());
+    return id;
+  }
+
+  /** List a session's lossless compaction archives (oldest first). */
+  /**
+   * Last message activity for a bot across all its sessions (UTC ms),
+   * or undefined when the bot has no messages. Powers idle triggers.
+   */
+  lastActivityForBot(botId: string): number | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT MAX(m.ts) AS last_ts FROM messages m
+         JOIN sessions s ON s.id = m.session_id WHERE s.bot_id = ?`,
+      )
+      .get(botId) as { last_ts: string | null } | undefined;
+    if (!row?.last_ts) return undefined;
+    const ms = Date.parse(row.last_ts);
+    return Number.isFinite(ms) ? ms : undefined;
+  }
+
+  listArchives(sessionId: string): CompactionArchiveEntry[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, session_id AS sessionId, from_id AS fromId, to_id AS toId, summary, created_at AS createdAt,
+                message_count AS messageCount
+         FROM compaction_archive WHERE session_id = ? ORDER BY from_id ASC`,
+      )
+      .all(sessionId) as unknown as CompactionArchiveEntry[];
+    return rows;
+  }
+
+  /** Derefence one archive: the original messages, verbatim. */
+  readArchive(archiveId: string): { entry: CompactionArchiveEntry; messages: RichMessage[] } | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT id, session_id AS sessionId, from_id AS fromId, to_id AS toId, summary, created_at AS createdAt, messages_json AS messagesJson
+         FROM compaction_archive WHERE id = ?`,
+      )
+      .get(archiveId) as (CompactionArchiveEntry & { messagesJson: string }) | undefined;
+    if (!row) return undefined;
+    let messages: RichMessage[] = [];
+    try {
+      messages = JSON.parse(row.messagesJson) as RichMessage[];
+    } catch {
+      messages = [];
+    }
+    return {
+      entry: { ...row, messageCount: messages.length },
+      messages,
+    };
+  }
+
+  private compactionHeader(sessionId: string, summary: string, compactedCount: number, keptCount: number): ChatMessage {
+    const archives = this.summarizer ? this.listArchives(sessionId) : [];
+    const archiveNote =
+      archives.length > 0
+        ? `\n[lossless archive: the original messages are preserved — recall them with the ` +
+          `recall_compacted_context tool using an archive id: ${archives.map((a) => a.id).join(', ')}]`
+        : '';
+    return {
+      role: 'system',
+      content:
+        `[compacted summary — ${compactedCount} older message(s) summarized; ` +
+        `the last ${keptCount} message(s) follow verbatim]${archiveNote}\n${summary}`,
+    };
+  }
+
+  /**
+   * Fold the planned range: archive it losslessly, summarize only the
+   * messages past the watermark, and extend the stored summary.
+   * Idempotent — a range already covered by the watermark reuses the
+   * cached summary without calling the summarizer or re-archiving.
+   */
+  private async foldRange(
+    sessionId: string,
+    compactRange: MessageRow[],
+  ): Promise<{ summary: string; upToId: number }> {
+    const lastCompactId = compactRange[compactRange.length - 1]!.id;
+    const cached = this.compactionCache.get(sessionId) ?? this.readCompaction(sessionId);
+    if (cached && cached.upToId >= lastCompactId) return cached;
+    const fresh = compactRange.filter((r) => r.id > (cached?.upToId ?? -1));
+    const chunk = await this.summarizer!(fresh.map(mapRow));
+    if (fresh.length > 0) this.archiveRange(sessionId, fresh, chunk);
+    const summary = cached ? `${cached.summary}\n\n${chunk}` : chunk;
+    this.writeCompaction(sessionId, summary, lastCompactId);
+    return { summary, upToId: lastCompactId };
+  }
+
+  /**
+   * Force a compaction fold for a session now (e.g. a /compact command
+   * or a background janitor). Returns true when a fold actually ran.
+   */
+  async compactNow(sessionId: string): Promise<boolean> {
+    if (!this.summarizer) return false;
+    const rows = this.allRows(sessionId);
+    const keepN = Math.max(this.historyLimit, COMPACTION_KEEP_FLOOR);
+    const plan = this.planCompaction(rows, keepN);
+    if (!plan) return false;
+    const before = (this.compactionCache.get(sessionId) ?? this.readCompaction(sessionId))?.upToId ?? -1;
+    const after = await this.foldRange(sessionId, plan.compactRange);
+    return after.upToId > before;
+  }
+
+  private startBackgroundFold(sessionId: string, rows: MessageRow[], keepN: number): void {
+    if (this.foldsInFlight.has(sessionId)) return;
+    const plan = this.planCompaction(rows, keepN);
+    if (!plan) return;
+    this.foldsInFlight.add(sessionId);
+    void this.foldRange(sessionId, plan.compactRange)
+      .catch(() => undefined)
+      .finally(() => {
+        this.foldsInFlight.delete(sessionId);
+      });
+  }
+
+  async getMessages(sessionId: string): Promise<ChatMessage[]> {
+    const rows = this.allRows(sessionId);
 
     const keepN = Math.max(this.historyLimit, COMPACTION_KEEP_FLOOR);
-    if (!this.summarizer || rows.length <= keepN + this.compactThreshold) {
+    if (!this.summarizer) {
       // Legacy blind-truncation rolling window (unchanged behaviour).
       const mapped = rows.map(mapRow);
       if (mapped.length > this.historyLimit) {
@@ -458,29 +679,37 @@ export class SessionStore {
       return mapped;
     }
 
-    // Summarization auto-compaction: everything except the last keepN
-    // messages becomes one leading system summary.
-    const kept = rows.slice(-keepN);
-    const compactRange = rows.slice(0, rows.length - keepN);
-    const lastCompactId = compactRange[compactRange.length - 1]!.id;
-
-    const cached = this.compactionCache.get(sessionId) ?? this.readCompaction(sessionId);
-    let summary: string;
-    if (cached && cached.upToId >= lastCompactId) {
-      // Idempotent: the whole range is already compacted; reuse the summary.
-      summary = cached.summary;
-    } else {
-      // Incremental: summarize only messages appended since the watermark.
-      const fresh = compactRange.filter((r) => r.id > (cached?.upToId ?? -1));
-      const chunk = await this.summarizer(fresh.map(mapRow));
-      summary = cached ? `${cached.summary}\n\n${chunk}` : chunk;
-      this.writeCompaction(sessionId, summary, lastCompactId);
+    const plan = this.planCompaction(rows, keepN);
+    if (!plan) {
+      const mapped = rows.map(mapRow);
+      if (mapped.length > this.historyLimit) {
+        const dropped = mapped.length - this.historyLimit;
+        console.warn(
+          `[sessions] session ${sessionId}: history truncated, dropped ${dropped} of ${mapped.length} messages (limit ${this.historyLimit})`,
+        );
+        return mapped.slice(-this.historyLimit);
+      }
+      return mapped;
     }
 
-    const header =
-      `[compacted summary — ${compactRange.length} older message(s) summarized; ` +
-      `the last ${keepN} message(s) follow verbatim]\n${summary}`;
-    return [{ role: 'system', content: header }, ...kept.map(mapRow)];
+    // Background folds: with a prior summary in hand, serve the current
+    // view (stale summary + verbatim tail past its watermark) and fold
+    // in the background; the first fold is always synchronous.
+    if (this.backgroundCompaction) {
+      const cached = this.compactionCache.get(sessionId) ?? this.readCompaction(sessionId);
+      if (cached) {
+        this.startBackgroundFold(sessionId, rows, keepN);
+        const kept = rows.filter((r) => r.id > cached.upToId).slice(-keepN);
+        const compactedCount = rows.length - kept.length;
+        return [this.compactionHeader(sessionId, cached.summary, compactedCount, kept.length), ...kept.map(mapRow)];
+      }
+    }
+
+    const { summary } = await this.foldRange(sessionId, plan.compactRange);
+    return [
+      this.compactionHeader(sessionId, summary, plan.compactRange.length, plan.kept.length),
+      ...plan.kept.map(mapRow),
+    ];
   }
 
   /**

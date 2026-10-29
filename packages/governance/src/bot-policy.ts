@@ -23,6 +23,10 @@ export interface BotPolicyRule {
   toolPattern: string;
   effect: 'allow' | 'deny' | 'require-approval';
   reason?: string;
+  /** Guardrails as code: argument-value condition (see PolicyRule.argPattern). */
+  argPattern?: { arg: string; pattern: string };
+  /** Guardrails as code: session-history condition (see PolicyRule.requiresHistory). */
+  requiresHistory?: { toolPattern: string; minCount?: number };
 }
 
 /** Per-bot governance policy — field-compatible with agent-runtime's BotPolicy. */
@@ -41,6 +45,8 @@ export function mergeBotPolicy(globalPolicy: Policy, botPolicy?: BotPolicy): Pol
     toolPattern: r.toolPattern,
     effect: r.effect,
     reason: r.reason,
+    argPattern: r.argPattern,
+    requiresHistory: r.requiresHistory,
   }));
   return {
     defaultEffect: globalPolicy.defaultEffect,

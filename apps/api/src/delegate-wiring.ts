@@ -17,6 +17,8 @@ import {
   AgentRuntime,
   SubagentStore,
   createDelegateTools,
+  createEmbedderFromEnv,
+  resolveBotWorkspaceDir,
 } from '@mvp/agent-runtime';
 import type {
   BotConfig,
@@ -99,6 +101,16 @@ export function registerDelegateTools(opts: DelegateWiringOpts): void {
       governance: opts.governanceAdapter,
       toolRegistry: childRegistry,
       defaultProviderId: opts.defaultProviderId ?? 'groq',
+      // Octomind parity wiring (same as the server runtime): per-bot
+      // workspaces for project instructions/policy/tools + the shared
+      // platform embedder for discovery.
+      workspaceDirForBot: (bot) =>
+        resolveBotWorkspaceDir({
+          botWorkspace: bot.workspace,
+          globalWorkspaceDir: opts.workspaceDir,
+          dataDir: opts.dataDir,
+        }),
+      embedder: createEmbedderFromEnv(),
     });
 
     // Collect the child's final text from the token stream. (runTurn returns

@@ -10,6 +10,8 @@
 import { createProvider } from '@mvp/agent-runtime';
 import type { ChatMessage } from '@mvp/agent-runtime';
 import { PromptOverrideStore } from '@mvp/agent-runtime';
+import { resolvePurposeProfile } from '@mvp/agent-runtime';
+import type { ModelProfiles } from '@mvp/agent-runtime';
 
 const MAX_INPUT_CHARS = 24_000;
 
@@ -52,8 +54,15 @@ function extractiveFallback(messages: ChatMessage[]): string {
  *
  * `promptStore` (tests): stage-prompt override store; defaults to the
  * module-level store against ~/.kriyadot/prompts.
+ *
+ * `profiles` (Octomind parity — purpose-based model profiles): the
+ * 'compression' purpose profile picks the provider/model; unset keeps
+ * the historical default (Groq llama-3.1-8b-instant).
  */
-export function createSummarizer(promptStore?: PromptOverrideStore): (messages: ChatMessage[]) => Promise<string> {
+export function createSummarizer(
+  promptStore?: PromptOverrideStore,
+  profiles?: ModelProfiles,
+): (messages: ChatMessage[]) => Promise<string> {
   return async (messages: ChatMessage[]): Promise<string> => {
     if (messages.length === 0) return '[empty range]';
     const input = messages.map(renderMessage).join('\n\n').slice(0, MAX_INPUT_CHARS);
@@ -62,8 +71,9 @@ export function createSummarizer(promptStore?: PromptOverrideStore): (messages: 
     // hot-reload without a restart.
     const store = promptStore ?? promptOverrides;
     const systemPrompt = store.resolve('summarizer', BUILTIN_SUMMARIZER_PROMPT).text;
+    const profile = resolvePurposeProfile('compression', { profiles });
     try {
-      const provider = createProvider('groq');
+      const provider = createProvider(profile?.providerId ?? 'groq');
       const turn = await provider.chat(
         [
           {
@@ -73,7 +83,11 @@ export function createSummarizer(promptStore?: PromptOverrideStore): (messages: 
           { role: 'user', content: input },
         ],
         [],
-        { model: 'llama-3.1-8b-instant' },
+        {
+          model: profile?.modelId ?? 'llama-3.1-8b-instant',
+          ...(profile?.temperature !== undefined ? { temperature: profile.temperature } : {}),
+          ...(profile?.maxTokens !== undefined ? { maxTokens: profile.maxTokens } : {}),
+        },
       );
       const summary = turn.content?.trim();
       if (summary) return summary;

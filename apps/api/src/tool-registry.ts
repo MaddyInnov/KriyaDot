@@ -155,6 +155,9 @@ export async function buildToolRegistry(opts: {
       serverName,
       pinDbPath: path.join(opts.dataDir, 'mcp-pins.db'),
       approvalBroker: opts.approvalBroker,
+      // MCP completion: servers may elicit mid-call input; route it to
+      // the calling turn's widget host (declines when no UI is attached).
+      elicitation: 'widget',
     });
     try {
       if ('url' in serverConfig && serverConfig.url) {

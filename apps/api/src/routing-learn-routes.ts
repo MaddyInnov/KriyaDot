@@ -5,7 +5,13 @@
 //   GET  /api/routing/rules         → { ok, rules } (learned rules, newest first)
 //   POST /api/routing/corrections   → { taskType, routedProviderId, routedModelId,
 //                                       correctedProviderId, correctedModelId,
-//                                       message? } → { ok, rules }
+//                                       message? } → { ok, rules, promoted }
+//                                       (shadow-trial pipeline: candidates
+//                                       start in shadow and are promoted
+//                                       only when their trial record — or a
+//                                       human — clears them)
+//   POST /api/routing/rules/:id/promote   → human-approve a rule live
+//   POST /api/routing/rules/:id/rollback  → retire a rule (never matched again)
 //
 // The chat route loads the stored rules via loadRoutingRules() and passes
 // them into runTurn({ routingRules }) — which routeModel() honors — so a
@@ -30,7 +36,10 @@ import {
 } from '@mvp/agent-runtime';
 import {
   loadRoutingRules,
-  recordRoutingCorrection,
+  promoteRule,
+  recordShadowCorrection,
+  retireRule,
+  saveRoutingRules,
   type RoutingCorrection,
 } from '@mvp/agent-runtime';
 
@@ -94,10 +103,44 @@ export function registerRoutingLearnRoutes(router: Router, deps: RoutingLearnRou
       return;
     }
     try {
-      const rules = recordRoutingCorrection(deps.dataDir, correction);
-      res.status(201).json({ ok: true, rules });
+      // Shadow-trial pipeline: candidates from a correction start in
+      // shadow, are scored against subsequent corrections, and are
+      // auto-promoted only when their agreement record clears the bar.
+      const { rules, promoted } = recordShadowCorrection(deps.dataDir, correction);
+      res.status(201).json({ ok: true, rules, promoted });
     } catch (err) {
       res.status(500).json(errorBody('Failed to record correction', errMessage(err)));
+    }
+  });
+
+  // Shadow-trial surface: human promote (approve) / rollback (retire).
+  router.post('/rules/:id/promote', (req: Request, res: Response) => {
+    try {
+      const rules = loadRoutingRules(deps.dataDir);
+      if (!rules.some((r) => r.id === req.params.id)) {
+        res.status(404).json(errorBody(`Unknown rule "${req.params.id}"`));
+        return;
+      }
+      const next = promoteRule(rules, req.params.id);
+      saveRoutingRules(deps.dataDir, next);
+      res.json({ ok: true, rules: next });
+    } catch (err) {
+      res.status(500).json(errorBody('Failed to promote rule', errMessage(err)));
+    }
+  });
+
+  router.post('/rules/:id/rollback', (req: Request, res: Response) => {
+    try {
+      const rules = loadRoutingRules(deps.dataDir);
+      if (!rules.some((r) => r.id === req.params.id)) {
+        res.status(404).json(errorBody(`Unknown rule "${req.params.id}"`));
+        return;
+      }
+      const next = retireRule(rules, req.params.id);
+      saveRoutingRules(deps.dataDir, next);
+      res.json({ ok: true, rules: next });
+    } catch (err) {
+      res.status(500).json(errorBody('Failed to roll back rule', errMessage(err)));
     }
   });
 

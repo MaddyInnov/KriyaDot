@@ -36,6 +36,12 @@ const MAX_OUTPUT_BYTES = 1_000_000;
 export interface CodeSandboxContext {
   input: unknown;
   nodes: Record<string, unknown>;
+  /** Current item in a match/loop sub-execution (`item` in scope). */
+  item?: unknown;
+  /** 0-based item position in a match body (`index` in scope). */
+  index?: number;
+  /** 1-based iteration counter in a loop body (`iteration` in scope). */
+  iteration?: number;
 }
 
 export function resolveCodeTimeoutMs(timeoutMs?: number): number {
@@ -70,10 +76,21 @@ export async function evaluateCode(
   const timeout = resolveCodeTimeoutMs(timeoutMs);
   const sandbox = vm.createContext(Object.create(null));
   // Seed data inside the context realm (see header for why).
-  const seed = new vm.Script(
-    `input = ${toJsonLiteral(context.input, 'input')};\nnodes = ${toJsonLiteral(context.nodes, 'nodes')};`,
-    { filename: 'workflow-code-seed.js' },
-  );
+  let seedSource =
+    `input = ${toJsonLiteral(context.input, 'input')};\n` +
+    `nodes = ${toJsonLiteral(context.nodes, 'nodes')};`;
+  // Sub-execution variables (match item / loop iteration) are seeded the
+  // same way when the caller provides them, so code bodies can use them.
+  if (context.item !== undefined) {
+    seedSource += `\nitem = ${toJsonLiteral(context.item, 'item')};`;
+  }
+  if (context.index !== undefined) {
+    seedSource += `\nindex = ${toJsonLiteral(context.index, 'index')};`;
+  }
+  if (context.iteration !== undefined) {
+    seedSource += `\niteration = ${toJsonLiteral(context.iteration, 'iteration')};`;
+  }
+  const seed = new vm.Script(seedSource, { filename: 'workflow-code-seed.js' });
   seed.runInContext(sandbox, { timeout: 1_000 });
 
   const script = new vm.Script(`(async () => {\n"use strict";\n${code}\n})()`, {

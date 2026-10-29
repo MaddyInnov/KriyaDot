@@ -607,6 +607,14 @@ export const getChatThreadBranches = (
 ): Promise<{ ok: boolean; root: string; threads: ChatThreadVersion[] }> =>
   apiJson(`/api/chat/threads/${encodeURIComponent(threadId)}/branches`);
 
+// ---- Session share links (Octomind parity) ----------------------------------
+
+/** Publish a session transcript as a public page; returns its /p/<slug> path. */
+export const shareSession = (
+  sessionId: string,
+): Promise<{ ok: boolean; slug: string; path: string; title: string; messages: number }> =>
+  apiJson(`/api/sessions/${encodeURIComponent(sessionId)}/share`, { method: 'POST' });
+
 // ---- Full-text message search (OpenMausBot parity) --------------------------
 
 /** One message-search hit. snippet wraps matched terms in \u0001..\u0002. */

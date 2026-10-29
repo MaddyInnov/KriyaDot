@@ -80,6 +80,15 @@ import { attachSpendCapGate } from './spend-caps.js';
 import { registerTasksRoutes } from './tasks.js';
 import { registerPagesRoutes } from './pages.js';
 import { registerPagePublicationRoutes } from './public-pages.js';
+import { registerBackgroundRunRoutes, registerSessionShareRoutes } from './session-share.js';
+import {
+  buildContextReport,
+  buildQuotedReply,
+  formatContextSummary,
+  parseReplyCommand,
+  registerSessionContextRoute,
+} from './session-craft.js';
+import { registerHumanAccountingRoute } from './human-accounting.js';
 import { registerTerminalRoutes } from './terminal-routes.js';
 import { registerTeamRoutes } from './teams-routes.js';
 import { resolvePersonContext } from './people.js';
@@ -400,6 +409,26 @@ function sseHeaders(res: express.Response): void {
 export const MAX_CHAT_MESSAGE_CHARS = 200_000;
 
 /** Validate a chat message. Returns an error string, or null when valid. */
+/**
+ * Parse a chat request's `responseFormat` (structured output, Octomind
+ * parity): { type: 'json_object' } or { type: 'json_schema', name?,
+ * schema, strict? }. Anything malformed → undefined (plain turn).
+ */
+export function parseResponseFormat(raw: unknown): import('@mvp/agent-runtime').StructuredOutputSpec | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (r.type === 'json_object') return { type: 'json_object' };
+  if (r.type === 'json_schema' && typeof r.schema === 'object' && r.schema !== null) {
+    return {
+      type: 'json_schema',
+      name: typeof r.name === 'string' && r.name ? r.name : undefined,
+      schema: r.schema as Record<string, unknown>,
+      strict: typeof r.strict === 'boolean' ? r.strict : undefined,
+    };
+  }
+  return undefined;
+}
+
 export function validateChatMessage(message: unknown): string | null {
   if (typeof message !== 'string' || !message.trim()) return 'message is required';
   if (message.length > MAX_CHAT_MESSAGE_CHARS) {
@@ -1582,6 +1611,46 @@ export function createRouter(deps: RouteDeps): express.Router {
       }
     }
 
+    // Session craft (Octomind parity): `/context` reports what this
+    // session's history holds (no turn runs); `/reply <ref> <text>`
+    // quotes an earlier message into the outgoing text. Both are
+    // intercepted before slash-template expansion.
+    if (body.message.trim() === '/context') {
+      if (!sessionKey) {
+        sseReply('📚 No session yet — send a message first, then /context can inspect its history.');
+        return;
+      }
+      try {
+        const messages = agentRuntime.listThreadMessages(sessionKey);
+        const archives = agentRuntime
+          .listCompactionArchives(sessionKey)
+          .map((a) => ({ id: a.id, messageCount: a.messageCount, createdAt: a.createdAt }));
+        sseReply(formatContextSummary(buildContextReport(sessionKey, bot.id, messages, archives)));
+      } catch {
+        sseReply('📚 Context inspection failed for this session.');
+      }
+      return;
+    }
+    const replyCommand = parseReplyCommand(body.message);
+    if (replyCommand) {
+      if (!replyCommand.ref || !replyCommand.text) {
+        res.status(400).json(errorBody('Usage: /reply <#messageId|position> <your reply>'));
+        return;
+      }
+      if (!sessionKey) {
+        res.status(400).json(errorBody('/reply needs an existing session with messages'));
+        return;
+      }
+      const wrapped = buildQuotedReply(agentRuntime.listThreadMessages(sessionKey), replyCommand);
+      if (!wrapped) {
+        res.status(400).json(
+          errorBody(`No message matches "${replyCommand.ref}" in this session (use #<messageId> or a 1-based position)`),
+        );
+        return;
+      }
+      body.message = wrapped;
+    }
+
     // Custom slash commands: expand `/name args` before the agent sees it.
     // Done before the queue check so queued messages are stored expanded.
     // Unknown `/command` → 400 with the list of known commands.
@@ -1795,6 +1864,7 @@ export function createRouter(deps: RouteDeps): express.Router {
       sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
       reasoningEffort?: 'low' | 'medium' | 'high';
       fileIds?: string[];
+      responseFormat?: import('@mvp/agent-runtime').StructuredOutputSpec;
     }): Promise<void> => {
       terminalEmitted = false;
       // Tiered memory: reset per-turn accumulators; recall relevant atoms.
@@ -1858,7 +1928,7 @@ export function createRouter(deps: RouteDeps): express.Router {
       }
       let memoryContext: string | undefined;
       try {
-        memoryContext = tieredMemoryStore.recallForPrompt(bot.id, turnMessage) || undefined;
+        memoryContext = await tieredMemoryStore.recallForPromptNeural(bot.id, turnMessage) || undefined;
       } catch {
         memoryContext = undefined; // memory must never break chat
       }
@@ -1935,6 +2005,9 @@ export function createRouter(deps: RouteDeps): express.Router {
           maxBudgetUsd: turnOpts.maxBudgetUsd,
           sandboxMode: turnOpts.sandboxMode,
           reasoningEffort: turnOpts.reasoningEffort,
+          // Structured output enforcement (Octomind parity): the client
+          // may request a JSON object / JSON-Schema-shaped final answer.
+          responseFormat: turnOpts.responseFormat,
           memoryContext,
           privacyGate: egressGate,
           egressItems,
@@ -2042,6 +2115,7 @@ export function createRouter(deps: RouteDeps): express.Router {
     const firstTurnOpts = {
       providerId: typeof body.provider === 'string' && body.provider.trim() ? body.provider.trim() : undefined,
       model: typeof body.model === 'string' && body.model.trim() ? body.model.trim() : undefined,
+      responseFormat: parseResponseFormat(body.responseFormat),
       reasoningEffort: body.reasoningEffort === 'low' || body.reasoningEffort === 'medium' || body.reasoningEffort === 'high' ? body.reasoningEffort : undefined,
       fileIds: Array.isArray(body.fileIds) ? body.fileIds.filter((x): x is string => typeof x === 'string') : undefined,
       taskType,
@@ -2769,6 +2843,12 @@ export function createRouter(deps: RouteDeps): express.Router {
       res.status(500).json(errorBody('Policy simulation failed', err instanceof Error ? err.message : String(err)));
     }
   });
+
+  // ---- Background specialist runs + session share/export (Octomind parity)
+  registerBackgroundRunRoutes(router, { agentRuntime, dataDir: config.dataDir });
+  registerSessionShareRoutes(router, { agentRuntime, dataDir: config.dataDir });
+  registerSessionContextRoute(router, { agentRuntime });
+  registerHumanAccountingRoute(router, { governance });
 
   // ---- Action registry (P3-B: open-dots parity) --------------------------
   // Read-only listing of every registered tool (the action registry the

@@ -5,7 +5,7 @@
 // HTTP-facing shapes built on top of them.
 
 import type { ApprovalRecord, AuditEntry } from '@mvp/governance';
-import type { ModelInfo, RateLimitSnapshot, StreamEvent } from '@mvp/agent-runtime';
+import type { ModelInfo, RateLimitSnapshot, StreamEvent, StructuredOutputSpec } from '@mvp/agent-runtime';
 import type { WorkflowDefinition, WorkflowRun } from '@mvp/workflows';
 
 export interface ChatRequestBody {
@@ -16,6 +16,8 @@ export interface ChatRequestBody {
   model?: string;
   /** Reasoning effort for models that support it (low/medium/high). */
   reasoningEffort?: 'low' | 'medium' | 'high';
+  /** Structured output for the final answer (Octomind parity). */
+  responseFormat?: StructuredOutputSpec;
   /** Attached file IDs (from /api/files/upload). Content is injected into the turn. */
   fileIds?: string[];
   /** Task type for Phase 3 smart model routing (only used when no model is pinned). */

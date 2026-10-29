@@ -16,10 +16,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
+  AcpGovernanceGateway,
+  AcpServer,
   AgentRuntime,
   SessionStore,
+  createEmbedderFromEnv,
+  parseModelProfiles,
+  resolveBotWorkspaceDir,
 } from '@mvp/agent-runtime';
-import type { BotConfig, StreamEvent, TokenUsage } from '@mvp/agent-runtime';
+import type { BotConfig, StreamEvent, StructuredOutputSpec, TokenUsage } from '@mvp/agent-runtime';
 import { DEFAULT_POLICY, GovernanceGateway } from '@mvp/governance';
 import { loadConfig } from './config.js';
 import { GovernanceAdapter } from './governance-adapter.js';
@@ -44,6 +49,7 @@ export const CHAT_USAGE = [
   '  --provider <id>   Override the provider (default: the bot\'s)',
   '  --model <id>      Override the model (default: the bot\'s)',
   '  --json            Print a single JSON object: { content, usage, sessionId }',
+  '  --schema <json>   Enforce structured output: a JSON Schema object (or {"type":"json_object"})',
   '  --pretty          Human output: content + usage line (default)',
   '  --help            Show this help',
   '',
@@ -60,9 +66,44 @@ export interface ParsedChatArgs {
   json: boolean;
   pretty: boolean;
   help: boolean;
+  /** --schema: per-turn structured-output enforcement (Tier 1 #2). */
+  responseFormat?: StructuredOutputSpec;
 }
 
 export class ChatArgError extends Error {}
+
+/**
+ * Parse a --schema value into a StructuredOutputSpec.
+ * Accepts: '{"type":"json_object"}', a full json_schema spec
+ * ('{"type":"json_schema","schema":{...}}'), or a bare JSON Schema
+ * object (wrapped as json_schema with the default name).
+ */
+export function parseSchemaFlag(raw: string): StructuredOutputSpec {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new ChatArgError('--schema needs a valid JSON value');
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new ChatArgError('--schema needs a JSON object');
+  }
+  const obj = parsed as Record<string, unknown>;
+  if (obj.type === 'json_object') return { type: 'json_object' };
+  if (obj.type === 'json_schema') {
+    if (typeof obj.schema !== 'object' || obj.schema === null) {
+      throw new ChatArgError('--schema json_schema needs a "schema" object');
+    }
+    return {
+      type: 'json_schema',
+      name: typeof obj.name === 'string' ? obj.name : undefined,
+      schema: obj.schema as Record<string, unknown>,
+      strict: obj.strict === true,
+    };
+  }
+  // Bare JSON Schema → wrap it.
+  return { type: 'json_schema', schema: obj };
+}
 
 /** Parse `argv` where argv[0] === 'chat' (index.ts passes process.argv.slice(2)). */
 export function parseChatArgs(argv: string[]): ParsedChatArgs {
@@ -94,6 +135,9 @@ export function parseChatArgs(argv: string[]): ParsedChatArgs {
         break;
       case '--model':
         args.model = takeValue(a, i++);
+        break;
+      case '--schema':
+        args.responseFormat = parseSchemaFlag(takeValue(a, i++));
         break;
       case '--json':
         args.json = true;
@@ -136,6 +180,7 @@ export interface ChatCliRuntime {
     message: string;
     providerId?: string;
     model?: string;
+    responseFormat?: StructuredOutputSpec;
     onEvent: (e: StreamEvent) => void | Promise<void>;
     approvalTimeoutMs?: number;
   }): Promise<ChatCliTurnResult>;
@@ -355,13 +400,31 @@ async function defaultBuildRuntime(): Promise<ChatCliRuntime> {
     approvalBroker: governance,
   });
 
+
+  // Octomind parity wiring (mirrors the server boot): purpose-based
+  // model profiles from <dataDir>/model-profiles.json ({} when absent).
+  const modelProfiles = (() => {
+    try {
+      return parseModelProfiles(fs.readFileSync(path.join(config.dataDir, 'model-profiles.json'), 'utf8'));
+    } catch {
+      return {};
+    }
+  })();
   const sessions = new SessionStore(`${config.dataDir}/agent.db`);
   const runtime = new AgentRuntime({
     dbPath: `${config.dataDir}/agent.db`,
     skillsDir: path.join(seedDir, 'skills'),
     governance: governanceAdapter,
     toolRegistry: registry,
-    sessionStoreOptions: { summarizer: createSummarizer() },
+    sessionStoreOptions: { summarizer: createSummarizer(undefined, modelProfiles), adaptiveCompaction: true, backgroundCompaction: true },
+    modelProfiles,
+    embedder: createEmbedderFromEnv(),
+    workspaceDirForBot: (bot) =>
+      resolveBotWorkspaceDir({
+        botWorkspace: bot.workspace,
+        globalWorkspaceDir: config.workspaceDir,
+        dataDir: config.dataDir,
+      }),
   });
 
   // Phase 2 host wiring: `delegate` subagent tool (same wiring as the server).
@@ -466,6 +529,7 @@ export async function runChatCli(argv: string[], deps: ChatCliDeps = {}): Promis
         message: prompt,
         providerId: args.providerId,
         model: args.model,
+        responseFormat: args.responseFormat,
         // Non-interactive mode: approvals wait a bounded 60s then deny.
         approvalTimeoutMs: 60_000,
         onEvent: (e) => {
@@ -489,4 +553,192 @@ export async function runChatCli(argv: string[], deps: ChatCliDeps = {}): Promis
     printError(args, err instanceof Error ? err.message : String(err));
     return 1;
   }
+}
+
+// ---------------------------------------------------------------------------
+// ACP server mode (Octomind parity): `mvp-server acp --bot <id>` serves the
+// bot as an ACP agent over stdio for ACP clients (Zed et al.). Approvals
+// become session/request_permission round-trips to the client. Delegate
+// tools are not registered in this mode (editor-hosted sessions are
+// single-bot); coding/memory/skill tools come from buildToolRegistry.
+// ---------------------------------------------------------------------------
+
+export const ACP_USAGE = [
+  'Usage: mvp-server acp --bot <id>',
+  '',
+  'Serve a bot as an ACP (Agent Client Protocol) agent over stdio.',
+  'The ACP client spawns this process; JSON-RPC flows on stdin/stdout,',
+  'diagnostics on stderr.',
+  '',
+  'Options:',
+  '  --bot <id>   Bot id from the seed data (default: helper)',
+  '  --help       Show this help',
+].join('\n');
+
+export interface ParsedAcpArgs {
+  botId: string;
+  help?: boolean;
+}
+
+/** Parse `argv` where argv[0] === 'acp'. */
+export function parseAcpArgs(argv: string[]): ParsedAcpArgs {
+  const rest = argv[0] === 'acp' ? argv.slice(1) : argv;
+  let botId = 'helper';
+  let help = false;
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i]!;
+    switch (arg) {
+      case '--bot':
+        botId = rest[++i] ?? botId;
+        break;
+      case '--help':
+      case '-h':
+        help = true;
+        break;
+      default:
+        throw new Error(`unknown option: ${arg}`);
+    }
+  }
+  return { botId, help };
+}
+
+export interface AcpCliRuntime {
+  runtime: AgentRuntime;
+  bridge: { server?: AcpServer };
+  createSessionId: () => string;
+  close: () => Promise<void>;
+}
+
+export interface AcpCliDeps {
+  findBot?: (botId: string) => Promise<BotConfig | undefined>;
+  buildRuntime?: (bot: BotConfig) => Promise<AcpCliRuntime>;
+  input?: NodeJS.ReadableStream;
+  output?: NodeJS.WritableStream;
+}
+
+async function defaultBuildAcpRuntime(bot: BotConfig): Promise<AcpCliRuntime> {
+  const config = loadConfig();
+  fs.mkdirSync(config.dataDir, { recursive: true });
+  fs.mkdirSync(config.workspaceDir, { recursive: true });
+  if (!process.env.PROVIDERS_FILE) {
+    process.env.PROVIDERS_FILE = path.join(config.dataDir, 'providers.local.json');
+  }
+  syncProviderKeysToEnv(config.dataDir);
+
+  const seedDir = resolveSeedDir(config.seedDir);
+  const seed = loadSeedCached();
+
+  const governance = new GovernanceGateway({
+    dbPath: `${config.dataDir}/governance.db`,
+    policy: DEFAULT_POLICY,
+  });
+  const bridge: { server?: AcpServer } = {};
+  const governanceGateway = new AcpGovernanceGateway(bridge);
+
+  const { registry, close: closeMcp } = await buildToolRegistry({
+    workspaceDir: config.workspaceDir,
+    dataDir: config.dataDir,
+    skillsDir: path.join(seedDir, 'skills'),
+    mcpServers: seed.mcpServers,
+    approvalBroker: governance,
+  });
+
+
+  // Octomind parity wiring (mirrors the server boot): purpose-based
+  // model profiles from <dataDir>/model-profiles.json ({} when absent).
+  const modelProfiles = (() => {
+    try {
+      return parseModelProfiles(fs.readFileSync(path.join(config.dataDir, 'model-profiles.json'), 'utf8'));
+    } catch {
+      return {};
+    }
+  })();
+  const sessions = new SessionStore(`${config.dataDir}/agent.db`);
+  const runtime = new AgentRuntime({
+    dbPath: `${config.dataDir}/agent.db`,
+    skillsDir: path.join(seedDir, 'skills'),
+    governance: governanceGateway,
+    toolRegistry: registry,
+    sessionStoreOptions: { summarizer: createSummarizer(undefined, modelProfiles), adaptiveCompaction: true, backgroundCompaction: true },
+    modelProfiles,
+    embedder: createEmbedderFromEnv(),
+    workspaceDirForBot: (b) =>
+      resolveBotWorkspaceDir({
+        botWorkspace: b.workspace,
+        globalWorkspaceDir: config.workspaceDir,
+        dataDir: config.dataDir,
+      }),
+  });
+
+  return {
+    runtime,
+    bridge,
+    createSessionId: () => sessions.createSession(bot.id),
+    close: async () => {
+      await closeMcp();
+      try {
+        runtime.close();
+      } catch {
+        // ignore
+      }
+      try {
+        sessions.close();
+      } catch {
+        // ignore
+      }
+      try {
+        governance.close();
+      } catch {
+        // ignore
+      }
+    },
+  };
+}
+
+/**
+ * Run the `acp` subcommand: serve until the client closes stdin.
+ * Returns the process exit code; never calls process.exit itself.
+ */
+export async function runAcpCli(argv: string[], deps: AcpCliDeps = {}): Promise<number> {
+  let args: ParsedAcpArgs;
+  try {
+    args = parseAcpArgs(argv);
+  } catch (err) {
+    console.error(`[acp] ${err instanceof Error ? err.message : String(err)}`);
+    return 2;
+  }
+  if (args.help) {
+    console.log(ACP_USAGE);
+    return 0;
+  }
+  const findBot = deps.findBot ?? defaultFindBot;
+  const bot = await findBot(args.botId);
+  if (!bot) {
+    console.error(`[acp] unknown bot "${args.botId}"`);
+    return 1;
+  }
+  const built = await (deps.buildRuntime ?? defaultBuildAcpRuntime)(bot);
+  const input = deps.input ?? process.stdin;
+  const output = deps.output ?? process.stdout;
+  const server = new AcpServer({
+    runtime: built.runtime,
+    bot,
+    input,
+    output,
+    createSessionId: built.createSessionId,
+    log: (m) => console.error(m),
+  });
+  built.bridge.server = server;
+  server.start();
+  try {
+    // Serve until the client hangs up (stdin end/close).
+    await new Promise<void>((resolve) => {
+      input.once('end', () => resolve());
+      input.once('close', () => resolve());
+    });
+  } finally {
+    await server.stop();
+    await built.close();
+  }
+  return 0;
 }

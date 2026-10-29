@@ -11,7 +11,44 @@ export type NodeType =
   | 'if'
   | 'set'
   | 'code'
-  | 'bot-turn';
+  | 'bot-turn'
+  | 'loop'
+  | 'match';
+
+/** Every known node type (used by the file-format parser / validation). */
+export const NODE_TYPES: readonly NodeType[] = [
+  'trigger',
+  'agent',
+  'tool',
+  'http',
+  'delay',
+  'approval',
+  'if',
+  'set',
+  'code',
+  'bot-turn',
+  'loop',
+  'match',
+];
+
+export function isNodeType(value: unknown): value is NodeType {
+  return typeof value === 'string' && (NODE_TYPES as readonly string[]).includes(value);
+}
+
+/**
+ * Per-node retry policy (enforced by the runner). `maxAttempts` is the TOTAL
+ * number of tries including the first (default 1 = no retry). `backoffMs`
+ * is a fixed delay slept between attempts (default 0).
+ */
+export interface NodeRetryPolicy {
+  maxAttempts: number;
+  backoffMs?: number;
+}
+
+/** Per-workflow spend cap, enforced by the runner (see src/cost.ts). */
+export interface WorkflowBudget {
+  maxCostUsd: number;
+}
 
 /**
  * Branch label on an edge leaving an 'if' node: which condition outcome the
@@ -32,6 +69,18 @@ export interface WorkflowNode {
   type: NodeType;
   name: string;
   config: Record<string, unknown>;
+  /**
+   * Optional per-step retry policy, enforced by the runner around the
+   * node's execution (including its timeout). See NodeRetryPolicy.
+   */
+  retry?: NodeRetryPolicy;
+  /**
+   * Optional per-step wall-clock timeout in ms, enforced by the runner
+   * with a Promise.race (same style as the code sandbox). Applies per
+   * attempt. Note this is distinct from a `code` node's config.timeoutMs,
+   * which caps the sandbox itself.
+   */
+  timeoutMs?: number;
 }
 
 /**
@@ -61,6 +110,45 @@ export interface CodeNodeConfig {
   timeoutMs?: number;
 }
 
+/**
+ * Config for a `loop` node. The loop repeatedly executes `bodyNodeId` and
+ * then `evaluatorNodeId` (both are subordinate nodes: they are NOT wired
+ * into the DAG with edges and never run standalone — the loop drives them).
+ * After each iteration the evaluator's output decides acceptance:
+ * - if the evaluator output is a boolean, it is used directly;
+ * - otherwise the value at `acceptPath` (dot path, default `"accept"`) in
+ *   the evaluator output must be truthy (e.g. `{ accept: true }`).
+ * Point `acceptPath` at `"condition"` to use an `if` node as evaluator.
+ * Body/evaluator templates and code see `{{iteration}}` / `iteration`
+ * (1-based) and the latest body output via `nodes.<bodyNodeId>.output`.
+ * The loop fails once `maxIterations` (default 5) pass without acceptance.
+ * Loop output: `{ accepted, iterations, bodyOutput, evaluatorOutput,
+ * history }` (plus `costUsd` when sub-executions reported costs).
+ */
+export interface LoopNodeConfig {
+  bodyNodeId: string;
+  evaluatorNodeId: string;
+  maxIterations?: number;
+  acceptPath?: string;
+}
+
+/**
+ * Config for a `match` node (dynamic fan-out). The array at
+ * `sourcePath` (dot path, default: the whole output) of `sourceNodeId`'s
+ * output is taken, and `bodyNodeId` (a subordinate node, not wired with
+ * edges) runs once per item with at most `maxParallel` (default 4)
+ * concurrent executions. The body sees the current item as `{{item}}` /
+ * `item` and its position as `{{index}}` / `index`. Results are collected
+ * in input order. Match output: `{ results, count }` (plus `costUsd`
+ * when body executions reported costs).
+ */
+export interface MatchNodeConfig {
+  sourceNodeId: string;
+  sourcePath?: string;
+  bodyNodeId: string;
+  maxParallel?: number;
+}
+
 export interface WorkflowDefinition {
   id: string;
   name: string;
@@ -68,6 +156,13 @@ export interface WorkflowDefinition {
   nodes: WorkflowNode[];
   /** Edges as [fromId, toId] pairs, with optional 'if'-branch labels. */
   edges: WorkflowEdge[];
+  /**
+   * Optional spend cap. The runner sums the cost signal carried by node
+   * outputs (see src/cost.ts: top-level `costUsd`, or `costCents` /
+   * `cost_cents`, or the same fields nested under `usage`) and fails the
+   * run with a budget error as soon as the total exceeds `maxCostUsd`.
+   */
+  budget?: WorkflowBudget;
 }
 
 export type NodeStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'paused' | 'skipped';
@@ -87,6 +182,12 @@ export interface NodeState {
    * Feeds run-health retry heuristics.
    */
   attempts?: number;
+  /**
+   * USD cost attributed to this node, extracted from its output by
+   * extractCostUsd (src/cost.ts). Present only when the output carried a
+   * cost signal. Summed by the runner for workflow budget enforcement.
+   */
+  costUsd?: number;
 }
 
 export interface WorkflowRun {

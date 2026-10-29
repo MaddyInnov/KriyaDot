@@ -2,15 +2,36 @@
 // Command implementations for the headless CLI. All I/O goes through the
 // injected CommandDeps so the commands are unit-testable with a mocked API.
 import { randomUUID } from 'node:crypto';
-import { normalizeApiUrl, readLoopbackToken, isLoopbackUrl, saveConfigFile, configPath, tokenSource } from './config.js';
-import type { CliConfig } from './config.js';
+import {
+  normalizeApiUrl,
+  readLoopbackToken,
+  isLoopbackUrl,
+  saveConfigFile,
+  configPath,
+  tokenSource,
+  getNamedSession,
+  loadNamedSessions,
+  saveNamedSession,
+  deleteNamedSession,
+} from './config.js';
+import type { CliConfig, NamedSession } from './config.js';
 import { ApiError, KriyaDotApi } from './api.js';
-import type { BotSummary } from './api.js';
+import type { BotSummary, ChatEvent } from './api.js';
 import { flagBool, flagString, requireFlag, validateCommand } from './args.js';
 import type { OutputFormat, ParsedArgs } from './args.js';
 import { HELP_TEXT, VERSION } from './help.js';
 import { createReadlineSource, runRepl, runStreamingTurn } from './repl.js';
 import type { ReplLineSource } from './repl.js';
+import { EXIT_ERROR, EXIT_RESUMABLE, EXIT_USAGE } from './exits.js';
+import { parseConfigOverrides, UsageError } from './overrides.js';
+import type { ConfigOverrides } from './overrides.js';
+import {
+  COMPLETION_API_TIMEOUT_MS,
+  bashCompletionScript,
+  withTimeout,
+  zshCompletionScript,
+} from './completion.js';
+import type { DynamicNames } from './completion.js';
 
 export interface CommandDeps {
   cfg: CliConfig;
@@ -74,9 +95,19 @@ interface ChatRunOpts {
   format: OutputFormat;
 }
 
-/** One-shot turn shared by `chat`, `run` and `bots run`. */
+/**
+ * Serialize one chat event as a JSONL line. Unknown events forward their
+ * raw payload so new server event types keep their original `type`.
+ */
+export function jsonlLine(ev: ChatEvent): string {
+  if (ev.type === 'unknown') return JSON.stringify(ev.raw ?? ev);
+  return JSON.stringify(ev);
+}
+
+/** One-shot turn shared by `chat`, `run`, `bots run` and `send`. */
 async function oneShotTurn(deps: CommandDeps, o: ChatRunOpts): Promise<number> {
   const json = o.format === 'json';
+  const jsonl = o.format === 'jsonl';
   const askApproval = async (toolName: string): Promise<boolean> => {
     err(deps, `[headless] denied approval for "${toolName}" (re-run with --auto-approve to allow)\n`);
     return false;
@@ -88,13 +119,26 @@ async function oneShotTurn(deps: CommandDeps, o: ChatRunOpts): Promise<number> {
       message: o.message,
       sessionId: o.sessionId,
       ...(o.model ? { model: o.model } : {}),
+      ...(o.providerId ? { providerId: o.providerId } : {}),
       autoApprove: o.autoApprove,
+      ...(jsonl
+        ? {
+            onEvent: (ev: ChatEvent) => {
+              out(deps, `${jsonlLine(ev)}\n`);
+            },
+          }
+        : {}),
     },
     askApproval,
     (t) => {
-      if (!json) deps.stdout.write(t);
+      if (!json && !jsonl) deps.stdout.write(t);
     },
   );
+  if (jsonl) {
+    // stdout is the pure event stream; diagnostics stay on stderr.
+    if (result.failed) err(deps, `[error] ${result.error ?? 'turn failed'}\n`);
+    return result.failed ? (result.resumable ? EXIT_RESUMABLE : EXIT_ERROR) : 0;
+  }
   if (!json) {
     deps.stdout.write('\n');
     if (result.failed) err(deps, `[error] ${result.error ?? 'turn failed'}\n`);
@@ -103,7 +147,13 @@ async function oneShotTurn(deps: CommandDeps, o: ChatRunOpts): Promise<number> {
     printJson(
       deps,
       result.failed
-        ? { ok: false, bot: o.bot.id, sessionId: o.sessionId, error: result.error ?? 'turn failed' }
+        ? {
+            ok: false,
+            bot: o.bot.id,
+            sessionId: o.sessionId,
+            error: result.error ?? 'turn failed',
+            ...(result.resumable ? { resumable: true } : {}),
+          }
         : {
             ok: true,
             bot: o.bot.id,
@@ -113,7 +163,7 @@ async function oneShotTurn(deps: CommandDeps, o: ChatRunOpts): Promise<number> {
           },
     );
   }
-  return result.failed ? 1 : 0;
+  return result.failed ? (result.resumable ? EXIT_RESUMABLE : EXIT_ERROR) : 0;
 }
 
 function printPauseState(
@@ -147,9 +197,68 @@ async function doPauseCommand(deps: CommandDeps, p: ParsedArgs): Promise<number>
   return 0;
 }
 
-async function doChat(deps: CommandDeps, p: ParsedArgs): Promise<number> {
+/** Apply a `-c apiUrl=` override by swapping in a client for that URL. */
+function withApiOverride(deps: CommandDeps, ov: ConfigOverrides): CommandDeps {
+  if (!ov.apiUrl || ov.apiUrl === deps.cfg.apiUrl) return deps;
+  return { ...deps, api: deps.createApi(ov.apiUrl, deps.cfg.token) };
+}
+
+/**
+ * Resolve the session for a run/chat invocation:
+ *  - `--daemon <name>`: reuse the named session's id (creating the record
+ *    on first use) so the conversation can be continued by name later.
+ *  - `--session <name>`: when the value names a recorded session, use its
+ *    sessionId (and note a bot mismatch); otherwise it is a raw session id.
+ *  - otherwise: the caller's default (a fresh random id).
+ * Returns the sessionId plus the daemon record to persist, if any.
+ */
+function resolveSessionFlags(
+  deps: CommandDeps,
+  p: ParsedArgs,
+  bot: BotSummary,
+  fallbackSessionId: string,
+): { sessionId: string; daemonName?: string } {
+  const daemonName = flagString(p.flags, 'daemon');
+  if (daemonName) {
+    const existing = getNamedSession(daemonName);
+    if (existing) {
+      if (existing.botId !== bot.id) {
+        err(
+          deps,
+          `[session] "${daemonName}" was recorded for bot ${existing.botId}; starting a fresh session for ${bot.id}\n`,
+        );
+        return { sessionId: randomUUID(), daemonName };
+      }
+      return { sessionId: existing.sessionId, daemonName };
+    }
+    return { sessionId: fallbackSessionId, daemonName };
+  }
+  const sessionFlag = flagString(p.flags, 'session');
+  if (sessionFlag) {
+    const named = getNamedSession(sessionFlag);
+    if (named) {
+      if (named.botId !== bot.id) {
+        err(deps, `[session] "${sessionFlag}" belongs to bot ${named.botId}, not ${bot.id} — using it anyway\n`);
+      }
+      return { sessionId: named.sessionId };
+    }
+    return { sessionId: sessionFlag };
+  }
+  return { sessionId: fallbackSessionId };
+}
+
+/** Persist a daemon record and announce it on stderr (stdout stays clean). */
+function recordDaemonSession(deps: CommandDeps, name: string, sessionId: string, botId: string): void {
+  const record: NamedSession = { name, sessionId, botId, updatedAt: Date.now() };
+  saveNamedSession(record);
+  err(deps, `[session] "${name}" → ${sessionId} (bot ${botId}) — continue with: kriyadot send ${name} "…"\n`);
+}
+
+async function doChat(deps0: CommandDeps, p: ParsedArgs, ov: ConfigOverrides): Promise<number> {
+  const deps = withApiOverride(deps0, ov);
+  const format = ov.format ?? p.global.format;
   // `chat <bot> [message...]` — subcommand slot holds the bot ref.
-  let botRef = p.subcommand;
+  let botRef = ov.bot ?? p.subcommand;
   if (!botRef && deps.isTTY) {
     const bots = await deps.api.listBots();
     if (bots.length === 0) throw new Error('No bots configured on this server.');
@@ -162,10 +271,14 @@ async function doChat(deps: CommandDeps, p: ParsedArgs): Promise<number> {
   if (!botRef) throw new Error('Usage: kriyadot chat <bot> [message]');
   const bot = await resolveBot(deps, botRef);
   const message = await resolveMessage(deps, p, p.positional);
+  const model = ov.model ?? flagString(p.flags, 'model');
+  const provider = ov.provider ?? flagString(p.flags, 'provider');
 
   if (message === null) {
     if (!deps.isTTY) throw new Error('No message given and stdin is not a pipe. Usage: kriyadot chat <bot> [message]');
-    // Interactive REPL.
+    // Interactive REPL. --daemon names the REPL session too.
+    const sess = resolveSessionFlags(deps, p, bot, randomUUID());
+    if (sess.daemonName) recordDaemonSession(deps, sess.daemonName, sess.sessionId, bot.id);
     return runRepl(
       {
         api: deps.api,
@@ -175,35 +288,127 @@ async function doChat(deps: CommandDeps, p: ParsedArgs): Promise<number> {
         lines: deps.createLineSource(),
         clearScreen: deps.clearScreen,
       },
-      { botId: bot.id, ...(flagString(p.flags, 'model') ? { model: flagString(p.flags, 'model')! } : {}) },
+      { botId: bot.id, sessionId: sess.sessionId, ...(model ? { model } : {}) },
     );
   }
 
+  const sess = resolveSessionFlags(deps, p, bot, randomUUID());
+  if (sess.daemonName) recordDaemonSession(deps, sess.daemonName, sess.sessionId, bot.id);
   return oneShotTurn(deps, {
     bot,
     message,
-    sessionId: flagString(p.flags, 'session') ?? randomUUID(),
-    ...(flagString(p.flags, 'model') ? { model: flagString(p.flags, 'model')! } : {}),
-    ...(flagString(p.flags, 'provider') ? { providerId: flagString(p.flags, 'provider')! } : {}),
+    sessionId: sess.sessionId,
+    ...(model ? { model } : {}),
+    ...(provider ? { providerId: provider } : {}),
     autoApprove: flagBool(p.flags, 'auto-approve') || flagBool(p.flags, 'autoapprove'),
-    format: p.global.format,
+    format,
   });
 }
 
-async function doRun(deps: CommandDeps, p: ParsedArgs): Promise<number> {
-  const botId = requireFlag(p.flags, 'bot', 'Example: kriyadot run --bot coder --message "hi"');
-  const bot = await resolveBot(deps, botId);
+async function doRun(deps0: CommandDeps, p: ParsedArgs, ov: ConfigOverrides): Promise<number> {
+  const deps = withApiOverride(deps0, ov);
+  const botRef = ov.bot ?? requireFlag(p.flags, 'bot', 'Example: kriyadot run --bot coder --message "hi"');
+  const bot = await resolveBot(deps, botRef);
   const message = await resolveMessage(deps, p, p.positional);
   if (message === null) throw new Error('No message given. Pass --message or pipe stdin.');
+  const sess = resolveSessionFlags(deps, p, bot, randomUUID());
+  if (sess.daemonName) recordDaemonSession(deps, sess.daemonName, sess.sessionId, bot.id);
+  const model = ov.model ?? flagString(p.flags, 'model');
+  const provider = ov.provider ?? flagString(p.flags, 'provider');
   return oneShotTurn(deps, {
     bot,
     message,
-    sessionId: flagString(p.flags, 'session') ?? randomUUID(),
+    sessionId: sess.sessionId,
+    ...(model ? { model } : {}),
+    ...(provider ? { providerId: provider } : {}),
+    autoApprove: flagBool(p.flags, 'auto-approve') || flagBool(p.flags, 'autoapprove'),
+    format: ov.format ?? p.global.format,
+  });
+}
+
+/**
+ * `kriyadot send <name> "follow-up"` — post a message to a named daemon
+ * session recorded by `run --daemon <name>`, continuing that conversation.
+ */
+async function doSend(deps: CommandDeps, p: ParsedArgs): Promise<number> {
+  const name = p.subcommand;
+  const named = getNamedSession(name);
+  if (!named) {
+    throw new Error(
+      `No named session "${name}". Start one with: kriyadot run --bot <id> --daemon ${name} --message "…"`,
+    );
+  }
+  const bot = await resolveBot(deps, named.botId);
+  const message = await resolveMessage(deps, p, p.positional);
+  if (message === null) throw new Error(`Usage: kriyadot send ${name} "message"`);
+  const code = await oneShotTurn(deps, {
+    bot,
+    message,
+    sessionId: named.sessionId,
     ...(flagString(p.flags, 'model') ? { model: flagString(p.flags, 'model')! } : {}),
     ...(flagString(p.flags, 'provider') ? { providerId: flagString(p.flags, 'provider')! } : {}),
     autoApprove: flagBool(p.flags, 'auto-approve') || flagBool(p.flags, 'autoapprove'),
     format: p.global.format,
   });
+  saveNamedSession({ ...named, updatedAt: Date.now() });
+  return code;
+}
+
+/** `kriyadot sessions [list]` / `kriyadot sessions delete <name>`. */
+async function doSessions(deps: CommandDeps, p: ParsedArgs): Promise<number> {
+  if (p.subcommand === 'delete') {
+    const name = p.positional[0];
+    if (!deleteNamedSession(name)) throw new Error(`No named session "${name}".`);
+    if (p.global.format === 'json') {
+      printJson(deps, { ok: true, deleted: name });
+      return 0;
+    }
+    out(deps, `Deleted named session "${name}"\n`);
+    return 0;
+  }
+  const sessions = loadNamedSessions();
+  if (p.global.format === 'json') {
+    printJson(deps, sessions);
+    return 0;
+  }
+  if (sessions.length === 0) {
+    out(deps, 'No named sessions. Start one with: kriyadot run --bot <id> --daemon <name> --message "…"\n');
+    return 0;
+  }
+  for (const s of sessions) {
+    const when = s.updatedAt ? new Date(s.updatedAt).toISOString() : '—';
+    out(deps, `${s.name}\tbot:${s.botId}\t${s.sessionId}\t${when}\n`);
+  }
+  return 0;
+}
+
+/**
+ * `kriyadot completion [bash|zsh]` — print a shell completion script.
+ * Bot/workflow names are baked in from the API when it answers quickly;
+ * otherwise the script silently covers the static surface only.
+ */
+async function doCompletion(deps: CommandDeps, p: ParsedArgs): Promise<number> {
+  let dynamic: DynamicNames = { bots: [], workflows: [] };
+  try {
+    const [bots, routines] = await withTimeout(
+      Promise.all([deps.api.listBots(), deps.api.listRoutines()]),
+      COMPLETION_API_TIMEOUT_MS,
+    );
+    dynamic = { bots: bots.map((b) => b.id), workflows: routines.map((r) => r.id) };
+  } catch {
+    // API unreachable or too slow — static fallback, by design.
+  }
+  if (p.subcommand === 'bash') {
+    out(deps, bashCompletionScript(dynamic));
+    return 0;
+  }
+  if (p.subcommand === 'zsh') {
+    out(deps, zshCompletionScript(dynamic));
+    return 0;
+  }
+  out(deps, `# ==== bash ====\n${bashCompletionScript(dynamic)}`);
+  out(deps, `# ==== zsh ====\n${zshCompletionScript(dynamic)}`);
+  return 0;
 }
 
 async function doBots(deps: CommandDeps, p: ParsedArgs): Promise<number> {
@@ -573,14 +778,35 @@ export async function runCommand(p: ParsedArgs, deps: CommandDeps): Promise<numb
   const invalid = validateCommand(p);
   if (invalid) {
     err(deps, `${invalid}\n`);
-    return 1;
+    return EXIT_USAGE;
+  }
+  // Per-run `-c key=value` overrides (chat/run only): parsed before any
+  // API call, applied in memory only, never persisted. A bad key or value
+  // is a usage error (exit 2).
+  let overrides: ConfigOverrides = {};
+  if ((p.command === 'chat' || p.command === 'run') && p.global.overrides.length > 0) {
+    try {
+      overrides = parseConfigOverrides(p.global.overrides);
+    } catch (e) {
+      if (e instanceof UsageError) {
+        err(deps, `kriyadot: ${e.message}\n`);
+        return EXIT_USAGE;
+      }
+      throw e;
+    }
   }
   try {
     switch (p.command) {
       case 'chat':
-        return await doChat(deps, p);
+        return await doChat(deps, p, overrides);
       case 'run':
-        return await doRun(deps, p);
+        return await doRun(deps, p, overrides);
+      case 'send':
+        return await doSend(deps, p);
+      case 'sessions':
+        return await doSessions(deps, p);
+      case 'completion':
+        return await doCompletion(deps, p);
       case 'bots':
         return await doBots(deps, p);
       case 'threads':
@@ -605,13 +831,17 @@ export async function runCommand(p: ParsedArgs, deps: CommandDeps): Promise<numb
         return await doConfig(deps, p);
       default:
         err(deps, `Unknown command "${p.command}". Run "kriyadot help".\n`);
-        return 1;
+        return EXIT_USAGE;
     }
   } catch (e) {
+    if (e instanceof UsageError) {
+      err(deps, `kriyadot: ${e.message}\n`);
+      return EXIT_USAGE;
+    }
     const msg = e instanceof Error ? e.message : String(e);
     // Hint at the token source when auth fails, without ever printing it.
     const hint = /401/.test(msg) ? ` (token from ${tokenSource({ token: p.global.token })})` : '';
     err(deps, `kriyadot: ${msg}${hint}\n`);
-    return 1;
+    return EXIT_ERROR;
   }
 }

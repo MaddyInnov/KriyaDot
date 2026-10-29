@@ -23,7 +23,7 @@ export interface ProviderPreset {
   id: string;
   name: string;
   /** Wire protocol driver to use. */
-  api: 'openai-compatible' | 'anthropic' | 'ollama' | 'llamacpp';
+  api: 'openai-compatible' | 'anthropic' | 'ollama' | 'llamacpp' | 'bedrock' | 'vertex';
   /** Base URL of the chat-completions (or messages) API. Empty for BYO presets until the user configures it. */
   baseUrl: string;
   /** Env var holding the user's API key. */

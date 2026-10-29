@@ -101,9 +101,27 @@ export class AnthropicProvider implements LLMProvider {
   async chat(
     messages: ChatMessage[],
     tools: ToolDefinition[],
-    opts: { model: string; onToken?: (t: string) => void; signal?: AbortSignal },
+    opts: Parameters<LLMProvider['chat']>[2],
   ): Promise<{ content: string; toolCalls: ToolCall[]; usage: TokenUsage }> {
-    const { system, messages: anthropicMessages } = toAnthropicMessages(messages);
+    const { system: rawSystem, messages: anthropicMessages } = toAnthropicMessages(messages);
+    // Structured output (Octomind parity): the Messages API has no
+    // response_format parameter, so enforcement is an explicit output
+    // contract in the system prompt; the runtime additionally validates
+    // the JSON and retries once on a parse failure.
+    let system = rawSystem;
+    if (opts.responseFormat) {
+      const contract =
+        opts.responseFormat.type === 'json_schema'
+          ? 'Your reply must be exactly one JSON value (no prose, no code fences) conforming to this JSON Schema:\n' +
+            JSON.stringify(opts.responseFormat.schema)
+          : 'Your reply must be exactly one JSON value (no prose, no code fences).';
+      system = system ? `${system}\n\n${contract}` : contract;
+    }
+    let signal = opts.signal;
+    if (opts.timeoutMs && opts.timeoutMs > 0) {
+      const timeoutSignal = AbortSignal.timeout(opts.timeoutMs);
+      signal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+    }
     const res = await fetch(`${this.baseUrl}/messages`, {
       method: 'POST',
       headers: {
@@ -113,7 +131,8 @@ export class AnthropicProvider implements LLMProvider {
       },
       body: JSON.stringify({
         model: opts.model,
-        max_tokens: 4096,
+        max_tokens: opts.maxTokens ?? 4096,
+        ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
         ...(system ? { system } : {}),
         messages: anthropicMessages,
         ...(tools.length > 0
@@ -126,7 +145,7 @@ export class AnthropicProvider implements LLMProvider {
             }
           : {}),
       }),
-      signal: opts.signal,
+      signal,
     });
     if (!res.ok) {
       const body = await res.text().catch(() => '');

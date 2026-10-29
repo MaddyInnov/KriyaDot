@@ -8,3 +8,4 @@ export * from './hard-floors.js';
 export * from './gateway.js';
 export * from './privacy-tiers.js';
 export * from './processing-rules.js';
+export * from './policy-file.js';

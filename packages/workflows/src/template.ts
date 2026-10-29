@@ -8,6 +8,9 @@
  *   {{input.some.path}}      -> dot-path into the run input
  *   {{nodes.<id>.output}}    -> the whole output of node <id>
  *   {{nodes.<id>.output.a.b}} -> dot-path into that node's output
+ *   {{item}} / {{item.a.b}}  -> current item (match/loop sub-executions)
+ *   {{index}}                -> 0-based item position (match bodies)
+ *   {{iteration}}            -> 1-based loop iteration (loop bodies)
  *
  * If a string consists of exactly one placeholder, the resolved value is
  * returned as-is (preserving objects/arrays). Otherwise placeholders are
@@ -18,6 +21,15 @@
 export interface TemplateContext {
   input: unknown;
   nodes: Record<string, unknown>;
+  /**
+   * Current item while a `match` body (or `loop` body) executes:
+   * `{{item}}` / `{{item.some.path}}`. Undefined outside sub-executions.
+   */
+  item?: unknown;
+  /** 0-based position of `item` in a `match` fan-out: `{{index}}`. */
+  index?: number;
+  /** 1-based iteration counter inside a `loop`: `{{iteration}}`. */
+  iteration?: number;
 }
 
 const PLACEHOLDER_RE = /\{\{\s*([^{}]+?)\s*\}\}/g;
@@ -38,6 +50,10 @@ const NODES_OUTPUT_RE = /^nodes\.([^.]+)\.output(?:\.(.+))?$/;
 function resolveRef(ref: string, ctx: TemplateContext): unknown {
   if (ref === 'input') return ctx.input;
   if (ref.startsWith('input.')) return getPath(ctx.input, ref.slice('input.'.length));
+  if (ref === 'item') return ctx.item;
+  if (ref.startsWith('item.')) return getPath(ctx.item, ref.slice('item.'.length));
+  if (ref === 'index') return ctx.index;
+  if (ref === 'iteration') return ctx.iteration;
   const m = NODES_OUTPUT_RE.exec(ref);
   if (m) {
     const output = ctx.nodes[m[1]];

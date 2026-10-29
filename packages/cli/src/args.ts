@@ -2,7 +2,7 @@
 // argv parsing for the headless CLI. Pure functions — no I/O — so the
 // command table can be unit-tested without a server or a terminal.
 
-export type OutputFormat = 'text' | 'json';
+export type OutputFormat = 'text' | 'json' | 'jsonl';
 
 export interface GlobalFlags {
   api?: string;
@@ -10,10 +10,12 @@ export interface GlobalFlags {
   format: OutputFormat;
   help: boolean;
   version: boolean;
+  /** Raw `-c key=value` per-run config overrides (repeatable). */
+  overrides: string[];
 }
 
 export interface ParsedArgs {
-  /** Top-level command: chat, run, bots, threads, routines, team, serve, models, mcp, login, config, help. */
+  /** Top-level command: chat, run, send, sessions, bots, threads, routines, team, serve, models, mcp, login, config, completion, help. */
   command: string;
   /** Second token for grouped commands (bots list, threads show, …). */
   subcommand: string;
@@ -35,7 +37,7 @@ const GLOBAL_BOOL_FLAGS = new Set(['help', 'version']);
 export function parseArgs(argv: string[]): ParsedArgs {
   const positional: string[] = [];
   const flags: Record<string, string | boolean> = {};
-  const global: GlobalFlags = { format: 'text', help: false, version: false };
+  const global: GlobalFlags = { format: 'text', help: false, version: false, overrides: [] };
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -56,13 +58,25 @@ export function parseArgs(argv: string[]): ParsedArgs {
         else if (name === 'token' && typeof value === 'string') global.token = value;
         else if (name === 'format' && typeof value === 'string') {
           const f = value.toLowerCase();
-          if (f !== 'text' && f !== 'json') throw new Error(`--format must be "text" or "json", got "${value}"`);
+          if (f !== 'text' && f !== 'json' && f !== 'jsonl') {
+            throw new Error(`--format must be "text", "json" or "jsonl", got "${value}"`);
+          }
           global.format = f;
         } else if (name === 'help') global.help = true;
         else if (name === 'version') global.version = true;
         continue;
       }
       flags[name] = value;
+      continue;
+    }
+    if (a === '-c' || a.startsWith('-c=')) {
+      // Repeatable per-run config override: -c key=value (or -c=key=value).
+      if (a.startsWith('-c=')) {
+        global.overrides.push(a.slice(3));
+        continue;
+      }
+      if (i + 1 >= argv.length) throw new Error('-c needs a key=value argument, e.g. -c model=llama-3.3-70b');
+      global.overrides.push(argv[++i]);
       continue;
     }
     if (a.startsWith('-') && a.length > 1) {
@@ -118,8 +132,26 @@ export function validateCommand(p: ParsedArgs): string | null {
       }
       return null;
     case 'run':
-      if (!flagString(p.flags, 'bot')) return usage('kriyadot run needs --bot <id>.');
+      if (flagString(p.flags, 'daemon') && flagString(p.flags, 'session')) {
+        return usage('kriyadot run takes only one of --daemon <name> and --session <name>.');
+      }
+      if (!flagString(p.flags, 'bot') && !p.global.overrides.some((o) => o.startsWith('bot='))) {
+        return usage('kriyadot run needs --bot <id> (or -c bot=<id>).');
+      }
       return null;
+    case 'send':
+      if (!p.subcommand) return usage('kriyadot send <name> "message" — name a session from "kriyadot sessions".');
+      return null;
+    case 'sessions':
+      if (p.subcommand === '' || p.subcommand === 'list') return null;
+      if (p.subcommand === 'delete') {
+        if (p.positional.length === 0) return usage('kriyadot sessions delete <name>.');
+        return null;
+      }
+      return usage('kriyadot sessions [list|delete <name>].');
+    case 'completion':
+      if (p.subcommand === '' || p.subcommand === 'bash' || p.subcommand === 'zsh') return null;
+      return usage('kriyadot completion [bash|zsh].');
     case 'bots':
       if (p.subcommand === 'list') return null;
       if (p.subcommand === 'run') {

@@ -82,6 +82,7 @@ export type ChatEvent =
   | { type: 'tool_result'; name: string; denied?: boolean }
   | { type: 'approval_required'; approvalId: string; name: string }
   | { type: 'done'; usage?: TokenUsage }
+  | { type: 'spend_cap_reached'; message: string }
   | { type: 'error'; message: string }
   | { type: 'interrupted'; reason: string }
   | { type: 'notice'; kind: string; message: string }
@@ -119,6 +120,13 @@ export function parseChatEvent(data: string): ChatEvent {
       return { type: 'approval_required', approvalId: String(ev.approvalId ?? ''), name };
     case 'done':
       return { type: 'done', usage: ev.usage as TokenUsage | undefined };
+    case 'spend_cap_reached':
+      // Spend-cap / usage-limit hard stop (resumable — see exits.ts, 75).
+      // The API emits this right before the terminal 'error' event.
+      return {
+        type: 'spend_cap_reached',
+        message: typeof ev.message === 'string' ? ev.message : 'Spend cap reached',
+      };
     case 'error':
       return { type: 'error', message: typeof ev.message === 'string' ? ev.message : 'Unknown error' };
     case 'interrupted':

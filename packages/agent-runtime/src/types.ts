@@ -186,6 +186,12 @@ export interface ToolContext {
    */
   persistentSandboxId?: string;
   /**
+   * Commit attribution line for git_commit (Octomind parity small
+   * item): copied from the bot's `commitAttribution` config by the
+   * runtime each turn. Absent → commits carry no attribution.
+   */
+  commitAttribution?: string;
+  /**
    * Per-turn workspace override (Spaces feature). When set, tool calls in
    * this turn resolve their workspace from this value (same semantics as a
    * per-bot workspace) instead of the bot's configured workspace.
@@ -206,6 +212,15 @@ export interface ToolContext {
    * RunTurnOptions.conversationId.
    */
   conversationId?: string;
+  /**
+   * Guardrails-as-code (Octomind parity): names of tools already executed
+   * in this session (oldest first), maintained by the runtime. The
+   * governance adapter forwards it so policy rules with a
+   * `requiresHistory` condition can match ("allow X only after Y ran").
+   * Absent → history conditions never match (fail-closed for conditional
+   * allows, and conditional denies simply don't fire).
+   */
+  sessionToolHistory?: string[];
   /**
    * Interactive widgets (OpenMausBot parity P1 #15). Set by the runtime
    * when the host passed a WidgetCoordinator: tools can raise widgets
@@ -255,6 +270,21 @@ export interface BotPolicyRule {
   toolPattern: string;
   effect: 'allow' | 'deny' | 'require-approval';
   reason?: string;
+  /**
+   * Guardrails-as-code (Octomind parity): argument matching. The rule only
+   * matches when the named argument's value (stringified when not a
+   * string) matches `pattern` (RegExp, case-sensitive — argument values
+   * are data, not names). Absent → the rule matches on the tool name alone
+   * (previous behavior).
+   */
+  argPattern?: { arg: string; pattern: string };
+  /**
+   * Guardrails-as-code (Octomind parity): session-history condition. The
+   * rule only matches when at least `minCount` (default 1) earlier tool
+   * calls in THIS session match `toolPattern` — e.g. "allow git_push only
+   * after verify_changes ran". Absent → no history condition.
+   */
+  requiresHistory?: { toolPattern: string; minCount?: number };
 }
 
 /**
@@ -288,8 +318,64 @@ export interface ModelOptions {
   fastMode?: boolean;
   /** Sampling temperature (0-2). */
   temperature?: number;
+  /** Nucleus sampling cutoff (0-1). */
+  topP?: number;
   /** Max output tokens. */
   maxTokens?: number;
+}
+
+/**
+ * Structured output enforcement (Octomind parity): ask the provider to
+ * constrain the model's final response. `json_schema` carries a full JSON
+ * Schema the response must conform to; `json_object` only guarantees
+ * syntactically valid JSON. Drivers with native support (OpenAI-compatible
+ * `response_format`) send it on the wire; other drivers get a schema
+ * instruction plus a runtime-side JSON validity check with one corrective
+ * retry.
+ */
+export type StructuredOutputSpec =
+  | { type: 'json_object' }
+  | {
+      type: 'json_schema';
+      /** Schema name (required by some providers; defaults to 'response'). */
+      name?: string;
+      schema: Record<string, unknown>;
+      strict?: boolean;
+    };
+
+/**
+ * End-of-turn validator (Octomind parity): a declared check that runs
+ * automatically when a turn is about to finish. A failure injects the
+ * validator's output as the next instruction instead of ending the turn
+ * (bounded retries). `command` validators run an argv array (no shell) in
+ * the bot's workspace; `builtin: 'verify-changes'` runs the project's own
+ * checks via the verify tool machinery.
+ */
+export interface TurnValidatorSpec {
+  name: string;
+  command?: string[];
+  builtin?: 'verify-changes';
+  /** Per-validator timeout; default 120s. */
+  timeoutMs?: number;
+}
+
+/**
+ * One stage of an in-turn layer pipeline (Octomind parity). Stages run
+ * around the main turn loop with their own prompt and (optionally) model:
+ * `prepare` stages transform/augment the user message before the loop;
+ * `review` stages see the draft final answer and may return a revised
+ * answer (their full output replaces the draft when non-empty).
+ */
+export interface LayerStageSpec {
+  name: string;
+  kind: 'prepare' | 'review';
+  /** Stage system prompt (its job description). */
+  prompt: string;
+  /** Purpose profile or explicit model for this stage; default: turn model. */
+  model?: string;
+  providerId?: string;
+  /** What the stage receives: the user message, the draft answer, or both. */
+  inputMode?: 'user' | 'draft' | 'user+draft';
 }
 
 /**
@@ -424,6 +510,61 @@ export interface BotConfig {
    * A per-conversation pin can override this for one chat.
    */
   computerSurface?: ComputerSurface;
+  /**
+   * Supervisor verify-gate (Octomind parity): when true, a turn that used
+   * mutating tools may not end on an unverified completion claim — a
+   * separate cheap-model supervisor checks the final claim against the
+   * runtime evidence collected this turn (tool results) and can reject it,
+   * sending the bot back to work (bounded rejections per turn). Default
+   * false; the host may also enable it globally via env.
+   */
+  supervisorVerifyGate?: boolean;
+  /**
+   * End-of-turn validators (Octomind parity): declared checks run
+   * automatically before a turn may finish; failures are injected as the
+   * next instruction (bounded retries). Skill-declared validators are
+   * added on top of these.
+   */
+  validators?: TurnValidatorSpec[];
+  /**
+   * In-turn layers (Octomind parity): optional stage pipeline around the
+   * main turn loop — `prepare` stages shape the request, `review` stages
+   * may revise the draft answer. Each stage has its own prompt and model.
+   * Absent → single-stage turns (previous behavior).
+   */
+  layers?: LayerStageSpec[];
+  /**
+   * Project instruction files (Octomind parity): when not false, the
+   * runtime loads AGENTS.md-style files from the bot's workspace into the
+   * system prompt each turn. Default true (only active when the host
+   * supplies a workspace resolver).
+   */
+  projectInstructions?: boolean;
+  /**
+   * Semantic discovery (Octomind parity): when true, skills whose intent
+   * embedding decisively matches the user's message are auto-activated
+   * for the turn (deterministic policy with abstain-on-tie). Default
+   * false — skills otherwise activate via read_skill as before.
+   */
+  autoActivateSkills?: boolean;
+  /**
+   * Hindsight (Octomind parity): when true, a cheap-model retrospective
+   * runs after tool-using turns and stores one lesson atom in memory.
+   * Default false.
+   */
+  hindsight?: boolean;
+  /**
+   * Recite (Octomind parity): in plan mode, after the human approves the
+   * plan the bot must first recite the resolved checklist back (verified
+   * against the approved plan) before executing. Default false.
+   */
+  recitePlan?: boolean;
+  /**
+   * Commit attribution (Octomind parity): appended to git commit messages
+   * this bot creates (e.g. "Co-authored-by: KriyaDot Bot <bot@kriyadot>").
+   * Absent → no attribution line.
+   */
+  commitAttribution?: string;
 }
 
 export interface LLMProvider {
@@ -439,6 +580,22 @@ export interface LLMProvider {
       onRetry?: (attempt: number, error: Error) => void;
       /** Reasoning effort for models that support it (OpenAI reasoning_effort). */
       reasoningEffort?: 'low' | 'medium' | 'high';
+      /** Sampling temperature (0-2), when the driver supports it. */
+      temperature?: number;
+      /** Nucleus sampling cutoff (0-1), when the driver supports it. */
+      topP?: number;
+      /** Max output tokens, when the driver supports it. */
+      maxTokens?: number;
+      /** Per-call request timeout in ms (purpose-profile knob). */
+      timeoutMs?: number;
+      /** Per-call retry budget override (purpose-profile knob). */
+      maxRetries?: number;
+      /**
+       * Structured output enforcement (Octomind parity): constrain the
+       * response to JSON / a JSON Schema. Drivers without native support
+       * ignore this on the wire; the runtime still validates the result.
+       */
+      responseFormat?: StructuredOutputSpec;
       /**
        * Native CLI drivers (OpenMausBot parity): stable key for CLI session
        * resume (the runtime passes its sessionId). Absent = one-shot turn.

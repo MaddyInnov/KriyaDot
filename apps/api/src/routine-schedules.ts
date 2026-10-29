@@ -294,7 +294,7 @@ export function cronMatchesZone(parsed: ParsedCron, p: ZonedParts): boolean {
 // Schedule model
 // ---------------------------------------------------------------------------
 
-export type RoutineScheduleKind = 'once' | 'daily' | 'cron' | 'interval' | 'limit-reset' | 'event';
+export type RoutineScheduleKind = 'once' | 'daily' | 'cron' | 'interval' | 'limit-reset' | 'event' | 'idle';
 
 /** When a scheduled run fires while the previous run is still in flight. */
 export type OverlapPolicy = 'skip' | 'queue';
@@ -359,6 +359,18 @@ export interface IntervalSchedule extends ScheduleBase {
   windowEnd?: string;
   /** Optional absolute cutoff: ISO 8601 datetime with offset. */
   endsAt?: string;
+}
+
+/**
+ * Idle trigger (Octomind parity): fire once when the bot has had no
+ * completed turn activity for `afterMinutes`. Not a time grid — the
+ * scheduler's tick consults the host's lastBotActivityAt source.
+ * Re-arms automatically when new activity lands.
+ */
+export interface IdleSchedule extends ScheduleBase {
+  kind: 'idle';
+  /** 5..10080 minutes of inactivity before firing. */
+  afterMinutes: number;
 }
 
 /**
@@ -440,7 +452,7 @@ export interface EventSchedule extends ScheduleBase {
   windowMinutes?: number;
 }
 
-export type RoutineSchedule = OnceSchedule | DailySchedule | CronSchedule | IntervalSchedule | LimitResetSchedule | EventSchedule;
+export type RoutineSchedule = OnceSchedule | DailySchedule | CronSchedule | IntervalSchedule | LimitResetSchedule | EventSchedule | IdleSchedule;
 
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const ONCE_WALL_RE = /^(\d{4})-(\d{2})-(\d{2})T([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d)(?:\.\d+)?)?$/;
@@ -634,8 +646,8 @@ export function validateRoutineSchedule(input: unknown): RoutineSchedule {
   }
   const s = input as Record<string, unknown>;
   const kind = s.kind;
-  if (kind !== 'once' && kind !== 'daily' && kind !== 'cron' && kind !== 'interval' && kind !== 'limit-reset' && kind !== 'event') {
-    throw new Error('schedule.kind must be one of: once, daily, cron, interval, limit-reset, event');
+  if (kind !== 'once' && kind !== 'daily' && kind !== 'cron' && kind !== 'interval' && kind !== 'limit-reset' && kind !== 'event' && kind !== 'idle') {
+    throw new Error('schedule.kind must be one of: once, daily, cron, interval, limit-reset, event, idle');
   }
   const timezone = s.timezone;
   assertValidTimeZone(typeof timezone === 'string' ? timezone : '');
@@ -688,6 +700,14 @@ export function validateRoutineSchedule(input: unknown): RoutineSchedule {
       out.resumeAt = s.resumeAt.trim();
     }
     return out;
+  }
+
+  if (kind === 'idle') {
+    const after = s.afterMinutes;
+    if (!Number.isInteger(after) || (after as number) < 5 || (after as number) > 10080) {
+      throw new Error('idle schedule requires afterMinutes (integer 5..10080)');
+    }
+    return { kind, timezone: timezone as string, enabled, overlap, ...governance, afterMinutes: after as number };
   }
 
   if (kind === 'once') {
@@ -775,6 +795,8 @@ export function describeSchedule(s: RoutineSchedule): string {
       else d += ` — waits for a limit event (default backoff ${s.defaultBackoffMinutes ?? 60}m)`;
       return `${d} (${tz})`;
     }
+    case 'idle':
+      return `after ${s.afterMinutes}m of bot inactivity (${tz})`;
     case 'event': {
       let d = `on ${s.app} event via account ${s.accountId}`;
       if (s.app === 'gmail' && (s.from || s.subjectContains || s.query)) {
@@ -977,6 +999,10 @@ export function nextRuns(schedule: RoutineSchedule, n = 5, fromMs: number = Date
       // Event triggers are poll-driven (routine-events.ts), not a time
       // grid — there is no computable "next run" instant.
       return [];
+    case 'idle':
+      // Idle triggers are activity-driven (see tickRoutine), not a
+      // time grid — there is no computable "next run" instant.
+      return [];
   }
 }
 
@@ -1041,6 +1067,12 @@ export interface RoutineSchedulerDeps {
   onLimitResetResume?: (resume: LimitResetResume, routine: BotRoutine) => void;
   /** Global pause gate (W14d): while paused, ticks skip entirely. */
   isPaused?: () => boolean;
+  /**
+   * Idle triggers (Octomind parity): the bot's last turn-activity time
+   * (UTC ms), or undefined when the bot has never been active. Without
+   * this source, idle schedules simply never fire.
+   */
+  lastBotActivityAt?: (botId: string) => number | undefined;
 }
 
 /** Missed occurrences older than this are too stale to record (boot catch-up). */
@@ -1251,6 +1283,29 @@ export class RoutineScheduler {
     // authoritative path) when one is wired — never twice.
     if (schedule.kind === 'limit-reset' && this.deps.resumeStore) return;
 
+    // Idle triggers: fire once per idle period. An idle period's
+    // threshold instant is lastActivity + afterMinutes; the watermark
+    // reaching that instant means this period is already covered (by
+    // a fire, or by first-sight arming after the threshold passed —
+    // no backfill, matching the other kinds). New activity starts a
+    // new period with a later threshold, which re-arms the trigger.
+    if (schedule.kind === 'idle') {
+      const lastActivity = this.deps.lastBotActivityAt?.(routine.botId);
+      if (lastActivity === undefined) return;
+      const watermark = this.deps.routineStore.getLastFiredAt(routine.id);
+      if (watermark === undefined) {
+        this.deps.routineStore.setLastFiredAt(routine.id, now);
+        return;
+      }
+      const afterMs = schedule.afterMinutes * 60_000;
+      if (now - lastActivity < afterMs) return;
+      if (watermark >= lastActivity + afterMs) return; // period already covered
+      if (schedule.overlap === 'skip' && this.inFlight.has(routine.id)) return;
+      this.deps.routineStore.setLastFiredAt(routine.id, now);
+      void this.fire(routine, now);
+      return;
+    }
+
     let watermark = this.deps.routineStore.getLastFiredAt(routine.id);
     if (watermark === undefined) {
       // First sight (fresh schedule or pre-schedule routine): watermark
@@ -1308,6 +1363,8 @@ export class RoutineScheduler {
       // Event triggers reconcile through their own cursor catch-up in
       // the EventTriggerPoller (bounded, per routine-events.ts).
       if (schedule.kind === 'event') continue;
+      // Idle triggers have no occurrence grid to reconcile.
+      if (schedule.kind === 'idle') continue;
       const watermark = this.deps.routineStore.getLastFiredAt(routine.id);
       if (watermark === undefined || watermark >= now) continue;
       const gap = now - watermark;

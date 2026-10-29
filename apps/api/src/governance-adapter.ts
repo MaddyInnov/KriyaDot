@@ -28,6 +28,8 @@ import { checkHardFloor } from '@mvp/governance';
 // bot-policy.ts is a new module not re-exported from the governance index
 // (index untouched); import the built subpath directly.
 import { mergeBotPolicy } from '@mvp/governance/dist/bot-policy.js';
+import { loadWorkspacePolicy } from '@mvp/governance/dist/policy-file.js';
+import type { BotPolicy } from '@mvp/governance/dist/bot-policy.js';
 
 function toEvalContext(
   ctx: ToolContext,
@@ -38,6 +40,7 @@ function toEvalContext(
   actor: string;
   relayed?: boolean;
   addresseePersonId?: string;
+  sessionToolHistory?: string[];
 } {
   // Guarded external messages: turns triggered by a relayed external
   // message (webhook / external origin) mint relayed approvals, which can
@@ -50,6 +53,9 @@ function toEvalContext(
     ...(relayed ? { relayed } : {}),
     // W7: approvals are addressed to the bot's owner person.
     ...(addresseePersonId ? { addresseePersonId } : {}),
+    // Guardrails as code: session-history conditions match against the
+    // tools that already ran in this session.
+    ...(ctx.sessionToolHistory ? { sessionToolHistory: ctx.sessionToolHistory } : {}),
   };
 }
 
@@ -65,6 +71,14 @@ export interface GovernanceAdapterOptions {
    * the real gateway was constructed with).
    */
   getBotConfig?: (botId: string) => BotConfig | undefined;
+  /**
+   * Guardrails as code (Octomind parity): resolve a bot's workspace dir
+   * so evaluation can load its repo-local `.kriyadot/policy.json`. The
+   * workspace policy merges AHEAD of the bot's configured rules (the
+   * project is the most specific scope). Load errors are audited, never
+   * thrown. Default: undefined → no workspace policies.
+   */
+  workspaceDirForBot?: (botId: string) => string | undefined;
   /**
    * The global policy the real gateway was constructed with, used as the
    * merge base for per-bot policies. Defaults to DEFAULT_POLICY.
@@ -95,6 +109,7 @@ export interface GovernanceAdapterOptions {
 export class GovernanceAdapter implements RuntimeGovernanceGateway {
   private readonly real: RealGovernanceGateway;
   private readonly getBotConfig?: (botId: string) => BotConfig | undefined;
+  private readonly workspaceDirForBot?: (botId: string) => string | undefined;
   private readonly globalPolicy: Policy;
   private readonly getPreference?: (botId: string, toolName: string) => 'deny' | 'allow' | undefined;
   private readonly approvalObserver?: GovernanceAdapterOptions['approvalObserver'];
@@ -104,6 +119,7 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
   constructor(real: RealGovernanceGateway, opts: GovernanceAdapterOptions = {}) {
     this.real = real;
     this.getBotConfig = opts.getBotConfig;
+    this.workspaceDirForBot = opts.workspaceDirForBot;
     this.globalPolicy = opts.globalPolicy ?? DEFAULT_POLICY;
     this.getPreference = opts.getPreference;
     this.approvalObserver = opts.approvalObserver;
@@ -186,6 +202,40 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
     return toEvalContext(ctx, this.getBotConfig?.(ctx.botId)?.ownerId);
   }
 
+  /**
+   * Effective policy for a bot: repo-local workspace policy
+   * (`.kriyadot/policy.json`) ahead of the bot's configured rules ahead
+   * of the global policy — first match wins, so the most specific scope
+   * decides. Returns null when neither layer adds rules (evaluate
+   * against the gateway's own policy). Workspace load problems are
+   * audited once per (bot, file) state via the audit trail.
+   */
+  private mergedPolicyFor(botId: string, ctx?: ToolContext): Policy | null {
+    const botPolicy = this.getBotConfig?.(botId)?.policy;
+    let merged: Policy | null = null;
+    if (botPolicy && botPolicy.rules.length > 0) {
+      merged = mergeBotPolicy(this.globalPolicy, botPolicy);
+    }
+    const workspaceDir = this.workspaceDirForBot?.(botId);
+    if (workspaceDir) {
+      const loaded = loadWorkspacePolicy(workspaceDir);
+      if (loaded.errors.length > 0 && ctx) {
+        this.audit({
+          type: 'policy',
+          botId,
+          sessionId: ctx.sessionId,
+          detail: `workspace policy ${loaded.path}: ${loaded.errors.join('; ')}`,
+          ts: new Date().toISOString(),
+        });
+      }
+      if (loaded.policy.rules.length > 0) {
+        const wsPolicy: BotPolicy = loaded.policy;
+        merged = mergeBotPolicy(merged ?? this.globalPolicy, wsPolicy);
+      }
+    }
+    return merged;
+  }
+
   async evaluate(call: ToolCall, ctx: ToolContext): Promise<GovernanceEvaluation> {
     // Hard floors FIRST — before learned preferences, policy, always-allow.
     // No mode can bypass these.
@@ -228,17 +278,12 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
       }
     }
     // Per-bot policy: merge the calling bot's rules ahead of the global
-    // policy (first match wins). No bot policy → global policy only.
-    const botPolicy = this.getBotConfig?.(ctx.botId)?.policy;
-    const res =
-      botPolicy && botPolicy.rules.length > 0
-        ? await this.real.evaluateWithPolicy(
-            call.name,
-            call.args,
-            this.evalContext(ctx),
-            mergeBotPolicy(this.globalPolicy, botPolicy),
-          )
-        : await this.real.evaluate(call.name, call.args, this.evalContext(ctx));
+    // policy (first match wins); the repo-local workspace policy merges
+    // ahead of both. No extra rules → global policy only.
+    const mergedPolicy = this.mergedPolicyFor(ctx.botId, ctx);
+    const res = mergedPolicy
+      ? await this.real.evaluateWithPolicy(call.name, call.args, this.evalContext(ctx), mergedPolicy)
+      : await this.real.evaluate(call.name, call.args, this.evalContext(ctx));
     if (res.effect === 'require-approval' && res.approvalId) {
       const runtimeId = randomUUID();
       this.idMap.set(runtimeId, res.approvalId);
@@ -279,13 +324,10 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
     botId: string,
     toolName: string,
     args: Record<string, unknown>,
+    sessionToolHistory?: string[],
   ): Promise<SimulationResult> {
-    const botPolicy = this.getBotConfig?.(botId)?.policy;
-    const policy =
-      botPolicy && botPolicy.rules.length > 0
-        ? mergeBotPolicy(this.globalPolicy, botPolicy)
-        : this.globalPolicy;
-    return this.real.simulate(toolName, args, policy);
+    const policy = this.mergedPolicyFor(botId) ?? this.globalPolicy;
+    return this.real.simulate(toolName, args, policy, sessionToolHistory);
   }
 
   audit(entry: RuntimeAuditEntry): void {

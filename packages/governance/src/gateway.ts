@@ -290,7 +290,12 @@ export class GovernanceGateway {
    * — shared by evaluateInner() and simulate() so the simulator can never
    * drift from the live decision logic.
    */
-  private decidePolicy(toolName: string, args: Record<string, unknown>, policy: Policy): PolicyDecision {
+  private decidePolicy(
+    toolName: string,
+    args: Record<string, unknown>,
+    policy: Policy,
+    sessionToolHistory?: string[],
+  ): PolicyDecision {
     const actionClass = this.classify(toolName);
 
     // Hard floors FIRST — before denylist, policy rules, always-allow,
@@ -316,7 +321,9 @@ export class GovernanceGateway {
       return { effect: 'deny', actionClass, floorHit: null, denylistHit: true };
     }
 
-    const matchedRule = policy.rules.find((r) => this.ruleMatches(r, toolName, actionClass));
+    const matchedRule = policy.rules.find((r) =>
+      this.ruleMatches(r, toolName, actionClass, args, sessionToolHistory),
+    );
     return {
       effect: matchedRule?.effect ?? policy.defaultEffect,
       actionClass,
@@ -341,8 +348,9 @@ export class GovernanceGateway {
     toolName: string,
     args: Record<string, unknown>,
     policy?: Policy,
+    sessionToolHistory?: string[],
   ): Promise<SimulationResult> {
-    const d = this.decidePolicy(toolName, args, policy ?? this.policy);
+    const d = this.decidePolicy(toolName, args, policy ?? this.policy, sessionToolHistory);
     const reason =
       d.floorHit?.reason ??
       (d.denylistHit ? 'denylist: destructive command pattern' : (d.matchedRule?.reason ?? 'default policy'));
@@ -366,7 +374,7 @@ export class GovernanceGateway {
     ctx: EvalContext,
     policy: Policy,
   ): Promise<EvaluateResult> {
-    const d = this.decidePolicy(toolName, args, policy);
+    const d = this.decidePolicy(toolName, args, policy, ctx.sessionToolHistory);
     const { actionClass, floorHit, matchedRule: rule } = d;
 
     if (floorHit && floorHit.tier === 'catastrophic') {
@@ -801,6 +809,8 @@ export class GovernanceGateway {
     rule: PolicyRule,
     toolName: string,
     actionClass: ActionClass,
+    args: Record<string, unknown>,
+    sessionToolHistory?: string[],
   ): boolean {
     if (rule.actionClass !== undefined && rule.actionClass !== actionClass) {
       return false;
@@ -812,7 +822,36 @@ export class GovernanceGateway {
     } catch {
       return false; // Invalid pattern: fail closed (no match).
     }
-    return re.test(toolName);
+    if (!re.test(toolName)) return false;
+    // Guardrails as code: argument matching. The rule only fires when
+    // the named argument's value matches the pattern. Missing args and
+    // invalid patterns never match (fail-closed).
+    if (rule.argPattern) {
+      const value = args[rule.argPattern.arg];
+      if (value === undefined) return false;
+      let argRe: RegExp;
+      try {
+        argRe = new RegExp(rule.argPattern.pattern);
+      } catch {
+        return false;
+      }
+      const text = typeof value === 'string' ? value : (JSON.stringify(value) ?? '');
+      if (!argRe.test(text)) return false;
+    }
+    // Guardrails as code: session-history condition ("allow X only
+    // after Y ran"). Without a history the rule never matches.
+    if (rule.requiresHistory) {
+      if (!sessionToolHistory) return false;
+      let histRe: RegExp;
+      try {
+        histRe = new RegExp(rule.requiresHistory.toolPattern, 'i');
+      } catch {
+        return false;
+      }
+      const count = sessionToolHistory.filter((n) => histRe.test(n)).length;
+      if (count < (rule.requiresHistory.minCount ?? 1)) return false;
+    }
+    return true;
   }
 
   private markExpired(approvalId: string): void {

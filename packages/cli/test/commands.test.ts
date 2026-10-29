@@ -36,9 +36,9 @@ describe('meta commands', () => {
     }
   });
 
-  it('unknown commands fail with a hint', async () => {
+  it('unknown commands fail with a hint (usage error, exit 2)', async () => {
     const { code, deps } = await run(['frobnicate']);
-    expect(code).toBe(1);
+    expect(code).toBe(2);
     expect(deps.stderrText()).toMatch(/Unknown command/);
   });
 });

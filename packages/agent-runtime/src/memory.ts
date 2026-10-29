@@ -199,6 +199,15 @@ export interface AtomCard {
   /** Memory category: fact | preference | summary | decision | lesson | procedure | reflection. */
   category: MemoryCategory;
   /**
+   * Verbatim-quote provenance (learning hardening): when the atom was
+   * stored via storeVerbatimQuote, the exact quoted text and a
+   * reference to its source (event/message id). The quote was verified
+   * as a substring of the source before storage — see the grounding
+   * check there. Absent for ordinary distilled atoms.
+   */
+  quote?: string;
+  quoteSource?: string;
+  /**
    * Active memories participate in recall/search. Memories superseded by a
    * conflict resolution are kept (audit trail) but marked inactive.
    */
@@ -576,6 +585,14 @@ export interface TieredMemoryOptions {
    * zero-dependency TrigramEmbedder (deterministic, offline).
    */
   embedder?: SyncEmbedder;
+  /**
+   * Async (neural) embedder for recall re-ranking (learning
+   * hardening): recallHybridNeural narrows candidates with the sync
+   * hybrid path, then re-ranks with true embedding similarity. When
+   * it is the same trigram embedder the re-rank is a no-op ordering;
+   * hosts pass the env embedder (neural when configured).
+   */
+  neuralEmbedder?: SyncEmbedder;
 }
 
 /** One hybrid-recall hit: the atom plus how it was retrieved. */
@@ -591,6 +608,9 @@ export class TieredMemoryStore {
   private readonly db: DatabaseSyncType;
   private readonly distiller?: LlmDistiller;
   private readonly embedder: SyncEmbedder;
+  private readonly neuralEmbedder?: SyncEmbedder;
+  /** Verbatim quotes dropped by the grounding check (fail-closed count). */
+  private droppedUngrounded = 0;
 
   constructor(dataDir: string, opts: TieredMemoryOptions = {}) {
     mkdirSync(dataDir, { recursive: true });
@@ -626,12 +646,25 @@ export class TieredMemoryStore {
     if (!atomCols.some((c) => c.name === 'active')) {
       this.db.exec('ALTER TABLE memory_atoms ADD COLUMN active INTEGER NOT NULL DEFAULT 1');
     }
+    // Learning hardening: verbatim-quote provenance columns.
+    if (!atomCols.some((c) => c.name === 'quote')) {
+      this.db.exec('ALTER TABLE memory_atoms ADD COLUMN quote TEXT');
+    }
+    if (!atomCols.some((c) => c.name === 'quote_source')) {
+      this.db.exec('ALTER TABLE memory_atoms ADD COLUMN quote_source TEXT');
+    }
     const eventCols = this.db.prepare('PRAGMA table_info(memory_events)').all() as Array<{ name: string }>;
     if (!eventCols.some((c) => c.name === 'tier')) {
       this.db.exec('ALTER TABLE memory_events ADD COLUMN tier TEXT');
     }
     this.distiller = opts.distiller;
     this.embedder = opts.embedder ?? new TrigramEmbedder();
+    this.neuralEmbedder = opts.neuralEmbedder;
+  }
+
+  /** How many verbatim quotes the grounding check has dropped (fail-closed). */
+  get droppedUngroundedQuotes(): number {
+    return this.droppedUngrounded;
   }
 
   // ---- L0: raw events -----------------------------------------------------
@@ -744,7 +777,13 @@ export class TieredMemoryStore {
     fact: DistilledFact,
     sourceTurn: string,
     tier?: PrivacyTier,
-    opts: { category?: MemoryCategory; pinned?: boolean } = {},
+    opts: {
+      category?: MemoryCategory;
+      pinned?: boolean;
+      /** Verbatim-quote provenance (set by storeVerbatimQuote after grounding). */
+      quote?: string;
+      quoteSource?: string;
+    } = {},
   ): string {
     const factText = fact.fact.trim().slice(0, 500);
     if (!factText) throw new Error('fact must be non-empty');
@@ -759,7 +798,7 @@ export class TieredMemoryStore {
     const category = normalizeCategory(opts.category ?? inferCategory(factText));
     this.db
       .prepare(
-        'INSERT INTO memory_atoms (id, bot_id, fact, fact_norm, entities_json, confidence, source_turn, created_at, tier, pinned, category) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO memory_atoms (id, bot_id, fact, fact_norm, entities_json, confidence, source_turn, created_at, tier, pinned, category, quote, quote_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         id,
@@ -773,10 +812,82 @@ export class TieredMemoryStore {
         resolveTier('memory', tier),
         opts.pinned ? 1 : 0,
         category,
+        opts.quote ?? null,
+        opts.quoteSource ?? null,
       );
     this.indexAtomForSearch(botId, id, factText, entities);
     this.refreshEntityPages(botId, entities, id);
     return id;
+  }
+
+  /**
+   * Store a VERBATIM quote as memory (learning hardening).
+   *
+   * Grounding rule: the quote must literally appear in the source text
+   * (whitespace-normalized, case-sensitive) — a "quote" the source
+   * never said is a hallucination vector, so it is dropped fail-closed
+   * (returns null and bumps droppedUngroundedQuotes) rather than
+   * stored. Grounded quotes are stored with their provenance
+   * (quote + source reference) so the provenance inspector can show
+   * exactly where a memory came from.
+   */
+  storeVerbatimQuote(
+    botId: string,
+    input: {
+      quote: string;
+      sourceText: string;
+      sourceRef: string;
+      entities?: string[];
+      confidence?: number;
+    },
+    tier?: PrivacyTier,
+  ): string | null {
+    const normalize = (s: string): string => s.replace(/\s+/g, ' ').trim();
+    const quote = normalize(input.quote);
+    const source = normalize(input.sourceText);
+    if (!quote || !source.includes(quote)) {
+      this.droppedUngrounded++;
+      return null;
+    }
+    return this.storeAtom(
+      botId,
+      { fact: quote, entities: input.entities ?? [], confidence: input.confidence ?? 0.95 },
+      input.sourceRef,
+      tier,
+      { quote, quoteSource: input.sourceRef },
+    );
+  }
+
+  /**
+   * Near-duplicate atom pairs (learning hardening): active atoms whose
+   * stored-text embeddings are at least `threshold` similar but whose
+   * normalized texts differ (exact dupes are storeAtom's job). The
+   * tidy pass merges these ONLY behind a verifier — see tidyMemory.
+   * Bounded scan (≤300 atoms, ≤maxPairs pairs).
+   */
+  findNearDuplicatePairs(
+    botId: string,
+    threshold = 0.92,
+    maxPairs = 200,
+  ): Array<{ keep: AtomCard; duplicate: AtomCard; similarity: number }> {
+    const atoms = this.getAtoms(botId, 300);
+    if (atoms.length < 2) return [];
+    const vectors = this.embedder.embedSync(atoms.map((a) => a.fact));
+    const pairs: Array<{ keep: AtomCard; duplicate: AtomCard; similarity: number }> = [];
+    for (let i = 0; i < atoms.length; i++) {
+      for (let j = i + 1; j < atoms.length; j++) {
+        if (normFact(atoms[i]!.fact) === normFact(atoms[j]!.fact)) continue;
+        const similarity = cosineSimilarity(vectors[i]!, vectors[j]!);
+        if (similarity < threshold) continue;
+        const [keep, duplicate] =
+          atoms[i]!.createdAt <= atoms[j]!.createdAt
+            ? [atoms[i]!, atoms[j]!]
+            : [atoms[j]!, atoms[i]!];
+        pairs.push({ keep, duplicate, similarity });
+        if (pairs.length >= maxPairs) return pairs;
+      }
+    }
+    return pairs;
   }
 
   /**
@@ -934,6 +1045,7 @@ export class TieredMemoryStore {
         id: string; bot_id: string; fact: string; entities_json: string;
         confidence: number; source_turn: string; created_at: number; tier: string | null;
         pinned: number | null; category: string | null; active: number | null;
+        quote: string | null; quote_source: string | null;
       }>;
     return rows.map((r) => ({
       id: r.id,
@@ -947,6 +1059,8 @@ export class TieredMemoryStore {
       pinned: (r.pinned ?? 0) === 1,
       category: normalizeCategory(r.category),
       active: (r.active ?? 1) === 1,
+      ...(r.quote ? { quote: r.quote } : {}),
+      ...(r.quote_source ? { quoteSource: r.quote_source } : {}),
     }));
   }
 
@@ -1175,6 +1289,62 @@ export class TieredMemoryStore {
     if (hits.length === 0) return '';
     let block = '# What I remember (from past conversations)\n';
     for (const { atom } of hits) {
+      const line = `- ${atom.fact}\n`;
+      if (block.length + line.length > maxChars) break;
+      block += line;
+    }
+    return block;
+  }
+
+  /**
+   * Neural re-ranked recall (learning hardening): the sync hybrid path
+   * narrows to ≤50 candidates, then the async embedder re-ranks them
+   * by true embedding similarity (combined score = cosine + RRF).
+   * Without a neural embedder this degrades to the hybrid ordering.
+   * Scores on returned hits are the combined score.
+   */
+  async recallHybridNeural(
+    botId: string,
+    query: string,
+    topK = 5,
+    maxTier: PrivacyTier = 'cloud-ok',
+  ): Promise<HybridRecallHit[]> {
+    const candidates = this.recallHybrid(botId, query, 50, maxTier);
+    if (candidates.length === 0 || !this.neuralEmbedder) {
+      return candidates.slice(0, topK);
+    }
+    try {
+      const vectors = await this.neuralEmbedder.embed([
+        query,
+        ...candidates.map((h) => h.atom.fact),
+      ]);
+      const qv = vectors[0]!;
+      const rescored = candidates.map((hit, i) => ({
+        ...hit,
+        score: Math.round((cosineSimilarity(qv, vectors[i + 1]!) + hit.score) * 1e6) / 1e6,
+      }));
+      rescored.sort((a, b) => b.score - a.score);
+      return rescored.slice(0, topK);
+    } catch {
+      return candidates.slice(0, topK);
+    }
+  }
+
+  /** recallHybridNeural rendered as a prompt block (same shape/gate family as recallForPromptHybrid). */
+  async recallForPromptNeural(
+    botId: string,
+    query: string,
+    maxChars = 2000,
+    maxTier: PrivacyTier = 'cloud-ok',
+  ): Promise<string> {
+    const hits = await this.recallHybridNeural(botId, query, 12, maxTier);
+    // Keep a relevance gate equivalent in spirit to the hybrid one:
+    // lexical agreement always counts; otherwise the combined score
+    // must clear the single-leg RRF floor contribution.
+    const kept = hits.filter((h) => h.sources.includes('lexical') || h.score > 1 / 61);
+    if (kept.length === 0) return '';
+    let block = '# What I remember (from past conversations)\n';
+    for (const { atom } of kept) {
       const line = `- ${atom.fact}\n`;
       if (block.length + line.length > maxChars) break;
       block += line;

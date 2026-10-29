@@ -16,7 +16,14 @@ import express from 'express';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { AgentRuntime, SpanStore } from '@mvp/agent-runtime';
+import {
+  AgentRuntime,
+  SpanStore,
+  createEmbedderFromEnv,
+  discoverLocalTools,
+  parseModelProfiles,
+  resolveBotWorkspaceDir,
+} from '@mvp/agent-runtime';
 import type { BotConfig } from '@mvp/agent-runtime';
 import { DEFAULT_POLICY, GovernanceGateway, sanitizeTelemetry } from '@mvp/governance';
 import { TelemetryCollector } from '@mvp/agent-runtime';
@@ -124,7 +131,7 @@ import { registerPublicPageServing } from './public-pages.js';
 import { registerWorktreeRoutes } from './worktrees-routes.js';
 import { createWorktreeTools } from '@mvp/agent-runtime/dist/worktrees.js';
 import { HookBus, loadPlugins } from '@mvp/agent-runtime/dist/hooks.js';
-import { runChatCli, runScanCli } from './cli.js';
+import { runAcpCli, runChatCli, runScanCli } from './cli.js';
 // (selectComputerSandbox import removed: per-bot computers (P1 #14) replaced
 // the single shared sandbox with a PerBotComputerManager; see below.)
 // Phase 3: scheduled workflows create tasks; the platform also serves its
@@ -194,6 +201,8 @@ import { registerSignInCodeTools, signInCodePolicyRules } from './sign-in-code-t
 // require-approval), purchase intent service with Stripe Link / browser
 // executors, and the billing-area purchases routes (mounted via routes.ts).
 import { createPurchaseWiring, purchasePolicyRules, registerPurchaseTools } from './purchases.js';
+import { createMcpManageTool } from './mcp-manage-tool.js';
+import { createScheduleTools } from './schedule-tools.js';
 import { CostTracker, SpendCapStore } from '@mvp/billing';
 
 // Pipe/JSON chat mode: `mvp-server chat --bot <id> [--json]`. Parsed at the
@@ -209,6 +218,14 @@ if (process.argv[2] === 'chat') {
 // server, loads no config, and makes no network calls.
 if (process.argv[2] === 'scan') {
   const code = await runScanCli(process.argv.slice(2));
+  process.exit(code);
+}
+
+// ACP server mode: `mvp-server acp --bot <id>` serves the bot as an ACP
+// agent over stdio (Octomind parity). Parsed before boot() like chat —
+// stdout is the protocol channel, so the HTTP server never starts.
+if (process.argv[2] === 'acp') {
+  const code = await runAcpCli(process.argv.slice(2));
   process.exit(code);
 }
 
@@ -521,10 +538,45 @@ async function boot(): Promise<void> {
       computerManager.getLayer(botId, { surface: botsById.get(botId)?.computerSurface }),
   });
 
+  // Purpose-based model profiles (Octomind parity): optional
+  // <dataDir>/model-profiles.json maps purposes (main / supervisor /
+  // compression / reviewer / evaluate / …) to provider+model+knobs.
+  // Absent or invalid → empty table; every consumer falls back to its
+  // historical default. Loaded once at boot.
+  const modelProfiles = (() => {
+    try {
+      return parseModelProfiles(fs.readFileSync(path.join(config.dataDir, 'model-profiles.json'), 'utf8'));
+    } catch {
+      return {};
+    }
+  })();
+
+  // Per-bot workspace resolution shared by the runtime (project
+  // instructions, validators) and governance (repo-local policy file).
+  const workspaceDirForBotConfig = (bot: BotConfig): string =>
+    resolveBotWorkspaceDir({
+      botWorkspace: bot.workspace,
+      globalWorkspaceDir: config.workspaceDir,
+      dataDir: config.dataDir,
+    });
+
+  // Hindsight sink holder: the tiered memory store is constructed later
+  // in this function; the runtime's retrospective sink writes through
+  // this holder once it is filled (lessons before that are dropped —
+  // hindsight is best-effort by design).
+  const memorySinkHolder: {
+    storeLesson?: (botId: string, lesson: string, sessionId: string) => void;
+  } = {};
+
   const governanceAdapter = new GovernanceAdapter(governance, {
     getBotConfig: (id) => botsById.get(id),
     globalPolicy,
     getPreference: (botId, toolName) => preferenceStore.getPreference(botId, toolName)?.preference,
+    // Guardrails as code: repo-local .kriyadot/policy.json per bot workspace.
+    workspaceDirForBot: (botId) => {
+      const bot = botsById.get(botId);
+      return bot ? workspaceDirForBotConfig(bot) : undefined;
+    },
     // W6: when evaluation mints the request_purchase approval, register
     // the pending purchase intent against it (one card per purchase).
     approvalObserver: purchaseWiring.onApprovalMinted,
@@ -769,6 +821,11 @@ async function boot(): Promise<void> {
   // the observability routes serve the same store to Activity → Runs.
   const spanStore = new SpanStore(`${config.dataDir}/spans.db`);
 
+  // One platform embedder (Octomind parity): neural when EMBEDDING_MODEL
+  // is configured, trigram offline fallback otherwise. Shared by the
+  // runtime (semantic discovery) and the memory store (recall re-rank).
+  const platformEmbedder = createEmbedderFromEnv();
+
   const agentRuntime = new AgentRuntime({
     dbPath: `${config.dataDir}/agent.db`,
     spanStore,
@@ -781,13 +838,37 @@ async function boot(): Promise<void> {
       userSkillStore.isUserSkill(name) ? userSkillStore.isUsable(name, botId) : true,
     peerApprovalGate,
     // W9: per-bot private MCP tools, scoped strictly to the owning bot.
-    extraToolsForBot: (botId) => perBotMcpManager.toolDefinitions(botId),
+    // Octomind parity: local project tools from the bot workspace's
+    // .kriyadot/tools/ directory ride along (auto-registered per turn).
+    extraToolsForBot: (botId) => {
+      const bot = botsById.get(botId);
+      const local = bot ? discoverLocalTools(workspaceDirForBotConfig(bot)).tools : [];
+      return [...perBotMcpManager.toolDefinitions(botId), ...local];
+    },
     governance: governanceAdapter,
     toolRegistry,
     hooks: hookBus,
+    // Octomind parity wiring: per-bot workspace (project instructions +
+    // turn-end validators), purpose-based model profiles, the platform
+    // embedder (neural when configured, trigram offline fallback), and
+    // the hindsight lesson sink into tiered memory.
+    workspaceDirForBot: workspaceDirForBotConfig,
+    modelProfiles,
+    embedder: platformEmbedder,
+    // Background specialist runs: roster lookup for delegate_background.
+    resolveBot: (id) => botsById.get(id),
+    retrospectiveSink: (info) => {
+      memorySinkHolder.storeLesson?.(info.botId, info.lesson, info.sessionId);
+    },
     // Phase 2: summarization auto-compaction replaces blind truncation once
     // sessions grow past the threshold; the last-100-messages floor stays.
-    sessionStoreOptions: { summarizer: createSummarizer() },
+    // Octomind parity: adaptive (token-computed) fold depth + background
+    // folds; folded ranges are archived losslessly for the recall tool.
+    sessionStoreOptions: {
+      summarizer: createSummarizer(undefined, modelProfiles),
+      adaptiveCompaction: true,
+      backgroundCompaction: true,
+    },
     // Checkpoints: snapshot files before mutation (Claude Code rewind).
     // One checkpoint per (session, tool call) — files accumulate per call.
     onBeforeFileMutate: async (info) => {
@@ -802,6 +883,23 @@ async function boot(): Promise<void> {
     // rates, and token cost per bot turn. Metadata-tier only, guarded.
     telemetry,
   });
+
+  // Lossless-compaction recall tool (Octomind parity): bots dereference
+  // compaction archive ids from summary headers back to the original
+  // messages. Registered after the runtime exists (it binds its store);
+  // the registry Map is shared by reference, so the runtime sees it.
+  for (const tool of agentRuntime.createRecallTools()) {
+    toolRegistry.set(tool.name, tool);
+  }
+  // Background delegation tools (delegate_background / list / stop).
+  for (const tool of agentRuntime.createBackgroundTools()) {
+    toolRegistry.set(tool.name, tool);
+  }
+  // MCP management tool (Octomind parity): health/restart from inside a task.
+  {
+    const mcpManage = createMcpManageTool(lazyMcpManager);
+    toolRegistry.set(mcpManage.name, mcpManage);
+  }
 
   // Credential proposal host: the `request_credential` tool mints a card and
   // pauses the turn until the user fulfills/denies it in the approvals
@@ -988,6 +1086,12 @@ async function boot(): Promise<void> {
     getBots: () => seed.bots,
     runExecutor: routineRunExecutor,
   });
+  // In-session schedule/monitor tools (Octomind parity): bots create
+  // their own routines mid-conversation on this same store. The shared
+  // registry Map means late registration is fine.
+  for (const tool of createScheduleTools(routineStore)) {
+    toolRegistry.set(tool.name, tool);
+  }
   // Public webhook ingress (Codync parity): per-routine URL + secret with
   // HMAC verification and a queued delivery worker. The router is created
   // here; it mounts on `app` before the global express.json() parser below
@@ -1210,6 +1314,9 @@ async function boot(): Promise<void> {
     renderPrompt: renderRoutinePrompt,
     onScheduleAutoPaused: (routine, streak) => notifyRoutinePaused?.(routine, streak),
     isPaused,
+    // Idle triggers (Octomind parity): last message activity per bot
+    // from the runtime's session store.
+    lastBotActivityAt: (botId) => agentRuntime.lastBotActivityAt(botId),
     onLimitResetResume: (resume, routine) => {
       try {
         createTask({
@@ -1450,7 +1557,19 @@ async function boot(): Promise<void> {
   // The tiered memory store is hoisted here so both the call service and
   // the router deps share one instance.
   const { TieredMemoryStore: TieredMemoryStoreCtor } = await import('@mvp/agent-runtime');
-  const tieredMemoryStore = new TieredMemoryStoreCtor(config.dataDir);
+  const tieredMemoryStore = new TieredMemoryStoreCtor(config.dataDir, {
+    embedder: platformEmbedder,
+    neuralEmbedder: platformEmbedder,
+  });
+  // Hindsight (Octomind parity): runtime retrospective lessons land as
+  // memory atoms (deduped by the store; category inferred).
+  memorySinkHolder.storeLesson = (botId, lesson, sessionId) => {
+    try {
+      tieredMemoryStore.storeAtom(botId, { fact: lesson, entities: [], confidence: 0.6 }, sessionId);
+    } catch {
+      // Hindsight is best-effort — a memory write must never break a turn.
+    }
+  };
   // Memory fabric: install the live (model) distiller for bots that opted
   // in via memoryLiveDistill; everyone else keeps the zero-cost heuristic.
   wireMemoryDistillers(seed.bots, tieredMemoryStore);
@@ -1464,7 +1583,7 @@ async function boot(): Promise<void> {
     runBotTurn: async ({ bot, message, sessionId, signal, onText, onApproval }) => {
       let memoryContext: string | undefined;
       try {
-        memoryContext = tieredMemoryStore.recallForPrompt(bot.id, message) || undefined;
+        memoryContext = await tieredMemoryStore.recallForPromptNeural(bot.id, message) || undefined;
       } catch {
         memoryContext = undefined; // memory must never break calls
       }
@@ -1497,7 +1616,7 @@ async function boot(): Promise<void> {
     runBotTurn: async ({ bot, message, sessionId, signal, onText, onApproval }) => {
       let memoryContext: string | undefined;
       try {
-        memoryContext = tieredMemoryStore.recallForPrompt(bot.id, message) || undefined;
+        memoryContext = await tieredMemoryStore.recallForPromptNeural(bot.id, message) || undefined;
       } catch {
         memoryContext = undefined; // memory must never break calls
       }

@@ -68,7 +68,10 @@ export interface TurnOpts {
   message: string;
   sessionId: string;
   model?: string;
+  providerId?: string;
   autoApprove: boolean;
+  /** Observe every raw chat event (e.g. for --format jsonl streaming). */
+  onEvent?: (ev: ChatEvent) => void;
 }
 
 export interface TurnResult {
@@ -76,6 +79,11 @@ export interface TurnResult {
   usage?: TokenUsage;
   failed: boolean;
   error?: string;
+  /**
+   * True when the turn stopped on a resumable condition (spend cap /
+   * usage limit) rather than a hard failure — exit code 75 (exits.ts).
+   */
+  resumable?: boolean;
 }
 
 /**
@@ -95,6 +103,7 @@ export async function runStreamingTurn(
   let usage: TokenUsage | undefined;
   let failed = false;
   let error: string | undefined;
+  let resumable = false;
   let streamDone = false;
 
   const controller = await io.api.sendChat(
@@ -103,10 +112,12 @@ export async function runStreamingTurn(
       message: opts.message,
       sessionId: opts.sessionId,
       ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.providerId ? { providerId: opts.providerId } : {}),
       ...(opts.autoApprove ? { autoApprove: true } : {}),
     },
     {
       onEvent: (ev: ChatEvent) => {
+        opts.onEvent?.(ev);
         switch (ev.type) {
           case 'token':
             content += ev.content;
@@ -136,6 +147,16 @@ export async function runStreamingTurn(
             usage = ev.usage;
             streamDone = true;
             break;
+          case 'spend_cap_reached':
+            // Resumable stop: the session survives; the API follows this
+            // with a terminal 'error' event, but treat this as terminal
+            // too so a stream that ends here cannot hang the caller.
+            resumable = true;
+            failed = true;
+            error = ev.message || 'spend cap reached';
+            streamDone = true;
+            io.err(`[spend cap] ${error}\n`);
+            break;
           case 'interrupted':
             failed = true;
             error = ev.reason || 'interrupted';
@@ -163,7 +184,7 @@ export async function runStreamingTurn(
       }
     }, 25);
   });
-  return { content, usage, failed, error };
+  return { content, usage, failed, error, ...(resumable ? { resumable: true } : {}) };
 }
 
 function formatUsage(usage?: TokenUsage): string {

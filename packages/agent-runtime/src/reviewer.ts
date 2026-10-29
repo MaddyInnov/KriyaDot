@@ -15,6 +15,12 @@
 
 import type { LLMProvider, ToolCall } from './types.js';
 import { routeModel } from './routing.js';
+import {
+  profileModelForProvider,
+  resolvePurposeProfile,
+  type ModelProfiles,
+  type PurposeModelProfile,
+} from './model-profiles.js';
 
 export type ReviewerVerdict = 'yes' | 'no' | 'skip';
 
@@ -31,14 +37,23 @@ export interface ReviewerResult {
 export async function reviewToolCall(
   provider: LLMProvider,
   call: ToolCall,
-  opts: { signal?: AbortSignal } = {},
+  opts: { signal?: AbortSignal; profile?: PurposeModelProfile; profiles?: ModelProfiles } = {},
 ): Promise<ReviewerResult> {
-  // Resolve the cheapest model: explicit override > cheapest free > skip.
+  // Resolve the cheapest model: purpose profile ('reviewer') > explicit
+  // REVIEWER_MODEL override > cheapest free > skip.
   let model: string | undefined;
+  const profile = opts.profile ?? resolvePurposeProfile('reviewer', { profiles: opts.profiles });
+  const fromProfile = profileModelForProvider(profile, provider.providerId);
+  if (fromProfile) {
+    model = fromProfile;
+  } else if (profile?.modelId && !profile.providerId) {
+    model = profile.modelId;
+  }
   const override = process.env.REVIEWER_MODEL?.trim();
-  if (override) {
+  if (!model && override) {
     model = override.includes('/') ? override.split('/').slice(1).join('/') : override;
-  } else {
+  }
+  if (!model) {
     try {
       const routed = routeModel({ taskType: 'simple-qa', freeOnly: true });
       // Only use it if the provider matches (we don't want to spin up a new

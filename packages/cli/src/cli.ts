@@ -9,6 +9,7 @@ import { parseArgs } from './args.js';
 import { runCommand } from './commands.js';
 import type { CommandDeps } from './commands.js';
 import { createReadlineSource } from './repl.js';
+import { EXIT_ERROR, EXIT_INTERRUPTED, EXIT_USAGE } from './exits.js';
 
 async function readStdinAll(): Promise<string> {
   const chunks: Buffer[] = [];
@@ -28,12 +29,20 @@ async function prompt(question: string): Promise<string | null> {
 }
 
 async function main(): Promise<number> {
+  // Exit-code contract (exits.ts): Ctrl+C anywhere is 130, never the
+  // shell's signal report or a generic 1.
+  process.on('SIGINT', () => {
+    process.stderr.write('\nkriyadot: interrupted\n');
+    process.exit(EXIT_INTERRUPTED);
+  });
+
   let parsed;
   try {
     parsed = parseArgs(process.argv.slice(2));
   } catch (e) {
+    // argv itself is malformed — a usage error (exit 2).
     process.stderr.write(`kriyadot: ${e instanceof Error ? e.message : String(e)}\n`);
-    return 1;
+    return EXIT_USAGE;
   }
 
   let cfg;
@@ -41,7 +50,7 @@ async function main(): Promise<number> {
     cfg = resolveConfig({ api: parsed.global.api, token: parsed.global.token });
   } catch (e) {
     process.stderr.write(`kriyadot: ${e instanceof Error ? e.message : String(e)}\n`);
-    return 1;
+    return EXIT_ERROR;
   }
 
   const api = new KriyaDotApi(cfg.apiUrl, cfg.token);
@@ -66,7 +75,7 @@ async function main(): Promise<number> {
   } catch (e) {
     // runCommand already formats command errors; this is a last resort.
     process.stderr.write(`kriyadot: ${e instanceof Error ? e.message : String(e)}\n`);
-    return 1;
+    return EXIT_ERROR;
   }
 }
 

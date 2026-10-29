@@ -13,6 +13,7 @@ import {
   ensureApiReady,
   getBots,
   getChatThreadBranches,
+  shareSession,
   getChatThreadMessages,
   getMessageReactions,
   getMessageThread,
@@ -400,6 +401,44 @@ function CopyBtn({ text, title }: { text: string; title?: string }) {
       }}
     >
       {copied ? '✓ Copied' : '⧉ Copy'}
+    </button>
+  );
+}
+
+/**
+ * "Share" action for the active conversation: publishes the transcript
+ * as a public page (session share links) and copies the link.
+ */
+function ShareSessionBtn({ sessionId, disabled }: { sessionId: string; disabled?: boolean }) {
+  const [state, setState] = useState<'idle' | 'sharing' | 'copied' | 'error'>('idle');
+  if (!sessionId) return null;
+  return (
+    <button
+      type="button"
+      className="copy-btn"
+      title="Share this conversation — publishes the transcript to a public /p/ link and copies it"
+      aria-label="Share conversation"
+      disabled={disabled || state === 'sharing'}
+      onClick={async (e) => {
+        e.stopPropagation();
+        setState('sharing');
+        try {
+          const res = await shareSession(sessionId);
+          const url = `${window.location.origin}${res.path}`;
+          try {
+            await navigator.clipboard.writeText(url);
+          } catch {
+            // Clipboard unavailable — the link still exists; show it via title state.
+          }
+          setState('copied');
+          window.setTimeout(() => setState('idle'), 2000);
+        } catch {
+          setState('error');
+          window.setTimeout(() => setState('idle'), 2000);
+        }
+      }}
+    >
+      {state === 'sharing' ? '🔗 Sharing…' : state === 'copied' ? '✓ Link copied' : state === 'error' ? '⚠ Share failed' : '🔗 Share'}
     </button>
   );
 }
@@ -2209,6 +2248,9 @@ function ChatPageInner() {
               onSwitch={(id) => void switchBranchVersion(id)}
               disabled={sending || branching}
             />
+          )}
+          {chatMode === 'chat' && selectedBotId && (
+            <ShareSessionBtn sessionId={activeConvo[selectedBotId] ?? ''} disabled={sending} />
           )}
           {chatMode === 'chat' && (
             <MessageSearchBox

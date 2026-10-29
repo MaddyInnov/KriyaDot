@@ -16,6 +16,12 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { Sandbox } from 'e2b';
+import {
+  landlockHelperReady,
+  runInLandlock,
+  runInSeatbelt,
+  seatbeltAvailable,
+} from './sandbox-kernel.js';
 
 export interface SandboxCommandOptions {
   /** Kill the command after this many ms (default 60_000). */
@@ -34,7 +40,7 @@ export interface SandboxCommandResult {
   timedOut?: boolean;
 }
 
-export type SandboxBackend = 'e2b' | 'docker' | 'none';
+export type SandboxBackend = 'e2b' | 'docker' | 'landlock' | 'seatbelt' | 'none';
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 256 * 1024; // 256KB
@@ -106,13 +112,27 @@ function asCompletedResult(err: unknown): { exitCode: number; stdout: string; st
 
 /**
  * Which sandbox backend is available right now.
- * E2B wins when `E2B_API_KEY` is present; otherwise Docker if the CLI works.
+ * E2B wins when `E2B_API_KEY` is present; otherwise Docker if the CLI
+ * works. `SANDBOX_BACKEND` forces a backend (validated against
+ * availability; an unavailable choice falls through to auto). With
+ * `SANDBOX_KERNEL_FALLBACK=1`, kernel backends join the auto chain
+ * after Docker: Landlock on Linux (once its helper is compiled) and
+ * Seatbelt on macOS.
  */
 export function sandboxBackend(): SandboxBackend {
+  const forced = (process.env.SANDBOX_BACKEND ?? '').trim().toLowerCase();
+  if (forced === 'landlock' && landlockHelperReady()) return 'landlock';
+  if (forced === 'seatbelt' && seatbeltAvailable()) return 'seatbelt';
+  if (forced === 'none') return 'none';
   if (typeof process.env.E2B_API_KEY === 'string' && process.env.E2B_API_KEY.trim() !== '') {
     return 'e2b';
   }
-  return dockerAvailable() ? 'docker' : 'none';
+  if (dockerAvailable()) return 'docker';
+  if ((process.env.SANDBOX_KERNEL_FALLBACK ?? '') === '1') {
+    if (landlockHelperReady()) return 'landlock';
+    if (seatbeltAvailable()) return 'seatbelt';
+  }
+  return 'none';
 }
 
 function dockerAvailable(): boolean {
@@ -351,9 +371,20 @@ export async function executeSandboxedCommand(
   const backend = sandboxBackend();
   if (backend === 'e2b') return runInE2B(cmd, opts);
   if (backend === 'docker') return runInDocker(cmd, opts);
+  if (backend === 'landlock') return runInLandlock(cmd, opts);
+  if (backend === 'seatbelt') return runInSeatbelt(cmd, opts);
+  // First-use path: kernel fallback requested but the Landlock helper
+  // is not compiled yet — compile + probe now, then run confined
+  // rather than failing closed when the kernel can protect the run.
+  const forced = (process.env.SANDBOX_BACKEND ?? '').trim().toLowerCase();
+  if (forced === 'landlock' || (process.env.SANDBOX_KERNEL_FALLBACK ?? '') === '1') {
+    if (process.platform === 'linux') return runInLandlock(cmd, opts);
+    if (process.platform === 'darwin') return runInSeatbelt(cmd, opts);
+  }
   throw new Error(
-    'No sandbox backend available: set E2B_API_KEY for the E2B cloud sandbox ' +
-      'or install Docker for the local sandbox.',
+    'No sandbox backend available: set E2B_API_KEY for the E2B cloud sandbox, ' +
+      'install Docker for the local sandbox, or enable a kernel backend ' +
+      '(SANDBOX_KERNEL_FALLBACK=1 for Landlock on Linux / Seatbelt on macOS).',
   );
 }
 

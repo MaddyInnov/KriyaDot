@@ -157,9 +157,14 @@ function gitCommitTool(workspaceDir: WorkspaceSource): ToolDefinition {
       if (!message || message.length > 500) {
         throw new Error('message is required (1-500 chars)');
       }
+      const attribution = ctx.commitAttribution?.trim();
+      const fullMessage =
+        attribution && !message.includes(attribution)
+          ? `${message}\n\n${attribution.slice(0, 200)}`
+          : message;
       const add = runGit(ws, ['add', '-A']);
       if (!add.ok) throw new Error(`git add failed: ${add.stderr.trim()}`);
-      const commit = runGit(ws, ['commit', '-m', message, '--no-verify']);
+      const commit = runGit(ws, ['commit', '-m', fullMessage, '--no-verify']);
       if (!commit.ok) {
         throw new Error(`git commit failed: ${(commit.stderr || commit.stdout).trim()}`);
       }

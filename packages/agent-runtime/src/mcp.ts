@@ -4,7 +4,9 @@ import { createHash } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { ElicitRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { ToolCall, ToolContext, ToolDefinition } from './types.js';
+import { validateWidgetPayload, type ButtonsWidgetPayload } from './widgets.js';
 
 // vitest (Vite 5.4.21) cannot statically resolve the `node:sqlite` specifier,
 // so load it at runtime via the builtin-module API instead of a top-level import.
@@ -152,6 +154,16 @@ export interface MCPClientOptions {
   /** Test seam: build the underlying MCP Client (defaults to the real SDK client). */
   createClient?: () => Client;
   /**
+   * Elicitation (Octomind parity — MCP completion): how this client
+   * answers server-initiated `elicitation/create` requests.
+   * - 'widget': route to the calling turn's interactive widget host
+   *   (the ask_user_question machinery) — the user answers in chat.
+   * - a handler function: full custom routing (host-defined).
+   * - unset: the capability is not advertised; servers that require
+   *   elicitation get a method-not-supported error (fail-closed).
+   */
+  elicitation?: 'widget' | ElicitationHandler;
+  /**
    * Logical server name (e.g. the config key in mcp.json, like "fetch").
    * When set, tools are registered as `mcp:<server>:<tool>` so governance
    * policy can allowlist per server (see mcpServerAllowRule in
@@ -159,6 +171,20 @@ export interface MCPClientOptions {
    */
   serverName?: string;
 }
+
+/** MCP elicitation request (server → client, mid-tool-call). */
+export interface ElicitationRequest {
+  message: string;
+  requestedSchema: Record<string, unknown>;
+}
+
+/** MCP elicitation result: accept with content, or decline/cancel. */
+export interface ElicitationResult {
+  action: 'accept' | 'decline' | 'cancel';
+  content?: Record<string, unknown>;
+}
+
+export type ElicitationHandler = (req: ElicitationRequest) => Promise<ElicitationResult>;
 
 interface MCPToolMeta {
   name: string;
@@ -199,6 +225,14 @@ export class MCPClient {
   private readonly blockedTools = new Set<string>();
   /** Drift keys the human already denied (or that failed closed): don't re-spam approvals on reconnect. */
   private readonly deniedDrifts = new Set<string>();
+  /**
+   * Context of the tool call currently executing on this connection —
+   * elicitation requests arrive mid-call and route through its widget
+   * host. Concurrent calls on one connection share the slot (last
+   * writer wins); elicitation is rare and user-paced, so this is a
+   * deliberate simplification.
+   */
+  private activeToolCtx: ToolContext | null = null;
 
   constructor(options: MCPClientOptions = {}) {
     this.options = options;
@@ -256,8 +290,36 @@ export class MCPClient {
     transport: StdioClientTransport | StreamableHTTPClientTransport,
     what: string,
   ): Promise<void> {
-    const createClient = this.options.createClient ?? (() => new Client({ name: 'mvp-agent-runtime', version: '0.1.0' }));
+    const elicitationOn = this.options.elicitation !== undefined;
+    const createClient =
+      this.options.createClient ??
+      (() =>
+        new Client(
+          { name: 'mvp-agent-runtime', version: '0.1.0' },
+          elicitationOn ? { capabilities: { elicitation: {} } } : undefined,
+        ));
     const client = createClient();
+    if (elicitationOn) {
+      // Advertise + route server-initiated elicitation requests. A
+      // custom createClient that lacks setRequestHandler simply skips
+      // this (tests use the seam to observe registration).
+      const anyClient = client as unknown as {
+        setRequestHandler?: (schema: unknown, handler: (req: { params: unknown }) => Promise<ElicitationResult>) => void;
+      };
+      anyClient.setRequestHandler?.(ElicitRequestSchema, async (req) => {
+        const params = (req.params ?? {}) as {
+          message?: string;
+          requestedSchema?: Record<string, unknown>;
+        };
+        return this.handleElicitation({
+          message: typeof params.message === 'string' ? params.message : '',
+          requestedSchema:
+            params.requestedSchema && typeof params.requestedSchema === 'object'
+              ? params.requestedSchema
+              : {},
+        });
+      });
+    }
     try {
       await client.connect(transport);
     } catch (err) {
@@ -396,6 +458,134 @@ export class MCPClient {
     }
   }
 
+  /**
+   * Route one elicitation request. Custom handler wins; 'widget' mode
+   * asks the user through the in-flight turn's widget host (a buttons
+   * card: enum fields become options, everything else free text).
+   * Mapping back to content is deliberately conservative: a single
+   * requested property maps from the answer; multi-property schemas
+   * accept a JSON object typed as free text. Anything unmappable
+   * declines — the server decides how to proceed without the data.
+   */
+  async handleElicitation(req: ElicitationRequest): Promise<ElicitationResult> {
+    const opt = this.options.elicitation;
+    if (typeof opt === 'function') {
+      try {
+        return await opt(req);
+      } catch {
+        return { action: 'decline' };
+      }
+    }
+    if (opt !== 'widget') return { action: 'decline' };
+    const ctx = this.activeToolCtx;
+    const host = ctx?.widget;
+    if (!host || !ctx) return { action: 'decline' };
+
+    const schema = req.requestedSchema as {
+      properties?: Record<
+        string,
+        { type?: string; enum?: unknown[]; description?: string }
+      >;
+    };
+    const props = schema.properties ?? {};
+    const names = Object.keys(props);
+    const single = names.length === 1 ? names[0]! : undefined;
+    const singleProp = single ? props[single] : undefined;
+    const enumValues =
+      singleProp && Array.isArray(singleProp.enum)
+        ? singleProp.enum.map((v) => String(v))
+        : [];
+    const options = enumValues.map((v, i) => ({ id: `e${i}`, label: v }));
+    const fieldHint =
+      names.length > 1
+        ? ` Fields needed: ${names.join(', ')}. Reply with a JSON object.`
+        : single && !enumValues.length
+          ? ` (${singleProp?.description ?? single})`
+          : '';
+    const validated = validateWidgetPayload({
+      kind: 'buttons',
+      title: 'Information needed',
+      question: `${req.message || 'The tool needs more information.'}${fieldHint}`,
+      options,
+      allowFreeText: true,
+    });
+    if (!validated.ok) return { action: 'decline' };
+    const payload = validated.payload as ButtonsWidgetPayload;
+    let record: { id: string; expiresAt: number | null };
+    try {
+      record = await host.raise({
+        kind: 'buttons',
+        payload,
+        title: 'Information needed',
+        interactive: true,
+      });
+      try {
+        await host.emit({
+          type: 'widget',
+          widgetId: record.id,
+          sessionId: ctx.sessionId,
+          widget: payload,
+          expiresAt: record.expiresAt,
+          interactive: true,
+        });
+      } catch {
+        // Event sinks must never break the elicitation flow.
+      }
+    } catch {
+      return { action: 'decline' };
+    }
+    let answer: { answered: boolean; value?: unknown };
+    try {
+      answer = await host.awaitAnswer(record.id, 120_000);
+    } catch {
+      return { action: 'decline' };
+    }
+    if (!answer.answered) return { action: 'decline' };
+    // Interpret the answer the same way ask_user_question does.
+    let selectedLabel: string | undefined;
+    let freeText: string | undefined;
+    const v = answer.value;
+    if (Array.isArray(v) && v.length > 0) {
+      const opt = options.find((o) => o.id === String(v[0]));
+      selectedLabel = opt?.label ?? String(v[0]);
+    } else if (typeof v === 'string') {
+      freeText = v;
+    } else if (v && typeof v === 'object') {
+      const o = v as Record<string, unknown>;
+      if (Array.isArray(o.selected) && o.selected.length > 0) {
+        const firstSelected = String((o.selected as unknown[])[0]);
+        const opt = options.find((x) => x.id === firstSelected);
+        selectedLabel = opt?.label ?? firstSelected;
+      }
+      if (typeof o.freeText === 'string' && o.freeText) freeText = o.freeText;
+      else if (typeof o.text === 'string' && o.text) freeText = o.text;
+    }
+    if (!single) {
+      if (freeText) {
+        try {
+          const parsed = JSON.parse(freeText) as unknown;
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            return { action: 'accept', content: parsed as Record<string, unknown> };
+          }
+        } catch {
+          /* fall through to decline */
+        }
+      }
+      return { action: 'decline' };
+    }
+    const type = singleProp?.type ?? 'string';
+    let value: unknown;
+    if (enumValues.length > 0) value = selectedLabel;
+    else if (type === 'number' || type === 'integer') {
+      const n = Number(freeText);
+      value = Number.isFinite(n) ? n : undefined;
+    } else if (type === 'boolean') {
+      value = freeText !== undefined ? /^(true|yes|1)$/i.test(freeText.trim()) : selectedLabel === 'true';
+    } else value = freeText ?? selectedLabel;
+    if (value === undefined) return { action: 'decline' };
+    return { action: 'accept', content: { [single]: value } };
+  }
+
   async listTools(): Promise<ToolDefinition[]> {
     const metas = await this.fetchToolMetas();
     return metas.map((t) => {
@@ -404,7 +594,7 @@ export class MCPClient {
         name: this.registeredToolName(t.name),
         description: t.description ?? `MCP tool ${t.name} (${this.label})`,
         parameters: t.inputSchema ?? { type: 'object', properties: {} },
-        handler: async (args: Record<string, unknown>, _ctx: ToolContext): Promise<unknown> => {
+        handler: async (args: Record<string, unknown>, ctx: ToolContext): Promise<unknown> => {
           if (this.blockedTools.has(key)) {
             throw new Error(
               `MCP tool "${t.name}" is blocked: server "${this.label}" changed its input schema and the change was not approved.`,
@@ -412,16 +602,26 @@ export class MCPClient {
           }
           const client = this.requireClient();
           const call: ToolCall = { id: `mcp_${Date.now()}`, name: t.name, args };
+          // Elicitation requests can arrive while this call runs; give
+          // the router access to the calling turn's context.
+          this.activeToolCtx = ctx;
           try {
             return await client.callTool({ name: call.name, arguments: call.args });
           } catch (err) {
             throw new Error(
               `MCP tool "${t.name}" failed: ${err instanceof Error ? err.message : String(err)}`,
             );
+          } finally {
+            if (this.activeToolCtx === ctx) this.activeToolCtx = null;
           }
         },
       };
     });
+  }
+
+  /** Liveness probe used by the MCP health monitor (Octomind parity). */
+  async ping(): Promise<void> {
+    await this.requireClient().ping();
   }
 
   async close(): Promise<void> {

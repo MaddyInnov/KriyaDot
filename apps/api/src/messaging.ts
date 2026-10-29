@@ -24,6 +24,13 @@ import type { GovernanceGateway } from '@mvp/governance';
 import type { AppConfig } from './config.js';
 import { syncProviderKeysToEnv } from './providers.js';
 import type { OnBehalfOfLedger } from '@mvp/agent-runtime';
+import {
+  fetchUnseenMail,
+  sendSmtpMail,
+  type ImapConfig,
+  type IncomingMail,
+  type SmtpConfig,
+} from './email-transport.js';
 
 // ---------------------------------------------------------------------------
 // Provider interface + registry
@@ -293,6 +300,106 @@ export function createWhatsAppProvider(token: string, phoneNumberId: string): Me
 registerMessageProvider('whatsapp', (dataDir) =>
   createWhatsAppProvider(resolveWhatsAppToken(dataDir), resolveWhatsAppPhoneNumberId()),
 );
+
+// ---------------------------------------------------------------------------
+// Email provider (Octomind parity gap: email as a bot channel).
+//
+// Outbound: SMTP via email-transport.ts (no external dependency).
+// Inbound: an IMAP poller (started in registerMessagingRoutes when IMAP
+// is configured) — email has no webhook, so unseen INBOX mail is
+// fetched on an interval, recorded like any inbound message, and (like
+// Discord/Slack mentions) answered by the wired bot: mail addressed to
+// the bot IS a mention. The bot never replies to its own address
+// (loop guard).
+//
+// Configuration (env first; password may come from the encrypted store
+// via providerId "custom-email" → CUSTOM_EMAIL_API_KEY):
+//   SMTP_HOST SMTP_PORT SMTP_SECURE(1/0) SMTP_USER SMTP_PASS EMAIL_FROM
+//   IMAP_HOST IMAP_PORT IMAP_SECURE IMAP_USER IMAP_PASS (default: SMTP
+//   credentials) EMAIL_POLL_MS (default 60000)
+// ---------------------------------------------------------------------------
+
+export const EMAIL_FROM_ENV = 'EMAIL_FROM';
+
+export function resolveEmailSmtpConfig(dataDir: string): SmtpConfig {
+  const host = (process.env.SMTP_HOST ?? '').trim();
+  const from = (process.env[EMAIL_FROM_ENV] ?? process.env.SMTP_USER ?? '').trim();
+  if (!host) {
+    throw new Error('Email is not configured: set SMTP_HOST (and EMAIL_FROM) to enable the email channel.');
+  }
+  if (!from) {
+    throw new Error('Email is not configured: set EMAIL_FROM (the bot\'s email address).');
+  }
+  syncProviderKeysToEnv(dataDir);
+  const pass = process.env.SMTP_PASS ?? process.env['CUSTOM_EMAIL_API_KEY'];
+  const secureRaw = (process.env.SMTP_SECURE ?? '').trim().toLowerCase();
+  const port = Number(process.env.SMTP_PORT ?? '') || 465;
+  return {
+    host,
+    port,
+    secure: secureRaw === '0' || secureRaw === 'false' ? false : port === 465 || secureRaw === '1' || secureRaw === 'true',
+    user: (process.env.SMTP_USER ?? '').trim() || undefined,
+    pass: pass || undefined,
+    from,
+  };
+}
+
+export function resolveEmailImapConfig(dataDir: string): ImapConfig | null {
+  const host = (process.env.IMAP_HOST ?? process.env.SMTP_HOST ?? '').trim();
+  const user = (process.env.IMAP_USER ?? process.env.SMTP_USER ?? '').trim();
+  if (!host || !user) return null;
+  syncProviderKeysToEnv(dataDir);
+  const pass = process.env.IMAP_PASS ?? process.env.SMTP_PASS ?? process.env['CUSTOM_EMAIL_API_KEY'] ?? '';
+  if (!pass) return null;
+  const secureRaw = (process.env.IMAP_SECURE ?? '').trim().toLowerCase();
+  const port = Number(process.env.IMAP_PORT ?? '') || 993;
+  return {
+    host,
+    port,
+    secure: secureRaw === '0' || secureRaw === 'false' ? false : port === 993 || secureRaw === '1' || secureRaw === 'true',
+    user,
+    pass,
+  };
+}
+
+export function createEmailProvider(config: SmtpConfig): MessageProvider {
+  return {
+    id: 'email',
+    name: 'Email',
+    async send(to: string, text: string) {
+      const recipient = to.trim();
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(recipient)) {
+        throw new Error(`Email send: "${to}" is not an email address`);
+      }
+      if (!text?.trim()) throw new Error('Email send: text is required');
+      // Subject: the first non-empty line (chat replies read naturally
+      // this way); the full text stays the body.
+      const firstLine = text.split('\n').map((l) => l.trim()).find((l) => l.length > 0) ?? 'Message';
+      const subject = firstLine.length > 3 ? firstLine.slice(0, 78) : 'Message from your assistant';
+      const result = await sendSmtpMail(config, { to: recipient, subject, text });
+      return { ok: true, id: result.id };
+    },
+  };
+}
+
+registerMessageProvider('email', (dataDir) => createEmailProvider(resolveEmailSmtpConfig(dataDir)));
+
+/** Email InboundMessage from a fetched mail (exported for tests). */
+export function emailToInbound(mail: IncomingMail): InboundMessage {
+  const text = mail.subject
+    ? `${mail.subject}\n\n${mail.text}`.trim()
+    : mail.text;
+  return {
+    id: `email-${mail.uid}`,
+    providerId: 'email',
+    receivedAt: Date.now(),
+    from: mail.from,
+    chatId: mail.from,
+    text,
+    raw: mail,
+    relayed: true,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Approval-gated outbound sends
@@ -574,6 +681,9 @@ export interface MentionInfo {
 // Routes
 // ---------------------------------------------------------------------------
 
+/** Process-wide guard: registerMessagingRoutes may run per-test; the IMAP poller must not multiply. */
+let emailPollerStarted = false;
+
 export interface MessagingRouteDeps {
   config: AppConfig;
   governance: GovernanceGateway;
@@ -659,6 +769,42 @@ export function registerMessagingRoutes(router: express.Router, deps: MessagingR
     });
     console.log(`[messaging] inbound ${inbound.providerId} message from ${inbound.from ?? 'unknown'}`);
   };
+
+  // Email inbound poller: when IMAP is configured, unseen mail becomes
+  // inbound messages + bot mentions (replies go back over SMTP through
+  // handleMention). One poller per process; failures are logged and the
+  // next interval retries. Loop guard: never answer our own address.
+  if (!emailPollerStarted) {
+    const imapConfig = resolveEmailImapConfig(config.dataDir);
+    if (imapConfig) {
+      emailPollerStarted = true;
+      const ownAddress = (process.env[EMAIL_FROM_ENV] ?? imapConfig.user).toLowerCase();
+      const pollMs = Math.max(15_000, Number(process.env.EMAIL_POLL_MS ?? '') || 60_000);
+      const poll = async (): Promise<void> => {
+        try {
+          const mails = await fetchUnseenMail(imapConfig);
+          for (const mail of mails) {
+            const inbound = emailToInbound(mail);
+            recordInbound(inbound);
+            if (mail.from.toLowerCase() === ownAddress) continue; // loop guard
+            if (!inbound.text || !inbound.chatId) continue;
+            handleMention({
+              providerId: 'email',
+              chatId: inbound.chatId,
+              from: inbound.from,
+              text: inbound.text,
+              messageId: inbound.id,
+            });
+          }
+        } catch (err) {
+          console.error('[messaging] email poll failed:', err instanceof Error ? err.message : err);
+        }
+      };
+      const timer = setInterval(() => void poll(), pollMs);
+      timer.unref?.();
+      void poll();
+    }
+  }
 
   // POST /api/messaging/send — approval-gated outbound send.
   // Body: { provider, to, text, waitMs? }.

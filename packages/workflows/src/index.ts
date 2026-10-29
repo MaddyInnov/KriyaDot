@@ -31,3 +31,30 @@ export {
   type ComputerRecordedEventType,
   type RecordingCompilerOptions,
 } from './recording-compiler.js';
+export {
+  WORKFLOW_FILE_FORMAT,
+  WORKFLOW_FILE_VERSION,
+  serializeWorkflow,
+  parseWorkflowFile,
+  type WorkflowFile,
+} from './format.js';
+export {
+  buildExecutionPlan,
+  computeReachableNodeIds,
+  computeTopologicalLevels,
+  getSubordinateNodeIds,
+  subordinateIdsOf,
+  validateWorkflowStructure,
+  type DryRunPlan,
+  type DryRunLevel,
+  type DryRunPlanNode,
+} from './plan.js';
+export { extractCostUsd } from './cost.js';
+export {
+  WORKFLOW_TEMPLATES,
+  workflowTemplatesById,
+  sequentialPipelineTemplate,
+  fanOutTemplate,
+  graphTemplate,
+  researchTemplate,
+} from './templates.js';

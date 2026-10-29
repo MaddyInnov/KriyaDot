@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * KriyaDot harness micro-benchmarks (published benchmark, Tier 3).
+ *
+ * Run:  npm run build && node benchmarks/run.mjs [--write]
+ * With --write, results are written to ../../BENCHMARK.md.
+ *
+ * Honesty contract: these are LOCAL micro-benchmarks of deterministic
+ * harness components (embeddings, recall, compaction planning,
+ * discovery ranking, supervisor gating with a MOCK provider). They
+ * measure this machine, this Node version, zero network, zero paid
+ * API calls. They are NOT model-quality benchmarks and say nothing
+ * about any LLM's intelligence — only about the harness overhead
+ * KriyaDot adds around a model.
+ */
+
+import { performance } from 'node:perf_hooks';
+import { tmpdir } from 'node:os';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import {
+  TrigramEmbedder,
+  TieredMemoryStore,
+  SessionStore,
+  discoverByIntent,
+  verifyCompletionClaim,
+  MockProvider,
+} from '../dist/index.js';
+
+async function benchAsync(name, fn, iterations) {
+  await fn();
+  const samples = [];
+  for (let i = 0; i < iterations; i++) {
+    const t0 = performance.now();
+    await fn();
+    samples.push(performance.now() - t0);
+  }
+  samples.sort((a, b) => a - b);
+  const median = samples[Math.floor(samples.length / 2)];
+  return { name, iterations, medianMs: Math.round(median * 1000) / 1000 };
+}
+
+function bench(name, fn, iterations) {
+  // Warmup + timed run; report median per-op ms.
+  fn();
+  const samples = [];
+  for (let i = 0; i < iterations; i++) {
+    const t0 = performance.now();
+    fn();
+    samples.push(performance.now() - t0);
+  }
+  samples.sort((a, b) => a - b);
+  const median = samples[Math.floor(samples.length / 2)];
+  return { name, iterations, medianMs: Math.round(median * 1000) / 1000 };
+}
+
+const results = [];
+const dir = mkdtempSync(join(tmpdir(), 'kriyadot-bench-'));
+
+// 1. Trigram embedder throughput (the offline fallback embedder).
+{
+  const embedder = new TrigramEmbedder();
+  const texts = Array.from({ length: 100 }, (_, i) => `memory atom number ${i} about deployment schedules and coffee`);
+  results.push(bench('embedSync: 100 texts (trigram)', () => embedder.embedSync(texts), 20));
+}
+
+// 2. Hybrid recall over a populated memory store.
+{
+  const store = new TieredMemoryStore(dir);
+  for (let i = 0; i < 500; i++) {
+    store.storeAtom('bench-bot', { fact: `Fact ${i}: the user prefers topic ${i % 25} with detail level ${i % 7}`, entities: [], confidence: 0.8 }, `t${i}`);
+  }
+  results.push(bench('recallHybrid over 500 atoms', () => store.recallHybrid('bench-bot', 'what topic does the user prefer', 5), 30));
+  results.push(bench('findNearDuplicatePairs over 500 atoms', () => store.findNearDuplicatePairs('bench-bot', 0.99, 5), 10));
+}
+
+// 3. Session store: append + history read + idle activity lookup.
+{
+  const store = new SessionStore(join(dir, 'sessions.db'));
+  const sid = store.createSession('bench-bot');
+  for (let i = 0; i < 200; i++) store.appendMessage(sid, { role: 'user', content: `message ${i} with some content to fold` });
+  results.push(bench('listThreadMessages (200 rows)', () => store.listThreadMessages(sid), 50));
+  results.push(bench('lastActivityForBot', () => store.lastActivityForBot('bench-bot'), 50));
+}
+
+// 4. Semantic discovery ranking over a skill-catalog-sized item set.
+{
+  const embedder = new TrigramEmbedder();
+  const items = Array.from({ length: 200 }, (_, i) => ({
+    kind: 'skill',
+    id: `skill-${i}`,
+    name: `skill-${i}`,
+    description: `Capability ${i}: handles ${['code review', 'data cleaning', 'scheduling', 'translation', 'summaries'][i % 5]} tasks`,
+  }));
+  results.push(
+    await benchAsync('discoverByIntent over 200 items', async () => {
+      await discoverByIntent('review my pull request for bugs', items, embedder, { topK: 8 });
+    }, 20),
+  );
+}
+
+// 5. Supervisor gate with a mock provider + an explicit supervisor
+// profile so the model path (prompt build + verdict parse) is measured.
+{
+  const provider = new MockProvider(Array.from({ length: 64 }, () => '{"verdict":"accept","reason":"evidence checks out"}'));
+  const evidence = [{ toolName: 'run_command', ok: true, mutating: true, excerpt: 'tests passed: 42/42' }];
+  results.push(
+    await benchAsync('supervisor verify-gate (mock provider)', async () => {
+      await verifyCompletionClaim(
+        provider,
+        { request: 'fix the tests', claim: 'All tests pass now.', evidence },
+        { profile: { modelId: 'mock-model' } },
+      );
+    }, 20),
+  );
+}
+
+const env = {
+  node: process.version,
+  platform: `${process.platform}/${process.arch}`,
+  date: new Date().toISOString(),
+};
+
+console.log(JSON.stringify({ env, results }, null, 2));
+
+if (process.argv.includes('--write')) {
+  const rows = results
+    .map((r) => `| ${r.name} | ${r.iterations} | ${r.medianMs} |`)
+    .join('\n');
+  const doc = `# KriyaDot Harness Benchmarks
+
+Generated by \`packages/agent-runtime/benchmarks/run.mjs\` on ${env.date}
+(Node ${env.node}, ${env.platform}).
+
+## What this is — and is not
+
+These are **local micro-benchmarks of deterministic harness components**:
+the offline embedder, memory recall, session storage, discovery ranking,
+and the supervisor verify-gate running against a **mock provider**. They
+measure the overhead KriyaDot's harness adds around a model, on one
+machine, with zero network and zero paid API calls.
+
+They are **not** model-quality benchmarks. They say nothing about any
+LLM's reasoning, coding, or writing ability — only how fast the harness
+plumbing is. Numbers are medians; rerun the script to reproduce.
+
+## Results
+
+| Benchmark | Iterations | Median ms/op |
+| --- | ---: | ---: |
+${rows}
+
+## Reproduce
+
+\`\`\`sh
+cd packages/agent-runtime
+npm run build
+node benchmarks/run.mjs --write
+\`\`\`
+`;
+  writeFileSync(join(import.meta.dirname, '..', '..', '..', 'BENCHMARK.md'), doc);
+  console.error('Wrote BENCHMARK.md');
+}

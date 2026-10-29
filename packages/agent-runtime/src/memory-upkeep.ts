@@ -24,7 +24,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { openDb } from './sqlite.js';
-import type { TieredMemoryStore } from './memory.js';
+import type { AtomCard, TieredMemoryStore } from './memory.js';
 
 // ---------------------------------------------------------------------------
 // Fact extraction (zero-cost heuristic — same honesty contract as the
@@ -279,6 +279,10 @@ export interface TidyResult {
   examined: number;
   duplicatesDeactivated: number;
   contradictionsOpened: number;
+  /** Near-duplicate pairs found by embedding similarity (learning hardening). */
+  nearDuplicatesFound: number;
+  /** Near-duplicate merges the verifier rejected (atoms kept). */
+  mergesVetoed: number;
   at: number;
 }
 
@@ -311,10 +315,24 @@ export function tidyMemory(
   store: TieredMemoryStore,
   journal: MemoryJournal,
   botId: string,
-  opts: { maxPairs?: number } = {},
+  opts: {
+    maxPairs?: number;
+    /**
+     * Verifier gate for near-duplicate merges (learning hardening):
+     * near-dupes (similar but not identical text) are deactivated ONLY
+     * when this returns true. Without a verifier they are counted and
+     * left untouched — merging paraphrases on similarity alone is
+     * exactly how memory systems silently lose distinct facts.
+     */
+    mergeVerifier?: (keep: AtomCard, duplicate: AtomCard, similarity: number) => boolean;
+    /** Similarity threshold for near-duplicate candidates. Default 0.92. */
+    nearDuplicateThreshold?: number;
+  } = {},
 ): TidyResult {
   const atoms = store.getAtoms(botId, 5000);
   let duplicatesDeactivated = 0;
+  let nearDuplicatesFound = 0;
+  let mergesVetoed = 0;
   // Dedupe: group by normalized fact text; keep the earliest, deactivate rest.
   const normOf = (s: string): string =>
     s.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -343,6 +361,44 @@ export function tidyMemory(
     }
   }
 
+  // Near-duplicate merges (verifier-gated): paraphrase-level dupes the
+  // exact pass cannot see. Each candidate pair is offered to the
+  // verifier; only approved merges deactivate (journaled, undoable).
+  {
+    // Structural stores (test doubles, older hosts) may not implement
+    // near-duplicate detection — the pass is skipped for them.
+    const pairs =
+      typeof store.findNearDuplicatePairs === 'function'
+        ? store.findNearDuplicatePairs(botId, opts.nearDuplicateThreshold ?? 0.92)
+        : [];
+    nearDuplicatesFound = pairs.length;
+    const deactivatedThisRun = new Set<string>();
+    for (const { keep, duplicate, similarity } of pairs) {
+      if (deactivatedThisRun.has(keep.id) || deactivatedThisRun.has(duplicate.id)) continue;
+      if (!opts.mergeVerifier) continue; // no verifier → never merge paraphrases
+      let approved = false;
+      try {
+        approved = opts.mergeVerifier(keep, duplicate, similarity);
+      } catch {
+        approved = false; // verifier errors veto (fail-closed)
+      }
+      if (!approved) {
+        mergesVetoed += 1;
+        continue;
+      }
+      journal.record({
+        botId,
+        action: 'deactivate',
+        atomId: duplicate.id,
+        before: duplicate,
+        note: `tidy: verified near-duplicate of "${keep.fact.slice(0, 60)}" (similarity ${similarity.toFixed(2)})`,
+      });
+      deactivateAtomDirect(store, botId, duplicate.id);
+      deactivatedThisRun.add(duplicate.id);
+      duplicatesDeactivated += 1;
+    }
+  }
+
   // Contradiction check: bounded pairwise scan over active atoms.
   const active = store.getAtoms(botId, 5000);
   let contradictionsOpened = 0;
@@ -364,7 +420,15 @@ export function tidyMemory(
       }
     }
   }
-  return { botId, examined: atoms.length, duplicatesDeactivated, contradictionsOpened, at: Date.now() };
+  return {
+    botId,
+    examined: atoms.length,
+    duplicatesDeactivated,
+    contradictionsOpened,
+    nearDuplicatesFound,
+    mergesVetoed,
+    at: Date.now(),
+  };
 }
 
 /**

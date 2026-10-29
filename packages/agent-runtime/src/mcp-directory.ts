@@ -14,6 +14,7 @@
 // in mcp.ts applying as usual).
 
 import { MCPClient, mcpToolName } from './mcp.js';
+import { didYouMeanSuffix } from './tool-hints.js';
 import type { ToolContext, ToolDefinition } from './types.js';
 
 // vitest (Vite 5.4.21) cannot statically resolve the `node:sqlite` specifier,
@@ -400,9 +401,21 @@ export type McpServerHealth = 'stopped' | 'starting' | 'running' | 'error';
 export interface LazyMcpConnector {
   listTools(): Promise<ToolDefinition[]>;
   close(): Promise<void>;
+  /** Optional liveness probe for the health monitor. */
+  ping?: () => Promise<void>;
 }
 
 export type LazyMcpConnectFn = (server: InstalledMcpServer) => Promise<LazyMcpConnector>;
+
+/** Extended per-server health record (Octomind parity: MCP health monitor). */
+export interface McpServerHealthRecord {
+  status: McpServerHealth;
+  lastError: string | null;
+  /** Successful automatic restarts since this manager started. */
+  restarts: number;
+  /** ISO timestamp of the last completed health probe, when any. */
+  lastCheckAt: string | null;
+}
 
 export interface LazyMcpManagerOptions {
   dataDir: string;
@@ -410,11 +423,21 @@ export interface LazyMcpManagerOptions {
   connectFn?: LazyMcpConnectFn;
   /** Passed through to the default real-client connector (TOFU pinning). */
   pinDbPath?: string;
+  /**
+   * Health monitor (Octomind parity): probe connected servers every
+   * interval and auto-restart dead ones. Default 60s; 0 disables the
+   * timer (checkHealthOnce stays callable, e.g. from tests).
+   */
+  healthCheckIntervalMs?: number;
+  /** Per-probe timeout. Default 5s. */
+  healthPingTimeoutMs?: number;
+  /** Restart a server whose probe fails (default true). */
+  autoRestart?: boolean;
 }
 
 function defaultConnectFn(pinDbPath?: string): LazyMcpConnectFn {
   return async (server: InstalledMcpServer): Promise<LazyMcpConnector> => {
-    const client = new MCPClient({ serverName: server.label, pinDbPath });
+    const client = new MCPClient({ serverName: server.label, pinDbPath, elicitation: 'widget' });
     if (server.config.kind === 'http') {
       await client.connectHttp(server.config.url as string);
     } else {
@@ -437,14 +460,21 @@ export class LazyMcpManager {
   readonly store: LazyMcpServerStore;
   private readonly connectFn: LazyMcpConnectFn;
   private readonly connected = new Map<string, ConnectedEntry>();
-  private readonly health = new Map<string, { status: McpServerHealth; lastError: string | null }>();
+  private readonly health = new Map<string, McpServerHealthRecord>();
   private readonly connecting = new Map<string, Promise<ConnectedEntry>>();
   /** Exact stub names this manager has placed in the shared registry. */
   private readonly stubNames = new Set<string>();
+  private readonly healthPingTimeoutMs: number;
+  private readonly autoRestart: boolean;
+  private healthTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(options: LazyMcpManagerOptions) {
     this.store = new LazyMcpServerStore(`${options.dataDir.replace(/\/$/, '')}/mcp-directory.db`);
     this.connectFn = options.connectFn ?? defaultConnectFn(options.pinDbPath);
+    this.healthPingTimeoutMs = options.healthPingTimeoutMs ?? 5_000;
+    this.autoRestart = options.autoRestart ?? true;
+    const interval = options.healthCheckIntervalMs ?? 60_000;
+    if (interval > 0) this.startHealthMonitor(interval);
   }
 
   // -- installation ----------------------------------------------------------
@@ -479,6 +509,25 @@ export class LazyMcpManager {
     this.store.setBotEnabled(serverId, botId, enabled);
   }
 
+  /**
+   * Auto-bind safety rule (Octomind parity small item): intent-driven
+   * layers may REQUEST that a server be bound to a bot by label, but a
+   * bind happens ONLY on an exact, case-sensitive label match against
+   * an installed, enabled server. Fuzzy/semantic near-matches never
+   * bind — binding the wrong server would hand a bot real tools (and
+   * potentially credentials) it was never meant to have. Returns the
+   * bound server, or null when there is no exact match.
+   */
+  autoBindExact(botId: string, label: string): InstalledMcpServer | null {
+    const exact = this.store.list().filter((s) => s.label === label && s.enabled);
+    if (exact.length !== 1) return null; // none, or ambiguous duplicates
+    const server = exact[0]!;
+    if (!this.store.isBotAllowed(server.id, botId)) {
+      this.store.setBotEnabled(server.id, botId, true);
+    }
+    return server;
+  }
+
   clearBotOverride(serverId: string, botId: string): void {
     this.store.clearBotOverride(serverId, botId);
   }
@@ -487,8 +536,87 @@ export class LazyMcpManager {
     return this.store.list();
   }
 
-  status(id: string): { status: McpServerHealth; lastError: string | null } {
-    return this.health.get(id) ?? { status: 'stopped', lastError: null };
+  status(id: string): McpServerHealthRecord {
+    return (
+      this.health.get(id) ?? { status: 'stopped', lastError: null, restarts: 0, lastCheckAt: null }
+    );
+  }
+
+  // -- health monitor --------------------------------------------------------
+
+  /** Start the periodic health probe (idempotent). The timer is unref'd. */
+  startHealthMonitor(intervalMs = 60_000): void {
+    if (this.healthTimer || intervalMs <= 0) return;
+    this.healthTimer = setInterval(() => {
+      void this.checkHealthOnce().catch(() => undefined);
+    }, intervalMs);
+    this.healthTimer.unref?.();
+  }
+
+  stopHealthMonitor(): void {
+    if (this.healthTimer) clearInterval(this.healthTimer);
+    this.healthTimer = null;
+  }
+
+  /** Drop a connection WITHOUT touching the health record. */
+  private async dropConnection(id: string): Promise<void> {
+    const entry = this.connected.get(id);
+    this.connected.delete(id);
+    this.connecting.delete(id);
+    if (entry) await entry.connector.close().catch(() => undefined);
+  }
+
+  /**
+   * One health sweep: probe every connected server; a failed probe
+   * marks the server 'error', drops the connection, and (when
+   * autoRestart is on) makes exactly one reconnect attempt.
+   */
+  async checkHealthOnce(): Promise<void> {
+    for (const id of [...this.connected.keys()]) {
+      const entry = this.connected.get(id);
+      if (!entry) continue;
+      const ping = entry.connector.ping;
+      const record = this.status(id);
+      if (!ping) {
+        this.health.set(id, { ...record, lastCheckAt: new Date().toISOString() });
+        continue;
+      }
+      try {
+        await Promise.race([
+          ping.call(entry.connector),
+          new Promise<never>((_resolve, reject) =>
+            setTimeout(
+              () => reject(new Error(`health probe timed out after ${this.healthPingTimeoutMs}ms`)),
+              this.healthPingTimeoutMs,
+            ),
+          ),
+        ]);
+        this.health.set(id, {
+          status: 'running',
+          lastError: null,
+          restarts: record.restarts,
+          lastCheckAt: new Date().toISOString(),
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.health.set(id, {
+          status: 'error',
+          lastError: message,
+          restarts: record.restarts,
+          lastCheckAt: new Date().toISOString(),
+        });
+        await this.dropConnection(id);
+        if (this.autoRestart) {
+          try {
+            await this.ensureConnected(id);
+            const after = this.status(id);
+            this.health.set(id, { ...after, restarts: record.restarts + 1 });
+          } catch {
+            // ensureConnected already recorded the error state.
+          }
+        }
+      }
+    }
   }
 
   directoryWithInstallState(): Array<MCPDirectoryEntry & { installed: boolean; serverId: string | null }> {
@@ -502,7 +630,13 @@ export class LazyMcpManager {
   // -- lazy connection -------------------------------------------------------
 
   private setHealth(id: string, status: McpServerHealth, lastError: string | null = null): void {
-    this.health.set(id, { status, lastError });
+    const prev = this.health.get(id);
+    this.health.set(id, {
+      status,
+      lastError,
+      restarts: prev?.restarts ?? 0,
+      lastCheckAt: prev?.lastCheckAt ?? null,
+    });
   }
 
   async ensureConnected(id: string): Promise<ConnectedEntry> {
@@ -561,7 +695,12 @@ export class LazyMcpManager {
     for (const def of entry.tools.values()) {
       if (def.name === tail || def.name.endsWith(`:${tail}`)) return def;
     }
-    throw new Error(`MCP server "${server.label}" has no tool "${tail}".`);
+    throw new Error(
+      `MCP server "${server.label}" has no tool "${tail}".${didYouMeanSuffix(
+        tail,
+        [...entry.tools.values()].map((d) => d.name.split(':').pop() ?? d.name),
+      )}`,
+    );
   }
 
   /**
@@ -591,7 +730,19 @@ export class LazyMcpManager {
               throw new Error(`MCP server "${server.label}" is not enabled for this bot.`);
             }
             const real = await this.realToolDef(current, registeredName);
-            return real.handler(args, ctx);
+            try {
+              return await real.handler(args, ctx);
+            } catch (err) {
+              // Dead-connection smell: drop + reconnect + retry exactly
+              // once (health auto-restart on the call path).
+              const message = err instanceof Error ? err.message : String(err);
+              if (!/not connected|connection closed|econnreset|epipe|socket hang up|transport.*closed/i.test(message)) {
+                throw err;
+              }
+              await this.dropConnection(server.id);
+              const revived = await this.realToolDef(current, registeredName);
+              return revived.handler(args, ctx);
+            }
           },
         });
       }
@@ -625,6 +776,7 @@ export class LazyMcpManager {
   }
 
   async close(): Promise<void> {
+    this.stopHealthMonitor();
     const ids = [...this.connected.keys()];
     await Promise.all(ids.map((id) => this.disconnect(id)));
     this.store.close();

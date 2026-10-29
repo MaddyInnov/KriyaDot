@@ -17,6 +17,8 @@ import { OpenAICompatibleProvider } from './openai-compatible.js';
 import { createAgentCliProvider, parseAgentProviderId } from './agent-cli.js';
 import { createCopilotAcpProvider } from './acp-engines.js';
 import { createNativeCliDriver } from './cli-driver.js';
+import { BedrockProvider } from './bedrock.js';
+import { VertexProvider } from './vertex.js';
 
 /**
  * Build an LLMProvider from a catalog preset — or from a `custom-*` provider
@@ -79,6 +81,17 @@ export function createProvider(providerId: string, opts?: { apiKey?: string }): 
     throw new Error(
       `Unknown provider "${providerId}". Provider presets live in src/providers/catalog.json — add one there to support a new endpoint, or use a "custom-*" id via the Providers settings page.`,
     );
+  }
+
+  // Cloud-native drivers (Octomind parity): Bedrock (SigV4 + Converse)
+  // and Vertex (service-account OAuth2 + OpenAI-compatible endpoint)
+  // are configured entirely from the environment — no baseUrl/apiKey
+  // from the catalog machinery.
+  if (preset.api === 'bedrock') {
+    return new BedrockProvider();
+  }
+  if (preset.api === 'vertex') {
+    return new VertexProvider();
   }
 
   const baseUrl = resolveBaseUrl(providerId);

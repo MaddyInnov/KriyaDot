@@ -14,11 +14,23 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'n
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
+/** A named daemon session: `run --daemon <name>` records where a
+ * long-running conversation lives so `send <name>` can continue it. */
+export interface NamedSession {
+  name: string;
+  sessionId: string;
+  botId: string;
+  /** Epoch ms of the last run/send against this session. */
+  updatedAt: number;
+}
+
 export interface CliConfig {
   /** API base URL, e.g. http://localhost:4000 */
   apiUrl: string;
   /** Bearer token for the loopback auth (empty = unresolved). */
   token: string;
+  /** Named daemon sessions, keyed by name. */
+  sessions?: Record<string, NamedSession>;
 }
 
 export const DEFAULT_API_URL = 'http://localhost:4000';
@@ -41,8 +53,26 @@ export function normalizeApiUrl(raw: string): string {
   return v;
 }
 
+/** Validate an untrusted `sessions` value from the config file. */
+function parseNamedSessions(raw: unknown): Record<string, NamedSession> | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const out: Record<string, NamedSession> = {};
+  for (const [name, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v !== 'object' || v === null) continue;
+    const s = v as Partial<NamedSession>;
+    if (typeof s.sessionId === 'string' && s.sessionId && typeof s.botId === 'string' && s.botId) {
+      out[name] = {
+        name,
+        sessionId: s.sessionId,
+        botId: s.botId,
+        updatedAt: typeof s.updatedAt === 'number' && Number.isFinite(s.updatedAt) ? s.updatedAt : 0,
+      };
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export function loadConfigFile(): CliConfig {
-  const fallback: CliConfig = { apiUrl: DEFAULT_API_URL, token: '' };
   let file: Partial<CliConfig> = {};
   try {
     if (existsSync(configPath())) {
@@ -54,7 +84,8 @@ export function loadConfigFile(): CliConfig {
   const apiUrl =
     typeof file.apiUrl === 'string' && file.apiUrl ? safeNormalize(file.apiUrl) ?? DEFAULT_API_URL : DEFAULT_API_URL;
   const token = typeof file.token === 'string' ? file.token.trim() : '';
-  return { apiUrl, token };
+  const sessions = parseNamedSessions(file.sessions);
+  return { apiUrl, token, ...(sessions ? { sessions } : {}) };
 }
 
 function safeNormalize(raw: string): string | null {
@@ -116,7 +147,40 @@ export function resolveConfig(opts: { api?: string; token?: string } = {}): CliC
   if (!token && isLoopbackUrl(apiUrl)) {
     token = readLoopbackToken() ?? '';
   }
-  return { apiUrl, token };
+  // Carry named sessions through so a later saveConfigFile(cfg) call
+  // (login, config set) never wipes them.
+  return { apiUrl, token, ...(file.sessions ? { sessions: file.sessions } : {}) };
+}
+
+/** All named daemon sessions, sorted by name. */
+export function loadNamedSessions(): NamedSession[] {
+  const sessions = loadConfigFile().sessions ?? {};
+  return Object.values(sessions).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Look up one named daemon session; null when it does not exist. */
+export function getNamedSession(name: string): NamedSession | null {
+  return loadConfigFile().sessions?.[name] ?? null;
+}
+
+/**
+ * Create or update a named daemon session in the config file, preserving
+ * the API URL, token and any other sessions already stored.
+ */
+export function saveNamedSession(session: NamedSession): void {
+  const current = loadConfigFile();
+  const sessions = { ...(current.sessions ?? {}), [session.name]: session };
+  saveConfigFile({ ...current, sessions });
+}
+
+/** Remove a named daemon session. Returns true when one was removed. */
+export function deleteNamedSession(name: string): boolean {
+  const current = loadConfigFile();
+  if (!current.sessions || !(name in current.sessions)) return false;
+  const sessions = { ...current.sessions };
+  delete sessions[name];
+  saveConfigFile({ ...current, sessions });
+  return true;
 }
 
 /** Where the resolved token came from (for helpful error messages). */

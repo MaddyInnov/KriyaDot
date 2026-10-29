@@ -8,7 +8,7 @@
 //     Installer refuses to write an MCP server config without a one-time
 //     approval token issued only after a governance approval is approved.
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 
 export type MarketplaceKind = 'bot' | 'skill' | 'workflow' | 'mcp-server';
 
@@ -142,6 +142,14 @@ function isEntry(v: unknown): v is MarketplaceEntry {
  * (`{ entries: MarketplaceEntry[] }`). Malformed entries are rejected at
  * load time so a bad registry can never produce a half-valid install.
  */
+/** Manifest cache: fromFile re-parses only when the file's mtime/size change. */
+const registryFileCache = new Map<string, { sig: string; registry: MarketplaceRegistry }>();
+
+/** Test hook: drop all cached registry manifests. */
+export function clearMarketplaceRegistryCache(): void {
+  registryFileCache.clear();
+}
+
 export class MarketplaceRegistry {
   private readonly entries: MarketplaceEntry[];
 
@@ -150,6 +158,27 @@ export class MarketplaceRegistry {
   }
 
   static fromFile(registryPath: string): MarketplaceRegistry {
+    // Manifest caching (Octomind parity): hosts call fromFile on
+    // request paths; re-reading + re-validating a large registry JSON
+    // per call is wasted work. The (mtime, size) signature invalidates
+    // the cache the moment the manifest changes on disk.
+    try {
+      const st = statSync(registryPath);
+      const sig = `${st.mtimeMs}:${st.size}`;
+      const hit = registryFileCache.get(registryPath);
+      if (hit && hit.sig === sig) return hit.registry;
+      const registry = MarketplaceRegistry.parseFile(registryPath);
+      registryFileCache.set(registryPath, { sig, registry });
+      return registry;
+    } catch (err) {
+      // A missing/unreadable manifest keeps the historical behavior:
+      // parseFile throws the descriptive error.
+      if (registryFileCache.has(registryPath)) throw err;
+      return MarketplaceRegistry.parseFile(registryPath);
+    }
+  }
+
+  private static parseFile(registryPath: string): MarketplaceRegistry {
     const raw = readFileSync(registryPath, 'utf8');
     const parsed: unknown = JSON.parse(raw);
     const list =

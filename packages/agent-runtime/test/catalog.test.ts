@@ -22,6 +22,12 @@ const ENV_KEYS = [
   'ANTHROPIC_API_KEY',
   'OPENAI_API_KEY',
   'OMNIRUSH_API_KEY',
+  'XAI_API_KEY',
+  'TOGETHER_API_KEY',
+  'FIREWORKS_API_KEY',
+  'CEREBRAS_API_KEY',
+  'MINIMAX_API_KEY',
+  'MOONSHOT_API_KEY',
   'PROVIDERS_FILE',
 ];
 let savedEnv: Record<string, string | undefined> = {};
@@ -122,6 +128,99 @@ describe('omnirush bring-your-own preset', () => {
     expect(provider).toBeInstanceOf(OpenAICompatibleProvider);
     expect(provider.providerId).toBe('omnirush');
   });
+});
+
+describe('direct openai-compatible provider presets', () => {
+  const NEW_PRESETS = [
+    {
+      id: 'xai',
+      baseUrl: 'https://api.x.ai/v1',
+      envKey: 'XAI_API_KEY',
+      defaultModel: 'grok-4',
+      defaultContextLength: 256000,
+      models: ['grok-4', 'grok-3', 'grok-3-mini'],
+    },
+    {
+      id: 'together',
+      baseUrl: 'https://api.together.xyz/v1',
+      envKey: 'TOGETHER_API_KEY',
+      defaultModel: 'meta-llama/Llama-3.3-70B-Instruct-Turbo',
+      defaultContextLength: 131072,
+      models: [
+        'meta-llama/Llama-3.3-70B-Instruct-Turbo',
+        'meta-llama/Llama-3.1-8B-Instruct-Turbo',
+        'deepseek-ai/DeepSeek-V3',
+      ],
+    },
+    {
+      id: 'fireworks',
+      baseUrl: 'https://api.fireworks.ai/inference/v1',
+      envKey: 'FIREWORKS_API_KEY',
+      defaultModel: 'accounts/fireworks/models/llama-v3p3-70b-instruct',
+      defaultContextLength: 131072,
+      models: ['accounts/fireworks/models/llama-v3p3-70b-instruct', 'accounts/fireworks/models/deepseek-v3'],
+    },
+    {
+      id: 'cerebras',
+      baseUrl: 'https://api.cerebras.ai/v1',
+      envKey: 'CEREBRAS_API_KEY',
+      defaultModel: 'llama-3.3-70b',
+      defaultContextLength: 131072,
+      models: ['llama-3.3-70b', 'llama3.1-8b', 'qwen-3-32b'],
+    },
+    {
+      id: 'minimax',
+      baseUrl: 'https://api.minimax.io/v1',
+      envKey: 'MINIMAX_API_KEY',
+      defaultModel: 'MiniMax-Text-01',
+      defaultContextLength: 245760,
+      models: ['MiniMax-Text-01', 'MiniMax-M1'],
+    },
+    {
+      id: 'moonshot',
+      baseUrl: 'https://api.moonshot.ai/v1',
+      envKey: 'MOONSHOT_API_KEY',
+      defaultModel: 'kimi-k2-0711-preview',
+      defaultContextLength: 131072,
+      models: ['kimi-k2-0711-preview', 'moonshot-v1-8k', 'moonshot-v1-32k'],
+    },
+  ];
+
+  it('lists all six new presets', () => {
+    const ids = listProviderPresets().map((p) => p.id);
+    expect(ids).toEqual(expect.arrayContaining(NEW_PRESETS.map((p) => p.id)));
+  });
+
+  for (const expected of NEW_PRESETS) {
+    it(`${expected.id}: exists as an openai-compatible preset with the right baseUrl + envKey`, () => {
+      const preset = getProviderPreset(expected.id);
+      expect(preset).toBeDefined();
+      expect(preset?.api).toBe('openai-compatible');
+      expect(preset?.baseUrl).toBe(expected.baseUrl);
+      expect(preset?.envKey).toBe(expected.envKey);
+      expect(preset?.models.map((m) => m.id)).toEqual(expected.models);
+    });
+
+    it(`${expected.id}: has a default model and getDefaultModel returns it`, () => {
+      const preset = getProviderPreset(expected.id);
+      const defaults = preset?.models.filter((m) => m.default) ?? [];
+      expect(defaults).toHaveLength(1);
+      expect(defaults[0]?.id).toBe(expected.defaultModel);
+      expect(defaults[0]?.contextLength).toBe(expected.defaultContextLength);
+      expect(getDefaultModel(expected.id)).toBe(expected.defaultModel);
+    });
+
+    it(`${expected.id}: createProvider constructs an OpenAICompatibleProvider when ${expected.envKey} is set`, () => {
+      process.env[expected.envKey] = 'test-key';
+      const provider = createProvider(expected.id);
+      expect(provider).toBeInstanceOf(OpenAICompatibleProvider);
+      expect(provider.providerId).toBe(expected.id);
+    });
+
+    it(`${expected.id}: createProvider names ${expected.envKey} when the key is missing`, () => {
+      expect(() => createProvider(expected.id)).toThrow(new RegExp(expected.envKey));
+    });
+  }
 });
 
 describe('isFreeModel', () => {

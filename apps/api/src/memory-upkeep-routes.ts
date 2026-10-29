@@ -8,6 +8,9 @@
 //   POST /api/memory/upkeep/journal/undo { botId } → undo the last change
 //   GET  /api/memory/about-me        → the user-editable profile
 //   PUT  /api/memory/about-me        { text } → save the profile
+//   GET  /api/memory/atoms?botId     → provenance inspector: atoms + origins
+//   GET  /api/memory/atoms/:id?botId → one atom with provenance
+//   DELETE /api/memory/atoms/:id?botId → forget one atom
 //
 // HOST WIRING (index.ts):
 //   import { createMemoryUpkeepRouter, startMemoryUpkeep } from './memory-upkeep-routes.js';
@@ -127,6 +130,60 @@ export function createMemoryUpkeepRouter(deps: MemoryUpkeepRouterDeps): Router {
     } catch (err) {
       res.status(500).json(errorBody('Undo failed', err instanceof Error ? err.message : String(err)));
     }
+  });
+
+  // -- Provenance inspector (learning hardening) ------------------------------
+  // Every atom with where it came from: source turn, verbatim quote +
+  // quote source when grounded, category/confidence/tier. DELETE is the
+  // forget path (removes the atom and its search rows).
+  router.get('/atoms', (req, res) => {
+    const botId = typeof req.query.botId === 'string' ? req.query.botId : '';
+    if (!botId || !deps.getBots().some((b) => b.id === botId)) {
+      res.status(400).json(errorBody('query param "botId" (a known bot) is required'));
+      return;
+    }
+    const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : NaN;
+    const limit = Number.isSafeInteger(rawLimit) ? Math.min(Math.max(rawLimit, 1), 1000) : 200;
+    const includeInactive = req.query.includeInactive === '1' || req.query.includeInactive === 'true';
+    try {
+      const atoms = deps.tieredMemoryStore.getAtoms(botId, limit, { includeInactive });
+      res.json({
+        ok: true,
+        botId,
+        droppedUngroundedQuotes: deps.tieredMemoryStore.droppedUngroundedQuotes,
+        atoms,
+      });
+    } catch (err) {
+      res.status(500).json(errorBody('Failed to list atoms', err instanceof Error ? err.message : String(err)));
+    }
+  });
+
+  router.get('/atoms/:id', (req, res) => {
+    const botId = typeof req.query.botId === 'string' ? req.query.botId : '';
+    if (!botId) {
+      res.status(400).json(errorBody('query param "botId" is required'));
+      return;
+    }
+    const atom = deps.tieredMemoryStore.getAtom(botId, req.params.id);
+    if (!atom) {
+      res.status(404).json(errorBody('Atom not found'));
+      return;
+    }
+    res.json({ ok: true, atom });
+  });
+
+  router.delete('/atoms/:id', (req, res) => {
+    const botId = typeof req.query.botId === 'string' ? req.query.botId : '';
+    if (!botId) {
+      res.status(400).json(errorBody('query param "botId" is required'));
+      return;
+    }
+    const removed = deps.tieredMemoryStore.deleteAtom(botId, req.params.id);
+    if (!removed) {
+      res.status(404).json(errorBody('Atom not found'));
+      return;
+    }
+    res.json({ ok: true, deleted: req.params.id });
   });
 
   router.get('/about-me', (_req, res) => {

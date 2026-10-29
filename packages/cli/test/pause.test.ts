@@ -44,11 +44,11 @@ describe('kriyadot pause / resume / status', () => {
     expect(parsed.paused).toBe(true);
   });
 
-  it('an invalid pause subcommand is a usage error (exit 1, no API call)', async () => {
+  it('an invalid pause subcommand is a usage error (exit 2, no API call)', async () => {
     const fake = makeFakeApi();
     const deps = makeDeps(fake);
     const code = await runCommand(parseArgs(['pause', 'bogus']), deps);
-    expect(code).toBe(1);
+    expect(code).toBe(2);
     expect(fake.pauseCalls).toEqual([]);
   });
 });

@@ -109,9 +109,10 @@ export class OpenAICompatibleProvider implements LLMProvider {
     url: string,
     init: RequestInit,
     onRetry?: (attempt: number, error: Error) => void,
+    maxRetries: number = MAX_RETRIES,
   ): Promise<Response> {
     let lastError: Error | null = null;
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
       if (attempt > 0) {
         await sleep(BASE_BACKOFF_MS * 2 ** (attempt - 1));
       }
@@ -120,7 +121,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
         res = await fetch(url, init);
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
-        if (attempt < MAX_RETRIES) {
+        if (attempt < maxRetries) {
           try {
             onRetry?.(attempt + 1, lastError);
           } catch {
@@ -130,7 +131,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
         continue; // network error: retry
       }
       if (res.ok) return res;
-      if (!isRetryable(res.status) || attempt === MAX_RETRIES) {
+      if (!isRetryable(res.status) || attempt === maxRetries) {
         const body = await res.text().catch(() => '');
         // Rate-limit headers ride along on error responses too — record
         // the snapshot so near-limit warnings + failover reset times work
@@ -157,7 +158,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
         throw err;
       }
       lastError = new Error(`Provider request failed: ${res.status}`);
-      if (attempt < MAX_RETRIES) {
+      if (attempt < maxRetries) {
         try {
           onRetry?.(attempt + 1, lastError);
         } catch {
@@ -172,16 +173,45 @@ export class OpenAICompatibleProvider implements LLMProvider {
   async chat(
     messages: ChatMessage[],
     tools: ToolDefinition[],
-    opts: { model: string; onToken?: (t: string) => void; signal?: AbortSignal; onRetry?: (attempt: number, error: Error) => void; reasoningEffort?: 'low' | 'medium' | 'high' },
+    opts: Parameters<LLMProvider['chat']>[2],
   ): Promise<{ content: string; toolCalls: ToolCall[]; usage: TokenUsage }> {
     const body = {
       model: opts.model,
       messages: toOpenAIMessages(messages),
       ...(tools.length > 0 ? { tools: toFunctionTools(tools) } : {}),
       ...(opts.reasoningEffort ? { reasoning_effort: opts.reasoningEffort } : {}),
+      ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
+      ...(opts.topP !== undefined ? { top_p: opts.topP } : {}),
+      ...(opts.maxTokens !== undefined ? { max_tokens: opts.maxTokens } : {}),
+      // Structured output enforcement (Octomind parity): native
+      // response_format on the wire. json_schema carries the caller's
+      // schema verbatim; strict defaults to true when the caller asked
+      // for a schema without saying otherwise.
+      ...(opts.responseFormat
+        ? {
+            response_format:
+              opts.responseFormat.type === 'json_object'
+                ? { type: 'json_object' }
+                : {
+                    type: 'json_schema',
+                    json_schema: {
+                      name: opts.responseFormat.name ?? 'response',
+                      schema: opts.responseFormat.schema,
+                      strict: opts.responseFormat.strict ?? true,
+                    },
+                  },
+          }
+        : {}),
       stream: true,
       stream_options: { include_usage: true },
     };
+    // Per-call timeout (purpose-profile knob): combine with the caller's
+    // abort signal when both exist.
+    let signal = opts.signal;
+    if (opts.timeoutMs && opts.timeoutMs > 0) {
+      const timeoutSignal = AbortSignal.timeout(opts.timeoutMs);
+      signal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+    }
     const res = await this.fetchWithRetry(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -190,8 +220,8 @@ export class OpenAICompatibleProvider implements LLMProvider {
         ...this.extraHeaders,
       },
       body: JSON.stringify(body),
-      signal: opts.signal,
-    }, opts.onRetry);
+      signal,
+    }, opts.onRetry, opts.maxRetries);
 
     // Capture the provider's rate-limit/quota headers (Groq, OpenAI,
     // OpenRouter all send x-ratelimit-*). Missing headers → no snapshot.
