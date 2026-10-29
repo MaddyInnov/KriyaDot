@@ -149,8 +149,8 @@
 			children = (
 				F20000000000000000000005 /* Preview Assets.xcassets */,
 			);
-			path = Preview Content;
-			name = Preview Content;
+			path = "Preview Content";
+			name = "Preview Content";
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */

@@ -27,6 +27,8 @@ export interface AutostartDeps {
   homeDir?: string;
   /** App data dir for win32 %APPDATA% resolution; defaults to env/home. */
   appDataDir?: string;
+  /** XDG config dir for linux; defaults to $XDG_CONFIG_HOME when no explicit homeDir is given, else ~/.config. */
+  xdgConfigHome?: string;
   /** Executable the entry launches. Defaults to KRIYADOT_EXEC_PATH or the current process exec path. */
   execPath?: string;
   /** Extra args appended to the exec path (rarely needed). */
@@ -48,16 +50,23 @@ function isSupported(platform: string): platform is AutostartPlatform {
   return platform === 'linux' || platform === 'darwin' || platform === 'win32';
 }
 
-/** Absolute path of the autostart entry file for a platform/home pair. */
+/**
+ * Absolute path of the autostart entry file for a platform/home pair.
+ * Pure: every environment influence arrives via deps (the manager's
+ * constructor is the one place that reads process.env). An explicitly
+ * supplied homeDir is authoritative — a stray XDG_CONFIG_HOME in the
+ * environment must not redirect an entry into a different home.
+ */
 export function autostartEntryPath(deps: {
   platform: string;
   homeDir: string;
   appDataDir?: string;
+  xdgConfigHome?: string;
 }): string {
   const { platform, homeDir } = deps;
   if (platform === 'linux') {
-    const xdgConfig = process.env.XDG_CONFIG_HOME && path.isAbsolute(process.env.XDG_CONFIG_HOME)
-      ? process.env.XDG_CONFIG_HOME
+    const xdgConfig = deps.xdgConfigHome && path.isAbsolute(deps.xdgConfigHome)
+      ? deps.xdgConfigHome
       : path.join(homeDir, '.config');
     return path.join(xdgConfig, 'autostart', 'kriyadot.desktop');
   }
@@ -65,7 +74,7 @@ export function autostartEntryPath(deps: {
     return path.join(homeDir, 'Library', 'LaunchAgents', `${AUTOSTART_MAC_LABEL}.plist`);
   }
   if (platform === 'win32') {
-    const appData = deps.appDataDir ?? process.env.APPDATA ?? path.join(homeDir, 'AppData', 'Roaming');
+    const appData = deps.appDataDir ?? path.join(homeDir, 'AppData', 'Roaming');
     return path.join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'KriyaDot.cmd');
   }
   return path.join(homeDir, '.config', 'autostart', 'kriyadot.desktop');
@@ -147,19 +156,29 @@ export class AutostartManager {
   private readonly platform: string;
   private readonly homeDir: string;
   private readonly appDataDir?: string;
+  private readonly xdgConfigHome?: string;
   private readonly execPath: string;
   private readonly execArgs: string[];
 
   constructor(deps: AutostartDeps = {}) {
     this.platform = deps.platform ?? process.platform;
     this.homeDir = deps.homeDir ?? os.homedir();
-    this.appDataDir = deps.appDataDir;
+    this.appDataDir = deps.appDataDir ?? process.env.APPDATA;
+    // $XDG_CONFIG_HOME is honored only for the ambient (default) home.
+    // When a caller pins homeDir explicitly, that home is authoritative
+    // and the environment must not redirect the entry elsewhere.
+    this.xdgConfigHome = deps.xdgConfigHome ?? (deps.homeDir === undefined ? process.env.XDG_CONFIG_HOME : undefined);
     this.execPath = deps.execPath ?? process.env.KRIYADOT_EXEC_PATH ?? process.execPath;
     this.execArgs = deps.execArgs ?? [];
   }
 
   get entryPath(): string {
-    return autostartEntryPath({ platform: this.platform, homeDir: this.homeDir, appDataDir: this.appDataDir });
+    return autostartEntryPath({
+      platform: this.platform,
+      homeDir: this.homeDir,
+      appDataDir: this.appDataDir,
+      xdgConfigHome: this.xdgConfigHome,
+    });
   }
 
   status(): AutostartStatus {
