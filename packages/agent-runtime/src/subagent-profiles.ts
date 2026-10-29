@@ -25,9 +25,10 @@ export function loadSubagentProfiles(): SubagentProfile[] {
   if (cache) return cache;
   const here = dirname(fileURLToPath(import.meta.url));
   // src/ during tests (vitest), dist/ after build — data file is copied
-  // alongside both by living in src/data and referenced relative to src
-  // layout; fallback walks to src/data.
-  for (const cand of [join(here, 'data', 'subagent-profiles.json'), join(here, '..', 'src', 'data', 'subagent-profiles.json')]) {
+  // alongside both by living in src/profiles-data and referenced relative
+  // to src layout; fallback walks to src/profiles-data. (Directory is NOT
+  // named "data": the repo sync tooling skips any directory called data.)
+  for (const cand of [join(here, 'profiles-data', 'subagent-profiles.json'), join(here, '..', 'src', 'profiles-data', 'subagent-profiles.json')]) {
     try { cache = parseSubagentProfiles(JSON.parse(readFileSync(cand, 'utf8'))); return cache; } catch { /* try next */ }
   }
   throw new Error('subagent-profiles.json not found');

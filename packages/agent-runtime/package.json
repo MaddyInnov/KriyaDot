@@ -16,7 +16,7 @@
   "name": "@mvp/agent-runtime",
   "private": true,
   "scripts": {
-    "build": "tsc -p tsconfig.json && node -e \"require('fs').mkdirSync('dist/providers',{recursive:true});require('fs').copyFileSync('src/providers/catalog.json','dist/providers/catalog.json');require('fs').copyFileSync('src/providers/agent-registry.json','dist/providers/agent-registry.json');require('fs').mkdirSync('dist/data',{recursive:true});require('fs').copyFileSync('src/data/subagent-profiles.json','dist/data/subagent-profiles.json')\"",
+    "build": "tsc -p tsconfig.json && node -e \"require('fs').mkdirSync('dist/providers',{recursive:true});require('fs').copyFileSync('src/providers/catalog.json','dist/providers/catalog.json');require('fs').copyFileSync('src/providers/agent-registry.json','dist/providers/agent-registry.json');require('fs').mkdirSync('dist/profiles-data',{recursive:true});require('fs').copyFileSync('src/profiles-data/subagent-profiles.json','dist/profiles-data/subagent-profiles.json')\"",
     "test": "vitest run"
   },
   "types": "dist/index.d.ts",
