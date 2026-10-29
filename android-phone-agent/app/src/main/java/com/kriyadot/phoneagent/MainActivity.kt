@@ -84,6 +84,7 @@ class MainActivity : AppCompatActivity() {
         statusView = statusText
         shareButton = Button(this).apply { text = "Start sharing screen" }
         val stopButton = Button(this).apply { text = "Stop sharing" }
+        val dataPermButton = Button(this).apply { text = "Grant data permissions (calendar/contacts/SMS/location)" }
         val accessButton = Button(this).apply { text = "Open Accessibility settings (for input)" }
         val notifButton = Button(this).apply { text = "Open Notification access (for triage)" }
         val unpairButton = Button(this).apply { text = "Unpair this phone" }
@@ -95,11 +96,26 @@ class MainActivity : AppCompatActivity() {
         layout.addView(statusText)
         layout.addView(shareButton)
         layout.addView(stopButton)
+        layout.addView(dataPermButton)
         layout.addView(accessButton)
         layout.addView(notifButton)
         layout.addView(unpairButton)
         setContentView(layout)
 
+        dataPermButton.setOnClickListener {
+            // Runtime permissions for the read-only phone data tools. The
+            // system dialog is the consent point; handlers re-check grants.
+            requestPermissions(
+                arrayOf(
+                    android.Manifest.permission.READ_CALENDAR,
+                    android.Manifest.permission.READ_CONTACTS,
+                    android.Manifest.permission.READ_SMS,
+                    android.Manifest.permission.ACCESS_FINE_LOCATION,
+                    android.Manifest.permission.ACCESS_COARSE_LOCATION,
+                ),
+                1002,
+            )
+        }
         pairButton.setOnClickListener { onPairClicked() }
         shareButton.setOnClickListener { onStartSharing() }
         stopButton.setOnClickListener { onStopSharing() }

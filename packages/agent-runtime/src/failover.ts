@@ -29,12 +29,14 @@ import { getRateLimit, type RateLimitSnapshot } from './providers/rate-limit.js'
 import { freeOnlyActive } from './routing.js';
 import type { BotConfig } from './types.js';
 
-export type ProviderErrorKind = 'limit' | 'transient' | 'other';
+export type ProviderErrorKind = 'limit' | 'transient' | 'other' | 'model-unavailable' | 'auth' | 'server';
 
 export interface ClassifiedProviderError {
   kind: ProviderErrorKind;
   /** True only for hard usage-limit / quota exhaustion failures. */
   isLimit: boolean;
+  /** True for model-unavailable / not-found class errors (quick fallback, item 7a). Not a hard quota. */
+  isModelUnavailable?: boolean;
   /** True for a 429/throttle that is NOT a hard limit (drivers retry these). */
   isTransientRateLimit: boolean;
   status?: number;
@@ -205,9 +207,16 @@ export function classifyProviderError(err: unknown, opts?: { providerId?: string
   const remaining = numField(rec, ['remaining', 'remainingRequests', 'remainingTokens']);
   const exhausted = remaining === 0 && (status === 429 || /rate.?limit/i.test(haystack));
 
+  const modelUnavailable =
+    status === 404 ||
+    /model[_ ]?not[_ ]?found|model.*(?:not found|unavailable|does not exist)|no such model|invalid model/i.test(haystack);
   let kind: ProviderErrorKind = 'other';
   if (hasLimitSemantics || exhausted) {
     kind = 'limit';
+  } else if (modelUnavailable) {
+    kind = 'model-unavailable';
+  } else if (status === 401 || status === 403) {
+    kind = 'auth';
   } else if (
     status === 429 ||
     status === 408 ||
@@ -216,11 +225,14 @@ export function classifyProviderError(err: unknown, opts?: { providerId?: string
     TRANSIENT_TEXT_RE.test(message)
   ) {
     kind = 'transient';
+  } else if (status !== undefined && status >= 500) {
+    kind = 'server';
   }
 
   return {
     kind,
     isLimit: kind === 'limit',
+    isModelUnavailable: kind === 'model-unavailable',
     isTransientRateLimit: kind === 'transient' && (status === 429 || /rate.?limit/i.test(haystack)),
     status,
     code,
@@ -386,3 +398,43 @@ export function resolveFailoverTarget(input: {
   }
   return null;
 }
+
+// ---- Health-based failover (item 7b) ---------------------------------------
+// Rolling-window provider/model health. 5xx/auth/transient failures count;
+// successes probe recovery. When a provider is unhealthy, new turns should
+// start on the backup until a success (probe) restores health.
+export interface ProviderHealth { key: string; failures: number; successes: number; unhealthy: boolean; lastErrorKind?: string; windowStartedAt: number; }
+export class ProviderHealthTracker {
+  private readonly entries = new Map<string, { times: number[]; kinds: string[]; successes: number; lastKind?: string }>();
+  constructor(private readonly opts: { windowMs?: number; threshold?: number } = {}) {}
+  private key(providerId: string, model?: string): string { return model ? `${providerId}/${model}` : providerId; }
+  recordFailure(providerId: string, err: unknown, model?: string): ProviderHealth {
+    const c = classifyProviderError(err, { providerId });
+    const counts = c.kind === 'server' || c.kind === 'auth' || c.kind === 'transient' || c.kind === 'model-unavailable';
+    const k = this.key(providerId, model);
+    const e = this.entries.get(k) ?? { times: [], kinds: [], successes: 0 };
+    if (counts) { e.times.push(Date.now()); e.kinds.push(c.kind); e.lastKind = c.kind; }
+    this.entries.set(k, e); return this.health(providerId, model);
+  }
+  recordSuccess(providerId: string, model?: string): ProviderHealth {
+    const k = this.key(providerId, model); const e = this.entries.get(k) ?? { times: [], kinds: [], successes: 0 };
+    e.successes += 1; e.times = []; e.kinds = []; this.entries.set(k, e); return this.health(providerId, model);
+  }
+  health(providerId: string, model?: string): ProviderHealth {
+    const windowMs = this.opts.windowMs ?? 5 * 60_000; const threshold = this.opts.threshold ?? 3;
+    const k = this.key(providerId, model); const e = this.entries.get(k);
+    const now = Date.now(); const recent = (e?.times ?? []).filter(t => now - t <= windowMs);
+    if (e) e.times = recent;
+    return { key: k, failures: recent.length, successes: e?.successes ?? 0, unhealthy: recent.length >= threshold, lastErrorKind: e?.lastKind, windowStartedAt: recent[0] ?? now };
+  }
+  isUnhealthy(providerId: string, model?: string): boolean {
+    // Provider-level check aggregates model-specific entries too.
+    if (this.health(providerId, model).unhealthy) return true;
+    if (model) return this.health(providerId).unhealthy;
+    for (const k of this.entries.keys()) if (k.startsWith(providerId + '/') && this.health(k.split('/')[0]!, k.slice(providerId.length+1)).unhealthy) return true;
+    return false;
+  }
+  reset(): void { this.entries.clear(); }
+}
+/** Process-wide tracker used by the runtime. */
+export const providerHealth = new ProviderHealthTracker();

@@ -146,6 +146,13 @@ export interface AcpCreateOptions {
   label?: string;
   /** Working directory for the agent. Required (L4): no ambient default. */
   cwd: string;
+  /**
+   * Extra spawn env for the agent process (ENGINES pack: preset env +
+   * per-engine home overrides). Held in memory only — never persisted to
+   * the session store, so a resumed-after-restart session spawns with the
+   * default environment unless the host re-creates it.
+   */
+  env?: Record<string, string>;
 }
 
 /** SQLite-backed session + transcript store. */
@@ -299,6 +306,8 @@ export class AcpSessionManager {
   private readonly store: AcpSessionStore;
   private readonly live = new Map<string, LiveClient>();
   private readonly inFlight = new Map<string, InFlight>();
+  /** Per-session spawn env (memory-only; see AcpCreateOptions.env). */
+  private readonly spawnEnv = new Map<string, Record<string, string>>();
 
   constructor(store: AcpSessionStore) {
     this.store = store;
@@ -331,6 +340,7 @@ export class AcpSessionManager {
     const id = `acp_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
     const label = opts.label?.trim().slice(0, 80) || command.split(/\s+/)[0] || 'acp-agent';
     const session = this.store.insertSession({ id, label, command, args, cwd: opts.cwd, agentName: 'unknown' });
+    if (opts.env && Object.keys(opts.env).length > 0) this.spawnEnv.set(id, { ...opts.env });
     try {
       const agentName = await this.attach(id, session);
       this.store.updateSession(id, { agentName });
@@ -386,6 +396,7 @@ export class AcpSessionManager {
       }
       this.live.delete(id);
     }
+    this.spawnEnv.delete(id);
     this.store.updateSession(session.id, { status: 'closed' });
     this.store.appendTranscript(id, 'system', 'Session closed.');
     this.store.deleteSession(id);
@@ -476,6 +487,7 @@ export class AcpSessionManager {
   }
 
   private async attach(id: string, session: AcpSession): Promise<string> {
+    const env = this.spawnEnv.get(id);
     const client = new AcpClient({
       command: session.command,
       args: session.args,
@@ -483,6 +495,7 @@ export class AcpSessionManager {
       // that carry no cwd — fall back explicitly here (caller-visible
       // choice) rather than inside the client.
       cwd: session.cwd ?? process.cwd(),
+      ...(env ? { env } : {}),
       onNotification: (method, params) => this.handleNotification(id, method, params),
     });
     let agentName = 'unknown';

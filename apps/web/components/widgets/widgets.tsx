@@ -4,7 +4,7 @@
 
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   cellText,
   formatBytes,
@@ -16,6 +16,8 @@ import {
   type ImageViewWidget,
   type InputWidget,
   type MapWidget,
+  type McpAppWidget,
+  type PageWidget,
   type ProgressWidget,
   type SelectWidget,
   type TableWidget,
@@ -26,6 +28,12 @@ import {
   type WidgetOption,
   WIDGET_KINDS,
 } from './schema';
+import { authedFetch, getApiBase } from '../../lib/api';
+import {
+  McpAppBridgeRelay,
+  createBridgePoster,
+  mcpAppServeUrl,
+} from '../../lib/mcp-app-bridge';
 
 export type WidgetActionHandler = (action: WidgetAction, widget: ActionsWidget) => void | Promise<void>;
 
@@ -62,6 +70,8 @@ const KIND_LABEL: Record<WidgetKind, string> = {
   confirm: 'confirm',
   progress: 'progress',
   'image-view': 'image',
+  'mcp-app': 'app',
+  page: 'page',
 };
 
 /* ---------- interactive-widget helpers ---------- */
@@ -773,6 +783,106 @@ function ImageViewView({ widget }: { widget: ImageViewWidget; runtime: WidgetRun
   );
 }
 
+/* ---------- mcp-app (sandboxed iframe + postMessage bridge relay) ---------- */
+
+function McpAppView({ widget }: { widget: McpAppWidget }) {
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const apiBase = getApiBase();
+  const src = mcpAppServeUrl({
+    apiBase,
+    serverId: widget.serverId,
+    resourceUri: widget.resourceUri,
+    nonce: widget.nonce,
+  });
+  // The frame is served from the API origin (or same origin when the API
+  // serves the web app); only messages from that origin + this exact
+  // iframe window are relayed.
+  const frameOrigin =
+    apiBase || (typeof window !== 'undefined' ? window.location.origin : '');
+
+  useEffect(() => {
+    const relay = new McpAppBridgeRelay({
+      allowedOrigins: [frameOrigin],
+      getFrameSource: () => iframeRef.current?.contentWindow ?? null,
+      postToBridge: createBridgePoster({
+        serverId: widget.serverId,
+        nonce: widget.nonce,
+        authedFetch,
+      }),
+      postToFrame: (message) => {
+        iframeRef.current?.contentWindow?.postMessage(message, frameOrigin);
+      },
+    });
+    const onMessage = (e: MessageEvent) => {
+      void relay.handleEvent({ origin: e.origin, source: e.source, data: e.data });
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [frameOrigin, widget.serverId, widget.nonce]);
+
+  return (
+    <div className="widget-mcpapp">
+      <iframe
+        ref={iframeRef}
+        className="widget-mcpapp-frame"
+        src={src}
+        sandbox="allow-scripts"
+        title={widget.title ?? `App from ${widget.serverId}`}
+        style={{ width: '100%', minHeight: 320, border: '1px solid var(--border, #ddd)', borderRadius: 8 }}
+      />
+      <div className="small muted">
+        Sandboxed app from MCP server “{widget.serverId}” — it cannot reach the network; tool
+        calls cross the governed bridge.
+      </div>
+    </div>
+  );
+}
+
+/* ---------- page artifact card ---------- */
+
+function PageView({ widget }: { widget: PageWidget }) {
+  const [previewBusy, setPreviewBusy] = useState(false);
+  // The preview endpoint is auth-required (header token), so a plain
+  // link would 401: fetch it through authedFetch and open the blob.
+  const openPreview = async () => {
+    setPreviewBusy(true);
+    try {
+      const res = await authedFetch(
+        `/api/pages/${encodeURIComponent(widget.pageId)}/preview`,
+      );
+      if (!res.ok) return;
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      window.open(url, '_blank', 'noopener');
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch {
+      // Preview unavailable; the public Open action still works.
+    } finally {
+      setPreviewBusy(false);
+    }
+  };
+  return (
+    <div className="widget-page">
+      <div style={{ fontWeight: 650 }}>{widget.title ?? 'Page'}</div>
+      {widget.path && (
+        <div className="small muted">
+          Public link: <span className="mono">{widget.path}</span>
+        </div>
+      )}
+      <div className="widget-actions">
+        {widget.path && (
+          <a className="btn btn-primary" href={widget.path} target="_blank" rel="noreferrer">
+            Open
+          </a>
+        )}
+        <button type="button" className="btn" onClick={() => void openPreview()} disabled={previewBusy}>
+          {previewBusy ? 'Loading…' : 'Preview draft'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /* ---------- registry ---------- */
 
 /** Kind → view component registry. Views receive the validated widget as `widget`. */
@@ -793,6 +903,8 @@ export const WIDGET_REGISTRY: Record<
   'image-view': ({ widget, ...runtime }) => (
     <ImageViewView widget={widget as ImageViewWidget} runtime={runtime} />
   ),
+  'mcp-app': ({ widget }) => <McpAppView widget={widget as McpAppWidget} />,
+  page: ({ widget }) => <PageView widget={widget as PageWidget} />,
 };
 
 /** All kinds the registry can render (should mirror schema's WIDGET_KINDS). */

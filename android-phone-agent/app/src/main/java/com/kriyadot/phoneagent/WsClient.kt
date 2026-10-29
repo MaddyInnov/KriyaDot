@@ -28,6 +28,8 @@ class WsClient(
     var onCommand: ((JSONObject) -> Unit)? = null
     /** W14: server-dispatched phone-app actions ({type:'action', ...}). */
     var onAction: ((JSONObject) -> Unit)? = null
+    /** Phone data queries ({type:'data_query', id, query, params}). */
+    var onDataQuery: ((JSONObject) -> Unit)? = null
     var onStatus: ((connected: Boolean, detail: String) -> Unit)? = null
 
     companion object {
@@ -102,9 +104,13 @@ class WsClient(
                         if (authed) onCommand?.invoke(msg)
                     }
                     else -> {
-                        // W14 action messages use a `type` discriminator.
-                        if (msg.optString("type") == "action" && authed) {
+                        // W14 action / data-query messages use a `type` discriminator.
+                        if (!authed) {
+                            // not authenticated yet; ignore
+                        } else if (msg.optString("type") == "action") {
                             onAction?.invoke(msg)
+                        } else if (msg.optString("type") == "data_query") {
+                            onDataQuery?.invoke(msg)
                         }
                     }
                 }
@@ -135,6 +141,19 @@ class WsClient(
             try { Thread.sleep(delay) } catch (_: InterruptedException) { return@launch }
             if (wantConnected) doConnect()
         }
+    }
+
+    /** Answer a data query back to the server (data only on success). */
+    fun sendDataResult(id: String, ok: Boolean, error: String?, data: JSONObject?): Boolean {
+        val s = ws ?: return false
+        if (!authed) return false
+        val msg = JSONObject()
+            .put("type", "data_result")
+            .put("id", id)
+            .put("ok", ok)
+        if (!ok && !error.isNullOrEmpty()) msg.put("error", error)
+        if (ok && data != null) msg.put("data", data)
+        return try { s.send(msg.toString()) } catch (_: Exception) { false }
     }
 
     /** W14: ack a dispatched action back to the server. */

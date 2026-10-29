@@ -13,6 +13,10 @@ import {
   type VoiceCallProviderInfo,
 } from '../../lib/voice-call-client';
 import { setBotVoice, type BotConfig, type VoiceSettings } from '../../lib/api';
+import VoiceCatalogPicker from '../voice-catalog-picker';
+
+/** Providers with a browsable voice catalog (OMB §1.1 TTS breadth). */
+const CATALOG_PROVIDERS = ['elevenlabs', 'fish', 'chatterbox', 'openai'] as const;
 
 export interface VoiceSettingsPanelProps {
   bot: BotConfig;
@@ -27,6 +31,7 @@ export default function VoiceSettingsPanel({ bot, onSaved }: VoiceSettingsPanelP
   const [stt, setStt] = useState<string>(bot.voice?.sttProvider ?? 'mock');
   const [tts, setTts] = useState<string>(bot.voice?.ttsProvider ?? 'mock');
   const [ttsVoice, setTtsVoice] = useState(bot.voice?.ttsVoice ?? '');
+  const [catalogProvider, setCatalogProvider] = useState<string>('elevenlabs');
   const [autoVad, setAutoVad] = useState(bot.voice?.autoVad ?? false);
   const [sensitivity, setSensitivity] = useState(bot.voice?.vadSensitivity ?? 5);
   const [busy, setBusy] = useState(false);
@@ -129,6 +134,31 @@ export default function VoiceSettingsPanel({ bot, onSaved }: VoiceSettingsPanelP
           />
           <span className="muted">{t('bots.voiceTtsVoiceHint')}</span>
         </label>
+        <div className="small">
+          Browse voice catalog
+          <select
+            value={catalogProvider}
+            onChange={(e) => setCatalogProvider(e.target.value)}
+            style={{ display: 'block', marginTop: 4, width: '100%' }}
+            aria-label="Voice catalog provider"
+          >
+            {CATALOG_PROVIDERS.map((id) => (
+              <option key={id} value={id}>
+                {id}
+              </option>
+            ))}
+          </select>
+          <div style={{ marginTop: 8 }}>
+            <VoiceCatalogPicker
+              provider={catalogProvider}
+              value={ttsVoice}
+              onSelect={(voiceId) => setTtsVoice(voiceId)}
+            />
+          </div>
+          <span className="muted">
+            Picking a voice fills the voice id above; it is used by whichever TTS provider resolves for this bot.
+          </span>
+        </div>
         <label className="small" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <input type="checkbox" checked={autoVad} onChange={(e) => setAutoVad(e.target.checked)} />
           <span>

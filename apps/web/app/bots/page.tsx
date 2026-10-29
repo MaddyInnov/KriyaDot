@@ -8,6 +8,7 @@ import { useUxMode } from '../../lib/ux-mode';
 import { I18nProvider, LanguageSwitcher, useI18n } from '../../lib/i18n';
 import ComputerPanel from '../../components/panels/computer-panel';
 import VoiceSettingsPanel from '../../components/panels/voice-settings-panel';
+import { FederationPanel } from '../../components/federation-panel';
 import { ApprovalModeSelector } from '../../components/panels/approval-mode-selector';
 import { MemoryPanel } from '../../components/panels/memory-panel';
 import { RoutinesPanel } from '../../components/panels/routines-panel';
@@ -1083,6 +1084,9 @@ function BotsPageInner() {
         </div>
       </div>
       )}
+      {/* Bridge federation (Octop parity): link this instance to peer
+          KriyaDot instances and browse/chat with their expert bots. */}
+      <FederationPanel />
     </div>
   );
 }

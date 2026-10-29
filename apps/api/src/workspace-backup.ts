@@ -17,6 +17,8 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
@@ -410,4 +412,316 @@ export async function rollbackToSnapshot(
   const buf = readFileSync(abs);
   const result = await applyRestore(deps, buf, { skipSnapshot: true });
   return { ok: true, added: result.added, overwritten: result.overwritten, skippedSecrets: result.skippedSecrets };
+}
+
+// ---------------------------------------------------------------------------
+// Scheduled backups + retention + full-deployment archive export
+// (OpenMausBot §1.18 scheduled backups; Octop deployment parity).
+//
+// Schedules persist in <dataDir>/backup-schedules.json. The scheduler's
+// clock and timer functions are injectable so tests drive firing with a
+// fake clock — no real waiting, no fake-timer library.
+// ---------------------------------------------------------------------------
+
+export interface BackupSchedule {
+  id: string;
+  intervalMs: number;
+  enabled: boolean;
+  /** Retention: keep at most this many scheduled archives. */
+  keepCount?: number;
+  /** Retention: drop scheduled archives older than this many days. */
+  keepDays?: number;
+  createdAt: string;
+  lastRunAt?: string;
+  nextRunAt?: string;
+  lastArchive?: string;
+}
+
+export interface BackupSchedulerOptions {
+  /** Clock injection (tests). Default: Date.now. */
+  now?: () => number;
+  /** Timer injection (tests). Must return a handle accepted by clearTimer. */
+  setTimer?: (fn: () => void, ms: number) => unknown;
+  clearTimer?: (handle: unknown) => void;
+  /** Directory scheduled archives land in. Default <dataDir>/backups. */
+  snapshotDir?: string;
+}
+
+const SCHEDULES_FILE = 'backup-schedules.json';
+export const SCHEDULED_BACKUP_PREFIX = 'scheduled-';
+
+export function scheduledBackupFilename(scheduleId: string, at: Date): string {
+  const stamp = at.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const safeId = scheduleId.replace(/[^A-Za-z0-9_-]/g, '');
+  return `${SCHEDULED_BACKUP_PREFIX}${safeId}-${stamp}.zip`;
+}
+
+/**
+ * Prune scheduled archives in `dir` per retention policy. Only files with
+ * the scheduled- prefix are considered (pre-restore snapshots are never
+ * pruned here). Returns the removed filenames.
+ */
+export function pruneScheduledBackups(
+  dir: string,
+  policy: { keepCount?: number; keepDays?: number },
+  nowMs: number = Date.now(),
+): string[] {
+  let names: string[];
+  try {
+    names = readdirSync(dir).filter((n) => n.startsWith(SCHEDULED_BACKUP_PREFIX) && n.endsWith('.zip'));
+  } catch {
+    return [];
+  }
+  const entries = names
+    .map((name) => {
+      let mtimeMs = 0;
+      try {
+        mtimeMs = statSync(join(dir, name)).mtimeMs;
+      } catch { /* ignore */ }
+      return { name, mtimeMs };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs || (a.name < b.name ? 1 : -1)); // newest first
+  const removed: string[] = [];
+  entries.forEach((entry, idx) => {
+    const tooMany = policy.keepCount !== undefined && idx >= policy.keepCount;
+    const tooOld =
+      policy.keepDays !== undefined && nowMs - entry.mtimeMs > policy.keepDays * 86_400_000;
+    if (tooMany || tooOld) {
+      try {
+        rmSync(join(dir, entry.name));
+        removed.push(entry.name);
+      } catch { /* ignore */ }
+    }
+  });
+  return removed;
+}
+
+export class BackupScheduler {
+  private readonly deps: BackupDeps;
+  private readonly now: () => number;
+  private readonly setTimer: (fn: () => void, ms: number) => unknown;
+  private readonly clearTimer: (handle: unknown) => void;
+  private readonly snapshotDir: string;
+  private readonly timers = new Map<string, unknown>();
+  private schedules: BackupSchedule[];
+
+  constructor(deps: BackupDeps, opts: BackupSchedulerOptions = {}) {
+    this.deps = deps;
+    this.now = opts.now ?? Date.now;
+    this.setTimer =
+      opts.setTimer ??
+      ((fn, ms) => {
+        const t = setInterval(fn, ms);
+        if (typeof (t as { unref?: () => void }).unref === 'function') (t as { unref: () => void }).unref();
+        return t;
+      });
+    this.clearTimer =
+      opts.clearTimer ?? ((handle) => clearInterval(handle as ReturnType<typeof setInterval>));
+    this.snapshotDir = opts.snapshotDir ?? join(deps.dataDir, BACKUP_SNAPSHOTS_DIR);
+    this.schedules = this.load();
+  }
+
+  private schedulesPath(): string {
+    return join(this.deps.dataDir, SCHEDULES_FILE);
+  }
+
+  private load(): BackupSchedule[] {
+    try {
+      const parsed = JSON.parse(readFileSync(this.schedulesPath(), 'utf8')) as unknown;
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(
+        (s): s is BackupSchedule =>
+          typeof s === 'object' && s !== null &&
+          typeof (s as BackupSchedule).id === 'string' &&
+          typeof (s as BackupSchedule).intervalMs === 'number',
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  private persist(): void {
+    mkdirSync(this.deps.dataDir, { recursive: true });
+    const tmp = `${this.schedulesPath()}.tmp`;
+    writeFileSync(tmp, JSON.stringify(this.schedules, null, 2), 'utf8');
+    renameSync(tmp, this.schedulesPath());
+  }
+
+  listSchedules(): BackupSchedule[] {
+    return this.schedules.map((s) => ({ ...s }));
+  }
+
+  getSchedule(id: string): BackupSchedule | undefined {
+    const s = this.schedules.find((x) => x.id === id);
+    return s ? { ...s } : undefined;
+  }
+
+  createSchedule(input: {
+    id: string;
+    intervalMs: number;
+    enabled?: boolean;
+    keepCount?: number;
+    keepDays?: number;
+  }): BackupSchedule {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.id)) throw new Error(`invalid schedule id: ${input.id}`);
+    if (!Number.isFinite(input.intervalMs) || input.intervalMs <= 0) {
+      throw new Error('schedule intervalMs must be a positive number');
+    }
+    if (this.schedules.some((s) => s.id === input.id)) throw new Error(`schedule already exists: ${input.id}`);
+    const nowIso = new Date(this.now()).toISOString();
+    const schedule: BackupSchedule = {
+      id: input.id,
+      intervalMs: Math.floor(input.intervalMs),
+      enabled: input.enabled ?? true,
+      keepCount: input.keepCount,
+      keepDays: input.keepDays,
+      createdAt: nowIso,
+      nextRunAt: new Date(this.now() + input.intervalMs).toISOString(),
+    };
+    this.schedules.push(schedule);
+    this.persist();
+    if (schedule.enabled) this.arm(schedule);
+    return { ...schedule };
+  }
+
+  deleteSchedule(id: string): boolean {
+    const before = this.schedules.length;
+    this.disarm(id);
+    this.schedules = this.schedules.filter((s) => s.id !== id);
+    if (this.schedules.length !== before) this.persist();
+    return this.schedules.length !== before;
+  }
+
+  /** Arm timers for every enabled schedule (call at boot). */
+  startAll(): void {
+    for (const s of this.schedules) if (s.enabled) this.arm(s);
+  }
+
+  stopAll(): void {
+    for (const id of [...this.timers.keys()]) this.disarm(id);
+  }
+
+  private arm(schedule: BackupSchedule): void {
+    this.disarm(schedule.id);
+    const handle = this.setTimer(() => {
+      void this.runSchedule(schedule.id).catch(() => {
+        // A failed scheduled backup must never take the scheduler down;
+        // lastRunAt/nextRunAt still advance on the next manual inspection.
+      });
+    }, schedule.intervalMs);
+    this.timers.set(schedule.id, handle);
+  }
+
+  private disarm(id: string): void {
+    const handle = this.timers.get(id);
+    if (handle !== undefined) {
+      this.clearTimer(handle);
+      this.timers.delete(id);
+    }
+  }
+
+  /**
+   * Run one schedule now: build a backup, write it as a scheduled archive,
+   * stamp last/next run, and prune per the schedule's retention policy.
+   */
+  async runSchedule(id: string): Promise<{ archive: string; pruned: string[]; schedule: BackupSchedule }> {
+    const schedule = this.schedules.find((s) => s.id === id);
+    if (!schedule) throw new Error(`unknown backup schedule: ${id}`);
+    const { zip } = await buildBackup(this.deps);
+    mkdirSync(this.snapshotDir, { recursive: true });
+    const archive = scheduledBackupFilename(id, new Date(this.now()));
+    writeFileSync(join(this.snapshotDir, archive), zip);
+    const nowIso = new Date(this.now()).toISOString();
+    schedule.lastRunAt = nowIso;
+    schedule.lastArchive = archive;
+    schedule.nextRunAt = new Date(this.now() + schedule.intervalMs).toISOString();
+    this.persist();
+    const pruned = pruneScheduledBackups(
+      this.snapshotDir,
+      { keepCount: schedule.keepCount, keepDays: schedule.keepDays },
+      this.now(),
+    );
+    return { archive, pruned, schedule: { ...schedule } };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Full-deployment archive export
+// ---------------------------------------------------------------------------
+
+export interface DeploymentArchiveDeps extends BackupDeps {
+  /** Explicit config files to include under `config/` (secret-named files are excluded by the same blocklist). */
+  configFiles?: string[];
+  /** Knowledge-base store files to include under `kb/`. */
+  kbFiles?: string[];
+  /** Extra roots walked like the workspace, under `extra/<label>/`. */
+  extraRoots?: Array<{ label: string; dir: string }>;
+}
+
+export interface DeploymentManifest extends BackupManifestFile {
+  kind: 'deployment';
+  configFiles: string[];
+  kbFiles: string[];
+}
+
+/**
+ * Build a full-deployment archive: the standard workspace backup (data/ +
+ * workspace/, secrets excluded) PLUS explicit config files, KB store
+ * files, and any extra roots — all through the same secret blocklist.
+ */
+export async function buildDeploymentArchive(
+  deps: DeploymentArchiveDeps,
+): Promise<{ zip: Buffer; manifest: DeploymentManifest }> {
+  const base = await buildBackup(deps);
+  const zip = await JSZip.loadAsync(base.zip);
+  const extraManifest = zip.file(BACKUP_MANIFEST_NAME);
+  const baseManifest = JSON.parse(await extraManifest!.async('string')) as BackupManifestFile;
+  const files = [...baseManifest.files];
+  const excluded = [...baseManifest.excluded];
+
+  const addFile = (absPath: string, archivePath: string): void => {
+    const reason = secretExclusionReason(archivePath);
+    if (reason) {
+      excluded.push({ path: archivePath, reason });
+      return;
+    }
+    if (!existsSync(absPath)) return;
+    zip.file(archivePath, readFileSync(absPath));
+    files.push(archivePath);
+  };
+
+  const configFiles: string[] = [];
+  for (const cfg of deps.configFiles ?? []) {
+    const archivePath = `config/${cfg.split('/').pop() ?? cfg}`;
+    const before = files.length;
+    addFile(cfg, archivePath);
+    if (files.length > before) configFiles.push(archivePath);
+  }
+  const kbFiles: string[] = [];
+  for (const kb of deps.kbFiles ?? []) {
+    const archivePath = `kb/${kb.split('/').pop() ?? kb}`;
+    const before = files.length;
+    addFile(kb, archivePath);
+    if (files.length > before) kbFiles.push(archivePath);
+  }
+  for (const root of deps.extraRoots ?? []) {
+    const collected = collectBackupFiles(root.dir, `extra/${root.label}/`);
+    for (const f of collected.files) {
+      zip.file(f.archivePath, readFileSync(f.absPath));
+      files.push(f.archivePath);
+    }
+    excluded.push(...collected.excluded);
+  }
+
+  const manifest: DeploymentManifest = {
+    ...baseManifest,
+    kind: 'deployment',
+    files,
+    excluded,
+    configFiles,
+    kbFiles,
+  };
+  zip.file(BACKUP_MANIFEST_NAME, JSON.stringify(manifest, null, 2));
+  const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+  return { zip: buffer, manifest };
 }

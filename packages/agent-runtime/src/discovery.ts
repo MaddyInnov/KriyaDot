@@ -101,6 +101,37 @@ export interface ActivationDecision {
   reason: string;
 }
 
+// ---------------------------------------------------------------------------
+// Invocation-decision sink (routing-decisions.ts invocation model)
+// ---------------------------------------------------------------------------
+//
+// decideAutoActivation() is the exact function the runtime calls for
+// skill activation. Hosts may register ONE sink here (the invocation
+// decision log's createInvocationSink) and every activation decision —
+// including the runtime's — is recorded, with no runtime changes. The
+// sink is notified after the decision is computed; a throwing sink can
+// never change or break the decision.
+
+export type DiscoveryDecisionSink = (decision: ActivationDecision, hits: DiscoveryHit[]) => void;
+
+let discoveryDecisionSink: DiscoveryDecisionSink | undefined;
+
+/** Register (or clear, with undefined) the activation-decision sink. */
+export function registerDiscoveryDecisionSink(sink: DiscoveryDecisionSink | undefined): void {
+  discoveryDecisionSink = sink;
+}
+
+function notifyDiscoveryDecision(decision: ActivationDecision, hits: DiscoveryHit[]): ActivationDecision {
+  if (discoveryDecisionSink) {
+    try {
+      discoveryDecisionSink(decision, hits);
+    } catch {
+      // Recording must never break discovery.
+    }
+  }
+  return decision;
+}
+
 /**
  * Deterministic auto-activation policy (see header). Pure function.
  *
@@ -117,29 +148,29 @@ export function decideAutoActivation(
   const maxActivate = opts.maxActivate ?? 3;
   const eligible = hits.filter((h) => h.score >= threshold);
   if (eligible.length === 0) {
-    return { activate: [], abstained: true, reason: 'no candidate above the activation threshold' };
+    return notifyDiscoveryDecision({ activate: [], abstained: true, reason: 'no candidate above the activation threshold' }, hits);
   }
   const chosen = eligible.slice(0, maxActivate);
   const boundary = eligible[maxActivate];
   if (boundary && chosen[chosen.length - 1]!.score - boundary.score < margin) {
-    return {
+    return notifyDiscoveryDecision({
       activate: [],
       abstained: true,
       reason: `tie at the activation boundary (${chosen[chosen.length - 1]!.item.id} vs ${boundary.item.id}) — abstaining`,
-    };
+    }, hits);
   }
   if (chosen.length === 1 && eligible.length > 1 && chosen[0]!.score - eligible[1]!.score < margin) {
-    return {
+    return notifyDiscoveryDecision({
       activate: [],
       abstained: true,
       reason: `top candidates too close (${chosen[0]!.item.id} vs ${eligible[1]!.item.id}) — abstaining`,
-    };
+    }, hits);
   }
-  return {
+  return notifyDiscoveryDecision({
     activate: chosen,
     abstained: false,
     reason: `activated ${chosen.map((c) => c.item.id).join(', ')} (top score ${chosen[0]!.score.toFixed(3)})`,
-  };
+  }, hits);
 }
 
 /** Test hook: clear the item-vector cache. */

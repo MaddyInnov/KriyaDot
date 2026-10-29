@@ -124,6 +124,8 @@ export interface BotConfig {
   persona?: string | null;
   /** Per-bot workspace (Octop-style isolation); unset = global workspace. */
   workspace?: string;
+  /** Bot avatar picture URL (chat polish item 8): /api/bots/:id/avatar when set. */
+  avatarUrl?: string;
   /** Per-bot voice-call settings (STT/TTS providers, TTS voice, VAD). */
   voice?: VoiceSettings;
   /** Approval mode (Atomic parity): 'plan' | 'auto' | 'bypass'. Default 'auto'. */
@@ -733,7 +735,7 @@ export interface MessageReaction {
 }
 
 /** Common emoji options for the reaction picker. */
-export const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏'] as const;
+export const REACTION_EMOJIS = ['👍', '👎', '❤️', '😂', '🎉', '👀', '😮', '😢', '🙏'] as const;
 
 /** What a reaction resolved, when it decided a pending card (W8b). */
 export interface ReactionResolution {
@@ -1645,6 +1647,11 @@ export interface ChatRequest {
   model?: string;
   /** Reasoning effort for models that support it (low/medium/high). */
   reasoningEffort?: 'low' | 'medium' | 'high';
+  /** Turn-scoped model override (chat polish): applies to THIS turn only.
+   * The chat route already accepts a per-request `model`; the page sends
+   * the turn model as both `model` and `modelOverride` so the server can
+   * distinguish a one-turn override from the bot's saved model. */
+  modelOverride?: string;
   /** Attached file IDs (from /api/files/upload). */
   fileIds?: string[];
   /** Sandbox mode: read-only | workspace-write | danger-full-access. */
@@ -2437,3 +2444,48 @@ export function streamAcpPrompt(
   })();
   return () => controller.abort();
 }
+
+// ---- Chat polish: pins, text assist (OpenMausBot §1.1/§1.2/§2.6) -----------
+
+export interface PinnedChatMessage {
+  threadId: string;
+  messageId: string;
+  text?: string;
+  role?: string;
+  pinnedAt: number;
+  pinnedBy: string;
+}
+
+export const listPinnedMessages = (threadId: string): Promise<{ ok: boolean; pins: PinnedChatMessage[] }> =>
+  apiJson(`/api/chat-ux/threads/${encodeURIComponent(threadId)}/pins`);
+
+export const pinChatMessage = (
+  threadId: string, messageId: string | number, opts?: { text?: string; role?: string },
+): Promise<{ ok: boolean; pin: PinnedChatMessage }> =>
+  apiJson(`/api/chat-ux/threads/${encodeURIComponent(threadId)}/pins`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messageId: String(messageId), ...(opts ?? {}) }),
+  });
+
+export const unpinChatMessage = (threadId: string, messageId: string | number): Promise<{ ok: boolean }> =>
+  apiJson(`/api/chat-ux/threads/${encodeURIComponent(threadId)}/pins/${encodeURIComponent(String(messageId))}`, { method: 'DELETE' });
+
+/** POST /api/text-assist/polish — polish composer draft text (cheap model). */
+export const polishComposerText = (text: string): Promise<{ ok: boolean; text: string; changed: boolean }> =>
+  apiJson('/api/text-assist/polish', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }),
+  });
+
+/** POST /api/text-assist/skill — composer insertion text for a skill. */
+export const skillInsertionText = (skillId: string): Promise<{ ok: boolean; skillId: string; text: string }> =>
+  apiJson('/api/text-assist/skill', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ skillId }),
+  });
+
+/** PUT /api/bots/:id/avatar — set (data URL) or clear (null) a bot picture. */
+export const setBotAvatar = (
+  botId: string, avatar: string | null,
+): Promise<{ ok: boolean; botId: string; avatarUrl: string | null }> =>
+  apiJson(`/api/bots/${encodeURIComponent(botId)}/avatar`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ avatar }),
+  });

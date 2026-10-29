@@ -1,0 +1,1 @@
+{"description":"Demo UI plugin: a static HTML panel served by the API under sandboxed headers.","id":"demo-ui","kinds":["ui"],"name":"Demo UI Panel","ui":{"dir":"public","title":"Demo Panel"},"version":"1.0.0"}

@@ -7,6 +7,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { ElicitRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { ToolCall, ToolContext, ToolDefinition } from './types.js';
 import { validateWidgetPayload, type ButtonsWidgetPayload } from './widgets.js';
+import { filterMcpAppResources, type McpAppResource } from './mcp-apps.js';
 
 // vitest (Vite 5.4.21) cannot statically resolve the `node:sqlite` specifier,
 // so load it at runtime via the builtin-module API instead of a top-level import.
@@ -617,6 +618,62 @@ export class MCPClient {
         },
       };
     });
+  }
+
+  /**
+   * List the server's resources (MCP `resources/list`). Servers without
+   * the resources capability fail with a catchable error.
+   */
+  async listResources(): Promise<McpAppResource[]> {
+    const client = this.requireClient() as unknown as {
+      listResources?: () => Promise<{ resources?: McpAppResource[] }>;
+    };
+    if (typeof client.listResources !== 'function') {
+      throw new Error(`MCP resources/list is not supported by this client (${this.label})`);
+    }
+    const res = await client.listResources();
+    return Array.isArray(res.resources) ? res.resources : [];
+  }
+
+  /** List only the MCP App UI resources (ui:// + text/html profile). */
+  async listAppResources(): Promise<McpAppResource[]> {
+    return filterMcpAppResources(await this.listResources());
+  }
+
+  /**
+   * Read one resource (MCP `resources/read`) — the fetch path for MCP App
+   * HTML. Returns the SDK result verbatim: `{ contents: [{ uri, mimeType?,
+   * text? | blob? }] }`.
+   */
+  async readResource(uri: string): Promise<{ contents: Array<Record<string, unknown>> }> {
+    const client = this.requireClient() as unknown as {
+      readResource?: (params: { uri: string }) => Promise<{ contents: Array<Record<string, unknown>> }>;
+    };
+    if (typeof client.readResource !== 'function') {
+      throw new Error(`MCP resources/read is not supported by this client (${this.label})`);
+    }
+    return client.readResource({ uri });
+  }
+
+  /**
+   * Call a tool by its raw (unregistered) name, bypassing the ToolDefinition
+   * wrapper. Used by the MCP Apps bridge, which performs its own governance
+   * evaluation before delegating here. Blocked (schema-drifted) tools throw.
+   */
+  async callToolByName(name: string, args: Record<string, unknown>): Promise<unknown> {
+    if (this.blockedTools.has(this.blockedKey(name))) {
+      throw new Error(
+        `MCP tool "${name}" is blocked: server "${this.label}" changed its input schema and the change was not approved.`,
+      );
+    }
+    const client = this.requireClient();
+    try {
+      return await client.callTool({ name, arguments: args });
+    } catch (err) {
+      throw new Error(
+        `MCP tool "${name}" failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   /** Liveness probe used by the MCP health monitor (Octomind parity). */

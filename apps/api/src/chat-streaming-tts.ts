@@ -13,7 +13,7 @@
 // sentence is skipped (audited by the caller via onError) and never
 // breaks the turn or the ordering of the remaining sentences.
 
-import type { TTSProvider } from '@mvp/voice';
+import { prepareSpeechText, type TTSProvider } from '@mvp/voice';
 import { extractSentences } from './voice-realtime.js';
 
 export interface AudioChunkEvent {
@@ -30,6 +30,15 @@ export interface StreamingTtsPipelineDeps {
   /** Sentence synthesis failure observer (never throws into the pipeline). */
   onError?: (err: unknown, sentence: string) => void;
   voice?: string;
+  /**
+   * Markdown→speech rewrite applied to each sentence before synthesis
+   * (links become their text, code blocks a spoken placeholder, …).
+   * Defaults to prepareSpeechText from @mvp/voice; injectable for tests.
+   * The emitted event keeps the ORIGINAL sentence as its `text` (that
+   * is what the chat UI renders) — only the synthesized audio uses the
+   * rewritten text.
+   */
+  prepareText?: (text: string) => string;
 }
 
 /** Cap on buffered unsynthesized text — a runaway reply stops feeding TTS. */
@@ -86,7 +95,10 @@ export class StreamingTtsPipeline {
     this.seq += 1;
     this.chain = this.chain.then(async () => {
       try {
-        const res = await this.deps.tts.synthesize(text, this.deps.voice ? { voice: this.deps.voice } : {});
+        // Speak the rewritten text, display the original sentence.
+        const spoken = (this.deps.prepareText ?? prepareSpeechText)(text);
+        if (!spoken.trim()) return; // e.g. a sentence of pure markdown punctuation
+        const res = await this.deps.tts.synthesize(spoken, this.deps.voice ? { voice: this.deps.voice } : {});
         await this.deps.emit({
           type: 'audio_chunk',
           seq,

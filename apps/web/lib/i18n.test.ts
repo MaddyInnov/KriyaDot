@@ -1,11 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 import React from 'react';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { describe, expect, it, beforeEach } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { en, hi, it as itDict, ja, pl, ptBR, ru, type Strings } from './locales';
+import {
+  de,
+  en,
+  es,
+  fr,
+  hi,
+  it as itDict,
+  ja,
+  pl,
+  ptBR,
+  ru,
+  tr,
+  uk,
+  vi,
+  zh,
+  zhTW,
+  type Strings,
+} from './locales';
 import { getStoredLocale, setStoredLocale, useI18n, LanguageSwitcher, LOCALES } from './i18n';
 
-/** Every shipped dictionary, keyed by its BCP-47 locale id. */
+/** Every shipped dictionary, keyed by its BCP-47 locale id (en + 14). */
 const ALL_DICTS: Record<string, Strings> = {
   en,
   hi,
@@ -14,6 +33,14 @@ const ALL_DICTS: Record<string, Strings> = {
   pl,
   ja,
   'pt-BR': ptBR,
+  de,
+  es,
+  fr,
+  tr,
+  uk,
+  vi,
+  zh,
+  'zh-TW': zhTW,
 };
 const ALL_LOCALE_IDS = Object.keys(ALL_DICTS).sort();
 
@@ -41,9 +68,37 @@ function tokensOf(template: string): string[] {
 }
 
 describe('locale dictionaries', () => {
-  it('ships exactly the en, hi, ru, it, pl, ja and pt-BR locales', () => {
-    expect(LOCALES.map((l) => l.id).sort()).toEqual(ALL_LOCALE_IDS);
+  it('ships exactly 15 locales: en plus 14 translations', () => {
+    expect(ALL_LOCALE_IDS).toEqual(
+      [
+        'de',
+        'en',
+        'es',
+        'fr',
+        'hi',
+        'it',
+        'ja',
+        'pl',
+        'pt-BR',
+        'ru',
+        'tr',
+        'uk',
+        'vi',
+        'zh',
+        'zh-TW',
+      ].sort(),
+    );
     expect(Object.keys(ALL_DICTS).sort()).toEqual(ALL_LOCALE_IDS);
+  });
+
+  // NOTE (§1.15 locales workstream): the eight new dictionaries land in
+  // lib/locales.ts first; lib/i18n.tsx (LocaleId / LOCALES / DICTS / VALID)
+  // is wired by its owning workstream. Until then every runtime-wired
+  // locale must still resolve to a shipped dictionary — never the reverse.
+  it('every locale wired in i18n.tsx resolves to a shipped dictionary', () => {
+    for (const l of LOCALES) {
+      expect(ALL_DICTS[l.id], `LOCALES entry ${l.id}`).toBeDefined();
+    }
   });
 
   it('switcher lists every locale under its native language name', () => {
@@ -112,11 +167,80 @@ describe('locale dictionaries', () => {
     expect(ptBR.nav.activity).toBe('Atividade');
   });
 
+  it('translation smoke checks per §1.15 locale', () => {
+    expect(de.common.language).toBe('Sprache');
+    expect(de.chat.send).toBe('Senden');
+    expect(es.common.cancel).toBe('Cancelar');
+    expect(es.chat.send).toBe('Enviar');
+    expect(fr.common.close).toBe('Fermer');
+    expect(fr.chat.send).toBe('Envoyer');
+    expect(tr.common.language).toBe('Dil');
+    expect(tr.chat.send).toBe('Gönder');
+    expect(uk.common.cancel).toBe('Скасувати');
+    expect(uk.nav.chat).toBe('Чат');
+    expect(vi.common.language).toBe('Ngôn ngữ');
+    expect(vi.chat.send).toBe('Gửi');
+    expect(zh.common.language).toBe('语言');
+    expect(zh.chat.send).toBe('发送');
+    expect(zhTW.common.language).toBe('語言');
+    expect(zhTW.chat.send).toBe('傳送');
+  });
+
   it('covers the six top-level destination labels', () => {
     const nav = (en as Strings).nav;
     expect(Object.keys(nav).sort()).toEqual(
       ['activity', 'bots', 'chat', 'marketplace', 'workflows', 'workspace'],
     );
+  });
+});
+
+// SOURCE-HASH CHECK (audit §1.15): lib/locales.source-hash.json pins a
+// SHA-256 of the canonical `en` source strings. If `en` changes without
+// regenerating the manifest, this fails at release/test time so stale
+// translations are caught instead of silently shipping. Regenerate with:
+//   node scripts/gen-locales-hash.mjs   (from apps/web)
+// The canonical form here must match that script exactly.
+describe('en source-hash manifest (§1.15)', () => {
+  interface SourceHashManifest {
+    regenerate: string;
+    algorithm: string;
+    locale: string;
+    keyCount: number;
+    sourceHash: string;
+  }
+
+  function readManifest(): SourceHashManifest {
+    const raw = readFileSync(new URL('./locales.source-hash.json', import.meta.url), 'utf8');
+    return JSON.parse(raw) as SourceHashManifest;
+  }
+
+  /** Same canonical pairs as scripts/gen-locales-hash.mjs. */
+  function canonicalPairsOf(dict: Strings): Array<[string, string]> {
+    const pairs: Array<[string, string]> = [];
+    const walk = (obj: object, prefix: string) => {
+      for (const [k, v] of Object.entries(obj)) {
+        const path = prefix ? `${prefix}.${k}` : k;
+        if (v !== null && typeof v === 'object') walk(v, path);
+        else pairs.push([path, v as string]);
+      }
+    };
+    walk(dict, '');
+    return pairs.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  }
+
+  it('pins the current en source hash and key count', () => {
+    const manifest = readManifest();
+    const pairs = canonicalPairsOf(en);
+    const digest = createHash('sha256').update(JSON.stringify(pairs), 'utf8').digest('hex');
+    expect(manifest.algorithm).toBe('sha256');
+    expect(manifest.locale).toBe('en');
+    expect(manifest.keyCount).toBe(pairs.length);
+    expect(manifest.keyCount).toBe(keysOf(en).length);
+    expect(manifest.sourceHash).toBe(digest);
+  });
+
+  it('documents the regeneration command', () => {
+    expect(readManifest().regenerate).toContain('scripts/gen-locales-hash.mjs');
   });
 });
 
@@ -177,7 +301,9 @@ describe('locale persistence', () => {
 describe('LanguageSwitcher', () => {
   it('renders every locale option with native labels', () => {
     const html = renderToStaticMarkup(React.createElement(LanguageSwitcher));
-    for (const id of ALL_LOCALE_IDS) {
+    // The switcher renders the locales wired in i18n.tsx (LOCALES); the
+    // §1.15 dictionaries join this list once i18n.tsx is wired for them.
+    for (const id of LOCALES.map((l) => l.id)) {
       expect(html, id).toContain(`value="${id}"`);
     }
     expect(html).toContain('हिन्दी');

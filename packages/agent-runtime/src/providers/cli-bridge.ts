@@ -314,6 +314,28 @@ export function bridgeAccountHint(id: CliBridgeId, homeDir?: string): string | u
 }
 
 /**
+ * Load the Claude bridge token from an ACCOUNT PROFILE's config dir
+ * (ENGINES pack, multiple Claude accounts): the profile selects WHICH
+ * credential dir the bridge reads at request time
+ * (<configDir>/.credentials.json, CLAUDE_CONFIG_DIR layout). Same rules
+ * as loadBridgeToken: consent-gated, memory-only, never persisted or
+ * logged. Claude bridge only — other bridges have one login location.
+ */
+export function loadBridgeTokenForClaudeProfile(configDir: string): string | undefined {
+  if (!isBridgeConnected('claude')) return undefined;
+  const parsed = readJsonFile(join(configDir, '.credentials.json'));
+  if (parsed === undefined) return undefined;
+  return claudeTokenFromFile(parsed);
+}
+
+/** Consent-free shape probe for a profile's credential file (boolean only). */
+export function claudeProfileHasUsableToken(configDir: string): boolean {
+  const parsed = readJsonFile(join(configDir, '.credentials.json'));
+  if (parsed === undefined) return false;
+  return claudeTokenFromFile(parsed) !== undefined;
+}
+
+/**
  * Validate that a bridge can actually be connected right now: detected and a
  * token is readable from its credential file. Used by the Connect endpoint so
  * a stale detection (CLI uninstalled since boot) fails with a clear message.

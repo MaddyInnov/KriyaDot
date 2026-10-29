@@ -48,7 +48,9 @@ export type WidgetKind =
   | 'progress'
   | 'table'
   | 'image-view'
-  | 'chart';
+  | 'chart'
+  | 'mcp-app'
+  | 'page';
 
 export const WIDGET_KINDS: readonly WidgetKind[] = [
   'buttons',
@@ -59,6 +61,8 @@ export const WIDGET_KINDS: readonly WidgetKind[] = [
   'table',
   'image-view',
   'chart',
+  'mcp-app',
+  'page',
 ] as const;
 
 export function isWidgetKind(v: unknown): v is WidgetKind {
@@ -151,6 +155,35 @@ export interface ChartWidgetPayload {
   series: ChartSeries[];
 }
 
+/**
+ * MCP App widget: a sandboxed HTML UI shipped by an MCP server, rendered
+ * in an iframe. `nonce` is the per-render bridge nonce (see mcp-apps.ts);
+ * the web renderer passes it to the API serve/bridge endpoints and never
+ * exposes it to the app frame itself.
+ */
+export interface McpAppWidgetPayload {
+  kind: 'mcp-app';
+  title?: string;
+  serverId: string;
+  resourceUri: string;
+  nonce: string;
+}
+
+/**
+ * Page artifact card: raised when publish_page (or page creation via
+ * publish) completes during a turn. Carries everything the chat card
+ * needs for its Open / Preview actions.
+ */
+export interface PageWidgetPayload {
+  kind: 'page';
+  title?: string;
+  pageId: string;
+  /** Public slug when published. */
+  slug?: string;
+  /** Public path, e.g. /p/<slug>. */
+  path?: string;
+}
+
 export type WidgetPayload =
   | ButtonsWidgetPayload
   | SelectWidgetPayload
@@ -159,7 +192,9 @@ export type WidgetPayload =
   | ProgressWidgetPayload
   | TableWidgetPayload
   | ImageViewWidgetPayload
-  | ChartWidgetPayload;
+  | ChartWidgetPayload
+  | McpAppWidgetPayload
+  | PageWidgetPayload;
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -449,6 +484,43 @@ export function validateWidgetPayload(payload: unknown): ValidationResult {
         }
       }
       return { ok: true, payload: { kind: 'chart', ...base, chartType, labels, series } };
+    }
+    case 'mcp-app': {
+      const serverId = reqStr(payload.serverId, 200, 'serverId');
+      if (!serverId.ok) return serverId;
+      const resourceUri = reqStr(payload.resourceUri, WIDGET_CAPS.url, 'resourceUri');
+      if (!resourceUri.ok) return resourceUri;
+      if (!resourceUri.value.startsWith('ui://')) {
+        return invalid('mcp-app resourceUri must use the ui:// scheme');
+      }
+      const nonce = reqStr(payload.nonce, 200, 'nonce');
+      if (!nonce.ok) return nonce;
+      return {
+        ok: true,
+        payload: {
+          kind: 'mcp-app',
+          ...base,
+          serverId: serverId.value,
+          resourceUri: resourceUri.value,
+          nonce: nonce.value,
+        },
+      };
+    }
+    case 'page': {
+      const pageId = reqStr(payload.pageId, 200, 'pageId');
+      if (!pageId.ok) return pageId;
+      const out: PageWidgetPayload = { kind: 'page', ...base, pageId: pageId.value };
+      const slug = optStr(payload.slug, 200);
+      if (payload.slug !== undefined && slug === undefined) {
+        return invalid('slug must be a string of at most 200 characters');
+      }
+      if (slug !== undefined) out.slug = slug;
+      const path = optStr(payload.path, WIDGET_CAPS.url);
+      if (payload.path !== undefined && path === undefined) {
+        return invalid('path must be a string of at most 2000 characters');
+      }
+      if (path !== undefined) out.path = path;
+      return { ok: true, payload: out };
     }
   }
 }
@@ -1064,6 +1136,30 @@ export function extractWidgetAttachment(result: unknown): WidgetPayload | undefi
   if (raw === undefined) return undefined;
   const v = validateWidgetPayload(raw);
   return v.ok ? v.payload : undefined;
+}
+
+/**
+ * Build a 'page' widget payload from a publish_page tool result
+ * ({ published: true, pageId, title?, slug?, path? }). Returns undefined
+ * for anything else (never throws) so the runtime can call it on every
+ * tool result cheaply.
+ */
+export function pageWidgetFromPublishResult(
+  toolName: string,
+  result: unknown,
+): PageWidgetPayload | undefined {
+  if (toolName !== 'publish_page') return undefined;
+  if (!isRecord(result)) return undefined;
+  if (result.published !== true) return undefined;
+  if (typeof result.pageId !== 'string' || !result.pageId) return undefined;
+  const v = validateWidgetPayload({
+    kind: 'page',
+    pageId: result.pageId,
+    title: typeof result.title === 'string' ? result.title : undefined,
+    slug: typeof result.slug === 'string' ? result.slug : undefined,
+    path: typeof result.path === 'string' ? result.path : undefined,
+  });
+  return v.ok ? (v.payload as PageWidgetPayload) : undefined;
 }
 
 export { isWidgetStatus };

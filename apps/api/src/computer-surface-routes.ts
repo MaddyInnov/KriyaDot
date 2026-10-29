@@ -16,7 +16,9 @@ import type { Request, Response, Router } from 'express';
 import type { BotConfig, ComputerSurface, PerBotComputerManager } from '@mvp/agent-runtime';
 import { resolveSurfaceKind } from '@mvp/agent-runtime';
 import {
+  computerProviderReport,
   loadComputerSurfacePins,
+  saveBotComputerProvider,
   saveBotComputerSurface,
   saveComputerSurfacePin,
 } from './computer-surfaces.js';
@@ -46,11 +48,16 @@ function surfaceSummary(deps: ComputerSurfaceRouteDeps, bot: BotConfig) {
   // W4: the bot's persistent browser profile (dir + disk usage), so the
   // Computer tab can show it and offer the wipe action.
   const profile = deps.computerManager.profileInfo(bot.id);
+  const provider = computerProviderReport(bot);
   return {
     botId: bot.id,
     surface,
     resolved: resolved === 'off' ? null : resolved,
     off: resolved === 'off',
+    computerProvider: provider.computerProvider,
+    activeBackend: provider.activeBackend,
+    providerSource: provider.source,
+    providerReason: provider.reason,
     instances: deps.computerManager.status(bot.id),
     browserProfile: {
       profileDir: profile.profileDir,
@@ -82,9 +89,18 @@ export function registerComputerSurfaceRoutes(router: Router, deps: ComputerSurf
       res.status(400).json(deps.errorBody('Invalid bot id'));
       return;
     }
-    const body = (req.body ?? {}) as { surface?: unknown };
+    const body = (req.body ?? {}) as { surface?: unknown; computerProvider?: unknown };
     try {
+      if (body.computerProvider !== undefined && body.surface === undefined) {
+        saveBotComputerProvider(deps.dataDir, deps.bots, id, body.computerProvider);
+        const botOnly = botOf(deps, id);
+        res.json({ ok: true, ...(botOnly ? surfaceSummary(deps, botOnly) : { botId: id }) });
+        return;
+      }
       const surface = saveBotComputerSurface(deps.dataDir, deps.bots, id, body.surface);
+      if (body.computerProvider !== undefined) {
+        saveBotComputerProvider(deps.dataDir, deps.bots, id, body.computerProvider);
+      }
       // Drop cached instances so the next computer-tool use builds the new surface.
       await deps.computerManager.setSurface(id, surface);
       const bot = botOf(deps, id);

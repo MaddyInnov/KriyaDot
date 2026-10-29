@@ -63,6 +63,13 @@ function sanitizeOptions(input: unknown): ModelOptions {
   if (typeof o.maxTokens === 'number' && Number.isFinite(o.maxTokens) && o.maxTokens > 0) {
     out.maxTokens = Math.floor(o.maxTokens);
   }
+  // ENGINES pack: DeepSeek thinking selection + local reply timeout.
+  if (o.deepseekMode === 'chat' || o.deepseekMode === 'reasoner') {
+    out.deepseekMode = o.deepseekMode;
+  }
+  if (typeof o.replyTimeoutMs === 'number' && Number.isFinite(o.replyTimeoutMs) && o.replyTimeoutMs > 0) {
+    out.replyTimeoutMs = Math.min(3_600_000, Math.floor(o.replyTimeoutMs));
+  }
   return out;
 }
 

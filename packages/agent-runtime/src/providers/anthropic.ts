@@ -10,6 +10,7 @@ import type {
 } from '../types.js';
 import { getMessageToolCalls } from '../types.js';
 import { parseAnthropicRateLimitHeaders, recordRateLimit } from './rate-limit.js';
+import { anthropicThinkingFields } from '../reasoning-profiles.js';
 
 type AnthropicBlock =
   | { type: 'text'; text: string }
@@ -132,6 +133,7 @@ export class AnthropicProvider implements LLMProvider {
       body: JSON.stringify({
         model: opts.model,
         max_tokens: opts.maxTokens ?? 4096,
+        ...anthropicThinkingFields(opts.reasoningEffort, opts.maxTokens),
         ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
         ...(system ? { system } : {}),
         messages: anthropicMessages,

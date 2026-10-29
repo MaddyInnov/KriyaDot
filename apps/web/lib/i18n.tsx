@@ -25,9 +25,11 @@
 import React from 'react';
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
-import { en, fill, hi, it, ja, pl, ptBR, ru, type Strings } from './locales';
+import { de, en, es, fill, fr, hi, it, ja, pl, ptBR, ru, tr, uk, vi, zh, zhTW, type Strings } from './locales';
 
-export type LocaleId = 'en' | 'hi' | 'ru' | 'it' | 'pl' | 'ja' | 'pt-BR';
+export type LocaleId =
+  | 'en' | 'hi' | 'ru' | 'it' | 'pl' | 'ja' | 'pt-BR'
+  | 'de' | 'es' | 'fr' | 'tr' | 'uk' | 'vi' | 'zh' | 'zh-TW';
 
 export interface LocaleDef {
   id: LocaleId;
@@ -45,13 +47,27 @@ export const LOCALES: LocaleDef[] = [
   { id: 'pl', label: 'Polski', englishLabel: 'Polish' },
   { id: 'ja', label: '日本語', englishLabel: 'Japanese' },
   { id: 'pt-BR', label: 'Português (Brasil)', englishLabel: 'Brazilian Portuguese' },
+  { id: 'de', label: 'Deutsch', englishLabel: 'German' },
+  { id: 'es', label: 'Español', englishLabel: 'Spanish' },
+  { id: 'fr', label: 'Français', englishLabel: 'French' },
+  { id: 'tr', label: 'Türkçe', englishLabel: 'Turkish' },
+  { id: 'uk', label: 'Українська', englishLabel: 'Ukrainian' },
+  { id: 'vi', label: 'Tiếng Việt', englishLabel: 'Vietnamese' },
+  { id: 'zh', label: '中文（简体）', englishLabel: 'Chinese (Simplified)' },
+  { id: 'zh-TW', label: '中文（繁體）', englishLabel: 'Chinese (Traditional)' },
 ];
 
 const STORAGE_KEY = 'mvp:locale';
-const VALID: LocaleId[] = ['en', 'hi', 'ru', 'it', 'pl', 'ja', 'pt-BR'];
+const VALID: LocaleId[] = [
+  'en', 'hi', 'ru', 'it', 'pl', 'ja', 'pt-BR',
+  'de', 'es', 'fr', 'tr', 'uk', 'vi', 'zh', 'zh-TW',
+];
 export const DEFAULT_LOCALE: LocaleId = 'en';
 
-const DICTS: Record<LocaleId, Strings> = { en, hi, ru, it, pl, ja, 'pt-BR': ptBR };
+const DICTS: Record<LocaleId, Strings> = {
+  en, hi, ru, it, pl, ja, 'pt-BR': ptBR,
+  de, es, fr, tr, uk, vi, zh, 'zh-TW': zhTW,
+};
 
 export function getStoredLocale(): LocaleId {
   try {

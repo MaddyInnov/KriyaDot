@@ -54,3 +54,18 @@ export function nowCardLine(turn: CurrentTurnState): string {
   parts.push(formatElapsed(turn.elapsedMs));
   return parts.join(' · ');
 }
+
+/** Summary for finished steps once a turn completes (chat polish folding). */
+export interface FinishedStepsSummary { count: number; label: string; steps: string[] }
+
+/**
+ * Collapse a turn's completed step labels into one summary line:
+ * "✓ 4 steps · read_file, search, +2 more". Empty → null.
+ */
+export function foldFinishedSteps(steps: string[]): FinishedStepsSummary | null {
+  const clean = steps.map((s) => s.trim()).filter(Boolean);
+  if (clean.length === 0) return null;
+  const head = clean.slice(0, 2).join(', ');
+  const tail = clean.length > 2 ? `, +${clean.length - 2} more` : '';
+  return { count: clean.length, label: `✓ ${clean.length} step${clean.length === 1 ? '' : 's'} · ${head}${tail}`, steps: clean };
+}

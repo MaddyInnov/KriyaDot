@@ -7,8 +7,16 @@
 //   XLSX → fflate unzip + shared strings + sheet XML → markdown tables
 // Extracted text is capped (100KB) for chat-context injection.
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { unzipSync, strFromU8 } from 'fflate';
+import { findExecutable, resolveOcrProvider, type OcrProvider } from './ocr.js';
+import { parseImageMetadata } from './vision-pipeline.js';
+
+const execFileAsync = promisify(execFile);
 
 export const EXTRACT_TEXT_CAP = 100_000; // chars injected into chat context
 const MAX_PDF_PAGES = 200;
@@ -25,7 +33,22 @@ export interface ExtractResult {
   /** Unit label: 'pages' | 'slides' | 'sheets'. */
   unitLabel?: string;
   /** Machine-readable kind. */
-  kind: 'pdf' | 'docx' | 'pptx' | 'xlsx' | 'text' | 'unsupported';
+  kind: 'pdf' | 'docx' | 'pptx' | 'xlsx' | 'text' | 'image' | 'unsupported';
+  /** True when the text came from OCR (image input, or a textless PDF). */
+  ocr?: boolean;
+  /** OCR provider name that produced the text (e.g. 'tesseract', 'http'). */
+  ocrProvider?: string;
+  /** §2.12 #128: parsed image metadata (dimensions/EXIF) for image inputs. */
+  imageMeta?: import('./vision-pipeline.js').ImageAttachmentMetadata;
+}
+
+export interface ExtractOptions {
+  /** Injected OCR provider (tests pass a fake — no real OCR, no network). */
+  ocrProvider?: OcrProvider;
+  /** Injected OCR provider list; chained in order. */
+  ocrProviders?: OcrProvider[];
+  /** Set false to skip the OCR fallback entirely. */
+  ocr?: boolean;
 }
 
 /** Decode XML entities in OOXML text runs. */
@@ -213,6 +236,79 @@ export function detectDocKind(mimeType: string, fileName: string): ExtractResult
 }
 
 /**
+ * Image inputs stay 'unsupported' in detectDocKind (legacy contract: the
+ * chat pipeline only claims a kind it can extract without OCR). The OCR
+ * route in extractDocumentText upgrades them to kind 'image' when a
+ * provider actually produces text.
+ */
+export function isImageInput(mimeType: string, fileName: string): boolean {
+  const mt = mimeType.toLowerCase();
+  const ext = fileName.toLowerCase().split('.').pop() ?? '';
+  return mt.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'tif', 'tiff', 'bmp'].includes(ext);
+}
+
+const IMAGE_MIME_BY_EXT: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  tif: 'image/tiff',
+  tiff: 'image/tiff',
+  bmp: 'image/bmp',
+};
+
+/**
+ * Rasterize PDF pages to PNG buffers with `pdftoppm` (poppler) when the
+ * binary is available. Returns [] when pdftoppm is missing or fails —
+ * callers treat that as "OCR path unavailable", never an error.
+ */
+export async function rasterizePdfPages(
+  absPath: string,
+  opts?: { maxPages?: number; dpi?: number },
+): Promise<Buffer[]> {
+  const bin = findExecutable('pdftoppm');
+  if (!bin) return [];
+  const dir = mkdtempSync(join(tmpdir(), 'kriyadot-pdf-ocr-'));
+  try {
+    await execFileAsync(bin, [
+      '-png',
+      '-r',
+      String(opts?.dpi ?? 200),
+      '-l',
+      String(opts?.maxPages ?? 20),
+      absPath,
+      join(dir, 'page'),
+    ]);
+    const names = readdirSync(dir)
+      .filter((n) => n.endsWith('.png'))
+      .sort();
+    return names.map((n) => readFileSync(join(dir, n)));
+  } catch {
+    return [];
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** Run OCR over image bytes; null when no provider can run. */
+async function tryOcr(
+  image: Buffer,
+  mimeType: string,
+  provider: OcrProvider,
+): Promise<{ text: string; provider: string } | null> {
+  try {
+    if (!(await provider.isAvailable())) return null;
+    const text = await provider.recognize(image, mimeType);
+    const name =
+      (provider as { lastProviderName?: string }).lastProviderName ?? provider.name;
+    return { text, provider: name };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Extract text from a document file on disk.
  * Never throws — returns { kind: 'unsupported', text: '' } on any failure.
  */
@@ -220,6 +316,7 @@ export async function extractDocumentText(
   absPath: string,
   mimeType: string,
   fileName: string,
+  opts?: ExtractOptions,
 ): Promise<ExtractResult> {
   const kind = detectDocKind(mimeType, fileName);
   try {
@@ -231,8 +328,57 @@ export async function extractDocumentText(
         kind: 'text',
       };
     }
-    const data = new Uint8Array(readFileSync(absPath));
-    if (kind === 'pdf') return await extractPdf(data);
+    const raw = readFileSync(absPath);
+    const data = new Uint8Array(raw);
+    if (kind === 'unsupported' && isImageInput(mimeType, fileName)) {
+      // §2.12 #128: image metadata (dimensions + EXIF orientation) is
+      // parsed regardless of whether OCR runs or succeeds.
+      const imageMeta = parseImageMetadata(raw);
+      if (opts?.ocr === false) return { text: '', truncated: false, kind: 'unsupported', imageMeta };
+      const ext = fileName.toLowerCase().split('.').pop() ?? '';
+      const provider = resolveOcrProvider(opts);
+      const hit = await tryOcr(raw, mimeType.startsWith('image/') ? mimeType : IMAGE_MIME_BY_EXT[ext] ?? 'image/png', provider);
+      if (!hit) return { text: '', truncated: false, kind: 'unsupported', imageMeta };
+      return {
+        text: hit.text.slice(0, EXTRACT_TEXT_CAP),
+        truncated: hit.text.length > EXTRACT_TEXT_CAP,
+        kind: 'image',
+        ocr: true,
+        ocrProvider: hit.provider,
+        imageMeta,
+      };
+    }
+    if (kind === 'pdf') {
+      const result = await extractPdf(data);
+      // Textless (scanned) PDF: rasterize pages and OCR them.
+      if (!result.text.trim() && opts?.ocr !== false) {
+        const provider = resolveOcrProvider(opts);
+        const pages = await rasterizePdfPages(absPath);
+        if (pages.length > 0) {
+          const parts: string[] = [];
+          let providerName: string | undefined;
+          for (const pagePng of pages) {
+            const hit = await tryOcr(pagePng, 'image/png', provider);
+            if (hit) {
+              providerName = hit.provider;
+              if (hit.text.trim()) parts.push(hit.text.trim());
+            }
+            if (parts.join('\n').length >= EXTRACT_TEXT_CAP) break;
+          }
+          if (parts.length > 0) {
+            const text = parts.join('\n');
+            return {
+              ...result,
+              text: text.slice(0, EXTRACT_TEXT_CAP),
+              truncated: result.truncated || text.length > EXTRACT_TEXT_CAP,
+              ocr: true,
+              ocrProvider: providerName,
+            };
+          }
+        }
+      }
+      return result;
+    }
     if (kind === 'docx') return extractDocx(data);
     if (kind === 'pptx') return extractPptx(data);
     if (kind === 'xlsx') return extractXlsx(data);

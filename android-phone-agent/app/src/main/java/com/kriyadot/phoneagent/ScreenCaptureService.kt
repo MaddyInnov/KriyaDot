@@ -28,6 +28,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 
 /**
@@ -128,6 +129,23 @@ class ScreenCaptureService : Service() {
             // the result is acked back to the server exactly once.
             InputService.dispatchAction(msg) { id, ok, error ->
                 client.sendActionResult(id, ok, error)
+            }
+        }
+        client.onDataQuery = { msg ->
+            // Phone data queries: read-only, permission-gated on-device.
+            // Content-provider reads can block, so run them off the WS thread.
+            val id = msg.optString("id", "")
+            val query = msg.optString("query", "")
+            val params = msg.optJSONObject("params") ?: org.json.JSONObject()
+            scope.launch {
+                try {
+                    val data = PhoneDataHandlers.execute(this@ScreenCaptureService, query, params)
+                    client.sendDataResult(id, true, null, data)
+                } catch (e: PhoneDataException) {
+                    client.sendDataResult(id, false, e.code, null)
+                } catch (e: Exception) {
+                    client.sendDataResult(id, false, "query_failed", null)
+                }
             }
         }
         client.connect()

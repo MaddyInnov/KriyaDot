@@ -6,8 +6,10 @@ import type { SubagentAuditFn, SubagentSpawnFn } from '../subagents.js';
 import type { ProvenanceNote } from '../provenance.js';
 import { noteFromChain } from '../provenance.js';
 import { SubagentStore } from '../subagent-store.js';
+import { subagentProfiles } from '../subagent-profiles.js';
 import { AcpClient, acpOptionsFromBot } from '../acp.js';
 import type { BotConfig } from '../types.js';
+import type { DelegationDecisionEvent } from '../routing-decisions.js';
 
 export interface CreateDelegateToolsOptions {
   /**
@@ -26,6 +28,13 @@ export interface CreateDelegateToolsOptions {
   audit?: SubagentAuditFn;
   /** Override the nesting cap (default MAX_SUBAGENT_DEPTH = 2). */
   maxDepth?: number;
+  /**
+   * Invocation decision model (optional): called once per delegation
+   * outcome (subagent + ACP paths, success and failure) with a hashed —
+   * never raw — task. Wire to routing-decisions' delegation sink.
+   * Best-effort: a throwing callback never changes the delegation result.
+   */
+  recordDecision?: (event: DelegationDecisionEvent) => void;
   /**
    * Bot lookup for ACP delegation (Octop parity): `delegate` with
    * `via: 'acp'` reads the bot's `acp` config from here. When absent,
@@ -61,6 +70,10 @@ export interface CreateDelegateToolsOptions {
 export function createDelegateTools(opts: CreateDelegateToolsOptions): ToolDefinition[] {
   const { spawn, store, audit } = opts;
   const maxDepth = opts.maxDepth ?? MAX_SUBAGENT_DEPTH;
+  const recordDecision = (event: DelegationDecisionEvent): void => {
+    if (!opts.recordDecision) return;
+    try { opts.recordDecision(event); } catch { /* recording is best-effort */ }
+  };
 
   const delegateTool: ToolDefinition = {
     name: 'delegate',
@@ -87,6 +100,9 @@ export function createDelegateTools(opts: CreateDelegateToolsOptions): ToolDefin
       '  working directory confined to the workspace and its output is treated',
       '  as untrusted, exactly like any tool result.',
       '',
+      'Optional argument "profileId" (string): a specialist profile id from the',
+      'sub-agent profile library — spawns an ephemeral specialist with that',
+      'profile prompt and its suggested tools.',
       'Safety: this call goes through the normal tool-approval flow, the child',
       'runs under the same governance policy, and delegation nests at most',
       `${maxDepth} deep (root -> child -> grandchild). A subagent at the depth`,
@@ -157,6 +173,7 @@ export function createDelegateTools(opts: CreateDelegateToolsOptions): ToolDefin
         try {
           await client.connect();
           const text = await client.prompt(task);
+          recordDecision({ delegatingBotId: ctx.botId, targetBotId: botId, via: 'acp', outcome: 'success', task });
           // The runtime tags every tool result untrusted; the ACP agent's
           // output is additionally labeled so the parent model knows its
           // provenance.
@@ -165,11 +182,15 @@ export function createDelegateTools(opts: CreateDelegateToolsOptions): ToolDefin
             usage: null,
             via: 'acp',
           };
+        } catch (err) {
+          recordDecision({ delegatingBotId: ctx.botId, targetBotId: botId, via: 'acp', outcome: 'failed', task, error: err instanceof Error ? err.message : String(err) });
+          throw err;
         } finally {
           client.close();
         }
       }
 
+      const profile = typeof args.profileId === 'string' && args.profileId ? (()=>{ const e=subagentProfiles.ephemeralFor(args.profileId as string); if(!e) throw new Error(`delegate: unknown profileId "${String(args.profileId)}"`); return { id: args.profileId as string, name: e.name, systemPrompt: e.systemPrompt, tools: e.tools }; })() : undefined;
       // Strip `delegate` from any explicit subset — the child must not be
       // able to recurse unboundedly through the same tool.
       const requested = Array.isArray(args.tools)
@@ -202,33 +223,47 @@ export function createDelegateTools(opts: CreateDelegateToolsOptions): ToolDefin
       if (!store) {
         // Minimal wiring: spawn without depth enforcement or records.
         // Hosts SHOULD pass a SubagentStore (see options docs).
-        const result = await spawn({
-          task,
-          tools: requested,
-          botId: childBotId,
-          parentSessionId: ctx.sessionId,
-          provenance: childProvenance,
-        });
-        return { result: result.result, usage: result.usage ?? null };
+        try {
+          const result = await spawn({
+            task,
+            tools: requested ?? profile?.tools,
+            botId: childBotId,
+            parentSessionId: ctx.sessionId,
+            provenance: childProvenance,
+            profile,
+          });
+          recordDecision({ delegatingBotId: ctx.botId, targetBotId: childBotId, via: 'subagent', outcome: 'success', task });
+          return { result: result.result, usage: result.usage ?? null };
+        } catch (err) {
+          recordDecision({ delegatingBotId: ctx.botId, targetBotId: childBotId, via: 'subagent', outcome: 'failed', task, error: err instanceof Error ? err.message : String(err) });
+          throw err;
+        }
       }
 
-      const spawned = await spawnSubagent({
-        store,
-        spawn,
-        audit,
-        maxDepth,
-        parentBotId: ctx.botId,
-        parentSessionId: ctx.sessionId,
-        task,
-        tools: requested,
-        botId: botOverride ?? ctx.botId,
-        provenance: childProvenance,
-      });
-      return {
-        result: spawned.result,
-        usage: spawned.usage ?? null,
-        subagentId: spawned.subagentId,
-      };
+      try {
+        const spawned = await spawnSubagent({
+          store,
+          spawn,
+          audit,
+          maxDepth,
+          parentBotId: ctx.botId,
+          parentSessionId: ctx.sessionId,
+          task,
+          tools: requested ?? profile?.tools,
+          botId: botOverride ?? ctx.botId,
+          provenance: childProvenance,
+          profile,
+        });
+        recordDecision({ delegatingBotId: ctx.botId, targetBotId: childBotId, via: 'subagent', outcome: 'success', task });
+        return {
+          result: spawned.result,
+          usage: spawned.usage ?? null,
+          subagentId: spawned.subagentId,
+        };
+      } catch (err) {
+        recordDecision({ delegatingBotId: ctx.botId, targetBotId: childBotId, via: 'subagent', outcome: 'failed', task, error: err instanceof Error ? err.message : String(err) });
+        throw err;
+      }
     },
   };
 

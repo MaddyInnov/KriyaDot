@@ -19,7 +19,9 @@ import {
   PagePublicationStore,
   publicPathForSlug,
   publicationStatus,
+  sanitizeHtmlArtifact,
 } from './public-pages.js';
+import { compileJsxToHtml } from './jsx-compile.js';
 
 export function publishPagePolicyRules(): BotPolicyRule[] {
   return [
@@ -86,7 +88,14 @@ export function registerPublishTools(deps: PublishToolDeps): void {
         'later edits appear at the same link.',
         '',
         'Args:',
-        '- page (string, required): the page id, or its exact title.',
+        '- page (string): the page id, or its exact title. Required unless',
+        '  content is given.',
+        '- title + content (strings): publish a standalone artifact instead',
+        '  of a Page.',
+        '- format ("markdown" | "html" | "jsx", default "markdown"): the',
+        '  content format for standalone artifacts. "jsx" compiles the',
+        '  constrained JSX subset (lowercase HTML elements, literal',
+        '  expressions only) to HTML and sanitizes it before publishing.',
         '',
         'Returns { published, pageId, title, slug, path, views } where "path"',
         'is the public URL path (e.g. /p/<slug>) on this KriyaDot server.',
@@ -96,11 +105,45 @@ export function registerPublishTools(deps: PublishToolDeps): void {
         type: 'object',
         properties: {
           page: { type: 'string', description: 'Page id, or exact page title' },
+          title: { type: 'string', description: 'Artifact title (with content)' },
+          content: { type: 'string', description: 'Standalone artifact content' },
+          format: {
+            type: 'string',
+            enum: ['markdown', 'html', 'jsx'],
+            description: 'Content format for standalone artifacts',
+          },
         },
-        required: ['page'],
         additionalProperties: false,
       },
       handler: async (args: Record<string, unknown>, _ctx: ToolContext) => {
+        // Standalone-artifact mode: title + content (+ optional format).
+        if (typeof args.content === 'string' && args.content) {
+          const format = typeof args.format === 'string' ? args.format : 'markdown';
+          if (format !== 'markdown' && format !== 'html' && format !== 'jsx') {
+            throw new Error('"format" must be one of "markdown" | "html" | "jsx"');
+          }
+          let content: string = args.content;
+          let contentKind: 'markdown' | 'html' = format === 'html' ? 'html' : 'markdown';
+          if (format === 'jsx') {
+            // Compile, then the single sanitizer path — never store raw.
+            content = sanitizeHtmlArtifact(compileJsxToHtml(content));
+            contentKind = 'html';
+          }
+          const pub = publications.publishArtifact({
+            title: strArg(args, 'title'),
+            content,
+            contentKind,
+          });
+          return {
+            published: true,
+            pageId: null,
+            title: pub.title,
+            slug: pub.slug,
+            path: publicPathForSlug(pub.slug),
+            publishedAt: pub.publishedAt,
+            views: pub.views,
+          };
+        }
         const page = resolvePage(pages, strArg(args, 'page'));
         const pub = publications.publishPage(page);
         return {

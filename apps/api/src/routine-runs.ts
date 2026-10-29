@@ -51,6 +51,10 @@ export interface RoutineRun {
   tokens: number | null;
   costUsd: number | null;
   createdAt: number;
+  /** Item 4c: true when an automatic retry recovered this run. */
+  recovered?: boolean;
+  /** Total attempts made (1 = no retry). */
+  attempts?: number;
 }
 
 export interface FailureStreak {
@@ -72,6 +76,8 @@ interface RunRow {
   tokens: number | null;
   cost_usd: number | null;
   created_at: number;
+  recovered: number | null;
+  attempts: number | null;
 }
 
 function rowToRun(r: RunRow): RoutineRun {
@@ -89,6 +95,8 @@ function rowToRun(r: RunRow): RoutineRun {
     tokens: r.tokens,
     costUsd: r.cost_usd,
     createdAt: r.created_at,
+    recovered: r.recovered === 1 ? true : undefined,
+    attempts: r.attempts ?? undefined,
   };
 }
 
@@ -123,6 +131,9 @@ function openDb(dataDir: string): DatabaseSync {
       last_failed_at INTEGER
     );
   `);
+  const runCols = db.prepare('PRAGMA table_info(routine_runs)').all() as unknown as Array<{ name: string }>;
+  if (!runCols.some((c) => c.name === 'recovered')) db.exec('ALTER TABLE routine_runs ADD COLUMN recovered INTEGER');
+  if (!runCols.some((c) => c.name === 'attempts')) db.exec('ALTER TABLE routine_runs ADD COLUMN attempts INTEGER');
   return db;
 }
 
@@ -224,6 +235,8 @@ export class RoutineRunStore {
       error?: string | null;
       tokens?: number | null;
       costUsd?: number | null;
+      recovered?: boolean;
+      attempts?: number;
     },
   ): { run: RoutineRun; consecutiveFailures: number } | undefined {
     const run = this.get(id);
@@ -235,7 +248,7 @@ export class RoutineRunStore {
     this.db
       .prepare(
         `UPDATE routine_runs
-         SET status = ?, output_excerpt = ?, error = ?, tokens = ?, cost_usd = ?, ended_at = ?
+         SET status = ?, output_excerpt = ?, error = ?, tokens = ?, cost_usd = ?, ended_at = ?, recovered = ?, attempts = ?
          WHERE id = ?`,
       )
       .run(
@@ -245,6 +258,8 @@ export class RoutineRunStore {
         result.tokens ?? null,
         result.costUsd ?? null,
         now,
+        result.recovered ? 1 : 0,
+        result.attempts ?? 1,
         id,
       );
     let consecutiveFailures = this.getStreak(run.routineId).consecutiveFailures;
@@ -340,6 +355,13 @@ export class RoutineRunStore {
     return Number(r.changes);
   }
 
+  /** Most recent succeeded run's report summary (output excerpt), for previous-run memory (item 4d). */
+  lastSuccessfulSummary(routineId: string): string | null {
+    const rows = this.listByRoutine(routineId, 20);
+    const hit = rows.find((r) => r.status === 'succeeded' && r.outputExcerpt);
+    return hit?.outputExcerpt ?? null;
+  }
+
   /** Cascade when a routine is deleted. */
   deleteByRoutine(routineId: string): void {
     this.db.prepare(`DELETE FROM routine_runs WHERE routine_id = ?`).run(routineId);
@@ -356,6 +378,8 @@ export interface RunSettledResult {
   status: 'succeeded' | 'failed' | 'cancelled';
   error?: string | null;
   tokens?: number | null;
+  recovered?: boolean;
+  attempts?: number;
 }
 
 export interface ExecuteRoutineRunOptions {
@@ -522,34 +546,55 @@ export class RoutineRunExecutor {
         return;
       }
     }
-    try {
-      const message = opts.message ?? render(opts.routine.promptTemplate, opts.payload ?? {});
-      const usage = await this.deps.agentRuntime.runTurn({
-        bot,
-        message,
-        sessionId: opts.sessionId ?? opts.routine.sessionId ?? `routine_${opts.routine.id}`,
-        taskType: 'chat',
-        signal,
-        onEvent: (ev) => {
-          if (ev.type === 'token' && typeof ev.content === 'string' && excerpt.length < OUTPUT_EXCERPT_LIMIT) {
-            excerpt += ev.content;
-          } else if (ev.type === 'done') {
-            tokens = ev.usage.totalTokens;
-          }
-        },
-      });
-      tokens ??= usage?.totalTokens ?? null;
-      if (this.cancelled.has(runId) || signal.aborted) {
-        settle({ status: 'cancelled', error: 'cancelled by user' });
-      } else {
-        settle({ status: 'succeeded', tokens });
+    // Previous-run memory (item 4d): inject the last succeeded run's
+    // report summary. Default on for recurring routines; per-routine
+    // usePreviousRunSummary overrides.
+    const recurring = Boolean(opts.routine.schedule && opts.routine.schedule.kind !== 'once' && opts.routine.schedule.kind !== 'startup');
+    const includePrev = opts.routine.usePreviousRunSummary ?? recurring;
+    let baseMessage = opts.message ?? render(opts.routine.promptTemplate, opts.payload ?? {});
+    if (includePrev) {
+      try { const prev = store.lastSuccessfulSummary(opts.routine.id); if (prev) baseMessage += `\n\n[Previous run report summary]\n${prev}`; } catch { /* memory must never break a run */ }
+    }
+    // Per-routine timeout (item 4b) + automatic retry once (item 4c).
+    const maxAttempts = opts.routine.autoRetry === false ? 1 : 2;
+    const timeoutMs = opts.routine.timeoutMs && opts.routine.timeoutMs > 0 ? opts.routine.timeoutMs : undefined;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      excerpt = ''; tokens = null;
+      let timedOut = false;
+      let attemptSignal = signal;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      if (timeoutMs) {
+        const ctl = new AbortController();
+        if (signal.aborted) ctl.abort(); else signal.addEventListener('abort', () => ctl.abort(), { once: true });
+        timer = setTimeout(() => { timedOut = true; ctl.abort(); }, timeoutMs);
+        attemptSignal = ctl.signal;
       }
-    } catch (err) {
-      if (this.cancelled.has(runId) || signal.aborted) {
-        settle({ status: 'cancelled', error: 'cancelled by user' });
-      } else {
-        // Limit-reset (W1): a hard provider limit arms a resume hook so
-        // the routine can continue at the provider's reset time.
+      try {
+        const usage = await this.deps.agentRuntime.runTurn({
+          bot,
+          message: baseMessage,
+          sessionId: opts.sessionId ?? opts.routine.sessionId ?? `routine_${opts.routine.id}`,
+          taskType: 'chat',
+          signal: attemptSignal,
+          onEvent: (ev) => {
+            if (ev.type === 'token' && typeof ev.content === 'string' && excerpt.length < OUTPUT_EXCERPT_LIMIT) {
+              excerpt += ev.content;
+            } else if (ev.type === 'done') {
+              tokens = ev.usage.totalTokens;
+            }
+          },
+        });
+        tokens ??= usage?.totalTokens ?? null;
+        if (timer) clearTimeout(timer);
+        if (this.cancelled.has(runId)) { settle({ status: 'cancelled', error: 'cancelled by user', attempts: attempt }); return; }
+        if (timedOut) throw new Error(`routine run timed out after ${timeoutMs}ms`);
+        if (signal.aborted) { settle({ status: 'cancelled', error: 'cancelled by user', attempts: attempt }); return; }
+        settle({ status: 'succeeded', tokens, recovered: attempt > 1 ? true : undefined, attempts: attempt });
+        return;
+      } catch (err) {
+        if (timer) clearTimeout(timer);
+        if (this.cancelled.has(runId)) { settle({ status: 'cancelled', error: 'cancelled by user', attempts: attempt }); return; }
+        if (attempt < maxAttempts && !signal.aborted) continue; // automatic retry, once
         try {
           if (this.deps.onLimitBlocked && classifyProviderError(err).isLimit) {
             this.deps.onLimitBlocked({ routine: opts.routine, error: err });
@@ -557,7 +602,8 @@ export class RoutineRunExecutor {
         } catch (hookErr) {
           console.error('[routine-runs] onLimitBlocked threw:', hookErr instanceof Error ? hookErr.message : hookErr);
         }
-        settle({ status: 'failed', error: err instanceof Error ? err.message : String(err), tokens });
+        settle({ status: 'failed', error: err instanceof Error ? err.message : String(err), tokens, attempts: attempt });
+        return;
       }
     }
   }

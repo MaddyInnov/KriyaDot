@@ -18,6 +18,7 @@ import {
 import type { CliLoginStatus, ModelsCatalogInfo, ProviderInfo, RateLimitSnapshot } from '../../lib/api';
 import { formatResetIn, formatTokens } from '../../lib/usage';
 import { ChannelsPanel } from '../../components/channels/channels-panel';
+import { KeySuggestionCard } from '../../components/key-suggestion-card';
 
 /**
  * Quota line for one provider, e.g. "28/30 req remaining · 1.8M/2M tokens ·
@@ -456,6 +457,7 @@ export default function ProvidersPage() {
         file <span className="mono">providers.local.json</span> (mode 0600) next to the API&apos;s
         data directory. They are never logged and never returned by the API.
       </div>
+      <KeySuggestionCard />
       <div className="card" style={{ marginTop: 12 }}>
         <div className="row-between">
           <div>

@@ -50,6 +50,7 @@ import {
   type ToolContext,
 } from './computer.js';
 import { VpsNotConfiguredError } from './vps.js';
+import { defaultBrowserHoldRegistry, type BrowserHoldRegistry } from './browser-hold.js';
 
 /** "Works on" surface choices. Stored on BotConfig.computerSurface. */
 export type ComputerSurface = 'auto' | 'local' | 'docker' | 'browser' | 'vps' | 'off';
@@ -96,6 +97,59 @@ export function resolveSurfaceKind(
   if (surface === 'off') return 'off';
   if (surface === 'auto') return resolveAutoSurface();
   return surface;
+}
+
+// ---------------------------------------------------------------------------
+// Configured computer providers (per-bot `computerProvider`)
+// ---------------------------------------------------------------------------
+// A finer-grained, provider-named dial on top of surfaces:
+//   auto       — fall through to env, then the safe default.
+//   mock       — the safe MockOSScreenLayer (local surface, no real input).
+//   playwright — the Playwright browser surface.
+//   desktop    — real foreground desktop (local surface + COMPUTER_USE_REAL path).
+//   docker     — the Docker computer sandbox.
+// Resolution order: per-bot config → env (COMPUTER_USE_DOCKER /
+// COMPUTER_USE_PLAYWRIGHT / COMPUTER_USE_REAL) → auto (mock).
+
+export type ComputerProvider = 'auto' | 'mock' | 'playwright' | 'desktop' | 'docker';
+export const COMPUTER_PROVIDERS: readonly ComputerProvider[] = ['auto', 'mock', 'playwright', 'desktop', 'docker'];
+export function isComputerProvider(v: unknown): v is ComputerProvider {
+  return typeof v === 'string' && (COMPUTER_PROVIDERS as readonly string[]).includes(v);
+}
+export type ComputerBackend = 'mock' | 'playwright' | 'desktop' | 'docker';
+export type ComputerProviderSource = 'config' | 'env' | 'auto' | 'unavailable';
+
+export interface ComputerProviderResolution {
+  requested: ComputerProvider;
+  backend: ComputerBackend | null;
+  source: ComputerProviderSource;
+  reason: string;
+}
+
+export function resolveComputerProvider(input: {
+  configProvider?: ComputerProvider | null;
+  env?: NodeJS.ProcessEnv;
+  surface?: ComputerSurface;
+} = {}): ComputerProviderResolution {
+  const env = input.env ?? process.env;
+  if (input.surface === 'off') {
+    return { requested: input.configProvider ?? 'auto', backend: null, source: 'unavailable', reason: 'computer surface is "off" for this bot' };
+  }
+  const cfg = input.configProvider;
+  if (cfg && cfg !== 'auto') {
+    return { requested: cfg, backend: cfg, source: 'config', reason: `per-bot computerProvider="${cfg}"` };
+  }
+  if (env.COMPUTER_USE_DOCKER === '1') return { requested: 'auto', backend: 'docker', source: 'env', reason: 'COMPUTER_USE_DOCKER=1 in environment' };
+  if (env.COMPUTER_USE_PLAYWRIGHT === '1') return { requested: 'auto', backend: 'playwright', source: 'env', reason: 'COMPUTER_USE_PLAYWRIGHT=1 in environment' };
+  if (env.COMPUTER_USE_REAL === '1') return { requested: 'auto', backend: 'desktop', source: 'env', reason: 'COMPUTER_USE_REAL=1 in environment' };
+  return { requested: 'auto', backend: 'mock', source: 'auto', reason: 'auto: no real backend opted in — safe mock layer' };
+}
+
+/** Map a resolved provider backend back to the surface that implements it. */
+export function surfaceForComputerBackend(backend: ComputerBackend): ResolvedComputerSurface {
+  if (backend === 'docker') return 'docker';
+  if (backend === 'playwright') return 'browser';
+  return 'local'; // mock and desktop both live on the local surface
 }
 
 /** Default idle timeout: dispose a bot's computer after 30 min unused. */
@@ -214,6 +268,13 @@ export interface PerBotComputerManagerDeps {
    * profile content.
    */
   onProfileWipe?: (result: BrowserProfileWipeResult) => void;
+  /**
+   * §1.4 per-person browser hold registry. Defaults to the process-wide
+   * `defaultBrowserHoldRegistry` (shared with the API hold/release
+   * routes): while a person holds a bot's browser profile, every bot
+   * browser action on it fails with BrowserHeldError.
+   */
+  browserHolds?: BrowserHoldRegistry;
 }
 
 export interface ComputerInstanceStatus {
@@ -326,6 +387,8 @@ class LazyPerBotLayer implements OSScreenLayer {
       if (entry.closed) {
         throw new Error(`computer for bot "${entry.botId}" was shut down`);
       }
+      // §1.4: a person's hold on this browser profile blocks bot actions.
+      this.mgr.assertBrowserNotHeld(entry.botId);
       const layer = await this.mgr.ensureBackend(entry);
       return fn(layer);
     });
@@ -377,6 +440,7 @@ export class PerBotComputerManager {
   private readonly vpsLayerFor?: PerBotComputerManagerDeps['vpsLayerFor'];
   private readonly profileRoot: string;
   private readonly onProfileWipe?: PerBotComputerManagerDeps['onProfileWipe'];
+  private readonly browserHolds: BrowserHoldRegistry;
 
   constructor(deps: PerBotComputerManagerDeps = {}) {
     this.idleTimeoutMs = deps.idleTimeoutMs ?? DEFAULT_COMPUTER_IDLE_TIMEOUT_MS;
@@ -385,11 +449,22 @@ export class PerBotComputerManager {
     this.createBackendOverride = deps.createBackend;
     this.vpsLayerFor = deps.vpsLayerFor;
     this.onProfileWipe = deps.onProfileWipe;
+    this.browserHolds = deps.browserHolds ?? defaultBrowserHoldRegistry;
     this.profileRoot =
       deps.browserProfileRoot ??
       (deps.dataDir
         ? path.join(deps.dataDir, 'browser-profiles')
         : path.resolve(process.cwd(), 'data', 'browser-profiles'));
+  }
+
+  /** §1.4: throw BrowserHeldError when a person holds this bot's browser profile. */
+  assertBrowserNotHeld(botId: string): void {
+    this.browserHolds.assertNotHeld(botId);
+  }
+
+  /** The hold registry in effect (the shared default unless injected). */
+  browserHoldRegistry(): BrowserHoldRegistry {
+    return this.browserHolds;
   }
 
   // ---- W4 browser profiles --------------------------------------------------

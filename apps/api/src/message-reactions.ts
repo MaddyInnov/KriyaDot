@@ -26,7 +26,7 @@ export interface MessageReaction {
 export const MAX_REACTIONS_PER_MESSAGE = 8;
 
 /** Common emoji picker options for the web client. */
-export const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏'] as const;
+export const REACTION_EMOJIS = ['👍', '👎', '❤️', '😂', '🎉', '👀', '😮', '😢', '🙏'] as const;
 
 export class MessageReactionStore {
   private db: DatabaseSync;

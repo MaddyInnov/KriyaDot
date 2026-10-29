@@ -45,6 +45,15 @@
     }
   },
   "identifier": "com.kriyadot.desktop",
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "kriyadot"
+        ]
+      }
+    }
+  },
   "productName": "KriyaDot",
   "version": "0.1.0"
 }

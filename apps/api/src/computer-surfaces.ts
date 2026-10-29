@@ -11,8 +11,8 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import type { BotConfig, ComputerSurface, PerBotComputerManager } from '@mvp/agent-runtime';
-import { isComputerSurface } from '@mvp/agent-runtime';
+import type { BotConfig, ComputerProvider, ComputerSurface, PerBotComputerManager } from '@mvp/agent-runtime';
+import { isComputerProvider, isComputerSurface, resolveComputerProvider } from '@mvp/agent-runtime';
 
 const SURFACES_FILE = 'computer-surfaces.json';
 
@@ -23,11 +23,14 @@ export function botComputerSurfacesPath(dataDir: string): string {
 interface SurfaceOverlayFile {
   surfaces: Record<string, ComputerSurface>;
   pins: Record<string, ComputerSurface>;
+  providers: Record<string, ComputerProvider>;
 }
 
 function emptyOverlay(): SurfaceOverlayFile {
-  return { surfaces: {}, pins: {} };
+  return { surfaces: {}, pins: {}, providers: {} };
 }
+
+export { resolveComputerProvider };
 
 /** Load + validate the overlay file. Invalid entries are dropped with a warning. */
 export function loadComputerSurfaceOverlay(dataDir: string): SurfaceOverlayFile {
@@ -46,6 +49,14 @@ export function loadComputerSurfaceOverlay(dataDir: string): SurfaceOverlayFile 
           continue;
         }
         out[section][key] = value;
+      }
+    }
+    const providers = (parsed as { providers?: unknown }).providers;
+    if (typeof providers === 'object' && providers !== null) {
+      for (const [key, value] of Object.entries(providers as Record<string, unknown>)) {
+        if (key.length === 0 || key.length > 256) continue;
+        if (!isComputerProvider(value)) continue;
+        out.providers[key] = value;
       }
     }
     return out;
@@ -68,17 +79,55 @@ function writeOverlay(dataDir: string, overlay: SurfaceOverlayFile): void {
 export function applyComputerSurfaces(bots: BotConfig[], dataDir: string): SurfaceOverlayFile {
   const overlay = loadComputerSurfaceOverlay(dataDir);
   const ids = Object.keys(overlay.surfaces);
-  if (ids.length === 0) return overlay;
   for (const bot of bots) {
     const surface = overlay.surfaces[bot.id];
     if (surface && !bot.computerSurface) {
       bot.computerSurface = surface;
+    }
+    const provider = overlay.providers[bot.id];
+    if (provider && !bot.computerProvider) {
+      bot.computerProvider = provider;
     }
   }
   if (ids.length > 0) {
     console.log(`[computer-surfaces] applied per-bot surfaces for ${ids.length} bot(s)`);
   }
   return overlay;
+}
+
+/** Persist one bot's configured computer provider and update the in-memory bot. */
+export function saveBotComputerProvider(
+  dataDir: string,
+  bots: BotConfig[],
+  botId: string,
+  provider: unknown,
+): ComputerProvider {
+  const bot = bots.find((b) => b.id === botId);
+  if (!bot) throw new Error(`Unknown bot "${botId}"`);
+  if (!isComputerProvider(provider)) {
+    throw new Error(`"computerProvider" must be one of auto, mock, playwright, desktop, docker (got ${JSON.stringify(provider)})`);
+  }
+  const overlay = loadComputerSurfaceOverlay(dataDir);
+  overlay.providers[botId] = provider;
+  writeOverlay(dataDir, overlay);
+  bot.computerProvider = provider;
+  return provider;
+}
+
+/** Which computer backend is active for a bot, and why (config|env|auto|unavailable). */
+export function computerProviderReport(bot: BotConfig, env: NodeJS.ProcessEnv = process.env) {
+  const resolution = resolveComputerProvider({
+    configProvider: bot.computerProvider ?? null,
+    env,
+    surface: bot.computerSurface,
+  });
+  return {
+    botId: bot.id,
+    computerProvider: bot.computerProvider ?? 'auto',
+    activeBackend: resolution.backend,
+    source: resolution.source,
+    reason: resolution.reason,
+  };
 }
 
 /** Persist one bot's "Works on" surface and update the in-memory bot. */

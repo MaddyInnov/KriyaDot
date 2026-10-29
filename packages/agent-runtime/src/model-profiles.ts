@@ -30,6 +30,7 @@ export type ModelPurpose =
   | 'reviewer'
   | 'summarizer'
   | 'triage'
+  | 'extraction'
   | 'evaluate';
 
 export const MODEL_PURPOSES: readonly ModelPurpose[] = [
@@ -40,6 +41,7 @@ export const MODEL_PURPOSES: readonly ModelPurpose[] = [
   'reviewer',
   'summarizer',
   'triage',
+  'extraction',
   'evaluate',
 ];
 

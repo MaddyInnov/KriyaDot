@@ -1,0 +1,1 @@
+{"description":"Demo hook plugin: appends a footer instruction to ending turns via { inject }.","entry":"index.js","id":"demo-hook","kinds":["hook"],"name":"Demo Hook","permissions":{"env":[],"network":false},"version":"1.0.0"}

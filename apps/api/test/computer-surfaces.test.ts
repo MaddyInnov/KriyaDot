@@ -119,7 +119,7 @@ describe('computer surface overlay', () => {
 
   it('empty dataDir yields an empty overlay (no crash)', () => {
     const d = freshDir();
-    expect(loadComputerSurfaceOverlay(d)).toEqual({ surfaces: {}, pins: {} });
-    expect(applyComputerSurfaces(bots(), d)).toEqual({ surfaces: {}, pins: {} });
+    expect(loadComputerSurfaceOverlay(d)).toEqual({ surfaces: {}, pins: {}, providers: {} });
+    expect(applyComputerSurfaces(bots(), d)).toEqual({ surfaces: {}, pins: {}, providers: {} });
   });
 });

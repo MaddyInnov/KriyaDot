@@ -21,6 +21,8 @@ export const WIDGET_KINDS = [
   'confirm',
   'progress',
   'image-view',
+  'mcp-app',
+  'page',
 ] as const;
 export type WidgetKind = (typeof WIDGET_KINDS)[number];
 
@@ -93,6 +95,24 @@ export interface FileWidget extends WidgetBase {
   url?: string;
 }
 
+/** Sandboxed MCP App (HTML UI from an MCP server, rendered in an iframe). */
+export interface McpAppWidget extends WidgetBase {
+  kind: 'mcp-app';
+  serverId: string;
+  resourceUri: string;
+  /** Per-render bridge nonce (never exposed to the app frame). */
+  nonce: string;
+}
+
+/** Page artifact card (publish_page completion): open + preview actions. */
+export interface PageWidget extends WidgetBase {
+  kind: 'page';
+  pageId: string;
+  slug?: string;
+  /** Public path, e.g. /p/<slug>. */
+  path?: string;
+}
+
 export type Widget =
   | TableWidget
   | ChartWidget
@@ -104,7 +124,9 @@ export type Widget =
   | InputWidget
   | ConfirmWidget
   | ProgressWidget
-  | ImageViewWidget;
+  | ImageViewWidget
+  | McpAppWidget
+  | PageWidget;
 
 export type WidgetValidation =
   | { ok: true; widget: Widget }
@@ -472,6 +494,31 @@ function validateProgress(raw: Record<string, unknown>): WidgetValidation {
   return { ok: true, widget: w };
 }
 
+function validateMcpApp(raw: Record<string, unknown>): WidgetValidation {
+  const base = baseOf(raw, 'mcp-app');
+  const serverId = str(raw.serverId, 200);
+  if (serverId === undefined) return fail('mcp-app widget requires a "serverId" string');
+  const resourceUri = str(raw.resourceUri, MAX_IMAGE_URL);
+  if (resourceUri === undefined || !resourceUri.startsWith('ui://')) {
+    return fail('mcp-app widget requires a ui:// "resourceUri"');
+  }
+  const nonce = str(raw.nonce, 200);
+  if (nonce === undefined) return fail('mcp-app widget requires a "nonce" string');
+  return { ok: true, widget: { ...base, kind: 'mcp-app', serverId, resourceUri, nonce } };
+}
+
+function validatePage(raw: Record<string, unknown>): WidgetValidation {
+  const base = baseOf(raw, 'page');
+  const pageId = str(raw.pageId, 200);
+  if (pageId === undefined) return fail('page widget requires a "pageId" string');
+  const w: PageWidget = { ...base, kind: 'page', pageId };
+  const slug = str(raw.slug, 200);
+  if (slug !== undefined) w.slug = slug;
+  const path = str(raw.path, MAX_IMAGE_URL);
+  if (path !== undefined) w.path = path;
+  return { ok: true, widget: w };
+}
+
 function validateImageView(raw: Record<string, unknown>): WidgetValidation {
   const base = baseOf(raw, 'image-view');
   const w: ImageViewWidget = { ...base, kind: 'image-view' };
@@ -522,6 +569,10 @@ export function validateWidget(payload: unknown): WidgetValidation {
       return validateProgress(payload);
     case 'image-view':
       return validateImageView(payload);
+    case 'mcp-app':
+      return validateMcpApp(payload);
+    case 'page':
+      return validatePage(payload);
   }
 }
 

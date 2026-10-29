@@ -19,6 +19,9 @@
 // service is only invoked when the client names a pending target).
 
 import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import express from 'express';
 
 // ---------------------------------------------------------------------------
 // (d) Sign-in requests
@@ -217,4 +220,197 @@ export class ReactionAnswerService {
 
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Chat polish (OpenMausBot §1.1/§1.2/§2.6): message pinning, general
+// reactions breadth, and the spoiler content convention.
+// ---------------------------------------------------------------------------
+
+/** Emojis allowed for GENERAL message reactions (any message, any user). */
+export const GENERAL_REACTION_EMOJIS = ['👍', '👎', '❤️', '😂', '🎉', '👀'] as const;
+
+export function isGeneralReactionEmoji(v: unknown): v is string {
+  return typeof v === 'string' && (GENERAL_REACTION_EMOJIS as readonly string[]).includes(v);
+}
+
+/**
+ * Spoiler convention (server side): a span wrapped in ||double pipes||
+ * is a spoiler. Message content is stored and returned VERBATIM — the
+ * convention is only parsed, never rewritten — so the web client can
+ * render those spans blurred until clicked.
+ */
+export interface SpoilerSegment { text: string; spoiler: boolean }
+
+export function parseSpoilerSegments(content: string): SpoilerSegment[] {
+  const out: SpoilerSegment[] = [];
+  const re = /\|\|([\s\S]+?)\|\|/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(content)) !== null) {
+    if (m.index > last) out.push({ text: content.slice(last, m.index), spoiler: false });
+    out.push({ text: m[1] ?? '', spoiler: true });
+    last = m.index + m[0].length;
+  }
+  if (last < content.length) out.push({ text: content.slice(last), spoiler: false });
+  return out.length > 0 ? out : [{ text: content, spoiler: false }];
+}
+
+export function hasSpoiler(content: string): boolean {
+  return /\|\|[\s\S]+?\|\|/.test(content);
+}
+
+// --- Message pinning --------------------------------------------------------
+
+export interface PinnedMessage {
+  threadId: string;
+  messageId: string;
+  /** Optional snapshot so the banner can render without a thread fetch. */
+  text?: string;
+  role?: string;
+  pinnedAt: number;
+  pinnedBy: string;
+}
+
+type PinsFile = Record<string, PinnedMessage[]>;
+
+/** Persisted pinned messages, keyed by thread id. JSON file under dataDir (in-memory when omitted). */
+export class PinnedMessageStore {
+  private pins: PinsFile = {};
+  constructor(private readonly dataDir?: string) {
+    if (dataDir) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(path.join(dataDir, 'chat-pins.json'), 'utf8')) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) this.pins = parsed as PinsFile;
+      } catch { /* missing/corrupt → start empty */ }
+    }
+  }
+  private save(): void {
+    if (!this.dataDir) return;
+    fs.mkdirSync(this.dataDir, { recursive: true });
+    const tmp = path.join(this.dataDir, 'chat-pins.json.tmp');
+    fs.writeFileSync(tmp, JSON.stringify(this.pins, null, 2), 'utf8');
+    fs.renameSync(tmp, path.join(this.dataDir, 'chat-pins.json'));
+  }
+  pin(threadId: string, input: { messageId: string; text?: string; role?: string; pinnedBy?: string }): PinnedMessage {
+    const list = this.pins[threadId] ?? [];
+    const existing = list.find((p) => p.messageId === input.messageId);
+    if (existing) return existing;
+    const pin: PinnedMessage = {
+      threadId, messageId: input.messageId,
+      ...(input.text ? { text: input.text.slice(0, 2000) } : {}),
+      ...(input.role ? { role: input.role } : {}),
+      pinnedAt: Date.now(), pinnedBy: input.pinnedBy ?? 'user',
+    };
+    this.pins[threadId] = [...list, pin];
+    this.save();
+    return pin;
+  }
+  unpin(threadId: string, messageId: string): boolean {
+    const list = this.pins[threadId] ?? [];
+    const next = list.filter((p) => p.messageId !== messageId);
+    if (next.length === list.length) return false;
+    if (next.length === 0) delete this.pins[threadId]; else this.pins[threadId] = next;
+    this.save();
+    return true;
+  }
+  list(threadId: string): PinnedMessage[] { return [...(this.pins[threadId] ?? [])]; }
+  isPinned(threadId: string, messageId: string): boolean {
+    return (this.pins[threadId] ?? []).some((p) => p.messageId === messageId);
+  }
+}
+
+/** Structural subset of MessageReactionStore used for general reactions. */
+export interface GeneralReactionStoreLike {
+  toggle(sessionId: string, messageId: string, emoji: string, userId: string): { reactions: unknown[]; added: boolean };
+  listForMessages(sessionId: string, ids: string[]): Map<string, unknown[]>;
+}
+
+export interface ChatUxRouterDeps {
+  dataDir?: string;
+  pins?: PinnedMessageStore;
+  /** Existing MessageReactionStore — general reactions delegate to it. */
+  reactionStore?: GeneralReactionStoreLike;
+  /** Optional: verbatim thread messages, enriched with reactions + pinned flags. */
+  listThreadMessages?: (threadId: string) => Array<Record<string, unknown> & { id: unknown }> | Promise<Array<Record<string, unknown> & { id: unknown }>>;
+  audit?: (action: string, fields: Record<string, unknown>) => void;
+}
+
+function err(res: express.Response, status: number, message: string): void {
+  res.status(status).json({ ok: false, error: message });
+}
+
+/**
+ * Chat-UX router factory. HOST WIRING (parent):
+ *   app.use('/api/chat-ux', createChatUxRouter({ dataDir: config.dataDir,
+ *     reactionStore: messageReactionStore,
+ *     listThreadMessages: (id) => agentRuntime.listThreadMessages(id),
+ *     audit: (a, f) => governance.audit(a, f) }));
+ * Routes:
+ *   GET    /threads/:threadId/pins
+ *   POST   /threads/:threadId/pins            { messageId, text?, role? }
+ *   DELETE /threads/:threadId/pins/:messageId
+ *   POST   /threads/:threadId/messages/:messageId/reactions  { emoji, userId? }
+ *          — general reactions only: emoji must be in GENERAL_REACTION_EMOJIS;
+ *            the approval/widget reaction path in message-reactions-routes
+ *            is untouched and remains the only verdict path.
+ *   GET    /threads/:threadId/messages        — only when listThreadMessages
+ *          is injected: messages enriched with `reactions` + `pinned`.
+ */
+export function createChatUxRouter(deps: ChatUxRouterDeps = {}): express.Router {
+  const router = express.Router();
+  const pins = deps.pins ?? new PinnedMessageStore(deps.dataDir);
+
+  router.get('/threads/:threadId/pins', (req, res) => {
+    res.json({ ok: true, threadId: req.params.threadId, pins: pins.list(req.params.threadId) });
+  });
+  router.post('/threads/:threadId/pins', (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (typeof body.messageId !== 'string' && typeof body.messageId !== 'number') { err(res, 400, 'messageId is required'); return; }
+    const pin = pins.pin(req.params.threadId, {
+      messageId: String(body.messageId),
+      ...(typeof body.text === 'string' ? { text: body.text } : {}),
+      ...(typeof body.role === 'string' ? { role: body.role } : {}),
+      ...(typeof body.pinnedBy === 'string' ? { pinnedBy: body.pinnedBy } : {}),
+    });
+    deps.audit?.('chat.message_pin', { detail: { threadId: req.params.threadId, messageId: pin.messageId } });
+    res.status(201).json({ ok: true, pin });
+  });
+  router.delete('/threads/:threadId/pins/:messageId', (req, res) => {
+    const removed = pins.unpin(req.params.threadId, req.params.messageId);
+    if (!removed) { err(res, 404, 'pin not found'); return; }
+    deps.audit?.('chat.message_unpin', { detail: { threadId: req.params.threadId, messageId: req.params.messageId } });
+    res.json({ ok: true, removed: true });
+  });
+
+  router.post('/threads/:threadId/messages/:messageId/reactions', (req, res) => {
+    if (!deps.reactionStore) { err(res, 503, 'reaction store not configured'); return; }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (!isGeneralReactionEmoji(body.emoji)) {
+      err(res, 400, `emoji must be one of: ${GENERAL_REACTION_EMOJIS.join(' ')}`);
+      return;
+    }
+    const userId = typeof body.userId === 'string' && body.userId ? body.userId : 'user';
+    try {
+      const out = deps.reactionStore.toggle(req.params.threadId, req.params.messageId, body.emoji, userId);
+      res.json({ ok: true, reactions: out.reactions, added: out.added });
+    } catch (e) { err(res, 400, e instanceof Error ? e.message : String(e)); }
+  });
+
+  if (deps.listThreadMessages) {
+    router.get('/threads/:threadId/messages', async (req, res) => {
+      const messages = await deps.listThreadMessages!(req.params.threadId);
+      const ids = messages.map((m) => String(m.id));
+      const byId = deps.reactionStore?.listForMessages(req.params.threadId, ids) ?? new Map<string, unknown[]>();
+      res.json({
+        ok: true, threadId: req.params.threadId,
+        messages: messages.map((m) => ({
+          ...m,
+          reactions: byId.get(String(m.id)) ?? [],
+          pinned: pins.isPinned(req.params.threadId, String(m.id)),
+        })),
+      });
+    });
+  }
+  return router;
 }

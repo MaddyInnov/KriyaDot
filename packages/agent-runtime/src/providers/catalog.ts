@@ -44,6 +44,12 @@ export interface ProviderPreset {
   bridge?: 'claude' | 'codex' | 'opencode';
   /** When true, listModels() is fetched live from the provider. */
   liveModels?: boolean;
+  /**
+   * Per-provider local reply timeout in ms (ENGINES pack): the default
+   * reply timeout the local drivers (ollama / llamacpp / lmstudio) use
+   * when neither the call nor the bot's modelOptions set one.
+   */
+  replyTimeoutMs?: number;
   models: ProviderModelPreset[];
   extraHeaders?: Record<string, string>;
   notes?: string;

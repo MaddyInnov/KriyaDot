@@ -37,6 +37,8 @@ export interface SubagentSpawnInput {
    * consent rule and untrusted-content fencing apply to the child.
    */
   provenance?: ProvenanceNote;
+  /** Specialist profile (item 16): host spawns an ephemeral specialist with this prompt/tools. */
+  profile?: { id: string; name: string; systemPrompt: string; tools: string[] };
 }
 
 export interface SubagentSpawnResult {
@@ -77,6 +79,7 @@ export interface SpawnSubagentOptions {
   botId?: string;
   /** Provenance forwarded to the child's spawn input (P1 #13). */
   provenance?: ProvenanceNote;
+  profile?: { id: string; name: string; systemPrompt: string; tools: string[] };
 }
 
 /**
@@ -137,6 +140,7 @@ export async function spawnSubagent(
       // chain (grandchild delegation is correctly depth-limited).
       sessionId: record.sessionId,
       provenance: opts.provenance,
+      profile: opts.profile,
     });
     // If the host minted its own child session, prefer it for the record so
     // depth walks follow the real session chain.

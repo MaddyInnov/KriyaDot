@@ -1,0 +1,1 @@
+{"description":"Demo tool plugin: wordcount and timestamp tools over stdio JSON-RPC, zero dependencies.","entry":"index.js","id":"demo-toolkit","kinds":["tool"],"name":"Demo Toolkit","permissions":{"env":[],"network":false},"version":"1.0.0"}

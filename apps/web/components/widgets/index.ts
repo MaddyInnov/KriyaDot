@@ -19,6 +19,8 @@ export type {
   ConfirmWidget,
   ProgressWidget,
   ImageViewWidget,
+  McpAppWidget,
+  PageWidget,
   WidgetAnswerState,
   WidgetValidation,
 } from './schema';

@@ -41,6 +41,22 @@ export class TurnTimeoutError extends Error {
   }
 }
 
+/**
+ * §1.2: one participant (member) exceeded the per-participant turn
+ * timeout. Unlike TurnTimeoutError (whole turn), this fails only that
+ * member — the failure is recorded and the room moves on.
+ */
+export class ParticipantTurnTimeoutError extends Error {
+  readonly botId: string;
+  readonly timeoutMs: number;
+  constructor(botId: string, timeoutMs: number) {
+    super(`Participant "${botId}" exceeded the per-participant turn timeout of ${Math.round(timeoutMs / 1000)}s`);
+    this.name = 'ParticipantTurnTimeoutError';
+    this.botId = botId;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
 export interface RoomTurnDeps {
   store: GroupChatStore;
   /** Resolve a bot id to its config (seed roster + imports). */
@@ -51,6 +67,12 @@ export interface RoomTurnDeps {
    * text from token events, exactly like the delegate tool does.
    */
   runMemberTurn: (bot: BotConfig, prompt: string) => Promise<{ text: string; usage?: TokenUsage }>;
+  /**
+   * §1.2 per-participant turn timeout: max ms one member's turn may run.
+   * Return null/undefined for no per-member cap. Enforced by racing the
+   * member turn; a breach fails only that member (recorded as a failure).
+   */
+  memberTimeoutMs?: (bot: BotConfig) => number | null | undefined;
   /** Persist a bot reply to the group's transcript. */
   onReply?: (msg: GroupMessage) => void;
   /** Optional per-speaker callback (for SSE streaming to clients). */
@@ -312,7 +334,26 @@ export async function runRoomTurn(
       });
       let text: string;
       try {
-        const result = await deps.runMemberTurn(bot, prompt);
+        const runPromise = deps.runMemberTurn(bot, prompt);
+        const capMs = deps.memberTimeoutMs?.(bot) ?? null;
+        const result =
+          capMs !== null && capMs > 0
+            ? await Promise.race([
+                runPromise,
+                new Promise<never>((_resolve, reject) => {
+                  const timer = setTimeout(
+                    () => reject(new ParticipantTurnTimeoutError(bot.id, capMs)),
+                    capMs,
+                  );
+                  timer.unref?.();
+                  // If the member finishes first the timer must not linger.
+                  runPromise.then(
+                    () => clearTimeout(timer),
+                    () => clearTimeout(timer),
+                  );
+                }),
+              ])
+            : await runPromise;
         text = (result.text ?? '').trim();
       } catch (err) {
         deps.releaseSpeakerLock?.(bot.id);

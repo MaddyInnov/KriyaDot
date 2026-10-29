@@ -750,6 +750,150 @@ export function loadImportPayload(
   return payload;
 }
 
+// ---------------------------------------------------------------------------
+// Grok bot export import (§1.7)
+//
+// A Grok bot export is a single config JSON (not a home directory), shaped
+// roughly like:
+//   {
+//     "name": "Research Buddy",
+//     "description": "...",                // optional
+//     "instructions": "You are ...",       // or "persona" / "system_prompt"
+//     "model": "grok-4",                   // or model_preferences.model /
+//                                          // modelPreferences { model }
+//     "temperature": 0.7,                  // model prefs we cannot map 1:1
+//     "tools": [...], "knowledge": [...],  // Grok-side features: skipped
+//     ...
+//   }
+// parseGrokBotExport maps name/instructions/model onto a BotProposal and
+// reports every other top-level field as skipped (never silently dropped).
+// ---------------------------------------------------------------------------
+
+export interface GrokBotImportResult {
+  botProposal: BotProposal;
+  /** Top-level export fields that have no KriyaDot equivalent. */
+  skippedFields: string[];
+  /** Model-preference fields recognized but folded into notes, not config. */
+  notedFields: string[];
+}
+
+const GROK_MAPPED_FIELDS = new Set([
+  'name',
+  'description',
+  'instructions',
+  'persona',
+  'system_prompt',
+  'systemPrompt',
+  'model',
+]);
+const GROK_MODEL_PREF_CONTAINERS = ['model_preferences', 'modelPreferences', 'modelPrefs'] as const;
+/** Model-pref keys we acknowledge in notedFields (provider/model are mapped when nested). */
+const GROK_MODEL_PREF_KEYS = new Set([
+  'model',
+  'provider',
+  'temperature',
+  'top_p',
+  'topP',
+  'max_tokens',
+  'maxTokens',
+  'frequency_penalty',
+  'presence_penalty',
+]);
+
+function grokString(v: unknown): string | undefined {
+  return typeof v === 'string' && v.trim() ? v.trim() : undefined;
+}
+
+/**
+ * Parse a Grok bot export (JSON text or an already-parsed object) into a
+ * KriyaDot bot proposal. Throws on invalid JSON / non-object input / a
+ * missing name. Secrets anywhere in the prompt text are redacted.
+ */
+export function parseGrokBotExport(input: string | unknown): GrokBotImportResult {
+  let raw: unknown = input;
+  if (typeof input === 'string') {
+    raw = safeJsonParse(input);
+    if (raw === undefined) throw new Error('Grok bot export is not valid JSON.');
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('Grok bot export must be a JSON object.');
+  }
+  const cfg = raw as Record<string, unknown>;
+  const name = grokString(cfg.name);
+  if (!name) throw new Error('Grok bot export has no "name".');
+
+  const skippedFields: string[] = [];
+  const notedFields: string[] = [];
+
+  // Model prefs may be top-level or nested in a preferences container.
+  let model = grokString(cfg.model);
+  let provider = 'xai';
+  for (const containerKey of GROK_MODEL_PREF_CONTAINERS) {
+    const container = cfg[containerKey];
+    if (container && typeof container === 'object' && !Array.isArray(container)) {
+      const prefs = container as Record<string, unknown>;
+      if (!model) model = grokString(prefs.model);
+      const nestedProvider = grokString(prefs.provider);
+      if (nestedProvider) provider = nestedProvider;
+      for (const key of Object.keys(prefs)) {
+        if (GROK_MODEL_PREF_KEYS.has(key) && key !== 'model' && key !== 'provider') {
+          notedFields.push(`${containerKey}.${key}`);
+        }
+      }
+    }
+  }
+  for (const key of ['temperature', 'top_p', 'topP', 'max_tokens', 'maxTokens']) {
+    if (key in cfg) notedFields.push(key);
+  }
+
+  for (const key of Object.keys(cfg)) {
+    if (GROK_MAPPED_FIELDS.has(key)) continue;
+    if ((GROK_MODEL_PREF_CONTAINERS as readonly string[]).includes(key)) continue;
+    if (notedFields.includes(key)) continue;
+    skippedFields.push(key);
+  }
+
+  const instructions =
+    grokString(cfg.instructions) ??
+    grokString(cfg.persona) ??
+    grokString(cfg.system_prompt) ??
+    grokString(cfg.systemPrompt) ??
+    'You are a helpful assistant.';
+
+  return {
+    botProposal: {
+      name: truncate(name, 120),
+      description:
+        truncate(grokString(cfg.description) ?? 'Bot imported from a Grok bot export.', 500),
+      systemPrompt: truncate(redactSecrets(instructions), 20_000),
+      model: truncate(model ?? 'grok-4', 120),
+      provider,
+    },
+    skippedFields: skippedFields.sort(),
+    notedFields: notedFields.sort(),
+  };
+}
+
+/** Preview-shaped wrapper so the import UI can show the Grok bot item + skipped fields. */
+export function grokBotPreviewItem(result: GrokBotImportResult): ImportPreviewItem {
+  const skipped = result.skippedFields.length
+    ? ` Skipped (no KriyaDot equivalent): ${result.skippedFields.join(', ')}.`
+    : '';
+  const noted = result.notedFields.length
+    ? ` Model preferences noted but not applied: ${result.notedFields.join(', ')}.`
+    : '';
+  return {
+    id: 'bot:grok-bot',
+    kind: 'bot',
+    title: `Create bot: ${result.botProposal.name}`,
+    detail:
+      `New bot pre-filled from a Grok bot export (model "${result.botProposal.model}", ` +
+      `provider "${result.botProposal.provider}").${skipped}${noted}`,
+    excerpt: truncate(redactSecrets(result.botProposal.systemPrompt), 500),
+    ...(result.skippedFields.length ? { lossy: `Fields skipped: ${result.skippedFields.join(', ')}` } : {}),
+  };
+}
+
 /** Render a KriyaDot skill file (frontmatter format) from an imported skill. */
 export function renderKriyaDotSkill(name: string, description: string, content: string): string {
   const body = content.replace(/^---[\s\S]*?---\s*/, '').trim();

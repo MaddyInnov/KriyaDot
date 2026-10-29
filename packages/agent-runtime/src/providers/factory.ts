@@ -13,9 +13,10 @@ import {
 import { MockProvider } from './mock.js';
 import { OllamaProvider } from './ollama.js';
 import { LlamaCppProvider } from './llamacpp.js';
+import { LmStudioProvider } from './lmstudio.js';
 import { OpenAICompatibleProvider } from './openai-compatible.js';
 import { createAgentCliProvider, parseAgentProviderId } from './agent-cli.js';
-import { createCopilotAcpProvider } from './acp-engines.js';
+import { createAcpEngineProvider } from './acp-engines.js';
 import { createNativeCliDriver } from './cli-driver.js';
 import { BedrockProvider } from './bedrock.js';
 import { VertexProvider } from './vertex.js';
@@ -69,9 +70,11 @@ export function createProvider(providerId: string, opts?: { apiKey?: string }): 
   // observation, permission brokering, and session resume (cli-driver.ts);
   // the rest stay on the one-shot provider.
   if (parseAgentProviderId(providerId)) {
-    // ACP engines (W9): GitHub Copilot CLI speaks ACP, not a native
-    // streaming protocol — route it to the ACP-backed provider first.
-    const acpProvider = createCopilotAcpProvider(providerId);
+    // ACP engines (W9 + ENGINES fleet): ACP-speaking CLIs (Copilot,
+    // OpenCode, Antigravity, Grok, Cursor, Gemini, Kimi, Qwen, Droid,
+    // Hermes, Cline, DeepSeek harness) route to the ACP-backed provider
+    // first; native-driver CLIs (claude-code, codex) keep their drivers.
+    const acpProvider = createAcpEngineProvider(providerId);
     if (acpProvider) return acpProvider;
     return createNativeCliDriver(providerId) ?? createAgentCliProvider(providerId);
   }
@@ -113,13 +116,18 @@ export function createProvider(providerId: string, opts?: { apiKey?: string }): 
   }
 
   const apiKey = opts?.apiKey ?? resolveApiKey(providerId);
-  // Local providers (Ollama, managed llama.cpp): no API key, ever. Skip the key requirement.
+  // Local providers (Ollama, managed llama.cpp, LM Studio): no API key,
+  // ever. Skip the key requirement. The preset's replyTimeoutMs (ENGINES
+  // pack) becomes the provider's default local reply timeout.
   if (preset.local) {
     if (preset.api === 'ollama') {
-      return new OllamaProvider();
+      return new OllamaProvider({ replyTimeoutMs: preset.replyTimeoutMs });
     }
     if (preset.api === 'llamacpp') {
-      return new LlamaCppProvider();
+      return new LlamaCppProvider({ replyTimeoutMs: preset.replyTimeoutMs });
+    }
+    if (preset.id === 'lmstudio') {
+      return new LmStudioProvider({ replyTimeoutMs: preset.replyTimeoutMs });
     }
     // Future local providers fall through to the openai-compatible driver
     // with a dummy key (local endpoints ignore auth).

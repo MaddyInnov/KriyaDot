@@ -78,10 +78,15 @@ export function registerDelegateTools(opts: DelegateWiringOpts): void {
 
   const spawn: SubagentSpawnFn = async (input) => {
     const botId = input.botId ?? '';
-    const bot = opts.getBotConfig(botId);
-    if (!bot) {
+    const baseBot = opts.getBotConfig(botId);
+    if (!baseBot) {
       throw new Error(`delegate: unknown bot "${botId}" — cannot spawn a subagent for it`);
     }
+    // Profile-based ephemeral specialist (item 16): profile prompt/tools win.
+    const bot = input.profile
+      ? { ...baseBot, name: input.profile.name, systemPrompt: input.profile.systemPrompt, tools: input.profile.tools }
+      : baseBot;
+    if (input.profile) input = { ...input, tools: input.tools ?? input.profile.tools };
     // Default subset: the parent bot's tools minus `delegate` (no unbounded
     // recursion). Explicit subsets were already stripped by the tool itself;
     // strip again defensively.

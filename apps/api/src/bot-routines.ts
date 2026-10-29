@@ -69,6 +69,12 @@ export interface BotRoutine {
    * under Teams → Group goals.
    */
   goalMode?: boolean;
+  /** Per-routine run timeout in ms (item 4b). Unset = no timeout. */
+  timeoutMs?: number;
+  /** Automatic retry once on failure (item 4c). Default true. */
+  autoRetry?: boolean;
+  /** Inject previous run's summary into the next run (item 4d). Default: on for recurring. */
+  usePreviousRunSummary?: boolean;
   enabled: boolean;
   createdAt: number;
 }
@@ -96,6 +102,9 @@ interface RoutineRow {
   goal_mode: number | null;
   enabled: number;
   created_at: number;
+  timeout_ms: number | null;
+  auto_retry: number | null;
+  use_prev_summary: number | null;
 }
 
 interface TriggerRow {
@@ -126,6 +135,9 @@ function rowToRoutine(r: RoutineRow): BotRoutine {
     schedule,
     lastFiredAt: r.last_fired_at ?? undefined,
     goalMode: r.goal_mode === 1 ? true : undefined,
+    timeoutMs: r.timeout_ms ?? undefined,
+    autoRetry: r.auto_retry === null || r.auto_retry === undefined ? undefined : r.auto_retry === 1,
+    usePreviousRunSummary: r.use_prev_summary === null || r.use_prev_summary === undefined ? undefined : r.use_prev_summary === 1,
     enabled: r.enabled === 1,
     createdAt: r.created_at,
   };
@@ -192,6 +204,9 @@ function openDb(dataDir: string): DatabaseSync {
   if (!cols.some((c) => c.name === 'goal_mode')) {
     db.exec('ALTER TABLE bot_routines ADD COLUMN goal_mode INTEGER');
   }
+  if (!cols.some((c) => c.name === 'timeout_ms')) db.exec('ALTER TABLE bot_routines ADD COLUMN timeout_ms INTEGER');
+  if (!cols.some((c) => c.name === 'auto_retry')) db.exec('ALTER TABLE bot_routines ADD COLUMN auto_retry INTEGER');
+  if (!cols.some((c) => c.name === 'use_prev_summary')) db.exec('ALTER TABLE bot_routines ADD COLUMN use_prev_summary INTEGER');
   return db;
 }
 
@@ -213,6 +228,9 @@ export class RoutineStore {
     sessionId?: string;
     schedule?: RoutineSchedule | null;
     goalMode?: boolean;
+    timeoutMs?: number;
+    autoRetry?: boolean;
+    usePreviousRunSummary?: boolean;
   }): BotRoutine {
     const name = input.name.trim().slice(0, 120);
     if (!name) throw new Error('name is required');
@@ -235,12 +253,15 @@ export class RoutineStore {
       sessionId: input.sessionId,
       schedule,
       goalMode: input.goalMode === true ? true : undefined,
+      timeoutMs: input.timeoutMs && input.timeoutMs > 0 ? Math.floor(input.timeoutMs) : undefined,
+      autoRetry: input.autoRetry,
+      usePreviousRunSummary: input.usePreviousRunSummary,
       enabled: true,
       createdAt: Date.now(),
     };
     this.db
       .prepare(
-        'INSERT INTO bot_routines (id, name, bot_id, prompt_template, session_id, schedule, goal_mode, enabled, created_at, webhook_secret) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)',
+        'INSERT INTO bot_routines (id, name, bot_id, prompt_template, session_id, schedule, goal_mode, enabled, created_at, webhook_secret, timeout_ms, auto_retry, use_prev_summary) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)',
       )
       .run(
         routine.id,
@@ -252,6 +273,9 @@ export class RoutineStore {
         routine.goalMode === true ? 1 : null,
         routine.createdAt,
         randomBytes(32).toString('hex'),
+        routine.timeoutMs ?? null,
+        routine.autoRetry === undefined ? null : routine.autoRetry ? 1 : 0,
+        routine.usePreviousRunSummary === undefined ? null : routine.usePreviousRunSummary ? 1 : 0,
       );
     return routine;
   }
@@ -276,6 +300,9 @@ export class RoutineStore {
       schedule?: RoutineSchedule | null;
       goalMode?: boolean;
       enabled?: boolean;
+      timeoutMs?: number | null;
+      autoRetry?: boolean;
+      usePreviousRunSummary?: boolean;
     },
   ): BotRoutine | undefined {
     const cur = this.get(id);
@@ -306,9 +333,12 @@ export class RoutineStore {
     }
     if (patch.goalMode !== undefined) next.goalMode = patch.goalMode === true ? true : undefined;
     if (patch.enabled !== undefined) next.enabled = patch.enabled;
+    if (patch.timeoutMs !== undefined) next.timeoutMs = patch.timeoutMs && patch.timeoutMs > 0 ? Math.floor(patch.timeoutMs) : undefined;
+    if (patch.autoRetry !== undefined) next.autoRetry = patch.autoRetry;
+    if (patch.usePreviousRunSummary !== undefined) next.usePreviousRunSummary = patch.usePreviousRunSummary;
     this.db
       .prepare(
-        'UPDATE bot_routines SET name = ?, bot_id = ?, prompt_template = ?, session_id = ?, schedule = ?, last_fired_at = ?, goal_mode = ?, enabled = ? WHERE id = ?',
+        'UPDATE bot_routines SET name = ?, bot_id = ?, prompt_template = ?, session_id = ?, schedule = ?, last_fired_at = ?, goal_mode = ?, enabled = ?, timeout_ms = ?, auto_retry = ?, use_prev_summary = ? WHERE id = ?',
       )
       .run(
         next.name,
@@ -319,6 +349,9 @@ export class RoutineStore {
         next.lastFiredAt ?? null,
         next.goalMode === true ? 1 : null,
         next.enabled ? 1 : 0,
+        next.timeoutMs ?? null,
+        next.autoRetry === undefined ? null : next.autoRetry ? 1 : 0,
+        next.usePreviousRunSummary === undefined ? null : next.usePreviousRunSummary ? 1 : 0,
         id,
       );
     return this.get(id);
@@ -584,6 +617,9 @@ export function registerRoutineRoutes(
             ? null
             : (body.schedule as RoutineSchedule),
         goalMode: body.goalMode === true,
+        timeoutMs: typeof (body as {timeoutMs?: unknown}).timeoutMs === 'number' ? (body as {timeoutMs: number}).timeoutMs : undefined,
+        autoRetry: typeof (body as {autoRetry?: unknown}).autoRetry === 'boolean' ? (body as {autoRetry: boolean}).autoRetry : undefined,
+        usePreviousRunSummary: typeof (body as {usePreviousRunSummary?: unknown}).usePreviousRunSummary === 'boolean' ? (body as {usePreviousRunSummary: boolean}).usePreviousRunSummary : undefined,
       });
       res.status(201).json({ ok: true, routine: withNextRun(routine) });
     } catch (err) {
@@ -651,6 +687,9 @@ export function registerRoutineRoutes(
               : (body.schedule as RoutineSchedule),
         goalMode: typeof body.goalMode === 'boolean' ? body.goalMode : undefined,
         enabled: typeof body.enabled === 'boolean' ? body.enabled : undefined,
+        timeoutMs: typeof (body as {timeoutMs?: unknown}).timeoutMs === 'number' ? (body as {timeoutMs: number}).timeoutMs : (body as {timeoutMs?: unknown}).timeoutMs === null ? null : undefined,
+        autoRetry: typeof (body as {autoRetry?: unknown}).autoRetry === 'boolean' ? (body as {autoRetry: boolean}).autoRetry : undefined,
+        usePreviousRunSummary: typeof (body as {usePreviousRunSummary?: unknown}).usePreviousRunSummary === 'boolean' ? (body as {usePreviousRunSummary: boolean}).usePreviousRunSummary : undefined,
       });
       res.json({ ok: true, routine: updated ? withNextRun(updated) : updated });
     } catch (err) {

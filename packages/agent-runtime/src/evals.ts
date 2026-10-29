@@ -694,3 +694,174 @@ export function parseJudgeScore(text: string): number {
   if (!m) return 0;
   return clampJudgeScore(parseFloat(m[0]));
 }
+
+// ---------------------------------------------------------------------------
+// Skill bench (§1.20)
+//
+// A lightweight bench for ONE skill: each case sends a prompt to a turn
+// runner (injected — a mock in tests, the bot's real provider in the API
+// route) with the skill's instructions attached, then scores the response
+// against simple expectations:
+//   - expectContains: every string must appear (case-insensitive)
+//   - expectTool:     at least one of the named tools must have been used
+// A case passes when ALL of its expectations pass. Aggregation is a plain
+// pass count + rate — no LLM judge, fully deterministic given the runner.
+// ---------------------------------------------------------------------------
+
+export interface SkillBenchCase {
+  id?: string;
+  prompt: string;
+  expectContains?: string[];
+  expectTool?: string | string[];
+}
+
+export interface SkillBenchSubject {
+  name: string;
+  /** The skill's instruction body, handed to the runner with each prompt. */
+  instructions: string;
+}
+
+export interface SkillBenchTurnRequest {
+  caseId: string;
+  prompt: string;
+  skillName: string;
+  skillInstructions: string;
+}
+
+export interface SkillBenchCaseResult {
+  caseId: string;
+  prompt: string;
+  passed: boolean;
+  /** Per-expectation outcomes, in declaration order. */
+  checks: Array<{ kind: 'contains' | 'tool'; target: string; passed: boolean; detail: string }>;
+  responsePreview: string;
+  toolsUsed: string[];
+  error?: string;
+}
+
+export interface SkillBenchReport {
+  skillName: string;
+  total: number;
+  passed: number;
+  failed: number;
+  passRate: number;
+  cases: SkillBenchCaseResult[];
+  ranAt: string;
+}
+
+/** Validate bench cases; returns human-readable errors (empty = valid). */
+export function validateSkillBenchCases(cases: unknown): string[] {
+  if (!Array.isArray(cases)) return ['cases must be an array'];
+  if (cases.length === 0) return ['cases must not be empty'];
+  if (cases.length > EVAL_MAX_CASES_PER_SUITE) {
+    return [`cases exceed the ${EVAL_MAX_CASES_PER_SUITE}-case cap`];
+  }
+  const errors: string[] = [];
+  cases.forEach((c, i) => {
+    if (!c || typeof c !== 'object') {
+      errors.push(`case ${i}: must be an object`);
+      return;
+    }
+    const rec = c as Record<string, unknown>;
+    if (typeof rec.prompt !== 'string' || !rec.prompt.trim()) {
+      errors.push(`case ${i}: prompt is required`);
+    }
+    if (
+      rec.expectContains !== undefined &&
+      (!Array.isArray(rec.expectContains) || rec.expectContains.some((s) => typeof s !== 'string'))
+    ) {
+      errors.push(`case ${i}: expectContains must be an array of strings`);
+    }
+    if (
+      rec.expectTool !== undefined &&
+      typeof rec.expectTool !== 'string' &&
+      (!Array.isArray(rec.expectTool) || rec.expectTool.some((s) => typeof s !== 'string'))
+    ) {
+      errors.push(`case ${i}: expectTool must be a string or array of strings`);
+    }
+    if (rec.expectContains === undefined && rec.expectTool === undefined) {
+      errors.push(`case ${i}: at least one of expectContains / expectTool is required`);
+    }
+  });
+  return errors;
+}
+
+/**
+ * Run a skill bench. `runTurn` is injected: tests pass a mock provider,
+ * the API route passes a runner backed by the bot's configured provider.
+ * A runner throw fails that case (recorded as `error`) without aborting
+ * the rest of the bench.
+ */
+export async function runSkillBench(args: {
+  skill: SkillBenchSubject;
+  cases: SkillBenchCase[];
+  runTurn: (req: SkillBenchTurnRequest) => Promise<{ response: string; toolsUsed?: string[] }>;
+}): Promise<SkillBenchReport> {
+  const errors = validateSkillBenchCases(args.cases);
+  if (errors.length) throw new Error(`Invalid skill bench: ${errors.join('; ')}`);
+  const results: SkillBenchCaseResult[] = [];
+  for (const [i, benchCase] of args.cases.entries()) {
+    const caseId = benchCase.id ?? `case-${i + 1}`;
+    let response = '';
+    let toolsUsed: string[] = [];
+    let error: string | undefined;
+    try {
+      const out = await args.runTurn({
+        caseId,
+        prompt: benchCase.prompt,
+        skillName: args.skill.name,
+        skillInstructions: args.skill.instructions,
+      });
+      response = out.response ?? '';
+      toolsUsed = out.toolsUsed ?? [];
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    }
+    const checks: SkillBenchCaseResult['checks'] = [];
+    if (!error) {
+      for (const target of benchCase.expectContains ?? []) {
+        const hit = response.toLowerCase().includes(target.toLowerCase());
+        checks.push({
+          kind: 'contains',
+          target,
+          passed: hit,
+          detail: hit ? `response contains "${target}"` : `response is missing "${target}"`,
+        });
+      }
+      if (benchCase.expectTool !== undefined) {
+        // Same semantics as the eval tool_used rubric: any-of.
+        const wantedTools = Array.isArray(benchCase.expectTool)
+          ? benchCase.expectTool
+          : [benchCase.expectTool];
+        const hit = wantedTools.find((t) => toolsUsed.includes(t));
+        checks.push({
+          kind: 'tool',
+          target: wantedTools.join('|'),
+          passed: !!hit,
+          detail: hit
+            ? `tool "${hit}" was used`
+            : `expected one of [${wantedTools.join(', ')}]; used [${toolsUsed.join(', ') || 'none'}]`,
+        });
+      }
+    }
+    results.push({
+      caseId,
+      prompt: benchCase.prompt,
+      passed: !error && checks.every((c) => c.passed),
+      checks,
+      responsePreview: response.slice(0, 400),
+      toolsUsed,
+      ...(error ? { error } : {}),
+    });
+  }
+  const passed = results.filter((r) => r.passed).length;
+  return {
+    skillName: args.skill.name,
+    total: results.length,
+    passed,
+    failed: results.length - passed,
+    passRate: results.length === 0 ? 0 : passed / results.length,
+    cases: results,
+    ranAt: new Date().toISOString(),
+  };
+}

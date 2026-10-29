@@ -455,6 +455,36 @@ export function registerCompanionRoutes(router: Router, deps: CompanionRouteDeps
     res.json({ ok: true });
   });
 
+  /**
+   * Platform-aware push registration: { token, platform: 'ios'|'android' }.
+   * iOS tokens route to APNs, Android tokens to FCM. Same device-auth rule.
+   */
+  router.post('/devices/:id/push-token', requireAuth, (req: AuthedRequest, res: Response) => {
+    const me = deviceOf(req);
+    if (req.params.id !== me.id) {
+      err(res, 403, 'forbidden', 'A device can only register its own push token.');
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const platform = body.platform === 'ios' ? 'ios' : body.platform === 'android' ? 'android' : undefined;
+    if (!platform) {
+      err(res, 400, 'invalid_platform', 'platform must be "ios" or "android".');
+      return;
+    }
+    const token = typeof body.token === 'string' ? body.token : typeof body.fcmToken === 'string' ? body.fcmToken : '';
+    const ok = store.setPushToken(me.id, token, platform);
+    if (!ok) {
+      err(res, 400, 'invalid_token', 'A valid push registration token is required.');
+      return;
+    }
+    audit('companion.push_registered', {
+      actor: 'api',
+      toolName: 'companion',
+      detail: { deviceId: me.id, platform },
+    });
+    res.json({ ok: true });
+  });
+
   // ---- Devices --------------------------------------------------------------
 
   router.get('/devices', requireAuth, (_req: Request, res: Response) => {

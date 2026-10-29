@@ -78,6 +78,10 @@ export interface RoomSettingsRow {
   postsPerMinute: number | null;
   duplicateRepeatLimit: number | null;
   maxHeld: number | null;
+  /** §1.2: per-participant (per-member) turn timeout in seconds. Null = no per-member cap. */
+  participantTurnTimeoutSec: number | null;
+  /** §1.2: room bulletin — a pinned notice shown in the room detail. Null = none. */
+  bulletin: string | null;
   holdState: 'active' | 'held' | 'halted';
 }
 
@@ -149,6 +153,17 @@ export class GroupChatStore {
     } catch {
       // Column already exists — safe to ignore.
     }
+    // §1.2: per-participant turn timeout + room bulletin on existing databases.
+    for (const ddl of [
+      'ALTER TABLE room_settings ADD COLUMN participant_turn_timeout_sec INTEGER',
+      'ALTER TABLE room_settings ADD COLUMN bulletin TEXT',
+    ]) {
+      try {
+        this.db.exec(ddl);
+      } catch {
+        // Column already exists — safe to ignore.
+      }
+    }
     this.db.exec(`
       -- Room robustness (OpenMausBot parity): per-room settings + hold state.
       CREATE TABLE IF NOT EXISTS room_settings (
@@ -158,6 +173,8 @@ export class GroupChatStore {
         posts_per_minute INTEGER,
         duplicate_repeat_limit INTEGER,
         max_held INTEGER,
+        participant_turn_timeout_sec INTEGER,
+        bulletin TEXT,
         hold_state TEXT NOT NULL DEFAULT 'active',
         FOREIGN KEY (group_id) REFERENCES groups(group_id) ON DELETE CASCADE
       );
@@ -401,6 +418,8 @@ export class GroupChatStore {
           posts_per_minute: number | null;
           duplicate_repeat_limit: number | null;
           max_held: number | null;
+          participant_turn_timeout_sec: number | null;
+          bulletin: string | null;
           hold_state: string;
         }
       | undefined;
@@ -415,6 +434,8 @@ export class GroupChatStore {
         posts_per_minute: null,
         duplicate_repeat_limit: null,
         max_held: null,
+        participant_turn_timeout_sec: null,
+        bulletin: null,
         hold_state: 'active',
       };
     }
@@ -425,6 +446,8 @@ export class GroupChatStore {
       postsPerMinute: row.posts_per_minute,
       duplicateRepeatLimit: row.duplicate_repeat_limit,
       maxHeld: row.max_held,
+      participantTurnTimeoutSec: row.participant_turn_timeout_sec ?? null,
+      bulletin: row.bulletin ?? null,
       holdState: validHoldState(row.hold_state) ? row.hold_state : 'active',
     };
   }
@@ -438,6 +461,10 @@ export class GroupChatStore {
       postsPerMinute: number;
       duplicateRepeatLimit: number;
       maxHeld: number;
+      /** Explicit null clears the per-participant timeout. */
+      participantTurnTimeoutSec: number | null;
+      /** Explicit null (or empty string) clears the bulletin. */
+      bulletin: string | null;
     }>,
   ): RoomSettingsRow {
     this.getRoomSettingsRow(groupId); // ensure row exists
@@ -453,6 +480,17 @@ export class GroupChatStore {
     for (const [col, val] of cols) {
       this.db.prepare(`UPDATE room_settings SET ${col} = ? WHERE group_id = ?`).run(val, groupId);
     }
+    // §1.2 fields: explicit null clears, so they can't ride the put() path.
+    if (patch.participantTurnTimeoutSec !== undefined) {
+      this.db
+        .prepare(`UPDATE room_settings SET participant_turn_timeout_sec = ? WHERE group_id = ?`)
+        .run(patch.participantTurnTimeoutSec, groupId);
+    }
+    if (patch.bulletin !== undefined) {
+      this.db
+        .prepare(`UPDATE room_settings SET bulletin = ? WHERE group_id = ?`)
+        .run(patch.bulletin ? patch.bulletin : null, groupId);
+    }
     return this.getRoomSettingsRow(groupId);
   }
 
@@ -463,7 +501,8 @@ export class GroupChatStore {
       .prepare(
         `UPDATE room_settings
          SET turn_timeout_min = NULL, max_posts_per_member_per_turn = NULL,
-             posts_per_minute = NULL, duplicate_repeat_limit = NULL, max_held = NULL
+             posts_per_minute = NULL, duplicate_repeat_limit = NULL, max_held = NULL,
+             participant_turn_timeout_sec = NULL, bulletin = NULL
          WHERE group_id = ?`,
       )
       .run(groupId);

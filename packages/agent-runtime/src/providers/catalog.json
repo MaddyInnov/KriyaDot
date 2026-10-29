@@ -229,7 +229,47 @@
       "liveModels": true,
       "models": [],
       "name": "Local LLM (llama.cpp)",
-      "notes": "Managed local models via stock llama.cpp \u2014 zero-config binary download, GPU auto-detect, served on 127.0.0.1 only. No API key, ever. Manage it in Settings \u2192 Local LLM. Set KRIYADOT_LLAMACPP_PORT to change the server port."
+      "notes": "Managed local models via stock llama.cpp \u2014 zero-config binary download, GPU auto-detect, served on 127.0.0.1 only. No API key, ever. Manage it in Settings \u2192 Local LLM. Set KRIYADOT_LLAMACPP_PORT to change the server port.",
+      "replyTimeoutMs": 300000
+    },
+    "lmstudio": {
+      "api": "openai-compatible",
+      "baseUrl": "http://localhost:1234/v1",
+      "envKey": "LMSTUDIO_BASE_URL",
+      "id": "lmstudio",
+      "local": true,
+      "liveModels": true,
+      "models": [],
+      "name": "LM Studio (local)",
+      "notes": "Fully local models via LM Studio's OpenAI-compatible server \u2014 no API key needed, ever. Start LM Studio, load a model, and enable its local server (default http://localhost:1234/v1). Set LMSTUDIO_BASE_URL if it runs elsewhere. Model list is fetched live from /v1/models.",
+      "replyTimeoutMs": 300000
+    },
+    "meta": {
+      "api": "openai-compatible",
+      "baseUrl": "https://api.meta.ai/v1",
+      "envKey": "META_API_KEY",
+      "id": "meta",
+      "liveModels": true,
+      "models": [
+        {
+          "default": true,
+          "id": "muse-wonder-1.0",
+          "name": "Muse Wonder 1.0",
+          "contextLength": 1048576
+        },
+        {
+          "id": "muse-spark-1.3",
+          "name": "Muse Spark 1.3",
+          "contextLength": 1048576
+        },
+        {
+          "id": "muse-spark-1.3-contributor",
+          "name": "Muse Spark 1.3 Contributor",
+          "contextLength": 1048576
+        }
+      ],
+      "name": "Meta (Muse API)",
+      "notes": "Meta's Muse model API (OpenAI-compatible chat completions). Use your own Meta API key (META_API_KEY) from dev.meta.ai \u2014 never a shared or pooled key. This is Meta's hosted Muse API, distinct from Llama weights served by other providers."
     },
     "minimax": {
       "api": "openai-compatible",
@@ -250,6 +290,33 @@
         }
       ],
       "name": "MiniMax"
+    },
+    "mistral": {
+      "api": "openai-compatible",
+      "baseUrl": "https://api.mistral.ai/v1",
+      "envKey": "MISTRAL_API_KEY",
+      "id": "mistral",
+      "liveModels": true,
+      "models": [
+        {
+          "default": true,
+          "id": "mistral-large-latest",
+          "name": "Mistral Large (latest)",
+          "contextLength": 131072
+        },
+        {
+          "id": "mistral-small-latest",
+          "name": "Mistral Small (latest)",
+          "contextLength": 131072
+        },
+        {
+          "id": "codestral-latest",
+          "name": "Codestral (latest)",
+          "contextLength": 131072
+        }
+      ],
+      "name": "Mistral AI",
+      "notes": "Mistral AI's OpenAI-compatible API. Use your own Mistral API key (MISTRAL_API_KEY) from console.mistral.ai \u2014 never a shared or pooled key."
     },
     "moonshot": {
       "api": "openai-compatible",
@@ -285,7 +352,8 @@
       "liveModels": true,
       "models": [],
       "name": "Ollama (local)",
-      "notes": "Fully local models via Ollama \u2014 no API key needed, ever. Install from https://ollama.com/download, pull a model (e.g. \"ollama pull llama3.1\"), and it just works. Set OLLAMA_HOST if Ollama runs on another host."
+      "notes": "Fully local models via Ollama \u2014 no API key needed, ever. Install from https://ollama.com/download, pull a model (e.g. \"ollama pull llama3.1\"), and it just works. Set OLLAMA_HOST if Ollama runs on another host.",
+      "replyTimeoutMs": 300000
     },
     "omnirush": {
       "api": "openai-compatible",

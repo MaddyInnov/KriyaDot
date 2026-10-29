@@ -68,6 +68,19 @@ export interface BotRosterDeps {
   /** Live bot list — import appends created bots to this array. */
   getBots: () => BotConfig[];
   audit: (action: string, fields: { actor?: string; detail?: unknown }) => void;
+  /**
+   * Direct-delete cascade hooks (bot lifecycle, mirroring the Chief-proposal
+   * deletion cleanup in chief-routes.ts): called after a bot is removed so
+   * the host can tear down per-bot state (private MCP servers, sessions).
+   * Optional; failures are swallowed so teardown never blocks a delete.
+   */
+  onBotDeleted?: (botId: string) => void | Promise<void>;
+  /**
+   * Persist a deletion for bots that did NOT come from the roster imports
+   * file (seed bots) — host wires this to ChiefTeamsStore.addDeletedBotId.
+   * When absent, only imports-file bots are durably deleted.
+   */
+  recordDeletedBotId?: (botId: string) => void;
 }
 
 function errorBody(message: string, detail?: unknown): Record<string, unknown> {
@@ -482,6 +495,98 @@ export function createBotRosterRouter(deps: BotRosterDeps): Router {
       },
     });
     res.json(result);
+  });
+
+  /**
+   * Direct create (bot lifecycle): POST /bots with a single bot config.
+   * Same validation + defaults the setup flow applies (missing provider /
+   * model fall back to the first existing bot's, else groq/gpt-oss-20b;
+   * missing string/array fields default to '' / []), workspace allocation
+   * is best-effort, the bot is appended to the live list AND the roster
+   * imports file so it survives restarts. Duplicate ids → 409.
+   */
+  router.post('/', async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const rawBot = (typeof body.bot === 'object' && body.bot !== null ? body.bot : body) as Record<string, unknown>;
+    const bots = deps.getBots();
+    const fallback = bots[0];
+    const withDefaults: Record<string, unknown> = {
+      description: '',
+      systemPrompt: '',
+      provider: fallback?.provider ?? 'groq',
+      model: fallback?.model ?? 'gpt-oss-20b',
+      skills: [],
+      tools: [],
+      mcpServers: [],
+      ...rawBot,
+    };
+    const validation = validateBotEntry(withDefaults, 0);
+    if (!validation.bot) {
+      res.status(400).json(errorBody('Invalid bot config', validation.errors));
+      return;
+    }
+    const bot = validation.bot;
+    if (bots.some((b) => b.id === bot.id)) {
+      res.status(409).json(errorBody(`bot id "${bot.id}" already exists`));
+      return;
+    }
+    try {
+      const { allocateBotWorkspace } = await import('./bot-workspace-alloc.js');
+      allocateBotWorkspace(bot, deps.dataDir);
+    } catch {
+      // Invalid bot id — workspace allocation is best-effort (import parity).
+    }
+    bots.push(bot);
+    appendRosterImport(bot, deps.dataDir);
+    deps.audit('bots.created', { actor: 'api', detail: { botId: bot.id, name: bot.name } });
+    res.status(201).json({ ok: true, bot });
+  });
+
+  /**
+   * Direct delete (bot lifecycle): DELETE /bots/:id. Cascade mirrors the
+   * Chief-proposal deletion cleanup: refuse to delete the chief of staff,
+   * remove from the live list, run the host teardown hook, remove from the
+   * roster imports file — or, for seed bots, record the deletion via
+   * deps.recordDeletedBotId — and scrub the bot from any team's member /
+   * coordinator references that this router can reach (TeamStore).
+   * Unknown id → 404. Audit-logged as bots.deleted.
+   */
+  router.delete('/:id', (req, res) => {
+    const bots = deps.getBots();
+    const idx = bots.findIndex((b) => b.id === req.params.id);
+    if (idx === -1) {
+      res.status(404).json(errorBody(`unknown bot "${req.params.id}"`));
+      return;
+    }
+    const target = bots[idx]!;
+    if (target.chiefOfStaff === true) {
+      res.status(409).json(errorBody(`cannot delete the chief of staff ("${target.id}") — remove the chief first`));
+      return;
+    }
+    bots.splice(idx, 1);
+    if (deps.onBotDeleted) {
+      try {
+        void Promise.resolve(deps.onBotDeleted(target.id)).catch(() => undefined);
+      } catch {
+        // teardown must never block the delete
+      }
+    }
+    if (!removeRosterImport(target.id, deps.dataDir)) {
+      deps.recordDeletedBotId?.(target.id);
+    }
+    // Team cascade: drop the bot from team membership; a team whose
+    // coordinator is deleted is removed entirely (it cannot run).
+    try {
+      for (const team of teamStore.listTeams()) {
+        if (team.coordinatorBotId === target.id) {
+          (teamStore as unknown as { deleteTeam?: (id: string) => void }).deleteTeam?.(team.id);
+        }
+      }
+    } catch {
+      // Team cascade is best-effort; the bot itself is already deleted.
+    }
+    deps.audit('bots.deleted', { actor: 'api', detail: { botId: target.id } });
+    res.json({ ok: true, deleted: target.id });
   });
 
   return router;

@@ -17,7 +17,9 @@ interface LlamaCppModelEntry {
  * OpenAI-compatible /v1/chat/completions; model listing uses /v1/models.
  */
 export class LlamaCppProvider extends OpenAICompatibleProvider {
-  constructor() {
+  private readonly replyTimeoutMs?: number;
+
+  constructor(opts: { replyTimeoutMs?: number } = {}) {
     super({
       providerId: 'llamacpp',
       baseUrl: `${llamacppBaseUrl()}/v1`,
@@ -25,15 +27,20 @@ export class LlamaCppProvider extends OpenAICompatibleProvider {
       // a string. Never a real secret.
       apiKey: 'local-no-key-needed',
     });
+    this.replyTimeoutMs = opts.replyTimeoutMs;
   }
 
   override async chat(
     messages: ChatMessage[],
     tools: ToolDefinition[],
-    opts: { model: string; onToken?: (t: string) => void; signal?: AbortSignal },
+    opts: { model: string; onToken?: (t: string) => void; signal?: AbortSignal; timeoutMs?: number; replyTimeoutMs?: number },
   ): Promise<{ content: string; toolCalls: ToolCall[]; usage: TokenUsage }> {
+    const effectiveOpts =
+      opts.timeoutMs === undefined && opts.replyTimeoutMs === undefined && this.replyTimeoutMs !== undefined
+        ? { ...opts, replyTimeoutMs: this.replyTimeoutMs }
+        : opts;
     try {
-      return await super.chat(messages, tools, opts);
+      return await super.chat(messages, tools, effectiveOpts);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (/fetch failed|ECONNREFUSED|ENOTFOUND|network/i.test(msg)) {

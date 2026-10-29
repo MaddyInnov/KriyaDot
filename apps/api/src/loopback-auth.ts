@@ -143,6 +143,16 @@ export const LOOPBACK_AUTH_EXEMPT_PATHS: string[] = [
   '/api/health',
   '/.well-known',
   '/api/auth/bootstrap',
+  // Enterprise SSO surface (OIDC authorize/callback, LDAP login, captcha):
+  // pre-auth by nature — the IdP redirect cannot carry the loopback token.
+  // Its own mechanisms are the auth: OIDC state + PKCE + JWKS-verified
+  // id_token, LDAP bind, captcha after repeated failures.
+  '/api/auth/sso',
+  // Bridge federation peer protocol: remote KriyaDot instances cannot hold
+  // the loopback token; every inbound call carries a signed Ed25519
+  // envelope verified by the federation service. Local federation admin
+  // routes (/api/federation/identity, /invites, /peers…) stay gated.
+  '/api/federation/inbound',
   // WebSocket upgrade paths (see comment above — in-protocol auth applies):
   '/api/phone/ws',
   '/api/companion/ws',

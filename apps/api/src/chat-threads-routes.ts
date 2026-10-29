@@ -110,6 +110,8 @@ export interface ThreadInfo {
 }
 
 /** Per-conversation management flags (bot context-menu: pin, unread, hide). */
+export type ConversationModeSetting = 'ask' | 'plan' | 'craft';
+
 export interface ThreadFlags {
   pinned: boolean;
   unread: boolean;
@@ -136,11 +138,21 @@ export class ThreadTitleStore {
         branched_from TEXT,
         created_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS thread_modes (
+        thread_id TEXT PRIMARY KEY,
+        mode TEXT NOT NULL DEFAULT 'craft',
+        updated_at INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS thread_flags (
         thread_id TEXT PRIMARY KEY,
         pinned INTEGER NOT NULL DEFAULT 0,
         unread INTEGER NOT NULL DEFAULT 0,
         hidden INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS thread_connectors (
+        thread_id TEXT PRIMARY KEY,
+        slugs_json TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
     `);
@@ -207,10 +219,59 @@ export class ThreadTitleStore {
     return next;
   }
 
+  /** Conversation mode for a thread (item 6); default 'craft'. */
+  getMode(threadId: string): ConversationModeSetting {
+    const row = this.db.prepare('SELECT mode FROM thread_modes WHERE thread_id = ?').get(threadId) as { mode: string } | undefined;
+    return row?.mode === 'ask' || row?.mode === 'plan' ? row.mode : 'craft';
+  }
+  setMode(threadId: string, mode: ConversationModeSetting): ConversationModeSetting {
+    this.db.prepare(`INSERT INTO thread_modes (thread_id, mode, updated_at) VALUES (?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET mode = excluded.mode, updated_at = excluded.updated_at`).run(threadId, mode, Date.now());
+    return mode;
+  }
+
+  /**
+   * Per-conversation connector override (Octop #110): the enabled app
+   * (toolkit) slugs for THIS thread, or undefined when the thread has no
+   * override and the bot's own enablement applies unchanged.
+   */
+  getConnectorOverride(threadId: string): string[] | undefined {
+    const row = this.db
+      .prepare('SELECT slugs_json FROM thread_connectors WHERE thread_id = ?')
+      .get(threadId) as { slugs_json: string } | undefined;
+    if (!row) return undefined;
+    try {
+      const parsed = JSON.parse(row.slugs_json) as unknown;
+      if (Array.isArray(parsed)) {
+        return parsed.filter((s): s is string => typeof s === 'string');
+      }
+    } catch {
+      // fall through to undefined
+    }
+    return undefined;
+  }
+
+  /** Set (or replace) a thread's connector override. Returns the stored slugs. */
+  setConnectorOverride(threadId: string, slugs: string[]): string[] {
+    const clean = [...new Set(slugs.map((s) => s.trim().toLowerCase()).filter(Boolean))].slice(0, 100);
+    this.db
+      .prepare(
+        `INSERT INTO thread_connectors (thread_id, slugs_json, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET slugs_json = excluded.slugs_json, updated_at = excluded.updated_at`,
+      )
+      .run(threadId, JSON.stringify(clean), Date.now());
+    return clean;
+  }
+
+  /** Remove a thread's connector override (bot enablement applies again). */
+  clearConnectorOverride(threadId: string): void {
+    this.db.prepare('DELETE FROM thread_connectors WHERE thread_id = ?').run(threadId);
+  }
+
   /** Drop a thread's title + flags (used on thread delete). */
   deleteThread(threadId: string): void {
     this.db.prepare('DELETE FROM thread_titles WHERE thread_id = ?').run(threadId);
     this.db.prepare('DELETE FROM thread_flags WHERE thread_id = ?').run(threadId);
+    this.db.prepare('DELETE FROM thread_connectors WHERE thread_id = ?').run(threadId);
   }
 
   close(): void {
@@ -259,6 +320,7 @@ export function createChatThreadsRouter(deps: ChatThreadsDeps): Router {
           botId: s.botId,
           title: titles.getTitle(s.id) ?? null,
           flags: titles.getFlags(s.id),
+          mode: titles.getMode(s.id),
           createdAt: s.createdAt,
           messageCount: s.messageCount,
           lastMessageTs: s.lastMessageTs,
@@ -440,6 +502,51 @@ export function createChatThreadsRouter(deps: ChatThreadsDeps): Router {
   });
 
   /**
+   * Per-conversation connector selection (Octop #110):
+   *   GET    /:threadId/connectors → { override: string[] | null }
+   *   PUT    /:threadId/connectors { slugs: string[] } → set the override
+   *   DELETE /:threadId/connectors → clear it (bot enablement applies)
+   * The Composio tool path intersects this override with the bot's own
+   * enablement, so a thread can only ever NARROW what a bot may use.
+   */
+  router.get('/:threadId/connectors', async (req, res) => {
+    const override = titles.getConnectorOverride(req.params.threadId);
+    res.json({ ok: true, threadId: req.params.threadId, override: override ?? null });
+  });
+  router.put('/:threadId/connectors', async (req, res) => {
+    const threadId = req.params.threadId;
+    const slugs = (req.body as { slugs?: unknown })?.slugs;
+    if (!Array.isArray(slugs) || slugs.some((s) => typeof s !== 'string')) {
+      res.status(400).json(errorBody('slugs must be an array of app slug strings'));
+      return;
+    }
+    if (slugs.length > 100) {
+      res.status(400).json(errorBody('slugs is capped at 100 entries'));
+      return;
+    }
+    const saved = titles.setConnectorOverride(threadId, slugs as string[]);
+    deps.audit('chat.thread_connectors', { actor: 'api', sessionId: threadId, detail: { slugs: saved } });
+    res.json({ ok: true, threadId, override: saved });
+  });
+  router.delete('/:threadId/connectors', async (req, res) => {
+    titles.clearConnectorOverride(req.params.threadId);
+    deps.audit('chat.thread_connectors', { actor: 'api', sessionId: req.params.threadId, detail: { cleared: true } });
+    res.json({ ok: true, threadId: req.params.threadId, override: null });
+  });
+
+  /** Conversation mode (item 6): GET/PUT /:threadId/mode { mode: ask|plan|craft }. */
+  router.get('/:threadId/mode', async (req, res) => {
+    res.json({ ok: true, threadId: req.params.threadId, mode: titles.getMode(req.params.threadId) });
+  });
+  router.put('/:threadId/mode', async (req, res) => {
+    const mode = (req.body as { mode?: unknown })?.mode;
+    if (mode !== 'ask' && mode !== 'plan' && mode !== 'craft') { res.status(400).json(errorBody('mode must be one of: ask, plan, craft')); return; }
+    const set = titles.setMode(req.params.threadId, mode);
+    deps.audit('chat.thread_mode', { actor: 'api', sessionId: req.params.threadId, detail: { mode: set } });
+    res.json({ ok: true, threadId: req.params.threadId, mode: set });
+  });
+
+  /**
    * Duplicate a thread: new session for the same bot with the full history
    * copied. Titled "Copy of <original>".
    */
@@ -481,6 +588,7 @@ export function createChatThreadsRouter(deps: ChatThreadsDeps): Router {
       return;
     }
     titles.deleteThread(threadId);
+    try { titles.setMode(threadId, 'craft'); } catch { /* best-effort */ }
     try {
       deps.onThreadDeleted?.(threadId);
     } catch {

@@ -22,6 +22,7 @@
 
 import type { ToolContext, ToolDefinition } from '../types.js';
 import { MockOSScreenLayer, type OSScreenLayer } from './computer.js';
+import { createVaultLoginSource, loginSourceByKind, type LoginSource, type LoginSourceKind } from './login-source.js';
 // Type-only import: the runtime package must not depend on @mvp/vault at
 // build time (the host injects getLogin). LoginRecord shape is redeclared
 // structurally to avoid the dependency.
@@ -63,6 +64,12 @@ export interface TypeLoginToolOptions {
    * password never leaves this module except into os.type().
    */
   getLogin: (loginId: string) => TypeLoginRecord | undefined;
+  /**
+   * Additional login sources (e.g. the 1Password source from
+   * login-source.ts). The tool's optional `source` arg selects one;
+   * 'vault' (the default) always resolves through getLogin above.
+   */
+  loginSources?: LoginSource[];
   /**
    * Optional active-window/URL verifier. When present, the focused context
    * must match the login's site. When absent, the bot must pass
@@ -142,6 +149,11 @@ export function createTypeLoginTool(opts: TypeLoginToolOptions): ToolDefinition 
             'Required when no active-window verifier is configured: assert the site you expect to be ' +
             'focused (e.g. "github.com"). Must match the login\'s stored site.',
         },
+        source: {
+          type: 'string',
+          enum: ['vault', 'onepassword'],
+          description: 'Where the login is stored (default "vault"). "onepassword" resolves it via the 1Password CLI server-side.',
+        },
       },
       required: ['loginId'],
       additionalProperties: false,
@@ -150,7 +162,12 @@ export function createTypeLoginTool(opts: TypeLoginToolOptions): ToolDefinition 
       const loginId = loginIdArg(args);
       // Per-bot computers: resolve the layer for the calling bot.
       const os = opts.resolveOS ? await opts.resolveOS(ctx) : (opts.os ?? new MockOSScreenLayer());
-      const login = getLogin(loginId);
+      const sourceKind = (typeof args['source'] === 'string' ? args['source'] : 'vault') as LoginSourceKind;
+      if (sourceKind !== 'vault' && sourceKind !== 'onepassword') {
+        throw new Error('"source" must be "vault" or "onepassword"');
+      }
+      const sources: LoginSource[] = [createVaultLoginSource(getLogin), ...(opts.loginSources ?? [])];
+      const login = await loginSourceByKind(sources, sourceKind).getLogin(loginId);
       if (!login) {
         // Name-only error: never hint at whether the id exists vs is not a login.
         throw new Error(`unknown login "${loginId}"`);

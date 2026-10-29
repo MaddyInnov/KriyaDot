@@ -36,10 +36,31 @@ interface PolicyDecision {
   matchedRule?: PolicyRule;
 }
 
+/** One governance decision, reported to GatewayOptions.onDecision. */
+export interface GovernanceDecisionEvent {
+  toolName: string;
+  effect: Effect;
+  botId: string;
+  actor: string;
+  sessionId: string;
+  /** Human-readable reason (rule reason, floor reason, or 'default policy'). */
+  reason?: string;
+  ruleId?: string;
+  approvalId?: string;
+}
+
 export interface GatewayOptions {
   /** SQLite file path, or ':memory:' for an ephemeral database. */
   dbPath: string;
   policy: Policy;
+  /**
+   * Optional decision sink (invocation decision model): invoked once per
+   * evaluate()/evaluateWithPolicy() outcome — allow, deny, and
+   * require-approval — after the decision is made. Best-effort: a
+   * throwing sink never changes the decision. Hosts wire this to the
+   * invocation-decision log in @mvp/agent-runtime.
+   */
+  onDecision?: (event: GovernanceDecisionEvent) => void;
   /** Fallback timeout for awaitDecision(). */
   approvalTimeoutMs?: number;
   /** Hard floors config. Defaults to { enabled: true }. */
@@ -180,6 +201,7 @@ export class GovernanceGateway {
   private readonly policy: Policy;
   private readonly approvalTimeoutMs: number;
   private readonly hardFloorConfig: HardFloorConfig;
+  private readonly onDecision?: GatewayOptions['onDecision'];
   private readonly waiters = new Map<string, Waiter>();
   private readonly preHooks: PreHook[] = [];
   private readonly postHooks: PostHook[] = [];
@@ -190,6 +212,7 @@ export class GovernanceGateway {
 
   constructor(options: GatewayOptions) {
     this.policy = options.policy;
+    this.onDecision = options.onDecision;
     this.approvalTimeoutMs = options.approvalTimeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS;
     this.hardFloorConfig = options.hardFloors ?? { enabled: true };
     const ar = options.auditRetention ?? {};
@@ -253,6 +276,16 @@ export class GovernanceGateway {
     if (GovernanceGateway.EXECUTE_TOOLS.has(name)) return 'execute';
     if (name.startsWith('mcp:') || name.startsWith('http')) return 'network';
     return 'write';
+  }
+
+  /** Notify the optional invocation-decision sink (best-effort). */
+  private notifyDecision(event: GovernanceDecisionEvent): void {
+    if (!this.onDecision) return;
+    try {
+      this.onDecision(event);
+    } catch {
+      // A decision sink must never change or break governance.
+    }
   }
 
   /**
@@ -391,6 +424,7 @@ export class GovernanceGateway {
           args: redactSecrets(args),
         },
       });
+      this.notifyDecision({ toolName, effect: 'deny', botId: ctx.botId, actor: ctx.actor, sessionId: ctx.sessionId, reason: `hard floor (catastrophic): ${floorHit.reason}` });
       return { effect: 'deny' };
     }
     if (floorHit) {
@@ -413,6 +447,7 @@ export class GovernanceGateway {
           args: redactSecrets(args),
         },
       });
+      this.notifyDecision({ toolName, effect: 'require-approval', botId: ctx.botId, actor: ctx.actor, sessionId: ctx.sessionId, reason: `hard floor: ${floorHit.reason}`, approvalId });
       return { effect: 'require-approval', approvalId };
     }
 
@@ -428,6 +463,7 @@ export class GovernanceGateway {
           args: redactSecrets(args),
         },
       });
+      this.notifyDecision({ toolName, effect: 'deny', botId: ctx.botId, actor: ctx.actor, sessionId: ctx.sessionId, reason: 'denylist: destructive command pattern' });
       return { effect: 'deny' };
     }
 
@@ -441,6 +477,7 @@ export class GovernanceGateway {
         decision: 'allow',
         detail: { reason: rule?.reason ?? 'default policy', ruleId: rule?.id },
       });
+      this.notifyDecision({ toolName, effect: 'allow', botId: ctx.botId, actor: ctx.actor, sessionId: ctx.sessionId, reason: rule?.reason ?? 'default policy', ruleId: rule?.id });
       return { effect };
     }
 
@@ -456,6 +493,7 @@ export class GovernanceGateway {
           args: redactSecrets(args),
         },
       });
+      this.notifyDecision({ toolName, effect: 'deny', botId: ctx.botId, actor: ctx.actor, sessionId: ctx.sessionId, reason: rule?.reason ?? 'default policy', ruleId: rule?.id });
       return { effect };
     }
 
@@ -472,6 +510,7 @@ export class GovernanceGateway {
       decision: 'require-approval',
       detail: { approvalId, args: redactSecrets(args) },
     });
+    this.notifyDecision({ toolName, effect: 'require-approval', botId: ctx.botId, actor: ctx.actor, sessionId: ctx.sessionId, reason: rule?.reason ?? 'default policy', ruleId: rule?.id, approvalId });
     return { effect, approvalId };
   }
 

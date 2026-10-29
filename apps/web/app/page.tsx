@@ -35,6 +35,11 @@ import {
   fetchChatNow,
   listSignInRequests,
   toggleMessageReaction,
+  listPinnedMessages,
+  pinChatMessage,
+  unpinChatMessage,
+  polishComposerText,
+  type PinnedChatMessage,
   type CurrentTurnState,
   type FusionStreamEvent,
   type SignInRequest,
@@ -74,7 +79,19 @@ import { NoteAttachButton } from '../components/chat/note-attach-button';
 import { BotConversationSheet, BotNoticeRow, type BotNoticeData } from '../components/chat/bot-notice';
 import { PublishedPageCard, publishedPageFromToolResult } from '../components/chat/published-page-card';
 import { MessageReactions } from '../components/chat/message-reactions';
-import { NowCards, StepLine } from '../components/chat/step-line';
+import { CommandPalette, useCommandPaletteShortcut, type PaletteItem } from '../components/command-palette';
+import { PlacesRail } from '../components/places-rail';
+import { FindBar } from '../components/chat/find-bar';
+import { PinnedBanner } from '../components/chat/pinned-banner';
+import { CitationChips, SpoilerText } from '../components/chat/message-content';
+import { findInMessages, setAppBadge, splitByQuery, unreadDividerIndex } from '../components/chat/chat-polish';
+import { MentionMenu, filterMentions, mentionQueryAt, type MentionEntry } from '../components/chat/mention-menu';
+import { AudioBubble, VoiceNoteRecordButton } from '../components/chat/voice-note-composer';
+import { TokenCostChip } from '../components/chat/token-cost-chip';
+import { listPeople, type Person } from '../lib/people';
+import { applyUxMode, getStoredUxMode } from '../lib/ux-mode';
+import { THEMES, applyThemeChoice, getStoredThemeChoice } from '../lib/theme';
+import { FinishedSteps, NowCards, StepLine } from '../components/chat/step-line';
 import { applyStepEvent, type StepLineState } from '../components/chat/step-state';
 import { GaplessAudioQueue } from '../components/chat/audio-queue';
 import { GoalStatusCard } from '../components/chat/goal-card';
@@ -85,7 +102,7 @@ import { CodingSessionStrip } from '../components/code/CodingSessionStrip';
 
 type ChatBlock =
   | { kind: 'user'; id: string; text: string; ts: number }
-  | { kind: 'assistant'; id: string; text: string; streaming: boolean; usage?: TokenUsage; costUsd?: number; ts: number; botName?: string; step?: StepLineState }
+  | { kind: 'assistant'; id: string; text: string; streaming: boolean; usage?: TokenUsage; costUsd?: number; ts: number; botName?: string; step?: StepLineState; citations?: unknown; finishedSteps?: string[] }
   /** A `/goal` run started in this chat (W8f) — status polls the goal record. */
   | { kind: 'goal'; id: string; goalId: string; title: string }
   | { kind: 'tool'; id: string; call: ToolCall; result?: unknown; denied?: boolean }
@@ -140,6 +157,8 @@ type ChatBlock =
       durationMs: number;
       transcript: string;
       ts: number;
+      /** Recorded via the MediaRecorder composer button + uploaded as an attachment. */
+      viaRecorder?: boolean;
     };
 
 /** A saved conversation (one chat session) belonging to a bot. */
@@ -587,6 +606,33 @@ function ChatPageInner() {
   // Message reactions (Codync parity): per-message emoji reactions,
   // keyed by client message id.
   const [messageReactions, setMessageReactions] = useState<Record<string, MessageReaction[]>>({});
+  // Chat polish (OpenMausBot §1.1/§1.2/§2.6): command palette, in-chat
+  // find, pinned banner, follow-bottom, adjustable width, per-turn
+  // model, @mentions (bots + people), last-read marker.
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  useCommandPaletteShortcut(setPaletteOpen);
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState('');
+  const [findCurrent, setFindCurrent] = useState(0);
+  const [followBottom, setFollowBottom] = useState(true);
+  const [chatWidth, setChatWidth] = useState(0);
+  const [turnModel, setTurnModel] = useState('');
+  const turnModelRef = useRef('');
+  const [people, setPeople] = useState<Person[]>([]);
+  const [pins, setPins] = useState<PinnedChatMessage[]>([]);
+  const [inputCaret, setInputCaret] = useState(0);
+  const [lastReadTs, setLastReadTs] = useState(0);
+  useEffect(() => { try { setFollowBottom(localStorage.getItem('mvp:followBottom') !== '0'); const w = Number(localStorage.getItem('mvp:chatWidth') ?? 0); if (w > 0) setChatWidth(w); } catch { /* ignore */ } }, []);
+  useEffect(() => { try { localStorage.setItem('mvp:followBottom', followBottom ? '1' : '0'); } catch { /* ignore */ } }, [followBottom]);
+  useEffect(() => { if (chatWidth > 0) { try { localStorage.setItem('mvp:chatWidth', String(chatWidth)); } catch { /* ignore */ } } }, [chatWidth]);
+  // Ctrl+F opens the in-chat find bar (within the open thread only).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'f') { e.preventDefault(); setFindOpen(true); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
   // Live "Now" state (W8a): what every busy bot is doing right now,
   // polled from GET /api/chat/now while the chat is open.
   const [nowTurns, setNowTurns] = useState<CurrentTurnState[]>([]);
@@ -726,6 +772,7 @@ function ChatPageInner() {
       setProviders(p);
       setModelPrices(m);
       setSlashCommands(sc.commands ?? {});
+      void listPeople().then(setPeople).catch(() => {});
       if (b.length > 0) setSelectedBotId(b[0].id);
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : String(err));
@@ -795,11 +842,33 @@ function ChatPageInner() {
     saveOverride(selectedBotId, { provider: providerId, model: modelId });
   }, [selectedBotId, providerId, modelId]);
 
-  // Auto-scroll on new blocks.
+  // Auto-scroll on new blocks — only when follow-bottom is on.
   useEffect(() => {
+    if (!followBottom) return;
     const el = messagesRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [blocks]);
+  }, [blocks, followBottom]);
+
+  // Chat polish: pinned messages + last-read marker for the open thread.
+  const activeThreadId = selectedBotId ? (activeConvo[selectedBotId] ?? '') : '';
+  useEffect(() => {
+    if (!activeThreadId) { setPins([]); return; }
+    let alive = true;
+    void listPinnedMessages(activeThreadId)
+      .then((r) => { if (alive && r.ok) setPins(r.pins); })
+      .catch(() => { if (alive) setPins([]); });
+    try { setLastReadTs(Number(localStorage.getItem(`mvp:lastRead:${activeThreadId}`) ?? 0) || 0); } catch { setLastReadTs(0); }
+    return () => {
+      alive = false;
+      try { localStorage.setItem(`mvp:lastRead:${activeThreadId}`, String(Date.now())); } catch { /* ignore */ }
+    };
+  }, [activeThreadId]);
+  // App badge: document.title + favicon count of needs-you items.
+  const needsYouCount =
+    blocks.filter((b) => b.kind === 'approval' && b.status === 'pending').length +
+    blocks.filter((b) => b.kind === 'peer-approval' && b.status === 'pending').length +
+    signInRequests.length;
+  useEffect(() => { setAppBadge('KriyaDot', needsYouCount); }, [needsYouCount]);
 
   // Auto-grow the composer textarea (cap ~200px, then scroll).
   useEffect(() => {
@@ -1344,7 +1413,7 @@ function ChatPageInner() {
         for (let i = next.length - 1; i >= 0; i--) {
           const b = next[i];
           if (b && b.kind === 'assistant') {
-            next[i] = { ...b, streaming: false, step: undefined, usage: event.usage ?? undefined, costUsd };
+            next[i] = { ...b, streaming: false, step: undefined, usage: event.usage ?? undefined, costUsd, finishedSteps: b.step ? [b.step.step] : b.finishedSteps };
             break;
           }
         }
@@ -1540,13 +1609,19 @@ function ChatPageInner() {
     const assistantBlock: ChatBlock = { kind: 'assistant', id: nextId(), text: '', streaming: true, ts: Date.now(), botName: selectedBot.name };
     setBlocks((prev) => [...prev, userBlock, assistantBlock]);
     const budget = parseFloat(maxBudgetRef.current);
+    // Per-turn model override: captured for THIS turn, then cleared so
+    // the next turn falls back to the bot's model.
+    const turnModelValue = turnModelRef.current;
+    turnModelRef.current = '';
+    setTurnModel('');
     try {
       for await (const event of streamChat({
         botId: selectedBot.id,
         message: text,
         sessionId: cid,
         provider: providerIdRef.current || undefined,
-        model: modelIdRef.current || undefined,
+        model: turnModelValue || modelIdRef.current || undefined,
+        modelOverride: turnModelValue || undefined,
         reasoningEffort: reasoningEffortRef.current,
         fileIds: files,
         sandboxMode: sandboxModeRef.current,
@@ -1964,12 +2039,80 @@ function ChatPageInner() {
   const modelOptions = selectedProvider?.models ?? [];
   const activeModelId = modelId || selectedBot?.model || '';
   const contextLength = modelOptions.find((m) => m.id === activeModelId)?.contextLength;
+  // Chat polish derived state: find matches, @mention matches, palette.
+  const textOfBlock = (b: ChatBlock): string => (b.kind === 'user' || b.kind === 'assistant' ? b.text : '');
+  const findMatches = findOpen
+    ? findInMessages(blocks.filter((b) => b.kind === 'user' || b.kind === 'assistant').map((b) => ({ id: b.id, text: textOfBlock(b) })), findQuery)
+    : [];
+  const findIdx = findMatches.length > 0 ? ((findCurrent % findMatches.length) + findMatches.length) % findMatches.length : -1;
+  const jumpToFindMatch = (idx: number) => {
+    const m = findMatches[idx];
+    if (!m) return;
+    setFindCurrent(idx);
+    messagesRef.current?.querySelector(`[data-block-id="${CSS.escape(m.blockId)}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  };
+  const renderMsgText = (text: string) => {
+    if (findOpen && findQuery.trim()) {
+      return (<>{splitByQuery(text, findQuery).map((seg, i) => (seg.hit ? <mark key={i}>{seg.text}</mark> : <span key={i}>{seg.text}</span>))}</>);
+    }
+    return <SpoilerText text={text} />;
+  };
+  const pinBlock = (b: ChatBlock) => {
+    if (!activeThreadId) return;
+    void pinChatMessage(activeThreadId, b.id, { text: textOfBlock(b).slice(0, 300), role: b.kind })
+      .then((r) => { if (r.ok) setPins((prev) => [...prev.filter((x) => x.messageId !== r.pin.messageId), r.pin]); })
+      .catch(() => {});
+  };
+  const mentionState = mentionQueryAt(input, inputCaret || input.length);
+  const mentionEntries: MentionEntry[] = [
+    ...bots.map((b) => ({ id: b.id, kind: 'bot' as const, label: b.name })),
+    ...people.map((person) => ({ id: person.id, kind: 'person' as const, label: person.name })),
+  ];
+  const mentionMatches = mentionState ? filterMentions(mentionEntries, mentionState.query) : [];
+  const handleRecordedNote = async (blob: Blob, durationMs: number) => {
+    try {
+      const file = new File([blob], `voice-note-${Date.now()}.webm`, { type: blob.type || 'audio/webm' });
+      const uploaded = await uploadFile(file);
+      setAttachedFiles((prev) => [...prev, { ...uploaded, kind: 'voice-note' } as UploadedFile]);
+      setBlocks((prev) => [...prev, { kind: 'voice-note', id: nextId(), audioDataUrl: URL.createObjectURL(blob), mimeType: file.type, durationMs, transcript: '', ts: Date.now(), viaRecorder: true }]);
+    } catch (err) {
+      setBlocks((prev) => [...prev, { kind: 'error', id: nextId(), text: `Voice note upload failed: ${err instanceof Error ? err.message : String(err)}` }]);
+    }
+  };
+  const paletteItems: PaletteItem[] = [
+    ...bots.map((b) => ({ id: `bot:${b.id}`, kind: 'bot' as const, label: b.name, hint: 'bot' })),
+    ...(selectedBotId ? (convos[selectedBotId] ?? []).map((c) => ({ id: `thread:${c.id}`, kind: 'thread' as const, label: c.title, hint: 'thread' })) : []),
+    ...([['Chat', '/'], ['Bots', '/bots'], ['Workflows', '/workflows'], ['Marketplace', '/marketplace'], ['Workspace', '/workspace'], ['Activity', '/activity']] as const)
+      .map(([label, href]) => ({ id: `dest:${href}`, kind: 'destination' as const, label, hint: href })),
+    { id: 'action:new-thread', kind: 'action', label: 'New thread', hint: 'action' },
+    { id: 'action:toggle-mode', kind: 'action', label: 'Toggle Simple/Pro mode', hint: 'action' },
+    { id: 'action:cycle-theme', kind: 'action', label: 'Cycle theme', hint: 'action' },
+    { id: 'action:toggle-follow', kind: 'action', label: 'Toggle follow-bottom', hint: 'action' },
+    { id: 'action:find', kind: 'action', label: 'Find in conversation', hint: 'action' },
+  ];
+  const onPaletteSelect = (item: PaletteItem) => {
+    if (item.id.startsWith('bot:')) setSelectedBotId(item.id.slice(4));
+    else if (item.id.startsWith('thread:') && selectedBotId) switchConvo(selectedBotId, item.id.slice(7));
+    else if (item.id.startsWith('dest:')) window.location.href = item.id.slice(5);
+    else if (item.id === 'action:new-thread') newConversation();
+    else if (item.id === 'action:toggle-mode') applyUxMode(getStoredUxMode() === 'pro' ? 'simple' : 'pro');
+    else if (item.id === 'action:cycle-theme') {
+      const ids = THEMES.map((th) => th.id);
+      const next = ids[(ids.indexOf(getStoredThemeChoice()) + 1) % ids.length] ?? 'system';
+      applyThemeChoice(next);
+    }
+    else if (item.id === 'action:toggle-follow') setFollowBottom((v) => !v);
+    else if (item.id === 'action:find') setFindOpen(true);
+  };
+  const dividerIdx = unreadDividerIndex(blocks.map((b) => ({ id: b.id, ts: 'ts' in b ? b.ts : 0 })), { ts: lastReadTs });
   const botSessionUsage = selectedBotId ? sessionUsage[selectedBotId] : undefined;
   const botSessionCost = selectedBotId ? sessionCost[selectedBotId] : undefined;
   const sessionMeter = botSessionUsage ? contextMeter(botSessionUsage.totalTokens, contextLength) : null;
 
   return (
     <div className="chat-layout">
+      <PlacesRail />
+      <CommandPalette open={paletteOpen} items={paletteItems} onClose={() => setPaletteOpen(false)} onSelect={onPaletteSelect} />
       <aside className={`bot-roster${sideOpen ? ' open' : ''}`} aria-label="Conversations and bots">
         <button className="btn btn-primary new-chat-btn" onClick={newConversation} disabled={!selectedBotId}>
           {t('chat.newChat')}
@@ -2103,6 +2246,7 @@ function ChatPageInner() {
               setSideOpen(false);
             }}
           >
+            {b.avatarUrl && <img src={b.avatarUrl} alt="" width={28} height={28} style={{ borderRadius: '50%', objectFit: 'cover' }} />}
             <div className="bot-name">{b.name}</div>
             {b.description && <div className="bot-desc">{b.description}</div>}
             <div className="bot-ws small muted" title={b.workspace ? `Isolated workspace: ${b.workspace}` : 'Shared workspace'}>
@@ -2113,8 +2257,18 @@ function ChatPageInner() {
         {bots.length === 0 && <div className="small muted">Loading bots…</div>}
       </aside>
       {sideOpen && <div className="side-scrim" onClick={() => setSideOpen(false)} aria-hidden="true" />}
+      <div className="chat-width-handle" role="separator" aria-orientation="vertical" title="Drag to resize the chat column"
+        style={{ width: 6, cursor: 'col-resize', flex: 'none' }}
+        onMouseDown={(e) => {
+          const startX = e.clientX;
+          const startW = chatWidth || (messagesRef.current?.clientWidth ?? 720);
+          const move = (ev: MouseEvent) => setChatWidth(Math.max(360, Math.min(1600, startW + (ev.clientX - startX))));
+          const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); };
+          window.addEventListener('mousemove', move);
+          window.addEventListener('mouseup', up);
+        }} />
 
-      <div className="chat-main">
+      <div className="chat-main" style={chatWidth > 0 ? { width: chatWidth, flex: 'none' } : undefined}>
         <div className="chat-header">
           <button
             className="icon-btn side-toggle"
@@ -2124,6 +2278,7 @@ function ChatPageInner() {
           >
             ☰
           </button>
+          {selectedBot?.avatarUrl && <img src={selectedBot.avatarUrl} alt={selectedBot.name} width={30} height={30} style={{ borderRadius: '50%', objectFit: 'cover' }} />}
           <div
             className="model-picker"
             role="group"
@@ -2367,6 +2522,15 @@ function ChatPageInner() {
                 onFileDone={codeSession.markFileDone}
               />
             )}
+        {findOpen && (
+          <FindBar query={findQuery} onQuery={(q) => { setFindQuery(q); setFindCurrent(0); }}
+            matchCount={findMatches.length} current={findIdx}
+            onNext={() => jumpToFindMatch(findIdx + 1)} onPrev={() => jumpToFindMatch(findIdx - 1)}
+            onClose={() => setFindOpen(false)} />
+        )}
+        <PinnedBanner pins={pins}
+          onJump={(pin) => messagesRef.current?.querySelector(`[data-block-id="${CSS.escape(pin.messageId)}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })}
+          onUnpin={(pin) => { void unpinChatMessage(pin.threadId, pin.messageId).catch(() => {}); setPins((prev) => prev.filter((x) => x.messageId !== pin.messageId)); }} />
         <div className="chat-messages" ref={messagesRef}>
           {selectedBot?.approvalMode === 'bypass' && (
             <div
@@ -2423,7 +2587,7 @@ function ChatPageInner() {
               </p>
             </div>
           )}
-          {blocks.map((b) => {
+          {blocks.map((b, blockIdx) => {
             switch (b.kind) {
               case 'user': {
                 const summary = threadSummaries[b.id];
@@ -2435,6 +2599,7 @@ function ChatPageInner() {
                       </span>
                       <span className="msg-time">{fmtTime(b.ts)}</span>
                       <CopyBtn text={b.text} />
+                      <button type="button" className="copy-btn" title="Pin message" aria-label="Pin message" onClick={() => pinBlock(b)}>📌</button>
                       <BranchBtn onBranch={() => branchFromBlock(b.id)} disabled={branching || sending} />
                       <ThreadBtn
                         onThread={() => openThreadFromBlock(b.id)}
@@ -2443,7 +2608,8 @@ function ChatPageInner() {
                         unread={summary?.unread}
                       />
                     </div>
-                    <div className="msg-text">{b.text}</div>
+                    {blockIdx === dividerIdx && <div className="unread-divider" role="separator" style={{ textAlign: 'center', fontSize: 12, opacity: 0.75 }}>— New messages —</div>}
+                    <div className="msg-text">{renderMsgText(b.text)}</div>
                     <MessageReactions
                       reactions={messageReactions[b.id] ?? []}
                       onToggle={(emoji) => toggleReactionForBlock(b.id, emoji)}
@@ -2472,6 +2638,9 @@ function ChatPageInner() {
                       <span className="msg-time">{fmtTime(b.ts)}</span>
                     </div>
                     {b.audioDataUrl ? (
+                      b.viaRecorder ? (
+                        <AudioBubble src={b.audioDataUrl} durationMs={b.durationMs} />
+                      ) : (
                       <VoiceNoteBubble
                         audioDataUrl={b.audioDataUrl}
                         mimeType={b.mimeType}
@@ -2479,6 +2648,7 @@ function ChatPageInner() {
                         transcript={b.transcript}
                         from="user"
                       />
+                      )
                     ) : (
                       <div className="msg-text">
                         <span className="small muted">
@@ -2501,6 +2671,7 @@ function ChatPageInner() {
                       <span className="msg-author">{botLabel}</span>
                       <span className="msg-time">{fmtTime(b.ts)}</span>
                       {b.text.length > 0 && <CopyBtn text={b.text} />}
+                      {!b.streaming && <button type="button" className="copy-btn" title="Pin message" aria-label="Pin message" onClick={() => pinBlock(b)}>📌</button>}
                       {!b.streaming && (
                         <BranchBtn onBranch={() => branchFromBlock(b.id)} disabled={branching || sending} />
                       )}
@@ -2537,12 +2708,14 @@ function ChatPageInner() {
                         </span>
                       ) : (
                         <>
-                          {b.text}
+                          {renderMsgText(b.text)}
                           {b.streaming && <span className="stream-caret" aria-hidden="true" />}
                         </>
                       )}
                     </div>
                     {b.streaming && b.step && <StepLine state={b.step} />}
+                    {!b.streaming && b.finishedSteps && <FinishedSteps steps={b.finishedSteps} />}
+                    {!b.streaming && <CitationChips citations={b.citations} />}
                     {!b.streaming && (
                       <MessageReactions
                         reactions={messageReactions[b.id] ?? []}
@@ -2771,6 +2944,15 @@ function ChatPageInner() {
         </div>
 
         <div className="chat-input-wrap">
+          {mentionState && mentionMatches.length > 0 && (
+            <MentionMenu entries={mentionMatches} highlight={0}
+              onPick={(entry) => {
+                const start = mentionState.start;
+                const caret = inputCaret || input.length;
+                setInput(`${input.slice(0, start)}@${entry.label} ${input.slice(caret)}`);
+                inputRef.current?.focus();
+              }} />
+          )}
           {showSlashPop && (
             <div className="slash-pop" role="listbox" aria-label="Slash commands">
               {slashMatches.map((name, i) => (
@@ -2877,6 +3059,7 @@ function ChatPageInner() {
               rows={1}
               onChange={(e) => {
                 setInput(e.target.value);
+                setInputCaret(e.target.selectionStart ?? e.target.value.length);
                 setSlashHl(0);
               }}
               onKeyDown={(e) => {
@@ -2903,6 +3086,11 @@ function ChatPageInner() {
               disabled={!selectedBot}
               aria-label={t('chat.composerLabel')}
             />
+            <VoiceNoteRecordButton
+              disabled={!selectedBot || sending}
+              onRecorded={(blob, durationMs) => void handleRecordedNote(blob, durationMs)}
+              onError={(msg) => setBlocks((prev) => [...prev, { kind: 'error', id: nextId(), text: msg }])}
+            />
             <VoiceNoteRecorder
               stt={getWebSTTProvider()}
               disabled={!selectedBot || sending}
@@ -2922,6 +3110,23 @@ function ChatPageInner() {
             )}
           </div>
           <div className="composer-footer">
+            <button type="button" className={`fusion-toggle${followBottom ? ' on' : ''}`} aria-pressed={followBottom}
+              onClick={() => setFollowBottom((v) => !v)} title="Follow bottom: keep the view pinned to the newest messages">
+              ⬇ Follow{followBottom ? ' on' : ''}
+            </button>
+            <label className="small" title="Model for the NEXT turn only — after sending, the bot's model applies again">
+              Turn model{' '}
+              <select className="mp-select" value={turnModel} aria-label="Model for next turn"
+                onChange={(e) => { setTurnModel(e.target.value); turnModelRef.current = e.target.value; }}>
+                <option value="">(bot default)</option>
+                {modelOptions.map((m) => (<option key={m.id} value={m.id}>{m.name}</option>))}
+              </select>
+            </label>
+            <button type="button" className="fusion-toggle" title="Polish the draft with text assist"
+              onClick={() => { const cur = input; if (!cur.trim()) return; void polishComposerText(cur).then((r) => { if (r.ok) setInput(r.text); }).catch(() => {}); }}>
+              ✨ Polish
+            </button>
+            <TokenCostChip usage={botSessionUsage} costUsd={botSessionCost} />
             <span className="mono" title="Rough estimate: ~4 characters per token">
               ≈{formatTokens(estimateTokens(input))} tok
             </span>

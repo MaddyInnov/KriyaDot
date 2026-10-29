@@ -211,18 +211,45 @@ export class CompanionStore {
     );
   }
 
+  /** Register a push token together with the device platform ('ios' routes to APNs). */
+  setPushToken(deviceId: string, token: string, platform?: string): boolean {
+    const ok = this.setFcmToken(deviceId, token);
+    if (!ok) return false;
+    if (platform === 'ios' || platform === 'android') {
+      this.db.prepare('UPDATE companion_devices SET platform = ? WHERE id = ?').run(platform, deviceId);
+    }
+    return true;
+  }
+
+  /** APNs-token alias of setFcmToken (the token column is provider-neutral). */
+  setApnsToken(deviceId: string, token: string): boolean {
+    return this.setPushToken(deviceId, token, 'ios');
+  }
+
+  /** Prune a permanently invalid push token (e.g. APNs 410). */
+  clearPushToken(deviceId: string): boolean {
+    if (!DEVICE_ID_RE.test(deviceId)) return false;
+    return this.db.prepare("UPDATE companion_devices SET fcm_token = NULL WHERE id = ?").run(deviceId).changes > 0;
+  }
+
   /**
-   * Devices eligible for push: have an FCM token. Includes each device's
+   * Devices eligible for push: have a push token. Includes each device's
    * push key (null for devices paired before push keys existed — those get
-   * the generic fallback payload).
+   * the generic fallback payload) and its platform (registration-time
+   * platform, normalized to 'ios' | 'android').
    */
-  listPushDevices(): Array<{ deviceId: string; fcmToken: string; pushKey: string | null }> {
+  listPushDevices(): Array<{ deviceId: string; fcmToken: string; pushKey: string | null; platform: 'ios' | 'android' }> {
     const rows = this.db
       .prepare(
-        "SELECT id, fcm_token, push_key FROM companion_devices WHERE fcm_token IS NOT NULL AND fcm_token != ''",
+        "SELECT id, fcm_token, push_key, platform FROM companion_devices WHERE fcm_token IS NOT NULL AND fcm_token != ''",
       )
-      .all() as unknown as Array<{ id: string; fcm_token: string; push_key: string | null }>;
-    return rows.map((r) => ({ deviceId: r.id, fcmToken: r.fcm_token, pushKey: r.push_key ?? null }));
+      .all() as unknown as Array<{ id: string; fcm_token: string; push_key: string | null; platform: string }>;
+    return rows.map((r) => ({
+      deviceId: r.id,
+      fcmToken: r.fcm_token,
+      pushKey: r.push_key ?? null,
+      platform: r.platform === 'ios' ? 'ios' as const : 'android' as const,
+    }));
   }
 
   /**

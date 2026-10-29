@@ -48,6 +48,8 @@ export interface AcpSessionsDeps {
     awaitDecision(approvalId: string, timeoutMs: number): Promise<string>;
   };
   audit: (action: string, fields: { actor?: string; sessionId?: string; detail?: unknown }) => void;
+  /** Standalone engine installs: an installed build's path wins over PATH. */
+  standalonePath?: (engineId: string) => string | null;
 }
 
 function errorBody(message: string, detail?: string): Record<string, unknown> {
@@ -95,7 +97,7 @@ export function createAcpSessionsRouter(deps: AcpSessionsDeps): Router {
 
   /** Built-in ACP engine presets (W9) + live detection for the ACP panel. */
   router.get('/engines', (_req, res) => {
-    const detected = new Map(detectAcpEngines().map((d) => [d.id, d] as const));
+    const detected = new Map(detectAcpEngines({ standalonePath: deps.standalonePath }).map((d) => [d.id, d] as const));
     res.json({
       ok: true,
       engines: listAcpEnginePresets().map((p) => ({

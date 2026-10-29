@@ -36,21 +36,36 @@ import type { AgentRuntime, BotConfig } from '@mvp/agent-runtime';
 import type { StreamEvent } from '@mvp/agent-runtime';
 
 import { openDb as openSqliteDb } from '@mvp/agent-runtime';
+import { compileJsxToHtml, JsxCompileError } from './jsx-compile.js';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
+/** How a page's stored content must be rendered: markdown source, or HTML (authored directly or compiled from JSX). */
+export type PageFormat = 'markdown' | 'html';
+
+/** Formats accepted at write time; 'jsx' compiles to stored 'html'. */
+export type PageWriteFormat = PageFormat | 'jsx';
+
 export interface Page {
   id: string;
   title: string;
-  /** Markdown content. */
+  /** Markdown source, or HTML when `format` is 'html'. */
   content: string;
+  format: PageFormat;
   createdBy: string;
   createdAt: number;
   updatedAt: number;
   /** Monotonic per-page version number (1 = created). */
   version: number;
+  /**
+   * Representative assistant: true only when the owner explicitly marked
+   * this page shared-with-team. Default false — pages are NOT shared
+   * unless this flag is set, and only flagged pages may be cited as
+   * 'shared-notes' facts about the page's creator.
+   */
+  sharedWithTeam?: boolean;
 }
 
 export interface PageVersion {
@@ -91,10 +106,12 @@ interface PageRow {
   id: string;
   title: string;
   content: string;
+  format?: string | null;
   created_by: string;
   created_at: number;
   updated_at: number;
   version: number;
+  shared_with_team?: number | null;
 }
 
 interface PageVersionRow {
@@ -132,10 +149,12 @@ function rowToPage(r: PageRow): Page {
     id: r.id,
     title: r.title,
     content: r.content,
+    format: r.format === 'html' ? 'html' : 'markdown',
     createdBy: r.created_by,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     version: r.version,
+    sharedWithTeam: r.shared_with_team === 1,
   };
 }
 
@@ -184,6 +203,7 @@ const SCHEMA = `
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     content TEXT NOT NULL DEFAULT '',
+    format TEXT NOT NULL DEFAULT 'markdown',
     created_by TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
@@ -228,7 +248,41 @@ function openDb(dataDir: string): DatabaseSync {
   mkdirSync(dataDir, { recursive: true });
   const db = openSqliteDb(join(dataDir, 'pages.db'));
   db.exec(SCHEMA);
+  // Migration: format column for pre-existing pages.db files.
+  try {
+    db.exec("ALTER TABLE pages ADD COLUMN format TEXT NOT NULL DEFAULT 'markdown'");
+  } catch {
+    // Column already exists.
+  }
+  // Migration: shared-with-team flag for pre-existing pages.db files.
+  try {
+    db.exec('ALTER TABLE pages ADD COLUMN shared_with_team INTEGER NOT NULL DEFAULT 0');
+  } catch {
+    // Column already exists.
+  }
   return db;
+}
+
+/**
+ * Normalize a write-time format + content: JSX compiles to stored HTML
+ * (render paths sanitize it — the sanitizer stays the single enforcement
+ * path). Throws a validation error for unknown formats / bad JSX.
+ */
+function normalizeWriteContent(
+  content: string,
+  format: PageWriteFormat | undefined,
+): { content: string; format: PageFormat } {
+  if (format === undefined || format === 'markdown') return { content, format: 'markdown' };
+  if (format === 'html') return { content, format: 'html' };
+  if (format === 'jsx') {
+    try {
+      return { content: compileJsxToHtml(content), format: 'html' };
+    } catch (err) {
+      if (err instanceof JsxCompileError) throw validationError(`JSX compile failed: ${err.message}`);
+      throw err;
+    }
+  }
+  throw validationError('"format" must be one of "markdown" | "html" | "jsx"');
 }
 
 /** Pages + version snapshots. */
@@ -253,24 +307,41 @@ export class PageStore {
     return row ? rowToPage(row) : undefined;
   }
 
-  create(input: { title: string; content?: string; createdBy?: string }): Page {
+  /** Pages explicitly marked shared-with-team, optionally for one creator. */
+  listSharedWithTeam(createdBy?: string): Page[] {
+    return this.list().filter(
+      (pg) => pg.sharedWithTeam === true && (createdBy === undefined || pg.createdBy === createdBy),
+    );
+  }
+
+  /** Set/clear the shared-with-team flag (no content change, no version bump). */
+  setSharedWithTeam(id: string, shared: boolean): Page {
+    const current = this.get(id);
+    if (!current) throw pageNotFound(id);
+    this.db.prepare('UPDATE pages SET shared_with_team = ? WHERE id = ?').run(shared ? 1 : 0, id);
+    return this.get(id)!;
+  }
+
+  create(input: { title: string; content?: string; createdBy?: string; format?: PageWriteFormat; sharedWithTeam?: boolean }): Page {
     const title = requireTitle(input.title);
-    const content = requireContent(input.content ?? '');
+    const normalized = normalizeWriteContent(requireContent(input.content ?? ''), input.format);
     const now = Date.now();
     const page: Page = {
       id: randomUUID(),
       title,
-      content,
+      content: normalized.content,
+      format: normalized.format,
       createdBy: (input.createdBy ?? '').slice(0, 100),
       createdAt: now,
       updatedAt: now,
       version: 1,
+      sharedWithTeam: input.sharedWithTeam === true,
     };
     this.db
       .prepare(
-        'INSERT INTO pages (id, title, content, created_by, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, 1)',
+        'INSERT INTO pages (id, title, content, format, created_by, created_at, updated_at, version, shared_with_team) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)',
       )
-      .run(page.id, page.title, page.content, page.createdBy, page.createdAt, page.updatedAt);
+      .run(page.id, page.title, page.content, page.format, page.createdBy, page.createdAt, page.updatedAt, page.sharedWithTeam ? 1 : 0);
     return page;
   }
 
@@ -278,19 +349,30 @@ export class PageStore {
    * Update title/content. The pre-update state is snapshotted into
    * page_versions first (no-op when nothing actually changed).
    */
-  update(id: string, input: { title?: string; content?: string; updatedBy?: string }): Page {
+  update(
+    id: string,
+    input: { title?: string; content?: string; updatedBy?: string; format?: PageWriteFormat; sharedWithTeam?: boolean },
+  ): Page {
     const current = this.get(id);
     if (!current) throw pageNotFound(id);
+    if (input.sharedWithTeam !== undefined && input.sharedWithTeam !== (current.sharedWithTeam === true)) {
+      this.db.prepare('UPDATE pages SET shared_with_team = ? WHERE id = ?').run(input.sharedWithTeam ? 1 : 0, id);
+      current.sharedWithTeam = input.sharedWithTeam;
+    }
     const title = input.title === undefined ? current.title : requireTitle(input.title);
-    const content = input.content === undefined ? current.content : requireContent(input.content);
-    if (title === current.title && content === current.content) return current;
+    const normalized =
+      input.content === undefined
+        ? { content: current.content, format: current.format }
+        : normalizeWriteContent(requireContent(input.content), input.format ?? current.format);
+    const { content, format } = normalized;
+    if (title === current.title && content === current.content && format === current.format) return current;
     this.snapshot(current);
     const now = Date.now();
     // Monotonic updatedAt even within the same millisecond.
     const updatedAt = Math.max(now, current.updatedAt + 1);
     this.db
-      .prepare('UPDATE pages SET title = ?, content = ?, updated_at = ?, version = version + 1 WHERE id = ?')
-      .run(title, content, updatedAt, id);
+      .prepare('UPDATE pages SET title = ?, content = ?, format = ?, updated_at = ?, version = version + 1 WHERE id = ?')
+      .run(title, content, format, updatedAt, id);
     const next = this.get(id);
     if (!next) throw pageNotFound(id);
     return next;
@@ -570,11 +652,13 @@ export function registerPagesRoutes(router: Router, deps: PagesDeps): void {
 
   router.post('/', (req: Request, res: Response) => {
     try {
-      const body = (req.body ?? {}) as { title?: unknown; content?: unknown; createdBy?: unknown };
+      const body = (req.body ?? {}) as { title?: unknown; content?: unknown; createdBy?: unknown; format?: unknown; sharedWithTeam?: unknown };
       const page = pages.create({
         title: body.title as string,
         content: body.content as string | undefined,
         createdBy: typeof body.createdBy === 'string' ? body.createdBy : undefined,
+        format: typeof body.format === 'string' ? (body.format as PageWriteFormat) : undefined,
+        sharedWithTeam: body.sharedWithTeam === true,
       });
       res.status(201).json(page);
     } catch (err) {
@@ -593,11 +677,13 @@ export function registerPagesRoutes(router: Router, deps: PagesDeps): void {
 
   router.put('/:id', (req: Request, res: Response) => {
     try {
-      const body = (req.body ?? {}) as { title?: unknown; content?: unknown; updatedBy?: unknown };
+      const body = (req.body ?? {}) as { title?: unknown; content?: unknown; updatedBy?: unknown; format?: unknown; sharedWithTeam?: unknown };
       const page = pages.update(req.params.id, {
         title: body.title as string | undefined,
         content: body.content as string | undefined,
         updatedBy: typeof body.updatedBy === 'string' ? body.updatedBy : undefined,
+        format: typeof body.format === 'string' ? (body.format as PageWriteFormat) : undefined,
+        sharedWithTeam: typeof body.sharedWithTeam === 'boolean' ? body.sharedWithTeam : undefined,
       });
       publish(page.id, { kind: 'page', page });
       res.json(page);

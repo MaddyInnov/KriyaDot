@@ -17,6 +17,7 @@ export interface BackgroundRunHost {
     specialistBotId?: string;
     ephemeral?: { name: string; systemPrompt: string; model?: string; providerId?: string };
     tools?: string[];
+    profileId?: string;
   }): { runId: string; botName: string } | { error: string };
   listBackgroundRuns(originSessionId: string): BackgroundRunRecord[];
   stopBackgroundRun(runId: string): boolean;
@@ -39,6 +40,7 @@ export function createBackgroundTools(host: BackgroundRunHost & { getBot?: (botI
           ephemeralName: { type: 'string', description: 'Name for an ephemeral specialist (alternative to specialistBotId).' },
           ephemeralPrompt: { type: 'string', description: 'System prompt for the ephemeral specialist.' },
           ephemeralModel: { type: 'string', description: 'Model override for the ephemeral specialist.' },
+          profileId: { type: 'string', description: 'Sub-agent profile id (see the specialist profile library) — spawns an ephemeral specialist with that profile prompt and suggested tools.' },
           tools: {
             type: 'array',
             items: { type: 'string' },
@@ -67,6 +69,7 @@ export function createBackgroundTools(host: BackgroundRunHost & { getBot?: (botI
           task,
           specialistBotId: typeof args.specialistBotId === 'string' ? args.specialistBotId : undefined,
           ephemeral,
+          profileId: typeof args.profileId === 'string' ? args.profileId : undefined,
           tools: Array.isArray(args.tools) ? (args.tools as string[]) : undefined,
         });
         if ('error' in result) return { error: result.error };

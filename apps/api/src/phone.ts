@@ -324,6 +324,9 @@ export type ValidatedMessage =
   // phone-actions.ts); the validated shape carries both discriminators so
   // the existing `t`-based narrowing in the hub/routes keeps working.
   | { t: 'action_result'; type: 'action_result'; id: string; ok: boolean; error?: string }
+  // Phone data queries: the phone answers a server `data_query` with a
+  // bounded JSON `data` payload (calendar/contacts/messages/location).
+  | { t: 'data_result'; type: 'data_result'; id: string; ok: boolean; error?: string; data?: unknown }
   // W14 notification triage: a phone notification event. Title + app only —
   // notification bodies are sensitive and are never accepted here.
   | { t: 'notification'; type: 'notification'; appPackage: string; appName?: string; title: string; ts: number };
@@ -337,7 +340,21 @@ export function validateMessage(raw: unknown): { ok: true; msg: ValidatedMessage
   if (typeof raw !== 'object' || raw === null) return { ok: false, error: 'not_an_object' };
   const m = raw as Record<string, unknown>;
   // W14 new-style messages carry a `type` discriminator instead of `t`.
-  const newType = typeof m.type === 'string' ? m.type : m.t === 'action_result' || m.t === 'notification' ? m.t : undefined;
+  const newType = typeof m.type === 'string' ? m.type : m.t === 'action_result' || m.t === 'notification' || m.t === 'data_result' ? m.t : undefined;
+  if (newType === 'data_result') {
+    if (typeof m.id !== 'string' || m.id.length === 0 || m.id.length > 128) return { ok: false, error: 'bad_data_id' };
+    if (typeof m.ok !== 'boolean') return { ok: false, error: 'bad_data_ok' };
+    const error = typeof m.error === 'string' ? m.error.slice(0, 300) : undefined;
+    let data: unknown;
+    if (m.data !== undefined) {
+      try {
+        const json = JSON.stringify(m.data);
+        if (json.length > 256 * 1024) return { ok: false, error: 'data_too_large' };
+        data = JSON.parse(json) as unknown;
+      } catch { return { ok: false, error: 'bad_data_payload' }; }
+    }
+    return { ok: true, msg: { t: 'data_result', type: 'data_result', id: m.id, ok: m.ok, ...(error ? { error } : {}), ...(data !== undefined ? { data } : {}) } };
+  }
   if (newType === 'action_result') {
     if (typeof m.id !== 'string' || m.id.length === 0 || m.id.length > 128) return { ok: false, error: 'bad_action_id' };
     if (typeof m.ok !== 'boolean') return { ok: false, error: 'bad_action_ok' };
@@ -587,7 +604,11 @@ interface ViewerConn {
 export interface PhoneActionResult {
   ok: boolean;
   error?: string;
+  /** Data payload for data_query results (calendar/contacts/messages/location). */
+  data?: unknown;
 }
+
+export type PhoneDataQueryName = 'calendar' | 'contacts' | 'messages_recent' | 'location';
 
 interface PendingAction {
   deviceId: string;
@@ -642,6 +663,37 @@ export class PhoneSessionHub {
       phone.inputs += 1;
       try {
         phone.socket.sendText(JSON.stringify({ type: 'action', id, action, params }));
+      } catch {
+        clearTimeout(timer);
+        this.pendingActions.delete(id);
+        resolve({ ok: false, error: 'send_failed' });
+      }
+    });
+  }
+
+  /**
+   * Dispatch one read-only data query to a connected phone and await its
+   * `data_result`. Wire shape: { type:'data_query', id, query, params }.
+   * Same never-rejects contract as dispatchAction.
+   */
+  dispatchDataQuery(
+    deviceId: string,
+    query: PhoneDataQueryName | string,
+    params: Record<string, unknown> = {},
+    timeoutMs = 15_000,
+  ): Promise<PhoneActionResult> {
+    const phone = this.phones.get(deviceId);
+    if (!phone) return Promise.resolve({ ok: false, error: 'device_offline' });
+    const id = `dq_${randomBytes(8).toString('hex')}`;
+    return new Promise<PhoneActionResult>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingActions.delete(id);
+        resolve({ ok: false, error: 'timeout' });
+      }, Math.max(100, Math.min(60_000, timeoutMs)));
+      if (typeof timer === 'object' && 'unref' in timer) timer.unref();
+      this.pendingActions.set(id, { deviceId, resolve, timer });
+      try {
+        phone.socket.sendText(JSON.stringify({ type: 'data_query', id, query, params }));
       } catch {
         clearTimeout(timer);
         this.pendingActions.delete(id);
@@ -829,6 +881,15 @@ export class PhoneSessionHub {
             clearTimeout(pending.timer);
             this.pendingActions.delete(msg.id);
             pending.resolve(msg.ok ? { ok: true } : { ok: false, error: msg.error ?? 'action_failed' });
+          }
+          return;
+        }
+        if ('type' in msg && msg.type === 'data_result') {
+          const pending = this.pendingActions.get(msg.id);
+          if (pending && pending.deviceId === phoneConn.deviceId) {
+            clearTimeout(pending.timer);
+            this.pendingActions.delete(msg.id);
+            pending.resolve(msg.ok ? { ok: true, data: msg.data } : { ok: false, error: msg.error ?? 'query_failed' });
           }
           return;
         }

@@ -1,0 +1,1 @@
+{"description":"Demo channel plugin: an echo channel. channel/send queues an echo; channel/poll drains the queue.","entry":"index.js","id":"demo-channel","kinds":["channel"],"name":"Demo Echo Channel","permissions":{"env":[],"network":false},"version":"1.0.0"}

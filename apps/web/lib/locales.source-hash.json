@@ -1,0 +1,11 @@
+{
+  "note": "Checked-in hash of the canonical English source strings (audit §1.15). Regenerate after any edit to `en` in lib/locales.ts; lib/i18n.test.ts fails while this manifest is stale.",
+  "regenerate": "node scripts/gen-locales-hash.mjs (run from apps/web)",
+  "check": "node scripts/gen-locales-hash.mjs --check (run from apps/web)",
+  "algorithm": "sha256",
+  "canonical": "Flatten `en` from lib/locales.ts into dot-path keys, sort keys lexicographically, JSON.stringify the [key, value] pairs, SHA-256 hex of the UTF-8 bytes.",
+  "sourceFile": "apps/web/lib/locales.ts",
+  "locale": "en",
+  "keyCount": 96,
+  "sourceHash": "b639ff55e8ed3aa56e5352000f4dd9a5510f570efaac0bd2cf40dd0786c3179a"
+}

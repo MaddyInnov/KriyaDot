@@ -27,6 +27,11 @@ import { registerObservabilityRoutes } from './observability-routes.js';
 import { registerOmniRoutes } from './omni-routes.js';
 import type { OmniCollector, OmniStore } from './omni.js';
 import { registerBriefingRoutes } from './briefing-routes.js';
+import { FirstReplyRescue } from './first-reply-rescue.js';
+import { ThreadTitleStore } from './chat-threads-routes.js';
+import { DepartmentStore, getDepartmentInstructions } from './departments.js';
+import { registerPagePreviewRoutes } from './page-preview.js';
+import { registerMcpAppRoutes } from './mcp-apps-routes.js';
 import { PAUSED_MESSAGE, type PauseRegistry } from './system-pause.js';
 import type { RunHealthStore } from '@mvp/run-health';
 import type { AppConfig } from './config.js';
@@ -281,6 +286,14 @@ export interface RouteDeps {
   briefingSignalsSource?: { collect: () => Promise<import('./briefing.js').BriefingItem[]> };
   briefingNotificationDigest?: (since: number, now: number) => import('./briefing.js').BriefingItem[];
   /**
+   * OMB+Octop parity build (2026-10-29): live MCP clients by server name
+   * for the MCP Apps routes; nightly-dream items for the briefing; and a
+   * needs-you sink for the first-reply rescue. All optional in tests.
+   */
+  mcpClientsByServer?: Map<string, unknown>;
+  dreamsSource?: () => import('./briefing.js').BriefingItem[];
+  addNeedsYou?: (item: { personId?: string; title: string; summary: string; botId?: string }) => void;
+  /**
    * Companion app module (phone → PC remote control). Created by index.ts
    * so the WebSocket upgrade handler shares the same hub instance as the
    * REST routes. Optional: omitted in tests that don't exercise companion.
@@ -445,6 +458,12 @@ export function createRouter(deps: RouteDeps): express.Router {
   // context on every turn (chat, thread wakes, workflow bot-turns).
   // Idempotent — safe if createRouter is called more than once.
   attachNoteContextProvider(agentRuntime, { dataDir: config.dataDir });
+
+  // Conversation modes + departments (OMB §1.1): per-thread ask/plan/craft
+  // mode reads and per-bot department instructions. Second store instances
+  // on the same backing files as the dedicated routers (read-mostly here).
+  const threadModeStore = new ThreadTitleStore(config.dataDir);
+  const departmentStore = new DepartmentStore(config.dataDir);
 
   // ---- Run health scoring + regressions (features #2/#5) -------------------
   // Helpers shared by the workflow run payloads below and the /chat turn
@@ -1932,6 +1951,16 @@ export function createRouter(deps: RouteDeps): express.Router {
       } catch {
         memoryContext = undefined; // memory must never break chat
       }
+      // Departments: the bot's department instructions ride the same
+      // context channel into the system prompt.
+      try {
+        const deptInstructions = getDepartmentInstructions(departmentStore, bot.id);
+        if (deptInstructions) {
+          memoryContext = [memoryContext, deptInstructions].filter(Boolean).join('\n\n');
+        }
+      } catch {
+        // Departments must never break chat.
+      }
       // Run-health turn telemetry (features #2/#5): latency, tokens, errors
       // are recorded for health scoring + regression detection. The
       // try/finally guarantees a sample even when the turn throws, and the
@@ -1982,7 +2011,18 @@ export function createRouter(deps: RouteDeps): express.Router {
             startedAt: Date.now(),
           });
         }
-        turnUsage = await agentRuntime.runTurn({
+        // Conversation mode (ask/plan/craft) recorded for this thread.
+        // Defensive: a partial runtime/store surface degrades to no mode.
+        let conversationMode: 'ask' | 'plan' | 'craft' | undefined;
+        try {
+          conversationMode = trackSessionId ? threadModeStore.getMode(trackSessionId) : undefined;
+        } catch {
+          conversationMode = undefined;
+        }
+        // One turn attempt; resolves true when the attempt produced an
+        // assistant reply (streamed tokens or completion tokens).
+        const executeTurn = async (): Promise<boolean> => {
+          turnUsage = await agentRuntime.runTurn({
           bot,
           message: messageWithFiles,
           sessionId: body.sessionId,
@@ -2002,6 +2042,7 @@ export function createRouter(deps: RouteDeps): express.Router {
           signal: turnController!.signal,
           autoApprove: turnOpts.autoApprove,
           planMode: turnOpts.planMode,
+          conversationMode,
           maxBudgetUsd: turnOpts.maxBudgetUsd,
           sandboxMode: turnOpts.sandboxMode,
           reasoningEffort: turnOpts.reasoningEffort,
@@ -2032,7 +2073,65 @@ export function createRouter(deps: RouteDeps): express.Router {
             }
           })(),
           onEvent,
-        });
+          });
+          return turnAssistantText.trim().length > 0 || (turnUsage?.completionTokens ?? 0) > 0;
+        };
+        // First-reply rescue (OMB §1.1): a brand-new thread whose first
+        // turn produces no reply (empty completion or silent error) gets
+        // exactly one retry with a nudge; a failed rescue surfaces a
+        // visible system message + a needs-you entry instead of a silent
+        // dead thread. The watchdog timeout is deliberately generous so
+        // it never races a still-running turn — in practice the rescue
+        // fires on completed-but-empty and thrown turns.
+        let isFirstTurn = false;
+        try {
+          isFirstTurn =
+            trackSessionId !== undefined &&
+            typeof agentRuntime.sessionStore.listThreadMessages === 'function' &&
+            agentRuntime.sessionStore.listThreadMessages(trackSessionId).length <= 1;
+        } catch {
+          isFirstTurn = false;
+        }
+        if (isFirstTurn && trackSessionId) {
+          const rescue = new FirstReplyRescue({
+            timeoutMs: 600_000,
+            retryTurn: async ({ nudgePrompt }) => {
+              const before = turnAssistantText.length;
+              const usage = await agentRuntime.runTurn({
+                bot,
+                message: nudgePrompt,
+                sessionId: trackSessionId,
+                conversationMode,
+                onEvent,
+              });
+              return turnAssistantText.length > before || (usage?.completionTokens ?? 0) > 0;
+            },
+            appendSystemMessage: (threadId, text) => {
+              try {
+                agentRuntime.sessionStore.appendMessage(threadId, { role: 'system', content: text });
+              } catch {
+                // Surfacing the failure must never break the request.
+              }
+            },
+            addNeedsYou: (entry) => {
+              deps.addNeedsYou?.({ title: entry.title, summary: entry.detail, botId: entry.botId ?? bot.id });
+            },
+          });
+          await rescue.runFirstTurn({
+            threadId: trackSessionId,
+            botId: bot.id,
+            firstTurn: async () => {
+              try {
+                return await executeTurn();
+              } catch (err) {
+                turnError = err instanceof Error ? err.message : String(err);
+                return false;
+              }
+            },
+          });
+        } else {
+          await executeTurn();
+        }
       } catch (err) {
         turnError = err instanceof Error ? err.message : String(err);
         throw err;
@@ -2041,12 +2140,15 @@ export function createRouter(deps: RouteDeps): express.Router {
         if (typeof body.sessionId === 'string' && body.sessionId) {
           deps.turnTracker?.endTurn(body.sessionId);
         }
+        // turnUsage is assigned inside the executeTurn closure above, so
+        // TS narrows it to its null initializer here — re-read via a cast.
+        const finalUsage = turnUsage as TokenUsage | null;
         try {
           recordTurnHealth({
             botId: bot.id,
             sessionId: sessionKey ?? undefined,
             latencyMs: Date.now() - turnStart,
-            totalTokens: turnUsage?.totalTokens ?? 0,
+            totalTokens: finalUsage?.totalTokens ?? 0,
             errored: turnError !== null,
             ...(turnError ? { errorMessage: turnError } : {}),
             emptyResponse:
@@ -2059,14 +2161,14 @@ export function createRouter(deps: RouteDeps): express.Router {
         // GET /api/usage/breakdown shows real spend. Cost in USD cents is
         // auto-estimated from tokens by CostTracker (local price config,
         // no paid APIs). Metering must never break chat.
-        if (turnUsage) {
+        if (finalUsage) {
           try {
             costTracker.record({
               feature: 'chat',
               step: 'turn',
               model: turnOpts.model ?? turnOpts.providerId ?? bot.model ?? 'auto',
-              inputTokens: turnUsage.promptTokens,
-              outputTokens: turnUsage.completionTokens,
+              inputTokens: finalUsage.promptTokens,
+              outputTokens: finalUsage.completionTokens,
               sessionId: sessionKey ?? undefined,
               botId: bot.id,
             });
@@ -2772,7 +2874,7 @@ export function createRouter(deps: RouteDeps): express.Router {
   // The web UI's briefing panel is coded against GET /api/briefing.
   // Feature interconnection: the digest also pulls from notes and recent
   // workflow runs (the live runner satisfies the structural source type).
-  registerBriefingRoutes(router, { dataDir: config.dataDir, governance, runHealth, workflowSource: workflowRunner, signalsSource: deps.briefingSignalsSource, notificationDigest: deps.briefingNotificationDigest });
+  registerBriefingRoutes(router, { dataDir: config.dataDir, governance, runHealth, workflowSource: workflowRunner, signalsSource: deps.briefingSignalsSource, notificationDigest: deps.briefingNotificationDigest, dreamsSource: deps.dreamsSource });
 
   // Learning-from-corrections routing (feature #4): corrections recorded
   // here are learned locally (pattern → rule template) and reloaded by the
@@ -3023,7 +3125,21 @@ export function createRouter(deps: RouteDeps): express.Router {
   // router sits behind loopback auth). The public GET /p/<slug> serving
   // route itself is mounted on the app in index.ts (outside /api = no auth).
   registerPagePublicationRoutes(pagesRouter, { dataDir: config.dataDir });
+  // Pages depth (OMB §1.10): draft preview through the same sanitizer
+  // pipeline as publishing (picker script only in preview mode).
+  registerPagePreviewRoutes(pagesRouter, { dataDir: config.dataDir });
   router.use('/pages', pagesRouter);
+
+  // MCP Apps (OMB §1.4): interactive frames from MCP servers, served with
+  // a strict CSP and a nonce-bound bridge; bridge tool calls re-enter
+  // governance as mcp:<server>:<tool>. Clients resolve through the live
+  // map populated by connectMcp() in index.ts.
+  registerMcpAppRoutes(router, {
+    getClient: (serverId) => deps.mcpClientsByServer?.get(serverId) as never,
+    // GovernanceGateway.evaluate is structurally the bridge surface; the
+    // gateway's result type is wider than the bridge's minimal shape.
+    governance: governance as unknown as import('./mcp-apps-routes.js').McpAppGovernance,
+  });
 
   // ---- MCP tool scopes (settings API for the sibling web panel) --------
   if (mcpServer && mcpScopeStore) {

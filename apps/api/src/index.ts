@@ -104,8 +104,16 @@ import { createMessageReactionsRouter } from './message-reactions-routes.js';
 import { ReactionAnswerService, SignInRequestStore } from './chat-ux.js';
 import { CliAuthManager, type CliAuthId } from '@mvp/agent-runtime';
 import { buildVoiceProviders } from './voice-call.js';
+import {
+  ChatterboxTTSProvider,
+  ElevenLabsTTSProvider,
+  FishTTSProvider,
+  MockTTSProvider,
+  SystemTTSProvider,
+} from '@mvp/voice';
 import { MessageReactionStore } from './message-reactions.js';
 import { createAcpSessionsRouter } from './acp-sessions-routes.js';
+import { installedEnginePath } from './engine-installs.js';
 import { AcpSessionManager, AcpSessionStore } from '@mvp/agent-runtime';
 import { createGroupChatsRouter } from './group-chats-routes.js';
 import { PeopleStore, TeamInboxStore, createRelayToPersonTool } from '@mvp/agent-runtime';
@@ -116,7 +124,7 @@ import {
   resolvePersonContext,
 } from './people.js';
 import { createPeopleRouter } from './people-routes.js';
-import { applyImportedBots, createBotRosterRouter } from './bot-roster-routes.js';
+import { appendRosterImport, applyImportedBots, createBotRosterRouter } from './bot-roster-routes.js';
 import { createBotSetupRouter } from './bot-setup-routes.js';
 import { registerRoutineRoutes } from './bot-routines.js';
 import { createRoutineWebhookRouter } from './webhooks.js';
@@ -340,8 +348,42 @@ async function boot(): Promise<void> {
   // <dataDir>/computer-surfaces.json. Unset → 'auto'.
   applyComputerSurfaces(seed.bots, config.dataDir);
   // MBTI personas: per-bot overlay from <dataDir>/bot-personas.json.
-  const { applyBotPersonas } = await import('./bot-personas.js');
+  const { applyBotPersonas, applyBotAvatars } = await import('./bot-personas.js');
   applyBotPersonas(seed.bots, config.dataDir);
+  // Bot avatars (chat polish): per-bot overlay from <dataDir>/bot-avatars.json.
+  applyBotAvatars(seed.bots, config.dataDir);
+  // Durable seed-bot deletion: ids recorded by the roster DELETE route in
+  // <dataDir>/deleted-bots.json are filtered out of the seed roster at boot
+  // (the seed file itself is read-only). The roster router appends through
+  // recordDeletedBotId below.
+  const deletedBotsFile = path.join(config.dataDir, 'deleted-bots.json');
+  const readDeletedBotIds = (): string[] => {
+    try {
+      const parsed: unknown = JSON.parse(fs.readFileSync(deletedBotsFile, 'utf8'));
+      return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : [];
+    } catch {
+      return [];
+    }
+  };
+  const recordDeletedBotId = (botId: string): void => {
+    try {
+      const ids = readDeletedBotIds();
+      if (!ids.includes(botId)) {
+        ids.push(botId);
+        fs.writeFileSync(deletedBotsFile, JSON.stringify(ids, null, 2), 'utf8');
+      }
+    } catch {
+      // Best-effort durability; the in-memory deletion already happened.
+    }
+  };
+  {
+    const deleted = new Set(readDeletedBotIds());
+    if (deleted.size > 0) {
+      for (let i = seed.bots.length - 1; i >= 0; i--) {
+        if (deleted.has(seed.bots[i].id)) seed.bots.splice(i, 1);
+      }
+    }
+  }
   // Per-bot workspaces (Octop-style isolation): overlay from
   // <dataDir>/bot-workspaces.json. Unset → global workspaceDir.
   const { applyBotWorkspaces } = await import('./bot-workspaces.js');
@@ -582,7 +624,7 @@ async function boot(): Promise<void> {
     approvalObserver: purchaseWiring.onApprovalMinted,
   });
 
-  const { registry: toolRegistry, connections: mcpConnections, userSkillStore, connectMcp, close: closeMcp } =
+  const { registry: toolRegistry, connections: mcpConnections, mcpClientsByServer, userSkillStore, connectMcp, close: closeMcp } =
     await buildToolRegistry({
       workspaceDir: config.workspaceDir,
       dataDir: config.dataDir,
@@ -991,6 +1033,109 @@ async function boot(): Promise<void> {
   // default policy, so every relay needs a human approval first).
   const relayTool = createRelayToPersonTool({ people: peopleStore, relayService: peopleService.relayService });
   toolRegistry.set(relayTool.name, relayTool);
+
+  // ── OMB+Octop parity build (2026-10-29): tool registrations ─────────────
+  // Representative assistant (OMB §1.2): a person's Chief answers teammates'
+  // factual questions under the person's own policy. One service instance
+  // backs both the HTTP routes (mounted below) and the Chief tool.
+  const { RepresentativeService, RepresentativeStore, createAnswerForPersonTool, botOwnerPersonId } =
+    await import('@mvp/agent-runtime');
+  const { PageStore } = await import('./pages.js');
+  const { sharedNotesFromPages, botActivityFromTurnState } = await import('./representative-routes.js');
+  const representativeStore = new RepresentativeStore(config.dataDir);
+  const representativePageStore = new PageStore(config.dataDir);
+  const representativeService = new RepresentativeService({
+    people: peopleStore,
+    store: representativeStore,
+    inbox: teamInboxStore,
+    getBots: () => seed.bots,
+    getBotActivity: (botId) => {
+      const bot = botsById.get(botId);
+      if (!bot) return undefined;
+      const facts = botActivityFromTurnState(agentRuntime.turnStates, seed.bots, botOwnerPersonId(bot));
+      return facts.find((f) => f.botId === botId);
+    },
+    getSharedNotes: (personId) => {
+      const person = peopleStore.getPerson(personId);
+      return person ? sharedNotesFromPages(representativePageStore, person) : [];
+    },
+    audit: (action, fields) => governance.audit(action, fields),
+  });
+  {
+    const answerTool = createAnswerForPersonTool({ people: peopleStore, representative: representativeService });
+    toolRegistry.set(answerTool.name, answerTool);
+  }
+  // Managed knowledge bases (Octop §2.13): one KbStore backs the agent
+  // tools here and the /api/kb routes mounted below.
+  const { KbStore } = await import('./kb.js');
+  const { createKbTools } = await import('./kb-tools.js');
+  const kbStore = new KbStore(config.dataDir);
+  for (const tool of createKbTools(kbStore)) {
+    if (!toolRegistry.has(tool.name)) toolRegistry.set(tool.name, tool);
+  }
+  // Typed extraction (OMB §1.1): extract_values runs on the extraction
+  // purpose profile via a host provider for the first bot's provider id.
+  {
+    const { createProvider, createExtractTools } = await import('@mvp/agent-runtime');
+    const hostProviderId = seed.bots[0]?.provider ?? 'groq';
+    try {
+      for (const tool of createExtractTools({ provider: createProvider(hostProviderId) })) {
+        toolRegistry.set(tool.name, tool);
+      }
+    } catch (err) {
+      console.warn(`[tools] extract_values unavailable: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  // Plugin system (Octop §2.4): third-party plugins (tool/skill/hook/UI/
+  // channel kinds). Installs are deny-by-default: the approve hook mints a
+  // governance approval and only an explicit human approval installs.
+  const { PluginManager } = await import('@mvp/plugins');
+  const { buildPluginTools, registerPluginHooks, registerPluginChannels } = await import('./plugin-routes.js');
+  const pluginManager = new PluginManager({
+    dataDir: config.dataDir,
+    approveInstall: async (manifest, source) => {
+      try {
+        const approvalId = governance.requestApproval(
+          'plugin_install',
+          { plugin: manifest.name, version: manifest.version, kinds: manifest.kinds, source },
+          { botId: 'system', sessionId: 'plugin-install', actor: 'user' },
+        );
+        const decision = await governance.awaitDecision(approvalId, 180_000);
+        return decision === 'approved';
+      } catch {
+        return false;
+      }
+    },
+  });
+  await pluginManager.loadAll();
+  for (const tool of await buildPluginTools(pluginManager)) {
+    if (!toolRegistry.has(tool.name)) toolRegistry.set(tool.name, tool);
+  }
+  registerPluginHooks(pluginManager, hookBus);
+  registerPluginChannels(pluginManager);
+  // Connector + social tools (OMB §1.20 / Octop §2.x mop-up): X, Postiz,
+  // Whop, HighLevel, OpenAlex/TickTick/Obsidian/Dify. All credential-gated
+  // at call time (vault/env), deny-by-default under governance like every
+  // registry tool.
+  {
+    const { registerXTools } = await import('./x-tools.js');
+    const { registerPostizTools } = await import('./postiz-tools.js');
+    const { registerWhopTools } = await import('./whop-tools.js');
+    const { createHighLevelTools } = await import('./highlevel-tools.js');
+    const { createConnectorTools } = await import('./connector-tools.js');
+    registerXTools(toolRegistry);
+    registerPostizTools(toolRegistry);
+    registerWhopTools(toolRegistry);
+    for (const tool of [...createHighLevelTools(), ...createConnectorTools()]) {
+      if (!toolRegistry.has(tool.name)) toolRegistry.set(tool.name, tool);
+    }
+  }
+  // MQTT channel (Octop §2.x): env-configured messaging provider; inert
+  // unless MQTT_BROKER_URL is set (checked inside resolveMqttConfig).
+  {
+    const { registerMqttChannel } = await import('./mqtt-channel.js');
+    registerMqttChannel();
+  }
   const workflowRunner = new WorkflowRunner({
     dbPath: `${config.dataDir}/workflows.db`,
     agentRuntime,
@@ -1091,6 +1236,14 @@ async function boot(): Promise<void> {
   // registry Map means late registration is fine.
   for (const tool of createScheduleTools(routineStore)) {
     toolRegistry.set(tool.name, tool);
+  }
+  // Trigger tools from chat (OMB §1.1): create/list/delete routine triggers
+  // over the same store as the schedule tools.
+  {
+    const { createTriggerTools } = await import('./trigger-tools.js');
+    for (const tool of createTriggerTools(routineStore)) {
+      if (!toolRegistry.has(tool.name)) toolRegistry.set(tool.name, tool);
+    }
   }
   // Public webhook ingress (Codync parity): per-routine URL + secret with
   // HMAC verification and a queued delivery worker. The router is created
@@ -1515,6 +1668,17 @@ async function boot(): Promise<void> {
   // public, /api/auth/bootstrap issues the token itself under Origin gating).
   // CORS allowlist keeps evil origins from reading responses; the bearer
   // token is the actual auth (CORS is never auth).
+  // Subpath serving (Octop §2.x deployment polish): when KRIYADOT_BASE_PATH
+  // is set, the whole app is served under that prefix; the middleware
+  // strips it before auth/routing so everything below sees normal paths.
+  {
+    const { createBasePathMiddleware, basePathFromEnv } = await import('./base-path.js');
+    const basePath = basePathFromEnv();
+    if (basePath) {
+      app.use(createBasePathMiddleware(basePath));
+      console.log(`[api] serving under base path ${basePath}`);
+    }
+  }
   app.use(cors({ origin: corsOriginFn }));
   app.use(requireLoopbackAuth(loopbackToken));
   // Token bootstrap for the browser UI (and other browser clients): returns
@@ -1794,6 +1958,49 @@ async function boot(): Promise<void> {
     audit: (action, fields) => governance.audit(action, fields),
   });
 
+  // Nightly dreaming (OMB §1.1): a cheap-model pass over each bot's recent
+  // memory episodes proposes ideas that surface in the morning briefing.
+  // Host timer: an hourly check fires the dreamer once per day after
+  // 03:00 local. Dreams land in DreamStore; the briefing reads them via
+  // the dreamsSource dep below.
+  const { DreamStore, NightlyDreamer, dreamBriefingItems } = await import('./dreaming.js');
+  const dreamStore = new DreamStore(config.dataDir);
+  {
+    const { createProvider } = await import('@mvp/agent-runtime');
+    const dreamer = new NightlyDreamer({
+      store: dreamStore,
+      episodesForBot: (botId) =>
+        tieredMemoryStore
+          .getAtoms(botId, 50)
+          .map((a) => (a as { fact?: string }).fact ?? '')
+          .filter((s) => s.trim().length > 0),
+      model: async (prompt) => {
+        const bot = seed.bots[0];
+        const provider = createProvider(bot?.provider ?? 'groq');
+        const res = await provider.chat([{ role: 'user', content: prompt }], [], {
+          model: bot?.model ?? 'default',
+        });
+        return res.content ?? '';
+      },
+    });
+    let lastDreamDay = '';
+    const dreamTimer = setInterval(() => {
+      try {
+        const now = new Date();
+        const day = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}`;
+        if (now.getHours() >= 3 && lastDreamDay !== day) {
+          lastDreamDay = day;
+          void dreamer
+            .runForBots(seed.bots.map((b) => b.id))
+            .catch(() => undefined);
+        }
+      } catch {
+        // Dreaming must never break the server.
+      }
+    }, 3_600_000);
+    if (typeof dreamTimer.unref === 'function') dreamTimer.unref();
+  }
+
   app.use(
     '/api',
     createRouter({
@@ -1820,6 +2027,27 @@ async function boot(): Promise<void> {
           executor: createComposioEventExecutor({ dataDir: config.dataDir }),
         }) ?? undefined,
       briefingNotificationDigest: (since, now) => notificationStore.digestItems(since, now),
+      // OMB+Octop parity build: MCP Apps resolve live MCP clients by server
+      // name through this map (populated by connectMcp after listen).
+      mcpClientsByServer,
+      // Nightly dreaming: the briefing's dream section reads the store.
+      dreamsSource: () => dreamBriefingItems(dreamStore),
+      // First-reply rescue: a failed first turn lands in the owner's
+      // needs-you inbox (team inbox, FYI kind, needs-you state).
+      addNeedsYou: (item) => {
+        try {
+          teamInboxStore.addItem({
+            personId: item.personId ?? peopleStore.listPeople()[0]?.id ?? 'default',
+            kind: 'fyi',
+            state: 'needs-you',
+            title: item.title,
+            summary: item.summary,
+            botId: item.botId,
+          });
+        } catch {
+          // The rescue path must never break chat.
+        }
+      },
       companion: { store: companionStore, hub: companionHub },
       // Remote screen viewing (phone -> PC, Codync parity): approval-gated.
       remoteScreen: { store: companionStore, service: remoteScreenService, loopbackToken },
@@ -1863,8 +2091,29 @@ async function boot(): Promise<void> {
         return { signedIn: status.signedIn };
       },
       chatTtsProvider: (bot) => {
+        // Chat spoken replies use the bot's full TTS provider breadth
+        // (OMB §1.1): voice-call providers via the call builder (vault
+        // keys), the newer providers via @mvp/voice (env keys, synced
+        // from providers.local.json at boot).
         try {
-          return buildVoiceProviders('mock', bot.voice?.ttsProvider ?? 'mock', config.dataDir).tts;
+          const id = bot.voice?.ttsProvider ?? 'mock';
+          switch (id) {
+            case 'mock':
+              return new MockTTSProvider();
+            case 'groq':
+            case 'openai':
+              return buildVoiceProviders('mock', id, config.dataDir).tts;
+            case 'elevenlabs':
+              return new ElevenLabsTTSProvider();
+            case 'fish':
+              return new FishTTSProvider();
+            case 'chatterbox':
+              return new ChatterboxTTSProvider();
+            case 'system':
+              return new SystemTTSProvider();
+            default:
+              return undefined;
+          }
         } catch {
           return undefined; // routes fall back to the mock TTS
         }
@@ -1959,6 +2208,8 @@ async function boot(): Promise<void> {
       workspaceDir: config.workspaceDir,
       governance,
       audit: (action, fields) => governance.audit(action, fields),
+      // Standalone engine installs win over PATH copies in detection.
+      standalonePath: (engineId) => installedEnginePath(config.dataDir, engineId),
     }),
   );
   process.on('SIGTERM', () => {
@@ -1995,6 +2246,21 @@ async function boot(): Promise<void> {
       dataDir: config.dataDir,
       getBots: () => seed.bots,
       audit: (action, fields) => governance.audit(action, fields),
+      // Durable deletion for seed bots: record the id so the boot-time
+      // filter above keeps it deleted across restarts.
+      recordDeletedBotId,
+      // Teardown on delete: the bot's private MCP servers/processes and
+      // its chat sessions (best-effort; the deletion itself already landed).
+      onBotDeleted: async (botId) => {
+        await perBotMcpManager.removeAllForBot(botId);
+        try {
+          for (const s of agentRuntime.sessionStore.listSessions({ botId })) {
+            agentRuntime.sessionStore.deleteSession(s.id);
+          }
+        } catch {
+          // Session cleanup must never fail a deletion.
+        }
+      },
     }),
   );
   // "Set me up" (W12a): one-sentence bot setup. /propose runs a setup turn
@@ -2357,6 +2623,413 @@ async function boot(): Promise<void> {
       audit: (action, fields) => governance.audit(action, fields),
     }),
   );
+  // ── OMB+Octop parity build (2026-10-29): HTTP surface ───────────────────
+  // Bridge federation (Octop §2.1): local admin + peer protocol. Inbound
+  // peer routes are loopback-auth exempt (signed Ed25519 envelopes are
+  // their auth); trust actions additionally require the loopback-authed
+  // flag via authorizeLocal.
+  {
+    const { createFederationRouter } = await import('./federation-routes.js');
+    app.use(
+      '/api/federation',
+      createFederationRouter({
+        dataDir: config.dataDir,
+        publicUrl: process.env.KRIYADOT_FEDERATION_URL,
+        getBots: () => seed.bots,
+        runtime: agentRuntime as never,
+        audit: (action, fields) => governance.audit(action, fields),
+        isPaused,
+        authorizeLocal: (req) => (req as { loopbackAuthed?: boolean }).loopbackAuthed === true,
+      }),
+    );
+  }
+  // Representative assistant routes (OMB §1.2): policy/status/audit + ask.
+  {
+    const { createRepresentativeRouter } = await import('./representative-routes.js');
+    app.use(
+      '/api',
+      createRepresentativeRouter({
+        people: peopleStore,
+        store: representativeStore,
+        service: representativeService,
+        audit: (action, fields) => governance.audit(action, fields),
+      }),
+    );
+  }
+  // Proactive care (Octop §2.19): scored memory episodes → capped check-ins
+  // via needs-you inbox + push. Engine tick on a 15-minute host interval.
+  {
+    const { ProactiveCareStore, ProactiveCareEngine } = await import('./proactive-care.js');
+    const { createProactiveCareRouter } = await import('./proactive-care-routes.js');
+    const careStore = new ProactiveCareStore(config.dataDir);
+    const careEngine = new ProactiveCareEngine({
+      store: careStore,
+      listBots: () =>
+        seed.bots.map((b) => ({ id: b.id, name: b.name, ownerPersonId: botOwnerPersonId(b) })),
+      getAtoms: (botId) => tieredMemoryStore.getAtoms(botId, 300),
+      addInboxItem: (item) =>
+        teamInboxStore.addItem({
+          personId: item.personId,
+          kind: 'fyi',
+          state: 'needs-you',
+          title: item.title,
+          summary: item.summary,
+          botId: item.botId,
+          refId: item.refId,
+        }),
+      deliverChat: ({ botId, personId, text }) => {
+        const sessionId = agentRuntime.sessionStore.createSession(botId, { ownerPersonId: personId });
+        agentRuntime.sessionStore.appendMessage(sessionId, { role: 'assistant', content: text });
+      },
+      push: async ({ botId, botName, title, body }) => {
+        await pushService.notify({ kind: 'needsInput', botId, botName, title, body });
+      },
+      isPaused,
+      audit: (action, fields) => governance.audit(action, fields),
+    });
+    app.use(
+      '/api',
+      createProactiveCareRouter({
+        store: careStore,
+        engine: careEngine,
+        getBotOwner: (botId) => {
+          const bot = botsById.get(botId);
+          return bot ? botOwnerPersonId(bot) : undefined;
+        },
+        audit: (action, fields) => governance.audit(action, fields),
+      }),
+    );
+    const careTimer = setInterval(() => {
+      void careEngine.tick().catch(() => undefined);
+    }, 900_000);
+    if (typeof careTimer.unref === 'function') careTimer.unref();
+  }
+  // Invocation decision model (Octop §2.5): routing/skill/tool/team
+  // decision log + judgments.
+  {
+    const { createDecisionRouter } = await import('./decision-routes.js');
+    app.use('/api', createDecisionRouter({ dataDir: config.dataDir, audit: (action, fields) => governance.audit(action, fields) }));
+  }
+  // Plugin system (Octop §2.4): marketplace/admin surface for the manager
+  // constructed with the tool registrations above.
+  {
+    const { createPluginRouter } = await import('./plugin-routes.js');
+    app.use('/api', createPluginRouter({ manager: pluginManager, audit: (action, fields) => governance.audit(action, fields) }));
+  }
+  // Enterprise SSO + login captcha (Octop §2.5): OIDC/LDAP/captcha surface.
+  // Mounted under /api/auth/sso (loopback-exempt: pre-auth by design).
+  {
+    const { createAuthSsoRouter } = await import('./auth-sso-routes.js');
+    app.use('/api/auth/sso', createAuthSsoRouter({ dataDir: config.dataDir, audit: (action, fields) => governance.audit(action, fields) }));
+  }
+  // Tenancy depth: role templates, groups+grants, audiences, quotas.
+  {
+    const { createTenancyDepthRouter } = await import('./tenancy-depth-routes.js');
+    app.use('/api', createTenancyDepthRouter({ dataDir: config.dataDir, audit: (action, fields) => governance.audit(action, fields) }));
+  }
+  // Expert publishing + organization library + enterprise pack.
+  {
+    const { createPublishedBotsRouter } = await import('./published-bots-routes.js');
+    app.use(
+      '/api/published-bots',
+      createPublishedBotsRouter({ dataDir: config.dataDir, getBots: () => seed.bots, audit: (action, fields) => governance.audit(action, fields) }),
+    );
+    const { createOrgLibraryRouter, OrgLibraryStore } = await import('./org-library.js');
+    const { TeamLibraryService } = await import('./team-library-service.js');
+    const { TeamStore } = await import('@mvp/agent-runtime');
+    const orgLibraryStore = new OrgLibraryStore(config.dataDir);
+    app.use(
+      '/api/org-library',
+      createOrgLibraryRouter({
+        dataDir: config.dataDir,
+        getBots: () => seed.bots,
+        // Team-kind installs: persist the manifest as a library entry,
+        // then instantiate it (bots + team) through the team-library
+        // service, whose store reads are org-scoped — hence per-call
+        // construction with the caller's org bound in.
+        importTeamManifest: async (payload, orgId) => {
+          const manifestName =
+            (payload as { team?: { name?: string } } | null)?.team?.name ?? 'Imported team';
+          const entry = orgLibraryStore.create({
+            orgId,
+            kind: 'team',
+            name: manifestName,
+            payload,
+            author: 'api',
+            visibility: 'org',
+            allowedGroupIds: [],
+          });
+          const service = new TeamLibraryService({
+            getEntry: (entryId) => orgLibraryStore.get(orgId, entryId),
+            botExists: (botId) => botsById.has(botId),
+            createBot: (bot) => {
+              seed.bots.push(bot);
+              botsById.set(bot.id, bot);
+              appendRosterImport(bot, config.dataDir);
+            },
+            createTeam: (input) => {
+              const store = new TeamStore(config.dataDir);
+              try {
+                const team = store.createTeam(input.name, input.coordinatorBotId, input.memberBotIds, {
+                  enforceComposition: true,
+                });
+                store.setDelegationPolicy(team.id, input.delegationPolicy, input.delegationPolicyOverrides);
+                return store.getTeam(team.id) ?? team;
+              } finally {
+                store.close();
+              }
+            },
+            audit: (action, fields) => governance.audit(action, fields),
+          });
+          const result = await service.instantiate(entry.id);
+          return { teamId: result.team.id };
+        },
+        audit: (action, fields) => governance.audit(action, fields),
+      }),
+    );
+    const { createBrandRouter } = await import('./brand.js');
+    app.use('/api/brand', createBrandRouter({ dataDir: config.dataDir, audit: (action, fields) => governance.audit(action, fields) }));
+    const { createInstallationsRouter, registerSelfInstallation } = await import('./installations.js');
+    try {
+      registerSelfInstallation(config.dataDir, process.env.KRIYADOT_VERSION ?? '0.1.0');
+    } catch {
+      // Registration bookkeeping must never break boot.
+    }
+    app.use(
+      '/api/installations',
+      createInstallationsRouter({ dataDir: config.dataDir, audit: (action, fields) => governance.audit(action, fields) }),
+    );
+  }
+  // Voice catalog (OMB §1.1): provider voice search for the bot picker.
+  {
+    const { createVoiceCatalogRouter } = await import('./voice-catalog-routes.js');
+    app.use('/api', createVoiceCatalogRouter());
+  }
+  // Managed knowledge bases (Octop §2.13).
+  app.use('/api/kb', await (async () => {
+    const { createKbRouter } = await import('./kb-routes.js');
+    return createKbRouter({ dataDir: config.dataDir, store: kbStore });
+  })());
+  // Pluggable workspace backends (Octop §2.9): admin surface, only when a
+  // backend registry is configured via WORKSPACE_BACKENDS_JSON/_FILE.
+  try {
+    const { loadWorkspaceBackendsFromEnv } = await import('@mvp/agent-runtime/dist/workspace-backends.js');
+    const parsedBackends = await loadWorkspaceBackendsFromEnv();
+    if (parsedBackends) {
+      const { createStorageAdminRouter } = await import('./storage-admin-routes.js');
+      app.use(
+        '/api/storage',
+        createStorageAdminRouter({ backends: parsedBackends.backends, assignments: parsedBackends.assignments }),
+      );
+      console.log(`[storage] workspace backends registered: ${[...parsedBackends.backends.keys()].join(', ')}`);
+    }
+  } catch (err) {
+    console.warn(`[storage] workspace backend registry failed to load: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  // Interactive API docs (Octop §2.x deployment polish): /api/docs + spec.
+  {
+    const { createApiDocsRouter } = await import('./api-docs.js');
+    app.use('/api', createApiDocsRouter());
+  }
+  // Mid-turn steering + context budget (OMB §1.1).
+  {
+    const { createSteerRouter } = await import('./steer-routes.js');
+    app.use(
+      '/api',
+      createSteerRouter({
+        enqueueSteer: (id, text) => agentRuntime.enqueueSteer(id, text),
+        isTurnRunning: (id) => agentRuntime.isTurnRunning(id),
+      }),
+    );
+    const { createContextBudgetRouter } = await import('./context-budget-routes.js');
+    app.use('/api', createContextBudgetRouter({ getContextBudget: (id) => agentRuntime.getContextBudget(id) }));
+  }
+  // Triggers calendar (OMB §1.1 routine depth).
+  {
+    const { createTriggersCalendarRouter } = await import('./triggers-calendar-routes.js');
+    app.use('/api', createTriggersCalendarRouter({ routineStore, runStore: routineRunStore }));
+  }
+  // Chat polish (OMB §1.1/§1.2): pins/reactions/spoilers, bulk ops, thread
+  // folders, departments, text assist, bot avatars.
+  {
+    const { createChatUxRouter } = await import('./chat-ux.js');
+    app.use(
+      '/api',
+      createChatUxRouter({
+        dataDir: config.dataDir,
+        reactionStore: messageReactionStore,
+        listThreadMessages: (id) =>
+          agentRuntime.listThreadMessages(id) as unknown as Array<Record<string, unknown> & { id: unknown }>,
+        audit: (action, fields) => governance.audit(action, fields),
+      }),
+    );
+    const { createBulkRouter } = await import('./bulk-routes.js');
+    app.use(
+      '/api',
+      createBulkRouter({
+        deleteBot: async (id) => {
+          const idx = seed.bots.findIndex((b) => b.id === id);
+          if (idx < 0) return false;
+          const [removed] = seed.bots.splice(idx, 1);
+          botsById.delete(id);
+          if (removed) recordDeletedBotId(id);
+          await perBotMcpManager.removeAllForBot(id);
+          return true;
+        },
+        deleteThread: (id) => agentRuntime.sessionStore.deleteSession(id),
+        audit: (action, fields) => governance.audit(action, fields),
+      }),
+    );
+    const { createThreadFoldersRouter } = await import('./thread-folders.js');
+    app.use('/api', createThreadFoldersRouter({ dataDir: config.dataDir, audit: (action, fields) => governance.audit(action, fields) }));
+    const { createDepartmentsRouter, DepartmentStore } = await import('./departments.js');
+    app.use(
+      '/api',
+      createDepartmentsRouter({
+        dataDir: config.dataDir,
+        store: new DepartmentStore(config.dataDir),
+        audit: (action, fields) => governance.audit(action, fields),
+      }),
+    );
+    const { createTextAssistRouter } = await import('./text-assist-routes.js');
+    const { createProvider, SkillLoader } = await import('@mvp/agent-runtime');
+    const assistLoader = new SkillLoader(path.join(seedDir, 'skills'), {
+      additionalDirs: [path.join(config.dataDir, 'skills')],
+    });
+    app.use(
+      '/api',
+      createTextAssistRouter({
+        complete: async (text) => {
+          const bot = seed.bots[0];
+          const provider = createProvider(bot?.provider ?? 'groq');
+          const res = await provider.chat(
+            [
+              { role: 'system', content: 'Polish the following draft: fix grammar and clarity, keep the meaning and tone. Return only the polished text.' },
+              { role: 'user', content: text },
+            ],
+            [],
+            { model: bot?.model ?? 'default' },
+          );
+          return res.content || text;
+        },
+        skills: async (skillId) => {
+          try {
+            const loaded = await assistLoader.load(skillId);
+            return loaded ? { id: skillId, name: loaded.name, prompt: loaded.content } : undefined;
+          } catch {
+            return undefined;
+          }
+        },
+        audit: (action, fields) => governance.audit(action, fields),
+      }),
+    );
+    const { createBotAvatarRouter } = await import('./bot-personas.js');
+    app.use('/api', createBotAvatarRouter({ dataDir: config.dataDir, bots: seed.bots }));
+  }
+  // Engine depth (OMB §1.3): standalone installs (approval-gated; shipped
+  // manifest pins are fail-closed until a maintainer verifies digests) and
+  // Claude account profiles + custom ACP engines.
+  {
+    const { createEngineInstallsRouter } = await import('./engine-installs.js');
+    app.use(
+      '/api',
+      createEngineInstallsRouter({
+        dataDir: config.dataDir,
+        audit: (action, fields) => governance.audit(action, fields),
+        approve: async (engineId) => {
+          try {
+            const approvalId = governance.requestApproval(
+              'engine_install',
+              { engine: engineId },
+              { botId: 'system', sessionId: 'engine-install', actor: 'user' },
+            );
+            const decision = await governance.awaitDecision(approvalId, 180_000);
+            return decision === 'approved';
+          } catch {
+            return false;
+          }
+        },
+      }),
+    );
+    const { createEngineAccountsRouter } = await import('./engine-accounts-routes.js');
+    app.use(
+      '/api',
+      createEngineAccountsRouter({
+        dataDir: config.dataDir,
+        bots: seed.bots,
+        audit: (action, fields) => governance.audit(action, fields),
+        workspaceDir: config.workspaceDir,
+      }),
+    );
+  }
+  // Skill ecosystem (Octop §2.x): SkillHub installs (same trust gates as
+  // MCP installs), skill bench, key suggestions, per-person browser holds.
+  {
+    const { createSkillHubRouter } = await import('./skillhub.js');
+    const { SkillCopyPolicyStore } = await import('./skill-copy-policy.js');
+    app.use(
+      '/api/skills',
+      createSkillHubRouter({
+        store: userSkillStore,
+        copyPolicies: new SkillCopyPolicyStore(config.dataDir),
+        audit: (action, fields) => governance.audit(action, fields),
+      }),
+    );
+    const { createSkillBenchRouter } = await import('./skill-bench-routes.js');
+    app.use(
+      '/api/skills',
+      createSkillBenchRouter({
+        store: userSkillStore,
+        getBot: (id) => botsById.get(id),
+        runTurn: async (bot, req) => {
+          const sessionId = agentRuntime.sessionStore.createSession(bot.id);
+          await agentRuntime.runTurn({
+            bot,
+            sessionId,
+            message: `${req.skillInstructions}\n\n${req.prompt}`,
+            onEvent: () => undefined,
+          });
+          const messages = agentRuntime.listThreadMessages(sessionId);
+          const last = [...messages].reverse().find((m) => m.role === 'assistant');
+          return { response: typeof last?.content === 'string' ? last.content : '' };
+        },
+        audit: (action, fields) => governance.audit(action, fields),
+      }),
+    );
+    const { createKeySuggestionsRouter } = await import('./key-suggestions.js');
+    app.use('/api/settings/key-suggestions', createKeySuggestionsRouter());
+    const { createBrowserHoldRouter } = await import('./browser-hold-routes.js');
+    app.use('/api/browser', createBrowserHoldRouter({ audit: (action, fields) => governance.audit(action, fields) }));
+  }
+  // Platform extras (OMB §1.20): OS service manager + managed env admin.
+  {
+    const { ServiceManager, createServiceManagerRouter } = await import('./service-manager.js');
+    app.use(
+      '/api/service',
+      createServiceManagerRouter({
+        manager: new ServiceManager({ execPath: process.env.KRIYADOT_EXEC_PATH ?? process.execPath }),
+        audit: (action, fields) => governance.audit(action, fields),
+      }),
+    );
+    const { createEnvAdminRouter } = await import('./env-admin-routes.js');
+    app.use('/api/admin/env', createEnvAdminRouter({ dataDir: config.dataDir, audit: (action, fields) => governance.audit(action, fields) }));
+  }
+  // ACME http-01 challenge serving (Octop §2.x TLS): mounted at the app
+  // root — the CA fetches /.well-known/acme-challenge/<token> unauthenticated
+  // (that path prefix is loopback-auth exempt by design).
+  {
+    const { AcmeChallengeStore, createAcmeChallengeRouter } = await import('./acme.js');
+    app.use(createAcmeChallengeRouter(new AcmeChallengeStore()));
+  }
+  // Scheduled workspace backups with retention (Octop §2.x).
+  try {
+    const { BackupScheduler } = await import('./workspace-backup.js');
+    const backupScheduler = new BackupScheduler({ dataDir: config.dataDir, workspaceDir: config.workspaceDir, appVersion: process.env.KRIYADOT_VERSION ?? '0.1.0' });
+    backupScheduler.startAll();
+  } catch (err) {
+    console.warn(`[backup] scheduler failed to start: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   // Unknown /api paths → JSON 404 (before the SPA fallback claims them).
   app.use('/api', (_req, res) => {
     res.status(404).json({ error: 'Unknown API route' });
@@ -2385,8 +3058,13 @@ async function boot(): Promise<void> {
   });
   mountWebAssets(app, config.webOutDir);
 
-  const server = app.listen(config.port, '127.0.0.1', () => {
-    console.log(`[api] listening on http://127.0.0.1:${config.port}`);
+  // Built-in TLS (Octop §2.x deployment polish): when KRIYADOT_TLS_* env
+  // (or ACME-provisioned certs in the data dir) yields options, serve
+  // HTTPS directly; otherwise plain HTTP as before.
+  const { buildTlsOptionsFromEnv } = await import('./tls-options.js');
+  const tlsOptions = buildTlsOptionsFromEnv();
+  const onListening = () => {
+    console.log(`[api] listening on http${tlsOptions ? 's' : ''}://127.0.0.1:${config.port}`);
     console.log(
       `[api] data dir: ${config.dataDir} | bots: ${seed.bots.length} | ` +
         `workflows: ${seed.workflows.length} | tools: ${toolRegistry.size} | ` +
@@ -2405,7 +3083,10 @@ async function boot(): Promise<void> {
     // routine-hook deliveries. Started after listen like the MCP warmup.
     hookDeliveryWorker.start();
     console.log('[routine-hooks] delivery worker started');
-  });
+  };
+  const server = tlsOptions
+    ? (await import('node:https')).createServer(tlsOptions, app).listen(config.port, '127.0.0.1', onListening)
+    : app.listen(config.port, '127.0.0.1', onListening);
 
   // Remote-phone control: WebSocket endpoint for live sessions at
   // /api/phone/ws (REST routes live under /api/phone via routes.ts).

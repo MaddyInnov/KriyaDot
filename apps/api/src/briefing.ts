@@ -63,6 +63,8 @@ export interface Briefing {
    * payloads and not-connected setups render exactly as before.
    */
   signals?: BriefingItem[];
+  /** Nightly dreaming ideas (item 13). Optional, omitted when none. */
+  dreams?: BriefingItem[];
   /**
    * Batched phone notifications digest (W14b): non-urgent notifications
    * accumulated since the previous briefing. Optional, same rule.
@@ -292,6 +294,8 @@ export interface GenerateBriefingDeps {
    * satisfies this. Unset → no notifications section.
    */
   notificationDigest?: (since: number, now: number) => BriefingItem[];
+  /** Nightly dreaming ideas source (item 13): dreamBriefingItems satisfies this. Unset → no dreams section. */
+  dreamsSource?: () => BriefingItem[];
   /**
    * Summary override (tests). Defaults to the Ollama attempt with a
    * deterministic template fallback.
@@ -604,6 +608,8 @@ export async function generateBriefing(deps: GenerateBriefingDeps): Promise<Brie
     notificationCount: notifications.length,
   };
 
+  let dreams: BriefingItem[] = [];
+  if (deps.dreamsSource) { try { dreams = deps.dreamsSource().slice(0, 10); } catch { dreams = []; } }
   const summarize = deps.summarize ?? summarizeWithOllama;
   let summary: string | undefined;
   try {
@@ -622,6 +628,7 @@ export async function generateBriefing(deps: GenerateBriefingDeps): Promise<Brie
     workflows,
     signals,
     notifications,
+    dreams,
     summary,
     regressions,
   };

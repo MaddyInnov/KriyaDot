@@ -74,6 +74,15 @@ export interface ComposioToolHostOptions {
   resolveUserId?: (ctx: ToolContext) => string;
   /** Injected in tests; the real fetch client in production. */
   client?: ComposioClient;
+  /**
+   * Per-conversation connector override (Octop #110): given a thread
+   * (conversation) id, return the app slugs enabled for THAT thread, or
+   * undefined when the thread has no override. When present, the
+   * effective enablement is bot enablement ∩ thread override — a thread
+   * can narrow, never widen, what a bot may use. The host wires this to
+   * ThreadTitleStore.getConnectorOverride.
+   */
+  getThreadConnectorOverride?: (threadId: string) => string[] | undefined;
   /** Audit sink (host governance.audit). Parameters are logged redacted. */
   audit?: (action: string, fields: { actor?: string; toolName?: string; detail?: unknown; sessionId?: string }) => void;
   /** Max JSON chars of an execution result returned to the model. */
@@ -130,6 +139,26 @@ function finalizeResult(data: unknown, maxChars: number): Record<string, unknown
     totalChars: json.length,
     hint: 'Result truncated — refine the action arguments to narrow the results.',
   };
+}
+
+/**
+ * Octop #110: resolve the thread override for a tool-call context.
+ * Threads are sessions; the runtime carries the conversation id on
+ * ctx.conversationId (falling back to ctx.sessionId).
+ */
+function threadOverrideFor(
+  opts: ComposioToolHostOptions,
+  ctx: ToolContext,
+): string[] | undefined {
+  if (!opts.getThreadConnectorOverride) return undefined;
+  const threadId = ctx.conversationId ?? ctx.sessionId;
+  if (!threadId) return undefined;
+  try {
+    const override = opts.getThreadConnectorOverride(threadId);
+    return override ? override.map((s) => s.toLowerCase()) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function compactParameters(schema: unknown): unknown {
@@ -212,6 +241,13 @@ export function createComposioCallTool(opts: ComposioToolHostOptions): ToolDefin
       if (!enabled) {
         throw new Error(
           `refused: app "${account.toolkitSlug}" is not enabled for this bot — enable it in Accounts → Composio first.`,
+        );
+      }
+      // Per-conversation override (Octop #110): thread ∩ bot enablement.
+      const override = threadOverrideFor(opts, ctx);
+      if (override && !override.includes(account.toolkitSlug.toLowerCase())) {
+        throw new Error(
+          `refused: app "${account.toolkitSlug}" is not enabled for this conversation — the thread's connector selection narrows the bot's apps.`,
         );
       }
 
@@ -298,9 +334,15 @@ export function createComposioListActionsTool(opts: ComposioToolHostOptions): To
           `Could not list Composio accounts: ${err instanceof Error ? err.message : String(err)}`.slice(0, 300),
         );
       }
-      // Only ACTIVE accounts whose app is enabled for this bot.
+      // Only ACTIVE accounts whose app is enabled for this bot — and, when
+      // the thread carries a connector override (Octop #110), in the
+      // override too (intersection: threads narrow, never widen).
+      const override = threadOverrideFor(opts, ctx);
       let usable = accounts.filter(
-        (a) => a.status === 'ACTIVE' && enables[a.toolkitSlug] === true,
+        (a) =>
+          a.status === 'ACTIVE' &&
+          enables[a.toolkitSlug] === true &&
+          (!override || override.includes(a.toolkitSlug.toLowerCase())),
       );
       if (accountId) {
         usable = usable.filter((a) => a.id === accountId);

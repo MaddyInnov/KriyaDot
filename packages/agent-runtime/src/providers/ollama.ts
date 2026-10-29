@@ -25,7 +25,9 @@ interface OllamaTag {
  * Ollama's native /api/tags.
  */
 export class OllamaProvider extends OpenAICompatibleProvider {
-  constructor() {
+  private readonly replyTimeoutMs?: number;
+
+  constructor(opts: { replyTimeoutMs?: number } = {}) {
     super({
       providerId: 'ollama',
       baseUrl: `${ollamaHost()}/v1`,
@@ -33,15 +35,23 @@ export class OllamaProvider extends OpenAICompatibleProvider {
       // string. Never a real secret.
       apiKey: 'ollama-no-key-needed',
     });
+    this.replyTimeoutMs = opts.replyTimeoutMs;
   }
 
   override async chat(
     messages: ChatMessage[],
     tools: ToolDefinition[],
-    opts: { model: string; onToken?: (t: string) => void; signal?: AbortSignal },
+    opts: { model: string; onToken?: (t: string) => void; signal?: AbortSignal; timeoutMs?: number; replyTimeoutMs?: number },
   ): Promise<{ content: string; toolCalls: ToolCall[]; usage: TokenUsage }> {
+    // Local reply timeout (ENGINES pack): the provider-level default
+    // applies when the call carries neither an explicit timeout nor a
+    // per-bot replyTimeoutMs.
+    const effectiveOpts =
+      opts.timeoutMs === undefined && opts.replyTimeoutMs === undefined && this.replyTimeoutMs !== undefined
+        ? { ...opts, replyTimeoutMs: this.replyTimeoutMs }
+        : opts;
     try {
-      return await super.chat(messages, tools, opts);
+      return await super.chat(messages, tools, effectiveOpts);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const host = ollamaHost();

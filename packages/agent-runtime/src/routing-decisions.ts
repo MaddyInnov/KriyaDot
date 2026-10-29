@@ -19,9 +19,10 @@
  *    bumps the version so the log shows which decisions used which weights.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
+import type { ActivationDecision, DiscoveryHit } from './discovery.js';
 import {
   DEFAULT_ROUTER_WEIGHTS,
   routeMessageWithWeights,
@@ -113,10 +114,18 @@ export interface RoutingDecisionEntry {
 
 export class RouterDecisionLog {
   private readonly path: string;
+  /** Directory the log lives in (invocation log derives its path from it). */
+  readonly dataDir: string;
 
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
+    this.dataDir = dataDir;
     this.path = join(dataDir, DECISIONS_FILE);
+  }
+
+  /** The invocation-decision log sharing this log's directory. */
+  invocationLog(): InvocationDecisionLog {
+    return new InvocationDecisionLog(this.dataDir);
   }
 
   record(entry: RoutingDecisionEntry): void {
@@ -183,6 +192,22 @@ export function routeMessageLogged(
     reason: route.reason,
     weightsVersion: w.version,
   });
+  // Invocation decision model: every routing decision is ALSO an
+  // invocation decision (kind 'routing') in the unified log — this is the
+  // real producer wiring for routing, since hosts already route through
+  // this function. Best-effort: the unified log must never break routing.
+  try {
+    log.invocationLog().record({
+      kind: 'routing',
+      subject: route.botId,
+      outcome: 'routed',
+      confidence: route.confidence,
+      rationale: route.reason,
+      metadata: { textHash: hashRoutingText(text), weightsVersion: w.version, scores },
+    });
+  } catch {
+    // best-effort
+  }
   return route;
 }
 
@@ -319,5 +344,317 @@ export function computeRoutingStats(dataDir: string): RoutingStats {
     perBot,
     weightsVersion: weights.version,
     corrections: corrections.length,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Invocation decision model (Octop §2.5 parity, original implementation)
+// ---------------------------------------------------------------------------
+//
+// Routing is only one kind of invocation decision the system makes. This
+// section generalizes the scored log above to every invocation decision:
+//
+//   kind               producer (real wiring)
+//   -----------------  -----------------------------------------------------
+//   routing            routeMessageLogged() above (same call, both logs)
+//   skill-activation   discovery.ts decideAutoActivation() — it notifies a
+//                      registered sink on EVERY decision (see discovery.ts
+//                      registerDiscoveryDecisionSink); hosts register
+//                      createInvocationSink(log) once at startup.
+//   tool-invocation    the governance gateway — GatewayOptions.onDecision
+//                      (packages/governance, a small optional callback) is
+//                      invoked for every evaluate() outcome; hosts pass
+//                      createGovernanceDecisionSink(log).
+//   delegation         tools/delegate.ts — its optional recordDecision
+//                      callback fires for subagent + ACP outcomes.
+//
+// Every record carries a confidence (0–1, producer-defined and documented
+// per producer) and a human-readable rationale. Agreement stats are, like
+// the routing stats above, computed ONLY over records a user judged
+// (markJudged) and labelled agreement — never model accuracy. Raw user
+// text is never stored: delegation records carry a hash of the task.
+
+export type InvocationKind = 'routing' | 'skill-activation' | 'tool-invocation' | 'delegation';
+
+export const INVOCATION_KINDS: readonly InvocationKind[] = [
+  'routing', 'skill-activation', 'tool-invocation', 'delegation',
+] as const;
+
+export function isInvocationKind(v: unknown): v is InvocationKind {
+  return typeof v === 'string' && (INVOCATION_KINDS as readonly string[]).includes(v);
+}
+
+export interface InvocationDecisionEntry {
+  id: string;
+  ts: number;
+  kind: InvocationKind;
+  /** What was invoked / chosen: bot id, skill id, tool name, delegate target. */
+  subject: string;
+  /** Producer vocabulary: routed|activated|abstained|allow|deny|ask|success|failed|… */
+  outcome: string;
+  confidence: number;
+  rationale: string;
+  botId?: string;
+  actor?: string;
+  /** User judgment: true = the decision was right, false = wrong, absent = unjudged. */
+  judgedCorrect?: boolean;
+  metadata?: Record<string, unknown>;
+}
+
+export type NewInvocationDecision = Omit<InvocationDecisionEntry, 'id' | 'ts'> & { ts?: number };
+
+const INVOCATION_FILE = 'invocation-decisions.jsonl';
+const MAX_INVOCATION_LINES = 5000;
+
+function clampConfidence(n: unknown): number {
+  return typeof n === 'number' && Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 0;
+}
+
+export class InvocationDecisionLog {
+  private readonly path: string;
+  readonly dataDir: string;
+
+  constructor(dataDir: string) {
+    mkdirSync(dataDir, { recursive: true });
+    this.dataDir = dataDir;
+    this.path = join(dataDir, INVOCATION_FILE);
+  }
+
+  record(input: NewInvocationDecision): InvocationDecisionEntry {
+    const entry: InvocationDecisionEntry = {
+      ...input,
+      confidence: clampConfidence(input.confidence),
+      rationale: String(input.rationale ?? '').slice(0, 1000),
+      subject: String(input.subject ?? '').slice(0, 200),
+      outcome: String(input.outcome ?? '').slice(0, 64),
+      id: `inv_${Date.now().toString(36)}_${randomUUID().replace(/-/g, '').slice(0, 8)}`,
+      ts: input.ts ?? Date.now(),
+    };
+    appendFileSync(this.path, `${JSON.stringify(entry)}\n`, 'utf8');
+    try {
+      const lines = readFileSync(this.path, 'utf8').split('\n').filter(Boolean);
+      if (lines.length > MAX_INVOCATION_LINES) {
+        writeFileSync(this.path, `${lines.slice(-MAX_INVOCATION_LINES).join('\n')}\n`, 'utf8');
+      }
+    } catch {
+      // bounding is best-effort
+    }
+    return entry;
+  }
+
+  list(limit = 100, kind?: InvocationKind): InvocationDecisionEntry[] {
+    return this.all()
+      .filter((e) => !kind || e.kind === kind)
+      .slice(-Math.min(Math.max(limit, 1), MAX_INVOCATION_LINES))
+      .reverse();
+  }
+
+  all(): InvocationDecisionEntry[] {
+    try {
+      return readFileSync(this.path, 'utf8')
+        .split('\n')
+        .filter(Boolean)
+        .map((l) => JSON.parse(l) as InvocationDecisionEntry)
+        .filter((e) => e && isInvocationKind(e.kind));
+    } catch {
+      return [];
+    }
+  }
+
+  /** Record a user judgment on one decision (agreement stats input). */
+  markJudged(id: string, correct: boolean): InvocationDecisionEntry | undefined {
+    const entries = this.all();
+    const idx = entries.findIndex((e) => e.id === id);
+    if (idx < 0) return undefined;
+    entries[idx] = { ...entries[idx]!, judgedCorrect: correct };
+    writeFileSync(this.path, `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`, 'utf8');
+    return entries[idx];
+  }
+}
+
+// ---- Producer adapters ------------------------------------------------------
+
+/**
+ * Sink for semantic-discovery activation decisions. Register once:
+ *   registerDiscoveryDecisionSink(createInvocationSink(log))
+ * (discovery.ts notifies the sink from decideAutoActivation — the exact
+ * function runtime.ts calls — so skill activations are recorded without
+ * touching the runtime.)
+ * Confidence = top hit score when activating; when abstaining, the
+ * confidence is in the ABSTENTION: 1 − top score (bounded).
+ */
+export function createInvocationSink(
+  log: InvocationDecisionLog,
+): (decision: ActivationDecision, hits: DiscoveryHit[]) => void {
+  return (decision, hits) => {
+    try {
+      const top = hits[0]?.score ?? 0;
+      if (decision.abstained || decision.activate.length === 0) {
+        log.record({
+          kind: 'skill-activation',
+          subject: hits[0]?.item.id ?? '(none)',
+          outcome: 'abstained',
+          confidence: Math.min(1, Math.max(0, 1 - top)),
+          rationale: decision.reason,
+          metadata: { candidates: hits.slice(0, 8).map((h) => ({ id: h.item.id, score: h.score })) },
+        });
+        return;
+      }
+      for (const hit of decision.activate) {
+        log.record({
+          kind: 'skill-activation',
+          subject: hit.item.id,
+          outcome: 'activated',
+          confidence: hit.score,
+          rationale: decision.reason,
+          metadata: { kind: hit.item.kind, score: hit.score },
+        });
+      }
+    } catch {
+      // Recording must never break discovery.
+    }
+  };
+}
+
+/** Structural shape of the governance gateway's onDecision event. */
+export interface GovernanceDecisionEvent {
+  toolName: string;
+  effect: 'allow' | 'deny' | 'require-approval';
+  botId: string;
+  actor: string;
+  sessionId: string;
+  reason?: string;
+  ruleId?: string;
+  approvalId?: string;
+}
+
+/**
+ * Sink for governance tool-invocation decisions. Pass to the gateway:
+ *   new GovernanceGateway({ ..., onDecision: createGovernanceDecisionSink(log) })
+ * Outcome vocabulary: allow | deny | ask (require-approval).
+ * Confidence: 1 when an explicit policy rule / hard floor decided,
+ * 0.6 when the policy default decided (documented heuristic, not a model).
+ */
+export function createGovernanceDecisionSink(
+  log: InvocationDecisionLog,
+): (event: GovernanceDecisionEvent) => void {
+  return (event) => {
+    try {
+      log.record({
+        kind: 'tool-invocation',
+        subject: event.toolName,
+        outcome: event.effect === 'require-approval' ? 'ask' : event.effect,
+        confidence: event.ruleId || event.reason?.startsWith('hard floor') || event.reason?.includes('floor') ? 1 : 0.6,
+        rationale: event.reason ?? `governance ${event.effect} for ${event.toolName}`,
+        botId: event.botId,
+        actor: event.actor,
+        metadata: {
+          sessionId: event.sessionId,
+          ...(event.ruleId ? { ruleId: event.ruleId } : {}),
+          ...(event.approvalId ? { approvalId: event.approvalId } : {}),
+        },
+      });
+    } catch {
+      // Recording must never break governance.
+    }
+  };
+}
+
+/** Recording callback shape consumed by tools/delegate.ts. */
+export interface DelegationDecisionEvent {
+  delegatingBotId: string;
+  targetBotId: string;
+  via: 'subagent' | 'acp';
+  outcome: 'success' | 'failed';
+  task: string;
+  error?: string;
+}
+
+/**
+ * Sink for delegation decisions, wired via createDelegateTools'
+ * recordDecision option. The task text itself is NEVER stored — only its
+ * SHA-256 (same honesty rule as routing text).
+ * Confidence: 1 on success, 0 on failure (the outcome IS the evidence).
+ */
+export function createDelegationDecisionSink(
+  log: InvocationDecisionLog,
+): (event: DelegationDecisionEvent) => void {
+  return (event) => {
+    try {
+      log.record({
+        kind: 'delegation',
+        subject: event.targetBotId,
+        outcome: event.outcome,
+        confidence: event.outcome === 'success' ? 1 : 0,
+        rationale:
+          event.outcome === 'success'
+            ? `Delegation from ${event.delegatingBotId} to ${event.targetBotId} via ${event.via} completed`
+            : `Delegation from ${event.delegatingBotId} to ${event.targetBotId} via ${event.via} failed: ${event.error ?? 'unknown error'}`.slice(0, 1000),
+        botId: event.delegatingBotId,
+        metadata: { via: event.via, taskHash: hashRoutingText(event.task) },
+      });
+    } catch {
+      // Recording must never break delegation.
+    }
+  };
+}
+
+// ---- Stats ------------------------------------------------------------------
+
+export interface InvocationKindStats {
+  total: number;
+  judged: number;
+  correct: number;
+  /** correct / judged over USER-JUDGED records only, or null when unjudged. */
+  agreementRate: number | null;
+  avgConfidence: number;
+  outcomes: Record<string, number>;
+}
+
+export interface InvocationStats {
+  total: number;
+  judged: number;
+  correct: number;
+  agreementRate: number | null;
+  perKind: Record<InvocationKind, InvocationKindStats>;
+}
+
+/** Aggregate invocation stats, optionally from an explicit entry list. */
+export function computeInvocationStats(
+  dataDirOrEntries: string | InvocationDecisionEntry[],
+): InvocationStats {
+  const entries = Array.isArray(dataDirOrEntries)
+    ? dataDirOrEntries
+    : new InvocationDecisionLog(dataDirOrEntries).all();
+  const empty = (): InvocationKindStats => ({
+    total: 0, judged: 0, correct: 0, agreementRate: null, avgConfidence: 0, outcomes: {},
+  });
+  const perKind = Object.fromEntries(INVOCATION_KINDS.map((k) => [k, empty()])) as Record<InvocationKind, InvocationKindStats>;
+  const confSums = Object.fromEntries(INVOCATION_KINDS.map((k) => [k, 0])) as Record<InvocationKind, number>;
+  let judged = 0;
+  let correct = 0;
+  for (const e of entries) {
+    const s = perKind[e.kind];
+    if (!s) continue;
+    s.total += 1;
+    confSums[e.kind] += e.confidence;
+    s.outcomes[e.outcome] = (s.outcomes[e.outcome] ?? 0) + 1;
+    if (typeof e.judgedCorrect === 'boolean') {
+      s.judged += 1;
+      judged += 1;
+      if (e.judgedCorrect) { s.correct += 1; correct += 1; }
+    }
+  }
+  for (const k of INVOCATION_KINDS) {
+    const s = perKind[k];
+    s.avgConfidence = s.total > 0 ? Math.round((confSums[k] / s.total) * 1000) / 1000 : 0;
+    s.agreementRate = s.judged > 0 ? Math.round((s.correct / s.judged) * 1000) / 1000 : null;
+  }
+  return {
+    total: entries.length,
+    judged,
+    correct,
+    agreementRate: judged > 0 ? Math.round((correct / judged) * 1000) / 1000 : null,
+    perKind,
   };
 }

@@ -41,6 +41,12 @@ export interface BuiltRegistry {
   registry: Map<string, ToolDefinition>;
   connections: McpConnection[];
   /**
+   * Live MCP clients by server name (the mcp.json config key), populated by
+   * connectMcp(). Consumed by the MCP Apps routes (resources/read, bridge
+   * tools/call) — clients appear here only after a successful connect.
+   */
+  mcpClientsByServer: Map<string, MCPClient>;
+  /**
    * User skill lifecycle store (OpenMausBot parity P1 #20): authoring,
    * learning proposals, review, and the disabled-by-default gate. Shared
    * with the API skill routes and the runtime usability gate.
@@ -141,6 +147,7 @@ export async function buildToolRegistry(opts: {
 
   const connections: McpConnection[] = [];
   const clients: MCPClient[] = [];
+  const mcpClientsByServer = new Map<string, MCPClient>();
 
   async function connectMcp(): Promise<void> {
   for (const [serverName, serverConfig] of Object.entries(opts.mcpServers)) {
@@ -192,6 +199,7 @@ export async function buildToolRegistry(opts: {
         throw new Error('MCP server config needs either "url" or "command"');
       }
       clients.push(client);
+      mcpClientsByServer.set(serverName, client);
       const registered: string[] = [];
       for (const tool of await client.listTools()) {
         if (registry.has(tool.name)) {
@@ -222,6 +230,7 @@ export async function buildToolRegistry(opts: {
   return {
     registry,
     connections,
+    mcpClientsByServer,
     userSkillStore,
     connectMcp,
     close: async () => {

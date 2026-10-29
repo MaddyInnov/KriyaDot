@@ -219,36 +219,134 @@ function runCommandTool(workspaceDir: WorkspaceSource): ToolDefinition {
   };
 }
 
-function webSearchTool(): ToolDefinition {
+// ---------------------------------------------------------------------------
+// web_search provider chain (§2.11 #123)
+//
+// Probe order: the keyed provider selected via SEARCH_PROVIDER
+// (brave|tavily, key from BRAVE_API_KEY / TAVILY_API_KEY) runs FIRST when
+// configured; the keyless DuckDuckGo instant-answer implementation is
+// always the final fallback. Any provider failure (HTTP error, bad JSON,
+// network) falls through to the next provider; only when every provider
+// fails does the tool throw (with the last provider's error). The tool's
+// external result shape is identical for every provider:
+//   { abstract, source, topics: [{ text, url }] }
+// ---------------------------------------------------------------------------
+
+export type WebSearchProviderId = 'brave' | 'tavily' | 'duckduckgo';
+
+export interface WebSearchResult {
+  abstract: string;
+  source: string;
+  topics: Array<{ text?: string; url?: string }>;
+}
+
+export interface WebSearchOptions {
+  /** Injectable fetch (tests stub it — zero real network). */
+  fetchFn?: typeof fetch;
+  /** Env source (defaults to process.env). */
+  env?: Record<string, string | undefined>;
+}
+
+/** Ordered provider chain for the given env. Keyless DDG is always last. */
+export function resolveSearchProviders(env: Record<string, string | undefined>): WebSearchProviderId[] {
+  const selected = (env.SEARCH_PROVIDER ?? '').trim().toLowerCase();
+  const chain: WebSearchProviderId[] = [];
+  if (selected === 'brave' && env.BRAVE_API_KEY) chain.push('brave');
+  if (selected === 'tavily' && env.TAVILY_API_KEY) chain.push('tavily');
+  chain.push('duckduckgo');
+  return chain;
+}
+
+async function searchDuckDuckGo(query: string, fetchFn: typeof fetch): Promise<WebSearchResult> {
+  const url =
+    `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}` +
+    `&format=json&no_html=1&skip_disambig=1`;
+  const res = await fetchFn(url, { signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) throw new Error(`DuckDuckGo search failed: HTTP ${res.status}`);
+  const data = (await res.json()) as {
+    AbstractText?: string;
+    AbstractURL?: string;
+    RelatedTopics?: Array<{ Text?: string; FirstURL?: string }>;
+  };
+  return {
+    abstract: data.AbstractText ?? '',
+    source: data.AbstractURL ?? '',
+    topics: (data.RelatedTopics ?? [])
+      .filter((t) => t.Text)
+      .slice(0, 5)
+      .map((t) => ({ text: t.Text, url: t.FirstURL })),
+  };
+}
+
+async function searchBrave(query: string, apiKey: string, fetchFn: typeof fetch): Promise<WebSearchResult> {
+  const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5`;
+  const res = await fetchFn(url, {
+    headers: { accept: 'application/json', 'x-subscription-token': apiKey },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) throw new Error(`Brave search failed: HTTP ${res.status}`);
+  const data = (await res.json()) as {
+    web?: { results?: Array<{ title?: string; url?: string; description?: string }> };
+  };
+  const results = data.web?.results ?? [];
+  return {
+    abstract: results[0]?.description ?? '',
+    source: results[0]?.url ?? '',
+    topics: results.slice(0, 5).map((r) => ({ text: r.description ?? r.title, url: r.url })),
+  };
+}
+
+async function searchTavily(query: string, apiKey: string, fetchFn: typeof fetch): Promise<WebSearchResult> {
+  const res = await fetchFn('https://api.tavily.com/search', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ api_key: apiKey, query, max_results: 5 }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) throw new Error(`Tavily search failed: HTTP ${res.status}`);
+  const data = (await res.json()) as {
+    answer?: string;
+    results?: Array<{ title?: string; url?: string; content?: string }>;
+  };
+  const results = data.results ?? [];
+  return {
+    abstract: data.answer ?? results[0]?.content ?? '',
+    source: results[0]?.url ?? '',
+    topics: results.slice(0, 5).map((r) => ({ text: r.content ?? r.title, url: r.url })),
+  };
+}
+
+/** Run the provider chain for one query. First success wins. */
+export async function searchWeb(query: string, opts: WebSearchOptions = {}): Promise<WebSearchResult> {
+  const fetchFn = opts.fetchFn ?? fetch;
+  const env = opts.env ?? process.env;
+  const chain = resolveSearchProviders(env);
+  let lastError: unknown;
+  for (const provider of chain) {
+    try {
+      if (provider === 'brave') return await searchBrave(query, env.BRAVE_API_KEY!, fetchFn);
+      if (provider === 'tavily') return await searchTavily(query, env.TAVILY_API_KEY!, fetchFn);
+      return await searchDuckDuckGo(query, fetchFn);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('Web search failed');
+}
+
+function webSearchTool(opts: WebSearchOptions = {}): ToolDefinition {
   return {
     name: 'web_search',
-    description: 'Search the web via the DuckDuckGo instant-answer API. Returns the abstract plus top related topics.',
+    description:
+      'Search the web. Uses the configured search provider (SEARCH_PROVIDER=brave|tavily with its API key) when set, ' +
+      'falling back to the keyless DuckDuckGo instant-answer API. Returns the abstract plus top related topics.',
     parameters: {
       type: 'object',
       properties: { query: { type: 'string', description: 'Search query' } },
       required: ['query'],
       additionalProperties: false,
     },
-    handler: async (args, _ctx: ToolContext) => {
-      const url =
-        `https://api.duckduckgo.com/?q=${encodeURIComponent(String(args.query))}` +
-        `&format=json&no_html=1&skip_disambig=1`;
-      const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
-      if (!res.ok) throw new Error(`DuckDuckGo search failed: HTTP ${res.status}`);
-      const data = (await res.json()) as {
-        AbstractText?: string;
-        AbstractURL?: string;
-        RelatedTopics?: Array<{ Text?: string; FirstURL?: string }>;
-      };
-      return {
-        abstract: data.AbstractText ?? '',
-        source: data.AbstractURL ?? '',
-        topics: (data.RelatedTopics ?? [])
-          .filter((t) => t.Text)
-          .slice(0, 5)
-          .map((t) => ({ text: t.Text, url: t.FirstURL })),
-      };
-    },
+    handler: async (args, _ctx: ToolContext) => searchWeb(String(args.query), opts),
   };
 }
 
@@ -432,13 +530,15 @@ function webFetchTool(): ToolDefinition {
 }
 
 /** Built-in tools available to every bot: file I/O, shell, web, and interactive questions. */
-export function createBuiltInTools(opts: { workspaceDir: WorkspaceSource }): ToolDefinition[] {
+export function createBuiltInTools(
+  opts: { workspaceDir: WorkspaceSource } & WebSearchOptions,
+): ToolDefinition[] {
   const { workspaceDir } = opts;
   return [
     readFileTool(workspaceDir),
     writeFileTool(workspaceDir),
     runCommandTool(workspaceDir),
-    webSearchTool(),
+    webSearchTool(opts),
     webFetchTool(),
     askUserQuestionTool(),
   ];

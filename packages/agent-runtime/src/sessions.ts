@@ -905,6 +905,16 @@ export class SessionStore {
     return (this.db.prepare('SELECT COUNT(*) AS c FROM messages_fts').get() as { c: number }).c;
   }
 
+  /** Context-budget state for a session (item 5): estimated tokens vs budget. */
+  getContextBudget(sessionId: string, budgetOverride?: number): { sessionId: string; estimatedTokens: number; budget: number; ratio: number; level: 'ok' | 'warn' | 'critical'; messageCount: number } {
+    const rows = this.allRows(sessionId);
+    const estimatedTokens = rows.reduce((s, r) => s + estimateRowTokens(r), 0);
+    const budget = budgetOverride ?? this.contextBudgetTokens;
+    const ratio = budget > 0 ? estimatedTokens / budget : 0;
+    const level = ratio >= 1 ? 'critical' : ratio >= 0.8 ? 'warn' : 'ok';
+    return { sessionId, estimatedTokens, budget, ratio: Math.round(ratio * 1000) / 1000, level, messageCount: rows.length };
+  }
+
   close(): void {
     this.db.close();
   }

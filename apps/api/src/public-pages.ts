@@ -32,6 +32,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { Express, Request, Response, Router } from 'express';
 import { openDb as openSqliteDb } from '@mvp/agent-runtime';
 import { PageStore } from './pages.js';
+import { compileJsxToHtml } from './jsx-compile.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -526,7 +527,7 @@ export function registerPublicPageServing(app: Express, deps: PublicPagesDeps): 
       }
       title = page.title;
       content = page.content;
-      contentKind = 'markdown';
+      contentKind = page.format === 'html' ? 'html' : 'markdown';
     } else {
       content = pub.content ?? '';
       contentKind = pub.contentKind;
@@ -589,13 +590,29 @@ export function registerPagePublicationRoutes(router: Router, deps: PublicPagesD
 
   // Standalone artifact publishing (single-segment paths so they can never
   // be swallowed by the /:id routes registered before these).
+  // format: 'jsx' compiles the constrained JSX subset to HTML and runs it
+  // through the sanitizer before it is stored (single sanitizer path).
   router.post('/publish-artifact', (req: Request, res: Response) => {
     try {
-      const body = (req.body ?? {}) as { title?: unknown; content?: unknown; contentKind?: unknown };
+      const body = (req.body ?? {}) as {
+        title?: unknown;
+        content?: unknown;
+        contentKind?: unknown;
+        format?: unknown;
+      };
+      let content = body.content as string;
+      let contentKind = (body.contentKind === 'html' ? 'html' : 'markdown') as PublicationContentKind;
+      if (body.format === 'jsx') {
+        content = sanitizeHtmlArtifact(compileJsxToHtml(content));
+        contentKind = 'html';
+      } else if (body.format !== undefined && body.format !== 'markdown' && body.format !== 'html') {
+        res.status(400).json({ error: '"format" must be one of "markdown" | "html" | "jsx"' });
+        return;
+      }
       const pub = publications.publishArtifact({
         title: body.title as string,
-        content: body.content as string,
-        contentKind: (body.contentKind === 'html' ? 'html' : 'markdown') as PublicationContentKind,
+        content,
+        contentKind,
       });
       res.status(201).json({ ...publicationStatus(pub), title: pub.title });
     } catch (err) {

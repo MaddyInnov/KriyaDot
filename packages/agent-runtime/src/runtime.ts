@@ -40,7 +40,12 @@ import { resolvePersona } from './personas.js';
 import type { ApprovalMode } from './approval-modes.js';
 import type { PeerApprovalGate } from './peer-approval.js';
 import type { WidgetCoordinator } from './widgets.js';
-import { extractWidgetAttachment } from './widgets.js';
+import { extractWidgetAttachment, pageWidgetFromPublishResult } from './widgets.js';
+import {
+  defaultMcpAppNonceStore,
+  extractMcpAppLink,
+  mcpServerIdFromToolName,
+} from './mcp-apps.js';
 import type { ProvenanceNote } from './provenance.js';
 import type { CredentialProposer } from './credential-proposals.js';
 import {
@@ -97,6 +102,13 @@ import {
   type DiscoverableItem,
 } from './discovery.js';
 import { TrigramEmbedder, type SyncEmbedder } from './hybrid-search.js';
+import { SteerQueue } from './steer.js';
+import { filterToolsForMode, type ConversationMode } from './conversation-modes.js';
+import { fitToolsToLimit } from './tool-fitting.js';
+import { ToolSpillStore, createSpillTools } from './tool-spill.js';
+import { providerHealth } from './failover.js';
+import { subagentProfiles } from './subagent-profiles.js';
+import { join, dirname } from 'node:path';
 
 export interface AgentRuntimeOptions {
   dbPath: string;
@@ -450,6 +462,12 @@ export interface RunTurnOptions {
    * anyway (with an audit trail). Default 2.
    */
   maxGateRejections?: number;
+  /** Conversation mode per thread (item 6): ask= no tools, plan= read-only, craft= normal. Distinct from approval modes; filters compose by intersection. */
+  conversationMode?: ConversationMode;
+  /** Chief host restriction (item 15): only scheduling/delegation tools survive. */
+  chiefHostRestricted?: boolean;
+  /** Tool-result spill threshold override (bytes). */
+  spillThresholdBytes?: number;
 }
 
 export interface PreviewToolInfo {
@@ -625,6 +643,14 @@ export class AgentRuntime {
    * API layer serves this at GET /api/chat/now ("Now" cards).
    */
   readonly turnStates = new TurnStateRegistry();
+  /** Mid-turn steering queue (item 1). */
+  readonly steerQueue = new SteerQueue();
+  private readonly spillStores = new Map<string, ToolSpillStore>();
+  enqueueSteer(sessionId: string, text: string): { id: string; running: boolean; pending: number } { const m = this.steerQueue.enqueue(sessionId, text); return { id: m.id, running: Boolean(this.turnStates.snapshot(sessionId)), pending: this.steerQueue.pending(sessionId) }; }
+  isTurnRunning(sessionId: string): boolean { return Boolean(this.turnStates.snapshot(sessionId)); }
+  getContextBudget(sessionId: string): ReturnType<SessionStore['getContextBudget']> { return this.store.getContextBudget(sessionId); }
+  spillStoreFor(bot: BotConfig, threshold?: number): ToolSpillStore { const ws = this.workspaceDirForBot?.(bot); const dir = ws ? join(ws, 'spill') : join(dirname(this.dbPath === ':memory:' ? join(process.cwd(), 'agent.db') : this.dbPath), 'spill', bot.id); const key = dir + ':' + (threshold ?? ''); let st = this.spillStores.get(key); if (!st) { st = new ToolSpillStore(dir, threshold); this.spillStores.set(key, st); } return st; }
+  createSpillTools(bot: BotConfig): ToolDefinition[] { return createSpillTools(this.spillStoreFor(bot)); }
   /**
    * Parallel threads (W8g): per-bot cap of 16 concurrent turns. Turns
    * for different threads/bots never serialize on each other — a turn
@@ -805,7 +831,9 @@ export class AgentRuntime {
     specialistBotId?: string;
     ephemeral?: { name: string; systemPrompt: string; model?: string; providerId?: string };
     tools?: string[];
+    profileId?: string;
   }): { runId: string; botName: string } | { error: string } {
+    if (input.profileId && !input.specialistBotId && !input.ephemeral) { const prof = subagentProfiles.ephemeralFor(input.profileId); if (!prof) return { error: `Unknown subagent profile "${input.profileId}"` }; input = { ...input, ephemeral: { name: prof.name, systemPrompt: prof.systemPrompt }, tools: input.tools ?? prof.tools }; }
     let execBot: BotConfig;
     let ephemeral = false;
     if (input.specialistBotId) {
@@ -1263,7 +1291,13 @@ export class AgentRuntime {
       await this.combineTurnContext(opts, sessionId),
       { peerOriginated: botOriginated, extraSkills: autoActivatedSkills },
     );
-    const { tools } = this.resolveTools(opts.bot);
+    const resolvedTools = this.resolveTools(opts.bot);
+    const modeFiltered = filterToolsForMode(resolvedTools.tools, { mode: opts.conversationMode, chiefHostRestricted: opts.chiefHostRestricted ?? (opts.bot as BotConfig & { chiefHostRestricted?: boolean }).chiefHostRestricted });
+    const fitting = fitToolsToLimit(modeFiltered);
+    const tools = fitting.tools;
+    const allowedToolNames = new Set(tools.map((t) => t.name));
+    if (fitting.fitted) { await emit({ type: 'notice', kind: 'tools-fitted', message: `Tool list fitted to 128 for the provider (${fitting.originalCount} tools; ${fitting.stubbedSchemas} schemas stubbed, ${fitting.truncatedDescriptions} descriptions truncated).` }); }
+    try { const budget = this.store.getContextBudget(sessionId); if (budget.level !== 'ok') { await emit({ type: 'notice', kind: 'context-budget', message: `Context budget ${budget.level}: ~${budget.estimatedTokens} of ${budget.budget} tokens (${Math.round(budget.ratio*100)}%).` }); } } catch { /* budget surface must never break a turn */ }
 
     const turnMessage = botOriginated && turnProvenance
       ? wrapPeerContent(defusePeerText(opts.message), turnProvenance)
@@ -1566,6 +1600,19 @@ export class AgentRuntime {
       });
     };
 
+    // Health-based failover (item 7b): an unhealthy primary starts the
+    // turn on the backup until a success probes it healthy again.
+    try {
+      if (providerHealth.isUnhealthy(providerId, model)) {
+        const t = resolveFailoverTarget({ bot: opts.bot, excludeProviderId: providerId });
+        if (t) {
+          const hp = providerHealth.health(providerId, model);
+          provider = opts.apiKeyOverride ? createProvider(t.providerId, { apiKey: opts.apiKeyOverride }) : this.resolveProvider(t.providerId);
+          await emit({ type: 'failover', fromProvider: providerId, fromModel: model, toProvider: t.providerId, toModel: t.modelId, reason: 'provider-health', message: `Provider ${providerId} is unhealthy (${hp.failures} recent failures, ${hp.lastErrorKind ?? 'error'}); starting this turn on the backup.` });
+          providerId = t.providerId; model = t.modelId;
+        }
+      }
+    } catch { /* health routing must never break a turn */ }
     try {
       // Plan-mode gate: ask the model for a step-by-step plan and wait for
       // human approval BEFORE any tool may run. Denial (or timeout) ends
@@ -1588,6 +1635,8 @@ export class AgentRuntime {
       for (let iteration = 0; iteration < maxIterations; iteration++) {
         telIterations += 1;
         await emitStep('Thinking', iteration + 1, maxIterations);
+        // Mid-turn steering (item 1): drain at the model-call boundary.
+        { const steered = this.steerQueue.drain(sessionId); if (steered.length > 0) { const sm: ChatMessage = { role: 'user', content: SteerQueue.format(steered) }; this.store.appendMessage(sessionId, sm); messages.push(sm); await emit({ type: 'notice', kind: 'steering', message: `Steering applied (${steered.length} message(s)).` }); } }
         opts.signal?.throwIfAborted();
         // Privacy-tier gate: the provider call is a cloud egress. When the
         // host attached tier-tagged items, a single `local-only` item denies
@@ -1712,6 +1761,10 @@ export class AgentRuntime {
             maxTokens: opts.bot.modelOptions?.maxTokens ?? mainProfile?.maxTokens,
             timeoutMs: mainProfile?.timeoutMs,
             maxRetries: mainProfile?.maxRetries,
+            // Engine depth (OMB §1.3): per-bot reply timeout + DeepSeek
+            // shaping mode, threaded from the persisted model options.
+            replyTimeoutMs: opts.bot.modelOptions?.replyTimeoutMs,
+            deepseekMode: opts.bot.modelOptions?.deepseekMode,
             // Structured output enforcement (Octomind parity): forwarded
             // to drivers with native response_format support.
             responseFormat: opts.responseFormat,
@@ -1766,8 +1819,10 @@ export class AgentRuntime {
                 output: { content: result.content, toolCalls: result.toolCalls, usage: result.usage },
               },
             });
+            try { providerHealth.recordSuccess(p.providerId); } catch { /* ignore */ }
             return result;
           } catch (err) {
+            try { providerHealth.recordFailure(p.providerId, err, mdl); } catch { /* ignore */ }
             spanEnd(llmSpanId, {
               status: 'error',
               error: err instanceof Error ? err.message : String(err),
@@ -1797,7 +1852,7 @@ export class AgentRuntime {
             });
           }
           const target =
-            classified.isLimit && !failoverUsed
+            (classified.isLimit || classified.isModelUnavailable) && !failoverUsed
               ? resolveFailoverTarget({ bot: opts.bot, excludeProviderId: providerId })
               : null;
           if (!target) {
@@ -1984,7 +2039,13 @@ export class AgentRuntime {
         // require-approval → pause for a decision, allow → execute.
         const toExecute: Array<{ def: ToolDefinition; call: ToolCall; approvalId?: string }> = [];
         for (const call of turn.toolCalls) {
-          const def = this.toolRegistry.get(call.name);
+          if (!allowedToolNames.has(call.name)) {
+            const result = { denied: true, reason: `Tool "${call.name}" is not available in this conversation mode.` };
+            await emit({ type: 'tool_result', call, result, denied: true });
+            const deniedMsg: ChatMessage = { role: 'tool', content: `Tool call denied: not available in this conversation mode.`, toolCallId: call.id, toolName: call.name };
+            this.store.appendMessage(sessionId, deniedMsg); messages.push(deniedMsg); continue;
+          }
+          const def = this.toolRegistry.get(call.name) ?? tools.find((t) => t.name === call.name);
           if (!def) {
             // Misuse hint: suggest the closest real tool names so the
             // model self-corrects in one step instead of guessing again.
@@ -2491,6 +2552,52 @@ export class AgentRuntime {
             } catch {
               // Widget rendering must never break a turn.
             }
+            // MCP Apps: a tool result linking to a ui:// app resource
+            // raises a sandboxed 'mcp-app' widget. A per-render nonce is
+            // issued here and verified by the API bridge (mcp-apps.ts).
+            try {
+              const appLink = extractMcpAppLink(result);
+              const serverId = appLink ? mcpServerIdFromToolName(call.name) : undefined;
+              if (appLink && serverId) {
+                const { nonce } = defaultMcpAppNonceStore.issue(serverId, appLink.resourceUri);
+                const payload = {
+                  kind: 'mcp-app' as const,
+                  serverId,
+                  resourceUri: appLink.resourceUri,
+                  nonce,
+                  title: appLink.title ?? call.name,
+                };
+                const w = await ctx.widget.raise({ kind: 'mcp-app', payload, interactive: false });
+                await ctx.widget.emit({
+                  type: 'widget',
+                  widgetId: w.id,
+                  sessionId,
+                  widget: payload,
+                  expiresAt: w.expiresAt,
+                  interactive: false,
+                });
+              }
+            } catch {
+              // MCP App rendering must never break a turn.
+            }
+            // Page artifact cards: a completed publish_page raises a
+            // 'page' widget (title + slug + open/preview actions).
+            try {
+              const pagePayload = pageWidgetFromPublishResult(call.name, result);
+              if (pagePayload) {
+                const w = await ctx.widget.raise({ kind: 'page', payload: pagePayload, interactive: false });
+                await ctx.widget.emit({
+                  type: 'widget',
+                  widgetId: w.id,
+                  sessionId,
+                  widget: pagePayload,
+                  expiresAt: w.expiresAt,
+                  interactive: false,
+                });
+              }
+            } catch {
+              // Page cards must never break a turn.
+            }
           }
           // No-progress guard: feed each executed call; trip → stop the
           // turn with a clear report instead of looping on tokens.
@@ -2535,13 +2642,16 @@ export class AgentRuntime {
               });
             }
           }
+          const rawToolText = typeof result === 'string' ? result : JSON.stringify(result);
+          const spillRef = (() => { try { return this.spillStoreFor(opts.bot, opts.spillThresholdBytes).maybeSpill(call.name, rawToolText); } catch { return null; } })();
+          const modelToolText = spillRef ? this.spillStoreFor(opts.bot, opts.spillThresholdBytes).formatForModel(call.name, spillRef) : rawToolText;
           const toolMsg: ChatMessage = {
             role: 'tool',
             // Injection floor: tag the raw tool output with its origin before
             // it enters the model context (see tagUntrustedToolOutput).
             content: tagUntrustedToolOutput(
               call.name,
-              typeof result === 'string' ? result : JSON.stringify(result),
+              modelToolText,
             ),
             toolCallId: call.id,
             toolName: call.name,

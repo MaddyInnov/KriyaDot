@@ -4,8 +4,8 @@ import type { ApprovalMode } from './approval-modes.js';
 export type { ApprovalMode };
 import type { ProvenanceNote } from './provenance.js';
 export type { ProvenanceNote };
-import type { ComputerSurface } from './tools/computer-surfaces.js';
-export type { ComputerSurface };
+import type { ComputerProvider, ComputerSurface } from './tools/computer-surfaces.js';
+export type { ComputerProvider, ComputerSurface };
 import type { WidgetAnswer, WidgetHost, WidgetPayload } from './widgets.js';
 export type { WidgetAnswer, WidgetHost, WidgetPayload };
 import type { CredentialProposer } from './credential-proposals.js';
@@ -322,6 +322,30 @@ export interface ModelOptions {
   topP?: number;
   /** Max output tokens. */
   maxTokens?: number;
+  /**
+   * Vision fallback model (§2.12 #128): when a chat turn carries an image
+   * attachment and the bot's primary model is not vision-capable, the turn
+   * routes to this model instead (same provider unless written as
+   * "provider/model"). Unset → no auto-upgrade; the image is described by
+   * metadata/OCR only.
+   */
+  visionModel?: string;
+  /**
+   * DeepSeek thinking selection (ENGINES pack): 'chat' pins the fast chat
+   * model, 'reasoner' pins the reasoning model. Only honored by the
+   * DeepSeek drivers (API preset + `dsh` ACP harness); other providers
+   * ignore it. The explicit bot model still wins when it already names a
+   * DeepSeek model — see providers/deepseek.ts.
+   */
+  deepseekMode?: 'chat' | 'reasoner';
+  /**
+   * Local-model reply timeout in ms (ENGINES pack): how long the local
+   * drivers (ollama / llamacpp / lmstudio) wait for a reply before the
+   * request aborts. Local inference can be slow to first token, so this
+   * is separate from the cloud per-call timeout. Honored by the local
+   * drivers when the chat call carries no explicit timeoutMs.
+   */
+  replyTimeoutMs?: number;
 }
 
 /**
@@ -381,13 +405,18 @@ export interface LayerStageSpec {
 /**
  * Per-bot voice-call settings (Codync parity: realtime voice calls).
  * Provider ids: 'mock' (offline, zero-cost default), 'groq', 'openai'
- * (both key-gated BYOK). Unset → mock.
+ * (both key-gated BYOK), plus the OMB-parity TTS breadth providers
+ * 'elevenlabs', 'fish', 'chatterbox', 'system' (all key/local-gated;
+ * bot-voice.ts stores them through the @mvp/voice provider registry).
+ * Unset → mock. Note: live voice CALLS still accept only mock/groq/
+ * openai (voice-call.ts VOICE_CALL_PROVIDERS); the extra ids drive
+ * spoken replies / TTS rendering.
  */
 export interface VoiceSettings {
   /** STT provider for voice calls. */
   sttProvider?: 'mock' | 'groq' | 'openai';
   /** TTS provider for voice calls. */
-  ttsProvider?: 'mock' | 'groq' | 'openai';
+  ttsProvider?: 'mock' | 'groq' | 'openai' | 'elevenlabs' | 'fish' | 'chatterbox' | 'system';
   /** Provider-specific TTS voice id (e.g. 'alloy', 'Fritz-PlayAI'). */
   ttsVoice?: string;
   /** Client-side auto VAD instead of push-to-talk. */
@@ -443,6 +472,22 @@ export interface BotConfig {
    */
   acp?: { command?: string; args?: string[]; engine?: string };
   /**
+   * Claude account profile (ENGINES pack, multiple Claude accounts): the
+   * id of a named profile from the engine-accounts store. The profile
+   * points at its own credential dir (CLAUDE_CONFIG_DIR-style isolation),
+   * so two bots can run on two different Claude logins. Absent → the
+   * machine's default Claude login. Paths/labels only — never secrets.
+   */
+  accountProfile?: string;
+  /**
+   * Per-engine homes (ENGINES pack): when true, engine processes spawned
+   * for this bot SHARE the user's real home directory instead of the
+   * isolated <dataDir>/engine-homes/<botId>/<engineId> home. Default
+   * false (isolated) for ACP/CLI engine spawns that go through the
+   * engine-home env shaping (providers/engine-homes.ts).
+   */
+  sharedEngineHome?: boolean;
+  /**
    * Fast message-router keywords (message-router.ts): optional per-bot
    * persona/topic keywords that bias routeMessage() toward this bot.
    * Example: `['billing', 'invoice', 'refund']` for a billing bot.
@@ -497,6 +542,12 @@ export interface BotConfig {
    */
   chiefOfStaff?: boolean;
   /**
+   * Chief host restriction (item 15): when true, this (chief) bot's own
+   * turns have ONLY scheduling/delegation tools — no fs/browser/MCP.
+   * Enforced via conversation-mode tool filtering in the runtime.
+   */
+  chiefHostRestricted?: boolean;
+  /**
    * Sections the chief is the primary contact for (e.g. ['support']).
    * Rendered in the chief prompt header; empty/absent = 'general'.
    */
@@ -510,6 +561,12 @@ export interface BotConfig {
    * A per-conversation pin can override this for one chat.
    */
   computerSurface?: ComputerSurface;
+  /**
+   * Configured computer provider: 'auto'|'mock'|'playwright'|'desktop'|'docker'.
+   * Resolution order: this per-bot config → env opt-ins → auto (mock).
+   * Reported (with its source) by the computer view/API. Absent → 'auto'.
+   */
+  computerProvider?: ComputerProvider;
   /**
    * Supervisor verify-gate (Octomind parity): when true, a turn that used
    * mutating tools may not end on an unverified completion claim — a
@@ -588,6 +645,17 @@ export interface LLMProvider {
       maxTokens?: number;
       /** Per-call request timeout in ms (purpose-profile knob). */
       timeoutMs?: number;
+      /**
+       * Local-model reply timeout in ms (ENGINES pack): fallback timeout
+       * used by the local drivers (ollama / llamacpp / lmstudio) when
+       * `timeoutMs` is absent. Threaded from bot modelOptions by the host.
+       */
+      replyTimeoutMs?: number;
+      /**
+       * DeepSeek thinking selection (ENGINES pack): threaded from bot
+       * modelOptions; only the DeepSeek drivers honor it.
+       */
+      deepseekMode?: 'chat' | 'reasoner';
       /** Per-call retry budget override (purpose-profile knob). */
       maxRetries?: number;
       /**

@@ -40,6 +40,8 @@ export interface BriefingRouteDeps {
   /** W14c signals source + W14b notification digest (forwarded). */
   signalsSource?: GenerateBriefingDeps['signalsSource'];
   notificationDigest?: GenerateBriefingDeps['notificationDigest'];
+  /** Nightly dreaming: dream-idea items for the briefing's dream section. */
+  dreamsSource?: GenerateBriefingDeps['dreamsSource'];
 }
 
 /** Mount the /api/briefing/* routes. */
@@ -85,6 +87,7 @@ export function registerBriefingRoutes(router: express.Router, deps: BriefingRou
         workflowSource: deps.workflowSource,
         signalsSource: deps.signalsSource,
         notificationDigest: deps.notificationDigest,
+        dreamsSource: deps.dreamsSource,
       });
       const saved = store.saveBriefing('manual', briefing);
       res.status(201).json(saved.payload);

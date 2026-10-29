@@ -190,7 +190,8 @@ export function createGroupChatsRouter(deps: GroupChatsDeps): Router {
   router.get('/:id', (req, res) => {
     const group = groupOf(req, res);
     if (!group) return;
-    res.json({ ok: true, group });
+    // §1.2: the room bulletin rides along in the room detail.
+    res.json({ ok: true, group: { ...group, bulletin: rooms.getSettings(group.id).bulletin } });
   });
 
   /** Rename / update description / replace members. */

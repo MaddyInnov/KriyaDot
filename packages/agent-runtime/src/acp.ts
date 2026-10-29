@@ -27,6 +27,14 @@ export interface AcpClientOptions {
   /** Spawn timeout ms. */
   spawnTimeoutMs?: number;
   /**
+   * Extra environment for the child, merged AFTER the secret scrub (so a
+   * caller can deliberately hand the agent its OWN config, e.g. a
+   * per-engine home from providers/engine-homes.ts). Values must never be
+   * provider API keys — the scrub exists so OUR keys don't leak; overrides
+   * are the caller's explicit responsibility.
+   */
+  env?: Record<string, string>;
+  /**
    * Notification handler for agent-initiated messages (no `id`), e.g.
    * `session/update` text chunks or tool-call requests. Replaces the
    * previous "ignore everything" behavior so callers can stream and
@@ -76,6 +84,11 @@ export class AcpClient {
       if (v === undefined) continue;
       if (/API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/i.test(k)) continue;
       env[k] = v;
+    }
+    // Caller-supplied overrides (per-engine homes, the agent's own config)
+    // apply after the scrub — see AcpClientOptions.env.
+    if (this.opts.env) {
+      for (const [k, v] of Object.entries(this.opts.env)) env[k] = v;
     }
     this.proc = spawn(this.opts.command, this.opts.args ?? [], {
       cwd: this.opts.cwd,

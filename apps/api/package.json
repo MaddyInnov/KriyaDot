@@ -5,6 +5,7 @@
     "@mvp/governance": "*",
     "@mvp/marketplace": "*",
     "@mvp/muse-modules": "*",
+    "@mvp/plugins": "*",
     "@mvp/protocols": "*",
     "@mvp/redteam": "*",
     "@mvp/run-health": "*",

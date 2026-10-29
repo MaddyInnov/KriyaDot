@@ -191,6 +191,21 @@ export function buildCoordinatorPrompt(args: {
   ].join('\n');
 }
 
+// ---- Team composition rules (item 15) --------------------------------------
+// Enforced on the strict paths (createTeam with enforceComposition, and
+// updateMembers): at least 2 members (unless the solo exception flag is
+// set), no nested teams (a team cannot be a member of a team), and
+// in-flight member protection on removal. Legacy createTeam calls keep
+// their historical behaviour by default — enforcement is opt-in so
+// existing 1-member records/imports are not retroactively broken.
+export interface TeamCompositionOptions { allowSolo?: boolean; }
+export function validateTeamComposition(memberBotIds: string[], opts: TeamCompositionOptions = {}): string[] {
+  const errors: string[] = [];
+  const unique = [...new Set(memberBotIds)];
+  if (!opts.allowSolo && unique.length < 2) errors.push(`a team needs at least 2 members (got ${unique.length}); set allowSolo for a solo exception`);
+  return errors;
+}
+
 export class TeamStore {
   private readonly db: DatabaseSync;
 
@@ -244,18 +259,45 @@ export class TeamStore {
     `);
   }
 
-  createTeam(name: string, coordinatorBotId: string, memberBotIds: string[]): Team {
+  createTeam(name: string, coordinatorBotId: string, memberBotIds: string[], opts: TeamCompositionOptions & { enforceComposition?: boolean } = {}): Team {
+    const uniqueMembers = [...new Set(memberBotIds)];
+    if (opts.enforceComposition) {
+      const errors = validateTeamComposition(uniqueMembers, opts);
+      // No nested teams: a member that is itself a team id is rejected.
+      for (const m of uniqueMembers) if (this.getTeam(m)) errors.push(`nested teams are not allowed: "${m}" is a team`);
+      if (errors.length) throw new Error(errors.join('; '));
+    }
     const team: Team = {
       id: randomUUID(),
       name: name.trim().slice(0, 120) || 'Untitled team',
       coordinatorBotId,
-      memberBotIds: [...new Set(memberBotIds)],
+      memberBotIds: uniqueMembers,
       createdAt: Date.now(),
     };
     this.db
       .prepare('INSERT INTO teams (id, name, coordinator_bot_id, member_bot_ids_json, created_at) VALUES (?, ?, ?, ?, ?)')
       .run(team.id, team.name, team.coordinatorBotId, JSON.stringify(team.memberBotIds), team.createdAt);
     return team;
+  }
+
+  /**
+   * Replace a team's members under the composition rules (item 15).
+   * `isMemberBusy` protects in-flight members: removing a member with a
+   * running turn returns a clear error instead of mutating the roster.
+   */
+  updateMembers(teamId: string, memberBotIds: string[], opts: TeamCompositionOptions & { isMemberBusy?: (botId: string) => boolean } = {}): Team {
+    const team = this.getTeam(teamId);
+    if (!team) throw new Error(`Unknown team "${teamId}"`);
+    const next = [...new Set(memberBotIds)];
+    const errors = validateTeamComposition(next, opts);
+    for (const m of next) if (this.getTeam(m)) errors.push(`nested teams are not allowed: "${m}" is a team`);
+    if (errors.length) throw new Error(errors.join('; '));
+    const removed = team.memberBotIds.filter((m) => !next.includes(m));
+    for (const m of removed) {
+      if (opts.isMemberBusy?.(m)) throw new Error(`cannot remove member "${m}": it has a turn in flight`);
+    }
+    this.db.prepare('UPDATE teams SET member_bot_ids_json = ? WHERE id = ?').run(JSON.stringify(next), teamId);
+    return this.getTeam(teamId)!;
   }
 
   getTeam(id: string): Team | undefined {

@@ -11,6 +11,7 @@ import RemoteScreenBanner from '../components/remote-screen-banner';
 import { PauseControl, PausedBanner } from '../components/pause-control';
 import { BrandPet } from '../components/pet/BrandPet';
 import { I18nProvider } from '../lib/i18n';
+import { BrandProvider } from '../components/brand-provider';
 
 export const metadata: Metadata = {
   title: 'KriyaDot',
@@ -60,6 +61,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       </head>
       <body>
         <I18nProvider>
+        <BrandProvider>
         <div className="shell">
           <header className="topbar">
             <Link href="/" className="brand">
@@ -74,6 +76,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         </div>
         <PwaInstallBanner />
         <RemoteScreenBanner />
+        </BrandProvider>
         </I18nProvider>
       </body>
     </html>

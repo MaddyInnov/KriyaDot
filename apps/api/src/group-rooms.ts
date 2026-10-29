@@ -46,6 +46,14 @@ export interface RoomRobustnessSettings {
   duplicateRepeatLimit: number;
   /** Max queued/held messages per room. */
   maxHeld: number;
+  /**
+   * §1.2: per-participant turn timeout in seconds (5–3600). Null = no
+   * per-member cap (only the whole-turn deadline applies). A member that
+   * exceeds it is recorded as a failure and the room moves on.
+   */
+  participantTurnTimeoutSec: number | null;
+  /** §1.2: room bulletin (pinned notice), '' when unset. */
+  bulletin: string;
 }
 
 export const DEFAULT_ROOM_SETTINGS: RoomRobustnessSettings = {
@@ -54,6 +62,8 @@ export const DEFAULT_ROOM_SETTINGS: RoomRobustnessSettings = {
   postsPerMinute: 6,
   duplicateRepeatLimit: 3,
   maxHeld: 20,
+  participantTurnTimeoutSec: null,
+  bulletin: '',
 };
 
 /** Global default turn timeout (min), overridable per room. */
@@ -71,10 +81,12 @@ export function resolveRoomSettings(row: RoomSettingsRow): RoomRobustnessSetting
     postsPerMinute: row.postsPerMinute ?? DEFAULT_ROOM_SETTINGS.postsPerMinute,
     duplicateRepeatLimit: row.duplicateRepeatLimit ?? DEFAULT_ROOM_SETTINGS.duplicateRepeatLimit,
     maxHeld: row.maxHeld ?? DEFAULT_ROOM_SETTINGS.maxHeld,
+    participantTurnTimeoutSec: row.participantTurnTimeoutSec ?? null,
+    bulletin: row.bulletin ?? '',
   };
 }
 
-const SETTING_LIMITS: Record<keyof RoomRobustnessSettings, [number, number]> = {
+const SETTING_LIMITS: Record<string, [number, number]> = {
   turnTimeoutMin: [1, 1440],
   maxPostsPerMemberPerTurn: [1, 100],
   postsPerMinute: [1, 600],
@@ -82,26 +94,65 @@ const SETTING_LIMITS: Record<keyof RoomRobustnessSettings, [number, number]> = {
   maxHeld: [1, 20],
 };
 
+export const PARTICIPANT_TIMEOUT_LIMITS: [number, number] = [5, 3600];
+export const MAX_BULLETIN_CHARS = 500;
+
+/** A settings patch: numeric fields, plus the two nullable §1.2 fields. */
+export type RoomSettingsPatch = Partial<
+  Omit<RoomRobustnessSettings, 'participantTurnTimeoutSec' | 'bulletin'>
+> & {
+  participantTurnTimeoutSec?: number | null;
+  bulletin?: string | null;
+};
+
 /**
  * Validate a PATCH body for room settings. Returns the sanitized patch
  * (only known keys, integers within range) or an error string.
+ * §1.2: participantTurnTimeoutSec accepts an integer 5–3600 or null
+ * (clear); bulletin accepts a string up to 500 chars or null/'' (clear).
  */
 export function sanitizeRoomSettingsPatch(
   body: unknown,
-): { ok: true; patch: Partial<RoomRobustnessSettings> } | { ok: false; error: string } {
+): { ok: true; patch: RoomSettingsPatch } | { ok: false; error: string } {
   if (typeof body !== 'object' || body === null) {
     return { ok: false, error: 'settings must be an object' };
   }
-  const patch: Partial<RoomRobustnessSettings> = {};
-  for (const [key, [min, max]] of Object.entries(SETTING_LIMITS) as Array<
-    [keyof RoomRobustnessSettings, [number, number]]
-  >) {
+  const patch: RoomSettingsPatch = {};
+  for (const [key, [min, max]] of Object.entries(SETTING_LIMITS)) {
     const v = (body as Record<string, unknown>)[key];
     if (v === undefined) continue;
     if (typeof v !== 'number' || !Number.isInteger(v) || v < min || v > max) {
       return { ok: false, error: `${key} must be an integer ${min}–${max}` };
     }
-    patch[key] = v;
+    (patch as Record<string, unknown>)[key] = v;
+  }
+  const pTimeout = (body as Record<string, unknown>)['participantTurnTimeoutSec'];
+  if (pTimeout !== undefined) {
+    if (pTimeout === null) {
+      patch.participantTurnTimeoutSec = null;
+    } else if (
+      typeof pTimeout !== 'number' ||
+      !Number.isInteger(pTimeout) ||
+      pTimeout < PARTICIPANT_TIMEOUT_LIMITS[0] ||
+      pTimeout > PARTICIPANT_TIMEOUT_LIMITS[1]
+    ) {
+      return {
+        ok: false,
+        error: `participantTurnTimeoutSec must be an integer ${PARTICIPANT_TIMEOUT_LIMITS[0]}–${PARTICIPANT_TIMEOUT_LIMITS[1]} or null`,
+      };
+    } else {
+      patch.participantTurnTimeoutSec = pTimeout;
+    }
+  }
+  const bulletin = (body as Record<string, unknown>)['bulletin'];
+  if (bulletin !== undefined) {
+    if (bulletin === null) {
+      patch.bulletin = null;
+    } else if (typeof bulletin !== 'string' || bulletin.length > MAX_BULLETIN_CHARS) {
+      return { ok: false, error: `bulletin must be a string of at most ${MAX_BULLETIN_CHARS} chars or null` };
+    } else {
+      patch.bulletin = bulletin.trim() ? bulletin : null;
+    }
   }
   if (Object.keys(patch).length === 0) {
     return { ok: false, error: 'no valid settings provided' };
@@ -231,6 +282,8 @@ export interface RoomStatus {
     postsPerMinute: number | null;
     duplicateRepeatLimit: number | null;
     maxHeld: number | null;
+    participantTurnTimeoutSec: number | null;
+    bulletin: string | null;
   };
 }
 
@@ -287,7 +340,7 @@ export class GroupRoomManager {
     return resolveRoomSettings(this.deps.store.getRoomSettingsRow(groupId));
   }
 
-  updateSettings(groupId: string, patch: Partial<RoomRobustnessSettings>): RoomRobustnessSettings {
+  updateSettings(groupId: string, patch: RoomSettingsPatch): RoomRobustnessSettings {
     const row = this.deps.store.saveRoomSettings(groupId, patch);
     this.deps.audit('group.settings', { detail: { groupId, patch } });
     return resolveRoomSettings(row);
@@ -318,6 +371,8 @@ export class GroupRoomManager {
         postsPerMinute: row.postsPerMinute,
         duplicateRepeatLimit: row.duplicateRepeatLimit,
         maxHeld: row.maxHeld,
+        participantTurnTimeoutSec: row.participantTurnTimeoutSec,
+        bulletin: row.bulletin,
       },
     };
   }
@@ -685,6 +740,11 @@ export class GroupRoomManager {
         store: this.deps.store,
         getBot,
         runMemberTurn: (bot, prompt) => this.runMemberTurnGuarded(groupId, turn, bot, prompt),
+        // §1.2: per-participant timeout from room settings (null = uncapped).
+        memberTimeoutMs: () =>
+          settings.participantTurnTimeoutSec !== null
+            ? settings.participantTurnTimeoutSec * 1000
+            : null,
         isCancelled: () => turn.cancelled,
         skipSpeaker: (botId) => this.checkSkipSpeaker(groupId, botId, settings),
         claimSpeakerLock: (botId) => this.claimLock(groupId, botId, turn.id),

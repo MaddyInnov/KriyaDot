@@ -85,7 +85,7 @@ describe('provider selection', () => {
     expect(() => selectSTTProvider({ VOICE_STT_PROVIDER: 'deepgram' })).toThrow(
       /unknown STT provider/,
     );
-    expect(() => selectTTSProvider({ VOICE_TTS_PROVIDER: 'elevenlabs' })).toThrow(
+    expect(() => selectTTSProvider({ VOICE_TTS_PROVIDER: 'azure' })).toThrow(
       /unknown TTS provider/,
     );
   });

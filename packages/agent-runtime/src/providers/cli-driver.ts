@@ -54,6 +54,7 @@ import {
   MCP_SEARCH_TOOL_NAME,
   isMcpToolName,
 } from './cli-lazy-mcp.js';
+import { buildEngineSpawnEnv } from './engine-homes.js';
 import type { ToolContext } from '../types.js';
 import type {
   ApprovalMode,
@@ -628,7 +629,7 @@ function handleCodexItem(
 export type SpawnFn = (
   command: string,
   args: string[],
-  opts: { signal?: AbortSignal },
+  opts: { signal?: AbortSignal; env?: Record<string, string> },
 ) => {
   child: ChildProcess;
   stdout?: NodeJS.ReadableStream | null;
@@ -639,12 +640,14 @@ export type SpawnFn = (
 function defaultSpawn(
   command: string,
   args: string[],
-  _opts: { signal?: AbortSignal },
+  opts: { signal?: AbortSignal; env?: Record<string, string> },
 ): ReturnType<SpawnFn> {
   const child = spawn(command, args, {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
-    // No shell, no extra env: the CLI authenticates with its own login.
+    // No shell: the CLI authenticates with its own login. An explicit env
+    // is only supplied for per-engine home isolation (engine-homes.ts).
+    ...(opts.env ? { env: opts.env } : {}),
   });
   const done = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
     child.on('close', (code, signal) => resolve({ code, signal }));
@@ -681,6 +684,15 @@ export interface NativeCliDriverOptions {
    * search/describe loads them — instead of being silently dropped.
    */
   lazyMcp?: boolean;
+  /**
+   * Per-engine home isolation (ENGINES pack): when set, the CLI child
+   * spawns with HOME/USERPROFILE pointed at
+   * <dataDir>/engine-homes/<botId>/<cliId> (see engine-homes.ts), unless
+   * `sharedHome` opts this bot back into the real home.
+   */
+  engineHome?: { dataDir: string; botId: string; sharedHome?: boolean };
+  /** Extra spawn env merged into the child env (paths/config only — never secrets). */
+  env?: Record<string, string>;
 }
 
 const NATIVE_DEFAULT_TIMEOUT_MS = 600_000;
@@ -699,6 +711,8 @@ export class NativeCliDriver implements LLMProvider {
   private readonly preflightAuthCheck: (() => Promise<string | null>) | null;
   private readonly homeDir: string;
   private readonly lazyMcpEnabled: boolean;
+  private readonly engineHome?: NativeCliDriverOptions['engineHome'];
+  private readonly extraEnv?: Record<string, string>;
   private lazyMcpBridge: CliLazyMcpBridge | null = null;
   private lazyMcpKey = '';
 
@@ -716,6 +730,32 @@ export class NativeCliDriver implements LLMProvider {
       opts.preflightAuthCheck !== undefined ? opts.preflightAuthCheck : () => this.defaultPreflightAuthCheck();
     this.providerId = `agent/${this.cliId}/${this.model}`;
     this.lazyMcpEnabled = opts.lazyMcp ?? true;
+    this.engineHome = opts.engineHome;
+    this.extraEnv = opts.env;
+  }
+
+  /**
+   * Spawn env for one turn: undefined when no isolation/extras are
+   * configured (child inherits the process env exactly as before);
+   * otherwise the process env with the per-engine home overrides (and
+   * any explicit extras) applied.
+   */
+  private spawnEnv(): Record<string, string> | undefined {
+    if (!this.engineHome && !this.extraEnv) return undefined;
+    const base: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) if (v !== undefined) base[k] = v;
+    let env = base;
+    if (this.engineHome) {
+      env = buildEngineSpawnEnv({
+        baseEnv: env,
+        dataDir: this.engineHome.dataDir,
+        botId: this.engineHome.botId,
+        engineId: this.cliId,
+        sharedHome: this.engineHome.sharedHome,
+      }).env;
+    }
+    if (this.extraEnv) env = { ...env, ...this.extraEnv };
+    return env;
   }
 
   // -- Lazy MCP (W9) --------------------------------------------------------
@@ -882,7 +922,11 @@ export class NativeCliDriver implements LLMProvider {
     };
     const parseLine = this.cliId === 'codex' ? parseCodexJsonLine : parseClaudeStreamLine;
 
-    const { child, stdout, stderr, done } = this.spawnFn(this.command, args, { signal: opts.signal });
+    const spawnEnv = this.spawnEnv();
+    const { child, stdout, stderr, done } = this.spawnFn(this.command, args, {
+      signal: opts.signal,
+      ...(spawnEnv ? { env: spawnEnv } : {}),
+    });
     let stdoutBuf = '';
     let stderrText = '';
     let killedByGuard = false;
@@ -997,6 +1041,8 @@ export function createNativeCliDriver(
     preflightAuthCheck?: (() => Promise<string | null>) | null;
     homeDir?: string;
     lazyMcp?: boolean;
+    engineHome?: NativeCliDriverOptions['engineHome'];
+    env?: Record<string, string>;
   } = {},
 ): NativeCliDriver | null {
   const parsed = parseAgentProviderId(providerId);

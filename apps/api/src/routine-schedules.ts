@@ -294,7 +294,7 @@ export function cronMatchesZone(parsed: ParsedCron, p: ZonedParts): boolean {
 // Schedule model
 // ---------------------------------------------------------------------------
 
-export type RoutineScheduleKind = 'once' | 'daily' | 'cron' | 'interval' | 'limit-reset' | 'event' | 'idle';
+export type RoutineScheduleKind = 'once' | 'daily' | 'cron' | 'interval' | 'limit-reset' | 'event' | 'idle' | 'startup';
 
 /** When a scheduled run fires while the previous run is still in flight. */
 export type OverlapPolicy = 'skip' | 'queue';
@@ -316,6 +316,13 @@ interface ScheduleBase {
    * notified). Integer 1..20, default 3.
    */
   failureStreakLimit?: number;
+}
+
+/** Fires once when the server starts (item 4a). Per-routine opt-in flag: only fires when optIn === true. */
+export interface StartupSchedule extends ScheduleBase {
+  kind: 'startup';
+  /** Explicit opt-in: startup firing only happens when true. */
+  optIn: boolean;
 }
 
 /** Run once at a specific datetime. */
@@ -452,7 +459,7 @@ export interface EventSchedule extends ScheduleBase {
   windowMinutes?: number;
 }
 
-export type RoutineSchedule = OnceSchedule | DailySchedule | CronSchedule | IntervalSchedule | LimitResetSchedule | EventSchedule | IdleSchedule;
+export type RoutineSchedule = OnceSchedule | DailySchedule | CronSchedule | IntervalSchedule | LimitResetSchedule | EventSchedule | IdleSchedule | StartupSchedule;
 
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const ONCE_WALL_RE = /^(\d{4})-(\d{2})-(\d{2})T([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d)(?:\.\d+)?)?$/;
@@ -646,8 +653,8 @@ export function validateRoutineSchedule(input: unknown): RoutineSchedule {
   }
   const s = input as Record<string, unknown>;
   const kind = s.kind;
-  if (kind !== 'once' && kind !== 'daily' && kind !== 'cron' && kind !== 'interval' && kind !== 'limit-reset' && kind !== 'event' && kind !== 'idle') {
-    throw new Error('schedule.kind must be one of: once, daily, cron, interval, limit-reset, event, idle');
+  if (kind !== 'once' && kind !== 'daily' && kind !== 'cron' && kind !== 'interval' && kind !== 'limit-reset' && kind !== 'event' && kind !== 'idle' && kind !== 'startup') {
+    throw new Error('schedule.kind must be one of: once, daily, cron, interval, limit-reset, event, idle, startup');
   }
   const timezone = s.timezone;
   assertValidTimeZone(typeof timezone === 'string' ? timezone : '');
@@ -671,6 +678,10 @@ export function validateRoutineSchedule(input: unknown): RoutineSchedule {
     failureStreakLimit = s.failureStreakLimit as number;
   }
   const governance = { catchUp, failureStreakLimit };
+
+  if (kind === 'startup') {
+    return { kind, timezone: timezone as string, enabled, overlap, ...governance, optIn: s.optIn === true };
+  }
 
   if (kind === 'event') {
     return validateEventSchedule(s, { timezone: timezone as string, enabled, overlap, ...governance });
@@ -797,6 +808,8 @@ export function describeSchedule(s: RoutineSchedule): string {
     }
     case 'idle':
       return `after ${s.afterMinutes}m of bot inactivity (${tz})`;
+    case 'startup':
+      return `once on server startup${s.optIn ? '' : ' (not opted in)'} (${tz})`;
     case 'event': {
       let d = `on ${s.app} event via account ${s.accountId}`;
       if (s.app === 'gmail' && (s.from || s.subjectContains || s.query)) {
@@ -1003,6 +1016,8 @@ export function nextRuns(schedule: RoutineSchedule, n = 5, fromMs: number = Date
       // Idle triggers are activity-driven (see tickRoutine), not a
       // time grid — there is no computable "next run" instant.
       return [];
+    case 'startup':
+      return [];
   }
 }
 
@@ -1097,6 +1112,7 @@ export class RoutineScheduler {
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
   private readonly inFlight = new Set<string>();
+  private readonly startupFired = new Set<string>();
   private booted = false;
   private readonly executor: RoutineRunExecutor | undefined;
 
@@ -1278,6 +1294,13 @@ export class RoutineScheduler {
     // Event schedules are fired by the EventTriggerPoller
     // (routine-events.ts), which owns their cursors — never by this
     // time-grid tick.
+    if (schedule.kind === 'startup') {
+      if (schedule.optIn !== true) return;
+      if (this.startupFired.has(routine.id)) return;
+      this.startupFired.add(routine.id);
+      void this.fire(routine, now);
+      return;
+    }
     if (schedule.kind === 'event') return;
     // Limit-reset schedules fire through the durable resume store (the
     // authoritative path) when one is wired — never twice.
@@ -1365,6 +1388,7 @@ export class RoutineScheduler {
       if (schedule.kind === 'event') continue;
       // Idle triggers have no occurrence grid to reconcile.
       if (schedule.kind === 'idle') continue;
+      if (schedule.kind === 'startup') continue;
       const watermark = this.deps.routineStore.getLastFiredAt(routine.id);
       if (watermark === undefined || watermark >= now) continue;
       const gap = now - watermark;

@@ -4,17 +4,46 @@
 //
 // Mock-first by design (standing rule: zero paid usage in testing): the
 // mocks return canned data and cost nothing. Real providers are selected via
-// env (VOICE_STT_PROVIDER / VOICE_TTS_PROVIDER) — 'groq' is wired (Whisper
-// STT + PlayAI TTS, key-gated on GROQ_API_KEY); anything else throws a clear
-// error. Real providers MUST read keys from env, never hardcoded.
+// env (VOICE_STT_PROVIDER / VOICE_TTS_PROVIDER) — 'groq'/'openai' are wired
+// for STT; TTS additionally has 'elevenlabs' (ELEVENLABS_API_KEY), 'fish'
+// (FISH_API_KEY), 'chatterbox' (self-hosted, CHATTERBOX_BASE_URL), and
+// 'system' (the OS speech binary); anything else throws a clear error.
+// Real providers MUST read keys from env, never hardcoded.
+//
+// Default resolution: with no explicit VOICE_*_PROVIDER, the selector
+// picks the first configured real provider (see TTS_AUTO_PRIORITY /
+// STT_AUTO_PRIORITY) and falls back to 'mock' only when nothing is
+// configured — a configured real provider is never shadowed by the mock.
 
 import { randomUUID } from 'node:crypto';
+import { ChatterboxTTSProvider } from './chatterbox.js';
+import { ElevenLabsTTSProvider } from './elevenlabs.js';
+import { FishTTSProvider } from './fish.js';
 import { GroqSTTProvider, GroqTTSProvider } from './groq.js';
 import { OpenAISTTProvider, OpenAITTSProvider } from './openai.js';
+import { SystemTTSProvider } from './system-tts.js';
 
-/** Provider ids the platform recognises. 'mock' is the default; 'groq' and 'openai' are key-gated. */
+/**
+ * Injectable fetch shape shared by the network providers. Compatible
+ * with the global fetch for real use; tests pass a stub so no test
+ * ever touches the network.
+ */
+export type VoiceFetchFn = (url: string, init?: RequestInit) => Promise<Response>;
+
+/** Provider ids the platform recognises. 'mock' is the fallback; real providers are key/URL-gated. */
 export type STTProviderId = 'mock' | 'groq' | 'openai';
-export type TTSProviderId = 'mock' | 'groq' | 'openai';
+export type TTSProviderId = 'mock' | 'groq' | 'openai' | 'elevenlabs' | 'fish' | 'chatterbox' | 'system';
+
+export const STT_PROVIDER_IDS: readonly STTProviderId[] = ['mock', 'groq', 'openai'];
+export const TTS_PROVIDER_IDS: readonly TTSProviderId[] = [
+  'mock',
+  'groq',
+  'openai',
+  'elevenlabs',
+  'fish',
+  'chatterbox',
+  'system',
+];
 
 export interface STTResult {
   text: string;
@@ -153,25 +182,105 @@ export class MockTTSProvider implements TTSProvider {
   }
 }
 
-/** Env-driven provider selection. 'mock' is the default; 'groq'/'openai' need their API keys. */
+/**
+ * Auto-default priority for TTS when VOICE_TTS_PROVIDER is unset:
+ * dedicated voice services first (their key existing at all is a
+ * strong voice-specific signal), then the self-hosted server, then
+ * the general key-gated providers. 'system' is never auto-selected —
+ * env alone cannot prove the OS binary exists.
+ * Keep in sync with apps/api/src/bot-voice.ts (TTS_AUTO_PRIORITY).
+ */
+export const TTS_AUTO_PRIORITY: readonly TTSProviderId[] = ['elevenlabs', 'fish', 'chatterbox', 'groq', 'openai'];
+/** Auto-default priority for STT when VOICE_STT_PROVIDER is unset. */
+export const STT_AUTO_PRIORITY: readonly STTProviderId[] = ['groq', 'openai'];
+
+function envHas(env: NodeJS.ProcessEnv, name: string): boolean {
+  return typeof env[name] === 'string' && env[name]!.trim().length > 0;
+}
+
+/** Whether a TTS provider is usable from env alone (key/URL present). */
+export function isTTSProviderConfigured(id: TTSProviderId | string, env: NodeJS.ProcessEnv = process.env): boolean {
+  switch (id) {
+    case 'mock':
+      return true;
+    case 'elevenlabs':
+      return envHas(env, 'ELEVENLABS_API_KEY');
+    case 'fish':
+      return envHas(env, 'FISH_API_KEY');
+    case 'chatterbox':
+      return envHas(env, 'CHATTERBOX_BASE_URL');
+    case 'groq':
+      return envHas(env, 'GROQ_API_KEY');
+    case 'openai':
+      return envHas(env, 'OPENAI_API_KEY');
+    default:
+      // 'system' (binary presence is a runtime probe, not env) and
+      // unknown ids are never reported as env-configured.
+      return false;
+  }
+}
+
+/** Whether an STT provider is usable from env alone (key present). */
+export function isSTTProviderConfigured(id: STTProviderId | string, env: NodeJS.ProcessEnv = process.env): boolean {
+  switch (id) {
+    case 'mock':
+      return true;
+    case 'groq':
+      return envHas(env, 'GROQ_API_KEY');
+    case 'openai':
+      return envHas(env, 'OPENAI_API_KEY');
+    default:
+      return false;
+  }
+}
+
+/**
+ * The TTS provider id that applies when nothing overrides it: the
+ * explicit VOICE_TTS_PROVIDER when set, else the first configured real
+ * provider (TTS_AUTO_PRIORITY), else 'mock'.
+ */
+export function resolveDefaultTTSProviderId(env: NodeJS.ProcessEnv = process.env): string {
+  const explicit = env['VOICE_TTS_PROVIDER']?.trim().toLowerCase();
+  if (explicit) return explicit;
+  for (const id of TTS_AUTO_PRIORITY) {
+    if (isTTSProviderConfigured(id, env)) return id;
+  }
+  return 'mock';
+}
+
+/** STT twin of resolveDefaultTTSProviderId (VOICE_STT_PROVIDER wins). */
+export function resolveDefaultSTTProviderId(env: NodeJS.ProcessEnv = process.env): string {
+  const explicit = env['VOICE_STT_PROVIDER']?.trim().toLowerCase();
+  if (explicit) return explicit;
+  for (const id of STT_AUTO_PRIORITY) {
+    if (isSTTProviderConfigured(id, env)) return id;
+  }
+  return 'mock';
+}
+
+/** Env-driven provider selection; default resolution per resolveDefaultSTTProviderId. */
 export function selectSTTProvider(env: NodeJS.ProcessEnv = process.env): STTProvider {
-  const id = (env['VOICE_STT_PROVIDER'] ?? 'mock').toLowerCase();
+  const id = resolveDefaultSTTProviderId(env);
   if (id === 'mock') return new MockSTTProvider();
   if (id === 'groq') return new GroqSTTProvider({ env });
   if (id === 'openai') return new OpenAISTTProvider({ env });
   throw new Error(
-    `unknown STT provider "${id}" (VOICE_STT_PROVIDER). Available in this MVP: "mock", "groq", "openai".`,
+    `unknown STT provider "${id}" (VOICE_STT_PROVIDER). Available: ${STT_PROVIDER_IDS.map((p) => `"${p}"`).join(', ')}.`,
   );
 }
 
-/** Env-driven provider selection. 'mock' is the default; 'groq'/'openai' need their API keys. */
+/** Env-driven provider selection; default resolution per resolveDefaultTTSProviderId. */
 export function selectTTSProvider(env: NodeJS.ProcessEnv = process.env): TTSProvider {
-  const id = (env['VOICE_TTS_PROVIDER'] ?? 'mock').toLowerCase();
+  const id = resolveDefaultTTSProviderId(env);
   if (id === 'mock') return new MockTTSProvider();
   if (id === 'groq') return new GroqTTSProvider({ env });
   if (id === 'openai') return new OpenAITTSProvider({ env });
+  if (id === 'elevenlabs') return new ElevenLabsTTSProvider({ env });
+  if (id === 'fish') return new FishTTSProvider({ env });
+  if (id === 'chatterbox') return new ChatterboxTTSProvider({ env });
+  if (id === 'system') return new SystemTTSProvider();
   throw new Error(
-    `unknown TTS provider "${id}" (VOICE_TTS_PROVIDER). Available in this MVP: "mock", "groq", "openai".`,
+    `unknown TTS provider "${id}" (VOICE_TTS_PROVIDER). Available: ${TTS_PROVIDER_IDS.map((p) => `"${p}"`).join(', ')}.`,
   );
 }
 

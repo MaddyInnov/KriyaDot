@@ -10,7 +10,7 @@
 
 import React, { useEffect, useState } from 'react';
 import type { CurrentTurnState } from '../../lib/api';
-import { formatElapsed, nowCardLine, stepCounter, type StepLineState } from './step-state';
+import { foldFinishedSteps, formatElapsed, nowCardLine, stepCounter, type StepLineState } from './step-state';
 
 /** Slim live step line shown under a streaming message. */
 export function StepLine({ state }: { state: StepLineState }) {
@@ -51,5 +51,19 @@ export function NowCards({ turns }: { turns: CurrentTurnState[] }) {
         </div>
       ))}
     </div>
+  );
+}
+
+/** Finished steps folded into one expandable summary line (chat polish). */
+export function FinishedSteps({ steps }: { steps: string[] }) {
+  const summary = foldFinishedSteps(steps);
+  if (!summary) return null;
+  return (
+    <details className="finished-steps" style={{ fontSize: 12, opacity: 0.8, marginTop: 4 }}>
+      <summary style={{ cursor: 'pointer' }}>{summary.label}</summary>
+      <ol style={{ margin: '4px 0 0 18px', padding: 0 }}>
+        {summary.steps.map((s, i) => (<li key={i}>{s}</li>))}
+      </ol>
+    </details>
   );
 }

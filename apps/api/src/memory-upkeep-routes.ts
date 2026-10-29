@@ -42,6 +42,7 @@ import {
   tidyMemory,
   writeAboutMe,
 } from '@mvp/agent-runtime';
+import { MemoryBackupStore, adoptMemoryPack, doctorMemory, exportMemoryPack, type MemoryPack } from './memory-pack.js';
 
 export interface MemoryUpkeepRouterDeps {
   dataDir: string;
@@ -185,6 +186,20 @@ export function createMemoryUpkeepRouter(deps: MemoryUpkeepRouterDeps): Router {
     }
     res.json({ ok: true, deleted: req.params.id });
   });
+
+  // -- Memory portability (item 12) ------------------------------------------
+  const backups = new MemoryBackupStore(deps.dataDir);
+  const botFromBodyOrQuery = (req: express.Request): string => {
+    const id = (typeof req.body?.botId === 'string' ? req.body.botId : typeof req.query.botId === 'string' ? req.query.botId : '');
+    if (!id || !deps.getBots().some((b) => b.id === id)) throw new Error('"botId" (a known bot) is required');
+    return id;
+  };
+  router.post('/pack/export', (req, res) => { try { const botId = botFromBodyOrQuery(req); res.json({ ok: true, pack: exportMemoryPack(deps.tieredMemoryStore, botId) }); } catch (err) { res.status(400).json(errorBody(err instanceof Error ? err.message : 'export failed')); } });
+  router.post('/pack/adopt', (req, res) => { try { const botId = botFromBodyOrQuery(req); const pack = (req.body as { pack?: MemoryPack }).pack as MemoryPack; const decisions = ((req.body as { decisions?: Record<string, 'overwrite'|'skip'> }).decisions ?? {}) as Record<string, 'overwrite'|'skip'>; res.json({ ok: true, ...adoptMemoryPack(deps.tieredMemoryStore, botId, pack, decisions) }); } catch (err) { res.status(400).json(errorBody(err instanceof Error ? err.message : 'adopt failed')); } });
+  router.get('/pack/doctor', (req, res) => { try { const botId = botFromBodyOrQuery(req); res.json({ ok: true, report: doctorMemory(deps.tieredMemoryStore, botId) }); } catch (err) { res.status(400).json(errorBody(err instanceof Error ? err.message : 'doctor failed')); } });
+  router.post('/pack/backup', (req, res) => { try { const botId = botFromBodyOrQuery(req); const { id } = backups.create(deps.tieredMemoryStore, botId); res.status(201).json({ ok: true, backupId: id, backups: backups.list(botId) }); } catch (err) { res.status(400).json(errorBody(err instanceof Error ? err.message : 'backup failed')); } });
+  router.post('/pack/restore', (req, res) => { try { const botId = botFromBodyOrQuery(req); const backupId = typeof req.body?.backupId === 'string' ? req.body.backupId : ''; if (!backupId) throw new Error('"backupId" is required'); res.json({ ok: true, ...backups.restore(deps.tieredMemoryStore, botId, backupId) }); } catch (err) { res.status(400).json(errorBody(err instanceof Error ? err.message : 'restore failed')); } });
+  router.post('/upkeep/slim', (req, res) => { let botId: string; try { botId = requireBotId(req.body, deps.getBots); } catch (err) { res.status(400).json(errorBody(err instanceof Error ? err.message : 'Invalid request')); return; } try { const report = tidyMemory(deps.tieredMemoryStore, journal, botId); res.json({ ok: true, slim: true, report, doctor: doctorMemory(deps.tieredMemoryStore, botId) }); } catch (err) { res.status(500).json(errorBody('Slim failed', err instanceof Error ? err.message : String(err))); } });
 
   router.get('/about-me', (_req, res) => {
     try {

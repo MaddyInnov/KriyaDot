@@ -10,7 +10,9 @@ import type {
 } from '../types.js';
 import { getMessageToolCalls } from '../types.js';
 import { getDefaultModel, getProviderPreset } from './catalog.js';
+import { shapeDeepSeekRequest } from './deepseek.js';
 import { parseOpenAIRateLimitHeaders, recordRateLimit } from './rate-limit.js';
+import { shapeReasoning } from '../reasoning-profiles.js';
 
 interface OpenAIMessage {
   role: string;
@@ -175,11 +177,26 @@ export class OpenAICompatibleProvider implements LLMProvider {
     tools: ToolDefinition[],
     opts: Parameters<LLMProvider['chat']>[2],
   ): Promise<{ content: string; toolCalls: ToolCall[]; usage: TokenUsage }> {
+    // DeepSeek depth (ENGINES pack): an explicit per-bot thinking mode
+    // (modelOptions.deepseekMode, threaded as opts.deepseekMode) selects
+    // chat vs reasoner BEFORE the generic effort shaping runs. The
+    // DeepSeek API expresses effort through that model choice (the
+    // reasoner takes no reasoning_effort parameter), so only the model
+    // is shaped here; the dsh ACP harness takes a real effort option
+    // (see providers/deepseek.ts dshReasoningEffort).
+    const deepseekShape =
+      this.providerId === 'deepseek' && opts.deepseekMode
+        ? shapeDeepSeekRequest(opts.model, {
+            deepseekMode: opts.deepseekMode,
+            reasoningEffort: opts.reasoningEffort,
+          })
+        : null;
+    const reasoningShaping = shapeReasoning(this.providerId, opts.model, opts.reasoningEffort);
     const body = {
-      model: opts.model,
+      model: deepseekShape ? deepseekShape.model : (reasoningShaping.model ?? opts.model),
+      ...reasoningShaping.body,
       messages: toOpenAIMessages(messages),
       ...(tools.length > 0 ? { tools: toFunctionTools(tools) } : {}),
-      ...(opts.reasoningEffort ? { reasoning_effort: opts.reasoningEffort } : {}),
       ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
       ...(opts.topP !== undefined ? { top_p: opts.topP } : {}),
       ...(opts.maxTokens !== undefined ? { max_tokens: opts.maxTokens } : {}),
@@ -206,10 +223,13 @@ export class OpenAICompatibleProvider implements LLMProvider {
       stream_options: { include_usage: true },
     };
     // Per-call timeout (purpose-profile knob): combine with the caller's
-    // abort signal when both exist.
+    // abort signal when both exist. The local drivers' replyTimeoutMs
+    // (ENGINES pack, from bot modelOptions) is the fallback when no
+    // explicit per-call timeout was given.
     let signal = opts.signal;
-    if (opts.timeoutMs && opts.timeoutMs > 0) {
-      const timeoutSignal = AbortSignal.timeout(opts.timeoutMs);
+    const effectiveTimeoutMs = opts.timeoutMs ?? opts.replyTimeoutMs;
+    if (effectiveTimeoutMs && effectiveTimeoutMs > 0) {
+      const timeoutSignal = AbortSignal.timeout(effectiveTimeoutMs);
       signal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
     }
     const res = await this.fetchWithRetry(`${this.baseUrl}/chat/completions`, {
