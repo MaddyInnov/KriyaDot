@@ -4,10 +4,12 @@
 // the writable root is the bot workspace; unsandboxed host execution
 // requires an explicit opt-out (or is a loudly-flagged fallback).
 //
-// These tests use the REAL backend chain (no mocks): on this Linux VM
-// Docker is absent and E2B is unset, so the chain must land on
-// Landlock. Assertions about confinement follow the ABI-gated pattern
-// of sandbox-kernel.test.ts.
+// These tests use the REAL backend chain (no mocks): the Docker leg is
+// disabled via SANDBOX_DISABLE_DOCKER and E2B is unset, so the chain
+// must land on Landlock on any Linux host (CI runners HAVE Docker —
+// availability must be controlled, never assumed from the machine).
+// Assertions about confinement follow the ABI-gated pattern of
+// sandbox-kernel.test.ts.
 
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -24,6 +26,7 @@ const KEYS = [
   'SANDBOX_BACKEND',
   'SANDBOX_KERNEL_FALLBACK',
   'SANDBOX_DISABLE_KERNEL',
+  'SANDBOX_DISABLE_DOCKER',
   'SANDBOX_ALLOW_HOST',
   'SANDBOX_HOST_FALLBACK',
   'SANDBOX_STRICT',
@@ -35,6 +38,9 @@ beforeEach(() => {
     saved.set(k, process.env[k]);
     delete process.env[k];
   }
+  // The Docker leg is opt-out controlled so the default chain below is
+  // identical on machines with and without a Docker daemon.
+  process.env.SANDBOX_DISABLE_DOCKER = '1';
 });
 
 afterEach(() => {
@@ -52,7 +58,7 @@ describe('default sandbox resolution (#117)', () => {
     // resolver requires the compiled helper to exist).
     const bin = await ensureLandlockHelper();
     expect(bin).not.toBeNull();
-    // No E2B key, no Docker on this VM → container legs are out.
+    // No E2B key, Docker leg disabled → container legs are out.
     expect(sandboxBackend()).toBe('landlock');
   });
 
@@ -111,7 +117,7 @@ describe('default sandbox resolution (#117)', () => {
   it('host execution happens only with the explicit opt-out, flagged in metadata', async () => {
     process.env.SANDBOX_DISABLE_KERNEL = '1';
     process.env.SANDBOX_ALLOW_HOST = '1';
-    // No E2B, no Docker on this VM, kernel opted out of → host opt-out.
+    // No E2B, Docker leg disabled, kernel opted out of → host opt-out.
     expect(sandboxBackend()).toBe('host');
     const res = await executeSandboxedCommand('echo on-host');
     expect(res.exitCode).toBe(0);
@@ -124,7 +130,7 @@ describe('default sandbox resolution (#117)', () => {
   it('strict mode fails closed when no backend is available', async () => {
     process.env.SANDBOX_DISABLE_KERNEL = '1';
     process.env.SANDBOX_STRICT = '1';
-    // Docker is absent on this VM and E2B is unset, so nothing can
+    // Docker is disabled and E2B is unset, so nothing can
     // confine the run; strict mode must refuse rather than fall back.
     await expect(executeSandboxedCommand('echo never')).rejects.toThrow(/No sandbox backend available/);
   });

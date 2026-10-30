@@ -96,6 +96,10 @@ export function kernelSandboxDisabled(env: NodeJS.ProcessEnv = process.env): boo
   return env.SANDBOX_DISABLE_KERNEL === '1' || env.SANDBOX_KERNEL_FALLBACK === '0';
 }
 
+export function dockerSandboxDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.SANDBOX_DISABLE_DOCKER === '1';
+}
+
 export function hostFallbackOptedIn(
   opts: SandboxCommandOptions = {},
   env: NodeJS.ProcessEnv = process.env,
@@ -218,6 +222,7 @@ export function sandboxBackend(): SandboxBackend {
 }
 
 function dockerAvailable(): boolean {
+  if (dockerSandboxDisabled()) return false;
   try {
     const res = spawnSync('docker', ['info', '--format', '{{json .ServerVersion}}'], {
       timeout: 8_000,
