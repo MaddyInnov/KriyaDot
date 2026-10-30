@@ -39,6 +39,7 @@ import { registerFileMetaRoutes } from './file-metadata.js';
 import { registerFileIntakeRoutes } from './file-intake.js';
 import { registerPageRecordRoutes } from './page-records.js';
 import { registerPublishGateRoutes } from './publish-gate.js';
+import { registerStoreRoutes } from './store-routes.js';
 import { registerMcpAppRoutes } from './mcp-apps-routes.js';
 import { PAUSED_MESSAGE, type PauseRegistry } from './system-pause.js';
 import type { RunHealthStore } from '@mvp/run-health';
@@ -3445,15 +3446,32 @@ export function createRouter(deps: RouteDeps): express.Router {
   if (!existsSync(registrySeedPath) || readFileSync(registrySeedPath, 'utf8') !== registrySeedText) {
     writeFileSync(registrySeedPath, registrySeedText);
   }
+  const marketplaceRegistry = MarketplaceRegistry.fromFile(registrySeedPath);
+  const marketplaceInstaller = new MarketplaceInstaller(join(config.dataDir, 'marketplace'));
+  const marketplaceRevenue = new RevenueLedger(join(config.dataDir, 'marketplace.db'));
   registerMarketplaceRoutes(marketplaceRouter, {
     config,
     governance,
     dataDir: config.dataDir,
-    registry: MarketplaceRegistry.fromFile(registrySeedPath),
-    installer: new MarketplaceInstaller(join(config.dataDir, 'marketplace')),
-    revenue: new RevenueLedger(join(config.dataDir, 'marketplace.db')),
+    registry: marketplaceRegistry,
+    installer: marketplaceInstaller,
+    revenue: marketplaceRevenue,
   });
   router.use('/marketplace', marketplaceRouter);
+
+  // Muse closure ADD-1: unified Store aggregation over the same registry /
+  // installer / revenue instances (plugins, user skills and the MCP
+  // directory are constructed in index.ts; the web storefront merges those
+  // client-side until they are threaded through here).
+  {
+    const storeRouter = express.Router();
+    registerStoreRoutes(storeRouter, {
+      registry: marketplaceRegistry,
+      installer: marketplaceInstaller,
+      installsByCreator: (creator) => marketplaceRevenue.creatorSummary(creator).installs,
+    });
+    router.use('/store', storeRouter);
+  }
 
   const billingRouter = express.Router();
   registerBillingRoutes(billingRouter, {

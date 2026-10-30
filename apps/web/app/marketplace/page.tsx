@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 'use client';
 
-// Marketplace: browse/install bots, skills, workflows, and MCP servers from
-// the local registry. MCP installs are approval-gated: requesting an install
-// creates a governance approval; the entry installs only after the approval
-// is approved in the approvals inbox.
+// Marketplace: the default Store tab is the unified storefront (ADD-1)
+// merging bots, skills, workflows, MCP servers, and plugins into one
+// catalog; the original Browse/Skills/MCP/Plugins/Revenue tabs remain
+// reachable alongside it. MCP installs are approval-gated: requesting an
+// install creates a governance approval; the entry installs only after
+// the approval is approved in the approvals inbox.
 
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
@@ -12,6 +14,7 @@ import { authedFetch } from '../../lib/api';
 import SkillsPanel from '../../components/skills/skills-panel';
 import McpDirectoryPanel from '../../components/mcp/mcp-directory-panel';
 import PluginsSection from '../../components/plugins-section';
+import Storefront from '../../components/store/storefront';
 
 interface MarketplaceEntry {
   id: string;
@@ -46,10 +49,10 @@ const api = (path: string, init?: RequestInit): Promise<unknown> =>
 const fmtMoney = (cents: number): string =>
   `$${(cents / 100).toFixed(2).replace(/\.00$/, '')}`;
 
-type Tab = 'browse' | 'skills' | 'mcp' | 'plugins' | 'revenue';
+type Tab = 'store' | 'browse' | 'skills' | 'mcp' | 'plugins' | 'revenue';
 
 export default function MarketplacePage() {
-  const [tab, setTab] = useState<Tab>('browse');
+  const [tab, setTab] = useState<Tab>('store');
   const [entries, setEntries] = useState<MarketplaceEntry[]>([]);
   const [kind, setKind] = useState<string>('');
   const [query, setQuery] = useState('');
@@ -144,12 +147,15 @@ export default function MarketplacePage() {
     <div>
       <h1 className="page-title">Marketplace</h1>
       <p className="page-sub">
-        Browse and install bots, skills, workflows, and MCP servers from the local registry.
+        The Store brings every bot, skill, workflow, MCP server, and plugin into one catalog.
         MCP servers are never installed without your approval.
       </p>
 
       <div className="row-between" style={{ marginBottom: 16 }}>
         <div>
+          <button className={`btn btn-sm${tab === 'store' ? ' btn-primary' : ''}`} onClick={() => setTab('store')}>
+            Store
+          </button>{' '}
           <button className={`btn btn-sm${tab === 'browse' ? ' btn-primary' : ''}`} onClick={() => setTab('browse')}>
             Browse
           </button>{' '}
@@ -171,8 +177,10 @@ export default function MarketplacePage() {
         </Link>
       </div>
 
-      {error && <div className="error-box">{error}</div>}
-      {notice && <div className="warn-box">{notice}</div>}
+      {tab !== 'store' && error && <div className="error-box">{error}</div>}
+      {tab !== 'store' && notice && <div className="warn-box">{notice}</div>}
+
+      {tab === 'store' && <Storefront onGoToPlugins={() => setTab('plugins')} />}
 
       {tab === 'browse' && (
         <>

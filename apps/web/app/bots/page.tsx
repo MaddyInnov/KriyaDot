@@ -16,6 +16,7 @@ import TeamsPanel from '../../components/panels/teams-panel';
 import PeoplePanel from '../../components/panels/people-panel';
 import { BotSetupPanel } from '../../components/panels/bot-setup-panel';
 import { BotPlacementPanel } from '../../components/panels/bot-placement-panel';
+import { GuideHint } from '../../components/guide/hint';
 import { LayersEditor } from '../../components/bots/layers-editor';
 import type { LayerStage } from '../../lib/octomind-api';
 
@@ -967,6 +968,12 @@ function BotsPageInner() {
             </button>
           ))}
           {bots.length === 0 && !error && <div className="small muted">{t('bots.loadingBots')}</div>}
+          {bots.length === 0 && !error && (
+            <GuideHint
+              articleId="creating-bots"
+              text="No bots yet — create your first specialist with “✨ Set me up”."
+            />
+          )}
           <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             <button type="button" className="btn btn-sm btn-primary" onClick={() => setShowSetup(true)}>
               ✨ Set me up

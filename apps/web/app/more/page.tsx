@@ -160,6 +160,22 @@ export default function ModulesPage() {
       </div>
       {error && <div className="error-box">{error}</div>}
 
+      <div className="card" style={{ marginBottom: 16 }}>
+        <div className="row-between">
+          <strong>📖 User Guide</strong>
+          <span className="small muted">walkthroughs · search · “How do I…?”</span>
+        </div>
+        <p className="small muted mt">
+          Task-based walkthroughs for the whole product — first setup, Universal Chat routing,
+          bots, workflows, cloud, approvals and more — plus the first-run tour.
+        </p>
+        <div className="mt">
+          <Link className="btn btn-sm btn-primary" href="/more/guide">
+            Open the User Guide →
+          </Link>
+        </div>
+      </div>
+
       <div className="grid-2">
         {MODULES.map((m) => (
           <div className="card" key={m.key}>

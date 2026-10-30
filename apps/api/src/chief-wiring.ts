@@ -30,6 +30,15 @@ import {
   type ChiefIncident,
 } from '@mvp/agent-runtime';
 import { ChiefTeamsStore } from './chief-teams.js';
+import {
+  createCapabilityService,
+  type CapabilityService,
+} from './capabilities.js';
+import {
+  grantCapabilityToolsToBots,
+  registerCapabilityTools,
+} from './capability-tools.js';
+import { resolveAnchorBot } from './universal.js';
 
 export interface ChiefWiringOpts {
   registry: Map<string, ToolDefinition>;
@@ -41,6 +50,14 @@ export interface ChiefWiringOpts {
     action: string,
     fields: { actor?: string; sessionId?: string; toolName?: string; decision?: string; detail?: unknown },
   ) => void;
+  /**
+   * Capability Awareness Layer (ADD-2): the shared capability service
+   * (full catalogs) when the host built one. Absent → a default service
+   * is built here from the live roster + shared tool registry, so the
+   * Chief/anchor prompt section and the discover_capabilities tool work
+   * either way; the host service wins when supplied.
+   */
+  capabilityService?: CapabilityService;
 }
 
 /** Chief tools plus the bot-team collaboration tools the chief needs. */
@@ -279,6 +296,31 @@ export function registerChiefToolsWiring(opts: ChiefWiringOpts): ChiefWiringResu
     if (!info.bot.chiefOfStaff) return undefined;
     return buildChiefSection(info.bot, opts.getBots());
   });
+
+  // Capability Awareness Layer (ADD-2): register discover_capabilities
+  // into the shared registry, grant it to every bot on the roster, and
+  // inject the compact capability summary into the Chief's and the
+  // Universal anchor's system prompt on every turn build (the service
+  // TTL-caches the generated registry, so the section never goes stale
+  // beyond the TTL). Defensive: capability wiring must never break chief
+  // wiring — any failure leaves the chief exactly as before.
+  try {
+    const capabilityService = opts.capabilityService ?? createCapabilityService({
+      bots: () => opts.getBots(),
+      tools: () => [...opts.registry.values()],
+    });
+    registerCapabilityTools({ registry: opts.registry, service: capabilityService });
+    grantCapabilityToolsToBots(opts.getBots());
+    opts.agentRuntime.addContextProvider((info) => {
+      const bots = opts.getBots();
+      const chiefId = store.getChiefConfig().chiefBotId;
+      const anchor = resolveAnchorBot(bots, chiefId);
+      if (!info.bot.chiefOfStaff && info.bot.id !== anchor?.id) return undefined;
+      return capabilityService.promptSection();
+    });
+  } catch (err) {
+    console.warn('[capabilities] chief-wiring integration failed:', err instanceof Error ? err.message : err);
+  }
 
   // The chief needs its tools on the in-memory config (seed files untouched).
   const chiefId = store.getChiefConfig().chiefBotId;

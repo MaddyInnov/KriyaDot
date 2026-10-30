@@ -64,6 +64,19 @@ import {
   type TurnFailureKind,
 } from './progress-guard.js';
 import {
+  AttemptLedger,
+  classifyToolFailure,
+  isUniversalSessionId,
+  renderAttemptTrail,
+  resolveExecutionPolicy,
+  summarizeToolAction,
+  toolFailureText,
+  type ExecutionPolicy,
+  type ExecutionPolicyConfig,
+  type MaterialChangeKind,
+  type RetryDecision,
+} from './execution-policy.js';
+import {
   classifyProviderError,
   computeResumeAtMs,
   currentUsageWarning,
@@ -529,6 +542,28 @@ export interface RunTurnOptions {
    * anyway (with an audit trail). Default 2.
    */
   maxGateRejections?: number;
+  /**
+   * Universal Chat origin flag (closure ADD-4): the host's universal
+   * routes set this on every turn they execute (direct / specialist /
+   * split workers). Universal turns run under the autonomous
+   * execution-loop policy by default, as do Chief-of-Staff-led turns.
+   * Shadow/fusion session ids (`universal_via_…`, `universal_fusion_…`)
+   * are also recognised when the flag is absent.
+   */
+  universal?: boolean;
+  /**
+   * Per-turn execution-policy override (ADD-4): wins over the bot's
+   * `executionPolicy` config and the scope default. `false` disables the
+   * policy for this turn.
+   */
+  executionPolicy?: ExecutionPolicyConfig | false;
+  /**
+   * "What it took" trail rendering (ADD-4): 'pro' = one line per attempt,
+   * 'simple' = one plain sentence. Default 'pro'. The trail is emitted as
+   * a `what-it-took` notice on non-trivial turns and always lands in the
+   * run record's `attempts` array.
+   */
+  attemptTrailMode?: 'pro' | 'simple';
   /** Conversation mode per thread (item 6): ask= no tools, plan= read-only, craft= normal. Distinct from approval modes; filters compose by intersection. */
   conversationMode?: ConversationMode;
   /** Chief host restriction (item 15): only scheduling/delegation tools survive. */
@@ -1814,6 +1849,66 @@ ${record.priorContext ?? ''}`;
       }
     }
     const droppedToolNames = new Set<string>();
+    // ---- Autonomous execution-loop policy (closure ADD-4) ------------
+    // One explicit policy over the existing harness pieces: retries of a
+    // failed step must carry a material change, attempts per step are
+    // bounded, escalation classes (governance deny / approval / missing
+    // credential) bypass the loop at once and are never counted, and —
+    // with verifyBeforeDone — the supervisor verify-gate engages for the
+    // turn even when the bot did not opt into it on its own. Default ON
+    // for Universal Chat + Chief-led turns, OFF elsewhere (see
+    // execution-policy.ts). Inert (undefined ledger) when disabled.
+    const executionPolicy: ExecutionPolicy = resolveExecutionPolicy({
+      universal: opts.universal === true || isUniversalSessionId(sessionId),
+      chief: opts.bot.chiefOfStaff === true,
+      botConfig: opts.bot.executionPolicy,
+      perTurn: opts.executionPolicy,
+    });
+    const attemptLedger: AttemptLedger | undefined = executionPolicy.enabled
+      ? new AttemptLedger(executionPolicy)
+      : undefined;
+    // Plan/context revision for the policy's material-change check:
+    // bumped whenever a corrective instruction (validator, verify-gate,
+    // structured-output) sends the turn back to work — the retry that
+    // follows is a revised-plan attempt, not a blind repeat.
+    let policyContextRevision = 0;
+    const policyCtx = (): { model: string; agentId: string; planRevision: number } => ({
+      model: `${providerId}/${model}`,
+      agentId: opts.bot.id,
+      planRevision: policyContextRevision,
+    });
+    /** ADD-4 step identity: the tool being attempted (one step per tool). */
+    const policyStepFor = (call: ToolCall): string => call.name;
+    /** Per-call retry decisions from the governance pass, keyed by call id. */
+    const policyDecisions = new Map<string, { step: string; change: MaterialChangeKind }>();
+    /**
+     * ADD-4: record an escalation-class failure (governance deny, approval
+     * deny, peer/team gate deny) in the ledger. Recorded for the trail,
+     * never counted as an attempt, never retried by the policy.
+     */
+    const notePolicyEscalation = (
+      call: ToolCall,
+      failure: string,
+      failureClass: 'governance-deny' | 'approval',
+    ): void => {
+      attemptLedger?.noteEscalation(policyStepFor(call), {
+        failure,
+        failureClass,
+        action: summarizeToolAction({ tool: call.name, args: call.args }),
+      });
+    };
+    if (attemptLedger) {
+      this.audit({
+        type: 'turn.execution_policy',
+        sessionId,
+        botId: opts.bot.id,
+        detail: {
+          scope: executionPolicy.scope,
+          maxAttemptsPerStep: executionPolicy.maxAttemptsPerStep,
+          verifyBeforeDone: executionPolicy.verifyBeforeDone,
+        },
+      });
+    }
     // End-of-turn check bounds (each check may send the turn back to
     // work a bounded number of times; the iteration budget is the
     // outer bound).
@@ -1935,9 +2030,12 @@ ${record.priorContext ?? ''}`;
         }
       }
       // (d) Supervisor verify-gate: a mutating turn may not end on an
-      // unverified completion claim.
+      // unverified completion claim. ADD-4: an active execution policy
+      // with verifyBeforeDone engages the same gate for this turn.
       const gateEnabled =
-        opts.bot.supervisorVerifyGate === true || process.env.SUPERVISOR_VERIFY_GATE === '1';
+        opts.bot.supervisorVerifyGate === true ||
+        process.env.SUPERVISOR_VERIFY_GATE === '1' ||
+        (attemptLedger !== undefined && executionPolicy.verifyBeforeDone);
       const maxGateRejections = opts.maxGateRejections ?? 2;
       if (
         gateEnabled &&
@@ -1968,12 +2066,20 @@ ${record.priorContext ?? ''}`;
         });
         if (!verdict.accepted) {
           gateRejections += 1;
+          // ADD-4: the failed verification is a ledger step; the caller
+          // bumps the plan revision, so the re-entered loop's next
+          // attempts count as revised-plan changes, not blind repeats.
+          attemptLedger?.noteVerification({ ok: false, failure: verdict.reason });
           await emit({
             type: 'notice',
             kind: 'supervisor-gate',
             message: `Supervisor rejected the completion claim: ${verdict.reason}`,
           });
           return verdict.guidance;
+        }
+        // ADD-4: an accept AFTER a rejection closes the verify step.
+        if (attemptLedger && attemptLedger.verificationFailures > 0) {
+          attemptLedger.noteVerification({ ok: true });
         }
       }
       return null;
@@ -2224,7 +2330,10 @@ ${record.priorContext ?? ''}`;
           Boolean(opts.responseFormat) ||
           (opts.bot.layers?.some((l) => l.kind === 'review') ?? false) ||
           opts.bot.supervisorVerifyGate === true ||
-          process.env.SUPERVISOR_VERIFY_GATE === '1';
+          process.env.SUPERVISOR_VERIFY_GATE === '1' ||
+          // ADD-4: the policy's verify-before-done gate can also retract
+          // a draft final, so its tokens buffer the same way.
+          (attemptLedger !== undefined && executionPolicy.verifyBeforeDone);
         let tokenBuffer: string[] | null = null;
         const flushTokens = async (): Promise<void> => {
           const text = tokenBuffer?.join('') ?? '';
@@ -2525,10 +2634,31 @@ ${revised}` });
           const correction = await endOfTurnCorrection(turn.content);
           if (correction) {
             tokenBuffer = null; // the rejected draft is never streamed
+            // ADD-4: a corrective re-entry revises the plan/context —
+            // later retries are material changes, not blind repeats.
+            policyContextRevision += 1;
             const correctionMsg: ChatMessage = { role: 'user', content: correction };
             this.store.appendMessage(sessionId, correctionMsg);
             messages.push(correctionMsg);
             continue;
+          }
+          // ADD-4 "what it took" trail: a non-trivial attempt ledger is
+          // surfaced as a notice (the host renders it with the answer)
+          // and audited; the full trail also lands in the run record's
+          // `attempts` array in the finally block below.
+          if (attemptLedger) {
+            const trail = renderAttemptTrail(attemptLedger.allEntries, opts.attemptTrailMode ?? 'pro', {
+              outcome: 'succeeded',
+            });
+            if (trail) {
+              this.audit({
+                type: 'turn.attempt_trail',
+                sessionId,
+                botId: opts.bot.id,
+                detail: { trail, attempts: attemptLedger.toRunRecordAttempts() },
+              });
+              await emit({ type: 'notice', kind: 'what-it-took', message: trail });
+            }
           }
           // Hindsight (Octomind parity): a retrospective lesson from a
           // cheap model, handed to the host's sink. Isolated — it can
@@ -2598,6 +2728,79 @@ ${revised}` });
             continue;
           }
 
+          // ADD-4 execution policy: gate the call BEFORE governance and
+          // execution. A governance DENY below stays final and is never
+          // routed around — this gate only ever BLOCKS calls (identical
+          // retry of a failed step) or ENDS the turn (attempt bound hit,
+          // escalating with the tried-so-far summary). It never allows
+          // anything governance would deny.
+          if (attemptLedger) {
+            const step = policyStepFor(call);
+            const retry: RetryDecision = attemptLedger.beforeAttempt(
+              step,
+              { tool: call.name, args: call.args },
+              policyCtx(),
+            );
+            if (!retry.allowed && retry.kind === 'attempt-bound') {
+              attemptLedger.noteEscalation(step, {
+                failure: `attempt bound reached (${executionPolicy.maxAttemptsPerStep} failures on this step)`,
+                failureClass: 'ordinary',
+                action: summarizeToolAction({ tool: call.name, args: call.args }),
+              });
+              const trail = renderAttemptTrail(attemptLedger.allEntries, opts.attemptTrailMode ?? 'pro', {
+                outcome: 'escalated',
+              });
+              const summary = trail ? `${retry.summary}\n\n${trail}` : retry.summary;
+              this.audit({
+                type: 'turn.execution_policy_escalated',
+                sessionId,
+                botId: ctx.botId,
+                call,
+                detail: { step, attempts: attemptLedger.toRunRecordAttempts() },
+              });
+              recordTurnFailure('tool_error', `Execution policy: attempts exhausted on step "${step}".`, {
+                executionPolicy: 'attempt-bound',
+                step,
+              });
+              turnOutcome = mapTurnOutcome({ waitingForInput: true });
+              turnError = `Execution policy escalation: attempts exhausted on step "${step}"`;
+              const escMsg: ChatMessage = { role: 'assistant', content: summary };
+              this.store.appendMessage(sessionId, escMsg);
+              await emit({ type: 'notice', kind: 'execution-policy-escalation', message: summary });
+              tokenBuffer = null;
+              await emit({ type: 'token', content: summary });
+              await emit({ type: 'done', usage: totalUsage });
+              this.finishTelemetryRun(telRunId, 'interrupted', totalUsage, providerId, model, telIterations);
+              return totalUsage;
+            }
+            if (!retry.allowed) {
+              // Identical retry of a failed step: blocked before it can
+              // execute, with a tool-result instructing a different
+              // approach (the no-progress guard remains the hard stop
+              // for unproductive streaks across steps).
+              attemptLedger.noteBlocked(step, { tool: call.name, args: call.args });
+              this.audit({
+                type: 'tool.execution_policy_blocked',
+                sessionId,
+                botId: ctx.botId,
+                call,
+                detail: { step, reason: 'identical-retry' },
+              });
+              const result = { error: retry.message, blockedByExecutionPolicy: true };
+              await emit({ type: 'tool_result', call, result });
+              const toolMsg: ChatMessage = {
+                role: 'tool',
+                content: JSON.stringify(result),
+                toolCallId: call.id,
+                toolName: call.name,
+              };
+              this.store.appendMessage(sessionId, toolMsg);
+              messages.push(toolMsg);
+              continue;
+            }
+            policyDecisions.set(call.id, { step, change: retry.change });
+          }
+
           let decision: GovernanceDecision;
           let reason: string | undefined;
           let gatewayApprovalId: string | undefined;
@@ -2631,6 +2834,7 @@ ${revised}` });
                 detail: { reason: gateVerdict.reason },
               });
               await emit({ type: 'tool_result', call, result, denied: true });
+              notePolicyEscalation(call, gateVerdict.reason, 'governance-deny');
               const toolMsg: ChatMessage = {
                 role: 'tool',
                 content: `Delegation denied: ${gateVerdict.reason}`,
@@ -2682,6 +2886,7 @@ ${revised}` });
                 { cardId: peerVerdict.cardId },
               );
               await emit({ type: 'tool_result', call, result, denied: true });
+              notePolicyEscalation(call, peerVerdict.reason, 'approval');
               const toolMsg: ChatMessage = {
                 role: 'tool',
                 content: `Peer request not approved: ${peerVerdict.reason}`,
@@ -2792,6 +2997,9 @@ ${revised}` });
 
           if (decision === 'deny') {
             const result = { denied: true, reason: reason ?? 'denied by governance policy' };
+            // ADD-4: a governance DENY is final — ledgered as an
+            // escalation, never as a retryable failure.
+            notePolicyEscalation(call, result.reason, 'governance-deny');
             this.audit({ type: 'tool.denied', sessionId, botId: ctx.botId, call, detail: { reason } });
             await emit({ type: 'tool_result', call, result, denied: true });
             const toolMsg: ChatMessage = {
@@ -2952,6 +3160,7 @@ ${revised}` });
                   const result = { denied: true, reason: 'approval denied or timed out' };
                   await emit({ type: 'tool_result', call, result, denied: true });
                   recordTurnFailure('approval_denied', `Approval denied for tool "${call.name}".`, { approvalId });
+                  notePolicyEscalation(call, 'approval denied or timed out', 'approval');
                   const toolMsg: ChatMessage = {
                     role: 'tool',
                     content: 'Tool call was not approved.',
@@ -2993,6 +3202,7 @@ ${revised}` });
                 const result = { denied: true, reason: 'approval denied or timed out' };
                 await emit({ type: 'tool_result', call, result, denied: true });
                 recordTurnFailure('approval_denied', `Approval denied for tool "${call.name}".`, { approvalId });
+                  notePolicyEscalation(call, 'approval denied or timed out', 'approval');
                 const toolMsg: ChatMessage = {
                   role: 'tool',
                   content: 'Tool call was not approved.',
@@ -3029,6 +3239,10 @@ ${revised}` });
           );
         }
         const iterationHookInjections: string[] = [];
+        // ADD-4: escalation notes (missing credential etc.) collected
+        // during result processing; appended as one user note after the
+        // batch, like hook injections.
+        const policyEscalationNotes: string[] = [];
         const runOneTool = async ({ def, call }: { def: ToolDefinition; call: ToolCall }) => {
             const toolStep = telRunId ? this.telemetry?.startStep(telRunId, `tool:${call.name}`, 'tool') : null;
             // W13 AUTO-INSTRUMENTATION (tool choke point): every executed
@@ -3088,6 +3302,40 @@ ${revised}` });
               { toolName: call.name, args: call.args, result, ...(errText ? { error: errText } : {}) },
               result,
             );
+          }
+          // ADD-4 execution policy: record the executed attempt in the
+          // ledger. Ordinary failures arm the material-change rule and
+          // count toward the per-step bound; escalation classes
+          // (credential / approval-shaped results) are recorded as
+          // escalations — never counted, never retried by the policy.
+          if (attemptLedger) {
+            const decision = policyDecisions.get(call.id);
+            const failureText = toolFailureText(result);
+            const failureClass = failureText !== undefined ? classifyToolFailure(result) : null;
+            attemptLedger.afterAttempt(
+              decision?.step ?? policyStepFor(call),
+              { tool: call.name, args: call.args },
+              {
+                change: decision?.change ?? 'initial',
+                ok: failureText === undefined,
+                failure: failureText,
+                failureClass: failureClass ?? undefined,
+                ctx: policyCtx(),
+              },
+            );
+            if (failureClass === 'credential') {
+              policyEscalationNotes.push(
+                `[execution policy escalation] "${call.name}" needs something only the user can provide (${failureText}). ` +
+                  'Do not retry that step. Tell the user exactly what credential or sign-in is needed, and continue with anything else you can finish.',
+              );
+              this.audit({
+                type: 'turn.execution_policy_escalated',
+                sessionId,
+                botId: ctx.botId,
+                call,
+                detail: { step: call.name, failureClass },
+              });
+            }
           }
           // Octomind-parity bookkeeping: runtime evidence for the
           // supervisor verify-gate, the session tool history for
@@ -3281,6 +3529,16 @@ ${revised}` });
           this.store.appendMessage(sessionId, note);
           messages.push(note);
         }
+        // ADD-4: escalation notes (e.g. missing credential) reach the
+        // model the same way — the step is not retried; the user is told.
+        if (policyEscalationNotes.length > 0) {
+          const note: ChatMessage = {
+            role: 'user',
+            content: policyEscalationNotes.join('\n\n'),
+          };
+          this.store.appendMessage(sessionId, note);
+          messages.push(note);
+        }
         // Narration accompanying tool calls is final (stored as-is) —
         // flush any buffered tokens for this iteration.
         await flushTokens();
@@ -3335,6 +3593,11 @@ ${revised}` });
           spanEnd(sessionSpanId, { status, error: turnError });
           const loops = detectLoops(spanStore.listSpans(spanRunId));
           if (loops.length > 0) spanStore.flagLoop(spanRunId, loops);
+          // ADD-4: the attempt ledger serializes onto the run record
+          // (the work-panel projection surfaces it as `attempts`).
+          if (attemptLedger && !attemptLedger.isEmpty) {
+            spanStore.setRunAttempts(spanRunId, attemptLedger.toRunRecordAttempts());
+          }
           spanStore.finalizeRun(spanRunId, turnOutcome);
         } catch {
           // Observability must never break a turn.

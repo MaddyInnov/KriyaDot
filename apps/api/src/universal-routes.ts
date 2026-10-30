@@ -441,6 +441,8 @@ export function createUniversalRouter(deps: UniversalRoutesDeps): Router {
           bot: anchor,
           message: turnMessage,
           sessionId,
+          // ADD-4: universal turns run under the execution policy.
+          universal: true,
           onEvent: forward,
         });
       } else if (decision.path === 'specialist') {
@@ -454,6 +456,7 @@ export function createUniversalRouter(deps: UniversalRoutesDeps): Router {
           bot: target,
           message: turnMessage,
           sessionId: `universal_via_${target.id}_${userKey(principal.userId)}`,
+          universal: true,
           onEvent: async (e) => {
             if (e.type === 'token') reply += e.content;
             send(e);
@@ -639,6 +642,7 @@ async function runSplit(args: {
         bot: anchor,
         message: taskMessage,
         sessionId,
+        universal: true,
         onEvent: async (e) => send(e),
       });
     };
@@ -733,6 +737,7 @@ async function runSplit(args: {
         bot: workerBot,
         message: buildWorkerMessage(input.subtask, input.sharedContext, input.dependencyOutputs, titleMap),
         sessionId: `universal_fusion_${runKey}_${input.subtask.id}`,
+        universal: true,
         onEvent: (e) => {
           if (e.type === 'token') output += e.content;
         },

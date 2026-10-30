@@ -34,6 +34,7 @@ import {
   serializeWorkflowToml,
   type DryRunView,
 } from '../../lib/octomind-web';
+import { GuideHint } from '../../components/guide/hint';
 
 function downloadText(filename: string, text: string, type: string) {
   const blob = new Blob([text], { type });
@@ -465,7 +466,15 @@ export default function WorkflowsPage() {
           </div>
         ))}
       </div>
-      {defs.length === 0 && <p className="muted">No workflow definitions registered.</p>}
+      {defs.length === 0 && (
+        <>
+          <p className="muted">No workflow definitions registered.</p>
+          <GuideHint
+            articleId="workflows"
+            text="No workflows yet — import one, install one from the Marketplace, or draw your first on the canvas."
+          />
+        </>
+      )}
 
       <h3 className="mt">Runs</h3>
       <div className="card" style={{ padding: 0, overflow: 'hidden' }}>

@@ -29,6 +29,9 @@ import type { DatabaseSync } from 'node:sqlite';
 import { redactSecrets as redactStructured } from '@mvp/governance';
 import { redactSecrets as redactText } from './agent-import.js';
 import { openDb } from './sqlite.js';
+import type { AttemptRecord } from './execution-policy.js';
+
+export type { AttemptRecord } from './execution-policy.js';
 
 export type SpanKind = 'session' | 'bot' | 'goal' | 'routine' | 'turn' | 'llm' | 'tool';
 export type SpanStatus = 'running' | 'ok' | 'error';
@@ -69,6 +72,12 @@ export interface RunRecord {
   loopDetected: boolean;
   loopEvidence: LoopEvidence[];
   tags: string[];
+  /**
+   * ADD-4 execution-policy attempt trail, when the turn ran under the
+   * policy and recorded attempts. The API work-panel projection surfaces
+   * this array verbatim as the run's `attempts`. Absent when empty.
+   */
+  attempts?: AttemptRecord[];
 }
 
 export interface RunTotals {
@@ -364,6 +373,7 @@ interface RunRow {
   outcome: string | null;
   loop_detected: number;
   loop_evidence_json: string | null;
+  attempts_json: string | null;
 }
 
 function toSpan(row: SpanRow): Span {
@@ -449,6 +459,13 @@ export class SpanStore {
       CREATE INDEX IF NOT EXISTS idx_span_runs_bot ON span_runs(bot_id, started_at DESC);
       CREATE INDEX IF NOT EXISTS idx_run_tags_tag ON run_tags(tag);
     `);
+    // ADD-4: attempt-trail column for databases created before it existed.
+    const runCols = this.db.prepare('PRAGMA table_info(span_runs)').all() as unknown as Array<{
+      name: string;
+    }>;
+    if (!runCols.some((c) => c.name === 'attempts_json')) {
+      this.db.exec('ALTER TABLE span_runs ADD COLUMN attempts_json TEXT');
+    }
   }
 
   close(): void {
@@ -500,7 +517,16 @@ export class SpanStore {
         loopEvidence = [];
       }
     }
-    return {
+    let attempts: AttemptRecord[] | undefined;
+    if (row.attempts_json) {
+      try {
+        const parsed = JSON.parse(row.attempts_json) as AttemptRecord[];
+        if (Array.isArray(parsed) && parsed.length > 0) attempts = parsed;
+      } catch {
+        attempts = undefined;
+      }
+    }
+    const record: RunRecord = {
       runId: row.run_id,
       sessionId: row.session_id,
       botId: row.bot_id,
@@ -512,6 +538,20 @@ export class SpanStore {
       loopEvidence,
       tags: this.listTags(row.run_id),
     };
+    if (attempts) record.attempts = attempts;
+    return record;
+  }
+
+  /**
+   * ADD-4: persist the execution-policy attempt trail on the run record.
+   * The payload passes through the same redaction + size cap as span
+   * payloads (failure strings are tool-error text and can embed secrets).
+   * Unknown run ids are a no-op — instrumentation never breaks a caller.
+   */
+  setRunAttempts(runId: string, attempts: AttemptRecord[]): void {
+    if (!this.getRun(runId)) return;
+    const json = attempts.length > 0 ? (sanitizeSpanPayload(attempts) ?? null) : null;
+    this.db.prepare('UPDATE span_runs SET attempts_json = ? WHERE run_id = ?').run(json, runId);
   }
 
   getRun(runId: string): RunRecord | undefined {

@@ -32,6 +32,7 @@ if (typeof (globalThis as { require?: unknown }).require !== 'function') {
 import {
   AgentRuntime,
   SpanStore,
+  SkillLoader,
   createCacheWarmerForBot,
   createMcpFacade,
   createProvider,
@@ -268,6 +269,16 @@ import { FileLinkService, registerFileLinkServing } from './file-links.js';
 import { registerPageRecordPublicRoutes } from './page-records.js';
 import { registerGatedPublicServing } from './publish-gate.js';
 import { runTrashPurge } from './workspace-trash.js';
+// Muse closure (Wave 2): capability awareness (ADD-2) + user guide (ADD-3).
+import { createCapabilityService } from './capabilities.js';
+import {
+  registerCapabilityTools,
+  grantCapabilityToolsToBots,
+  capabilityToolsPolicyRules,
+} from './capability-tools.js';
+import { createCapabilitiesRouter } from './capabilities-routes.js';
+import { createGuideRouter } from './guide-routes.js';
+import { listChannelIds } from './channel-config.js';
 // Approval-gated purchasing (W6): request_purchase tool + policy (always
 // require-approval), purchase intent service with Stripe Link / browser
 // executors, and the billing-area purchases routes (mounted via routes.ts).
@@ -507,7 +518,7 @@ async function boot(): Promise<void> {
   // so deny-by-default is preserved and extended.
   const globalPolicy: Policy = {
     ...DEFAULT_POLICY,
-    rules: [...publishPagePolicyRules(), ...interconnectionPolicyRules(), ...computerUsePolicyRules(), ...museModuleToolPolicies(), ...composioToolPolicies(), ...signInCodePolicyRules(), ...purchasePolicyRules(), ...phoneActionPolicyRules(), ...DEFAULT_POLICY.rules],
+    rules: [...publishPagePolicyRules(), ...interconnectionPolicyRules(), ...computerUsePolicyRules(), ...museModuleToolPolicies(), ...composioToolPolicies(), ...signInCodePolicyRules(), ...purchasePolicyRules(), ...phoneActionPolicyRules(), ...capabilityToolsPolicyRules(), ...DEFAULT_POLICY.rules],
   };
   const governance = new GovernanceGateway({
     dbPath: `${config.dataDir}/governance.db`,
@@ -801,6 +812,35 @@ async function boot(): Promise<void> {
     resolveUserId: () => 'default-user',
     audit: (action, fields) => governance.audit(action, fields),
   });
+  // Capability awareness (Muse closure ADD-2): a GENERATED registry over
+  // the live catalogs (bots, tools, skills, workflows, plugins, channels +
+  // product features). discover_capabilities is granted to every bot; the
+  // Chief + Universal anchor also get the compact summary in their prompt
+  // (chief-wiring consumes the service below). Getters are lazy — the
+  // registry builds on first use, after all catalogs exist.
+  const capabilityService = createCapabilityService({
+    bots: () => seed.bots,
+    tools: () => [...toolRegistry.values()],
+    skills: () => {
+      try {
+        const loader = new SkillLoader(path.join(seedDir, 'skills'));
+        return loader.list().map((name) => ({ name, description: '' }));
+      } catch {
+        return [];
+      }
+    },
+    workflows: () => seed.workflows,
+    plugins: () => {
+      try {
+        return pluginManager.list();
+      } catch {
+        return [];
+      }
+    },
+    channels: () => listChannelIds().map((id) => ({ id })),
+  });
+  registerCapabilityTools({ registry: toolRegistry, service: capabilityService });
+  grantCapabilityToolsToBots(seed.bots);
   // Sign-in codes (W4b): enter_sign_in_code — approval-gated via
   // signInCodePolicyRules above (the approval card shows site + source;
   // no code exists until the handler runs). The handler searches the
@@ -1186,6 +1226,7 @@ async function boot(): Promise<void> {
     getBotConfig: (id) => botsById.get(id),
     getBots: () => seed.bots,
     audit: (action, fields) => governance.audit(action, fields),
+    capabilityService,
   });
 
   // Multiplayer layer (W7): people directory + team inbox + human relay.
@@ -3625,6 +3666,38 @@ async function boot(): Promise<void> {
     });
     app.use('/api', permissionsRouter);
   }
+  // Capability registry endpoint (Muse closure ADD-2) + user guide (ADD-3).
+  app.use('/api/capabilities', createCapabilitiesRouter({ service: capabilityService }));
+  app.use(
+    '/api/guide',
+    createGuideRouter({
+      ...(seed.bots[0]
+        ? {
+            askLlm: async (prompt: string) => {
+              let out = '';
+              await agentRuntime.runTurn({
+                bot: seed.bots[0],
+                message: prompt,
+                sessionId: `guide-${Date.now()}`,
+                onEvent: async (event) => {
+                  if (event.type === 'token') out += event.content;
+                },
+              });
+              return out;
+            },
+          }
+        : {}),
+      getCapabilities: () =>
+        capabilityService
+          .getRegistry()
+          .entries.map((e) => ({
+            id: e.id,
+            name: e.name,
+            description: e.whatItDoes,
+            whenToUse: e.whenToUse,
+          })),
+    }),
+  );
   // n8n workflow import/export.
   app.use('/api', createWorkflowN8nRouter({ workflowRunner }));
   // Git worktrees (OpenCode parity).

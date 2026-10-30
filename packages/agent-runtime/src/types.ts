@@ -10,6 +10,8 @@ import type { WidgetAnswer, WidgetHost, WidgetPayload } from './widgets.js';
 export type { WidgetAnswer, WidgetHost, WidgetPayload };
 import type { CredentialProposer } from './credential-proposals.js';
 export type { CredentialProposer };
+import type { ExecutionPolicyConfig } from './execution-policy.js';
+export type { ExecutionPolicyConfig };
 
 /**
  * A native media attachment on a user message (Octomind parity #38):
@@ -659,6 +661,15 @@ export interface BotConfig {
    * false; the host may also enable it globally via env.
    */
   supervisorVerifyGate?: boolean;
+  /**
+   * Autonomous execution-loop policy (closure ADD-4, execution-policy.ts):
+   * attempt → verify → retry-differently → escalate, with a material-change
+   * rule for retries, a per-step attempt bound, and an attempt ledger.
+   * Default ON for Universal Chat and Chief-of-Staff-led turns, OFF
+   * elsewhere; `enabled: false` is an explicit opt-out, `enabled: true`
+   * opts any bot in, and the numeric/verify fields tune the policy.
+   */
+  executionPolicy?: ExecutionPolicyConfig;
   /**
    * End-of-turn validators (Octomind parity): declared checks run
    * automatically before a turn may finish; failures are injected as the

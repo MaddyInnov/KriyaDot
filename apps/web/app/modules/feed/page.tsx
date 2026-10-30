@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { MODULES_BASE, api, fmtTs, PageHeader, ErrorBox, EmptyState, Markdown, useModuleData } from '../lib';
+import { GuideHint } from '../../../components/guide/hint';
 
 interface FeedBrief {
   brief: string;
@@ -224,6 +225,9 @@ export default function FeedPage() {
         ))}
       </div>
       {visible.length === 0 && <EmptyState text="No posts yet. Save a brief, then hit Generate posts." />}
+      {visible.length === 0 && (
+        <GuideHint articleId="feed" text="New to Feed? The guide shows how the brief drives every post." />
+      )}
     </div>
   );
 }
