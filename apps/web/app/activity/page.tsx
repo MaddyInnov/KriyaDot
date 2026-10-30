@@ -20,8 +20,11 @@ import { RunsPanel } from '../../components/activity/runs-panel';
 import { HumanAccountingPanel } from '../../components/activity/human-accounting-panel';
 import { SessionAnalyzePanel } from '../../components/activity/session-analyze-panel';
 import { UnifiedStatusPanel } from '../../components/activity/unified-status-panel';
+import { WorkPanel } from '../../components/activity/work-panel';
+import { PermissionsSummary } from '../../components/activity/permissions-summary';
 
 const TABS = [
+  { id: 'work', label: 'Work', pro: false },
   { id: 'briefing', label: 'Briefing', pro: false },
   { id: 'watch', label: 'Watch', pro: false },
   { id: 'notifications', label: 'Notifications', pro: false },
@@ -42,11 +45,23 @@ const TABS = [
 
 type TabId = (typeof TABS)[number]['id'];
 
+// Simple mode's consumer row (ACT-2): the same underlying panels, framed
+// as the four questions a non-technical user actually asks.
+const CONSUMER_MODES = [
+  { id: 'tasks', label: 'Tasks' },
+  { id: 'approvals', label: 'Approvals & safety' },
+  { id: 'history', label: 'History' },
+  { id: 'permissions', label: 'Permissions & identity' },
+] as const;
+
+type ConsumerMode = (typeof CONSUMER_MODES)[number]['id'];
+
 export default function ActivityPage() {
-  const [tab, setTab] = useState<TabId>('approvals');
+  const [tab, setTab] = useState<TabId>('work');
+  const [consumerMode, setConsumerMode] = useState<ConsumerMode>('tasks');
   const [mode] = useUxMode();
   const visibleTabs = TABS.filter((t) => !t.pro || mode === 'pro');
-  const activeTab: TabId = visibleTabs.some((t) => t.id === tab) ? tab : 'approvals';
+  const activeTab: TabId = visibleTabs.some((t) => t.id === tab) ? tab : 'work';
 
   return (
     <div>
@@ -55,37 +70,65 @@ export default function ActivityPage() {
         Everything the platform does and asks of you — briefing, human approvals, spaces,
         summaries, processing rules, cost, and the audit trail.
       </p>
-      <div className="tabs" role="tablist" aria-label="Activity sections">
-        {visibleTabs.map((t) => (
-          <button
-            key={t.id}
-            role="tab"
-            aria-selected={activeTab === t.id}
-            className={`tab${activeTab === t.id ? " active" : ""}`}
-            onClick={() => setTab(t.id)}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
-      <div className="tab-panel page-enter" key={activeTab} role="tabpanel">
-        {activeTab === "briefing" && <BriefingPanel />}
-        {activeTab === "watch" && <WatchPanel />}
-        {activeTab === "notifications" && <NotificationPanel />}
-        {activeTab === "approvals" && <ApprovalsPanel hideHeader />}
-        {activeTab === "runs" && <RunsPanel />}
-        {activeTab === "status" && <UnifiedStatusPanel />}
-        {activeTab === "analyze" && <SessionAnalyzePanel />}
-        {activeTab === "human" && <HumanAccountingPanel />}
-        {activeTab === "spaces" && <SpacePanel />}
-        {activeTab === "summary" && <OmniPanel />}
-        {activeTab === "rules" && <RulesPanel />}
-        {activeTab === "routing" && <RoutingPanel />}
-        {activeTab === "recovery" && <RecoveryPanel />}
-        {activeTab === "health" && <HealthPanel />}
-        {activeTab === "cost" && <CostPanel />}
-        {activeTab === "audit" && <AuditPanel hideHeader />}
-      </div>
+
+      {mode === 'simple' ? (
+        <>
+          <div className="tabs" role="tablist" aria-label="Activity modes">
+            {CONSUMER_MODES.map((m) => (
+              <button
+                key={m.id}
+                role="tab"
+                aria-selected={consumerMode === m.id}
+                className={`tab${consumerMode === m.id ? " active" : ""}`}
+                onClick={() => setConsumerMode(m.id)}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+          <div className="tab-panel page-enter" key={consumerMode} role="tabpanel">
+            {consumerMode === 'tasks' && <WorkPanel />}
+            {consumerMode === 'approvals' && <ApprovalsPanel hideHeader />}
+            {consumerMode === 'history' && <WorkPanel variant="history" />}
+            {consumerMode === 'permissions' && <PermissionsSummary />}
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="tabs" role="tablist" aria-label="Activity sections">
+            {visibleTabs.map((t) => (
+              <button
+                key={t.id}
+                role="tab"
+                aria-selected={activeTab === t.id}
+                className={`tab${activeTab === t.id ? " active" : ""}`}
+                onClick={() => setTab(t.id)}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+          <div className="tab-panel page-enter" key={activeTab} role="tabpanel">
+            {activeTab === "work" && <WorkPanel />}
+            {activeTab === "briefing" && <BriefingPanel />}
+            {activeTab === "watch" && <WatchPanel />}
+            {activeTab === "notifications" && <NotificationPanel />}
+            {activeTab === "approvals" && <ApprovalsPanel hideHeader />}
+            {activeTab === "runs" && <RunsPanel />}
+            {activeTab === "status" && <UnifiedStatusPanel />}
+            {activeTab === "analyze" && <SessionAnalyzePanel />}
+            {activeTab === "human" && <HumanAccountingPanel />}
+            {activeTab === "spaces" && <SpacePanel />}
+            {activeTab === "summary" && <OmniPanel />}
+            {activeTab === "rules" && <RulesPanel />}
+            {activeTab === "routing" && <RoutingPanel />}
+            {activeTab === "recovery" && <RecoveryPanel />}
+            {activeTab === "health" && <HealthPanel />}
+            {activeTab === "cost" && <CostPanel />}
+            {activeTab === "audit" && <AuditPanel hideHeader />}
+          </div>
+        </>
+      )}
     </div>
   );
 }

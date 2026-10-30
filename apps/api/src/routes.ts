@@ -31,6 +31,14 @@ import { FirstReplyRescue } from './first-reply-rescue.js';
 import { ThreadTitleStore } from './chat-threads-routes.js';
 import { DepartmentStore, getDepartmentInstructions } from './departments.js';
 import { registerPagePreviewRoutes } from './page-preview.js';
+// Muse closure §4.8 file lifecycle: trash, expiring links, metadata,
+// intake, page records (FL-5), publish gate (FL-6/FL-8).
+import { TrashStore, registerWorkspaceTrashRoutes } from './workspace-trash.js';
+import { FileLinkService, registerFileLinkRoutes } from './file-links.js';
+import { registerFileMetaRoutes } from './file-metadata.js';
+import { registerFileIntakeRoutes } from './file-intake.js';
+import { registerPageRecordRoutes } from './page-records.js';
+import { registerPublishGateRoutes } from './publish-gate.js';
 import { registerMcpAppRoutes } from './mcp-apps-routes.js';
 import { PAUSED_MESSAGE, type PauseRegistry } from './system-pause.js';
 import type { RunHealthStore } from '@mvp/run-health';
@@ -2950,14 +2958,11 @@ export function createRouter(deps: RouteDeps): express.Router {
         res.status(404).json(errorBody('File not found'));
         return;
       }
-      const filePath = join(uploadsDir, match);
-      unlinkSync(filePath);
-      try {
-        unlinkSync(`${filePath}.meta.json`);
-      } catch {
-        // ignore
-      }
-      res.json({ ok: true });
+      // Muse closure FL-13: delete now moves the upload to the workspace
+      // trash (30-day recovery) instead of destroying it.
+      const store = new TrashStore(config.dataDir);
+      store.trashUploadFile(uploadsDir, id, 'user');
+      res.json({ ok: true, trashed: true });
     } catch (err) {
       res.status(500).json(errorBody('Failed to delete file', err instanceof Error ? err.message : String(err)));
     }
@@ -3370,7 +3375,43 @@ export function createRouter(deps: RouteDeps): express.Router {
   // Pages depth (OMB §1.10): draft preview through the same sanitizer
   // pipeline as publishing (picker script only in preview mode).
   registerPagePreviewRoutes(pagesRouter, { dataDir: config.dataDir });
+  // Muse closure §4.8: one shared file-link service so FL-8 atomic delete
+  // revokes the same links FL-7 creates (SQLite-backed, same dataDir).
+  const lifecycleFileLinks = new FileLinkService(config.dataDir, { governance });
+  // FL-5: per-page record collections (owner CRUD; public reads mount in index.ts).
+  registerPageRecordRoutes(pagesRouter, { dataDir: config.dataDir });
+  // FL-6/FL-8: publish requests + gated snapshots + atomic artifact delete.
+  registerPublishGateRoutes(pagesRouter, {
+    dataDir: config.dataDir,
+    governance,
+    fileLinkService: lifecycleFileLinks,
+  });
   router.use('/pages', pagesRouter);
+
+  // Muse closure §4.8 file lifecycle under /api/files: trash (FL-13),
+  // expiring links (FL-7), metadata pin/rename/reorder (FL-12), intake (FL-10).
+  {
+    const filesLifecycleRouter = express.Router();
+    registerWorkspaceTrashRoutes(filesLifecycleRouter, {
+      dataDir: config.dataDir,
+      workspaceRoot: config.workspaceDir,
+      governance,
+    });
+    registerFileLinkRoutes(filesLifecycleRouter, {
+      dataDir: config.dataDir,
+      workspaceRoot: config.workspaceDir,
+      governance,
+      service: lifecycleFileLinks,
+    });
+    registerFileMetaRoutes(filesLifecycleRouter, {
+      dataDir: config.dataDir,
+      workspaceRoot: config.workspaceDir,
+    });
+    registerFileIntakeRoutes(filesLifecycleRouter, {
+      workspaceRoot: config.workspaceDir,
+    });
+    router.use('/files', filesLifecycleRouter);
+  }
 
   // MCP Apps (OMB §1.4): interactive frames from MCP servers, served with
   // a strict CSP and a nonce-bound bridge; bridge tool calls re-enter

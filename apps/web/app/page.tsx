@@ -722,6 +722,9 @@ function ChatPageInner() {
   const [inputCaret, setInputCaret] = useState(0);
   const [lastReadTs, setLastReadTs] = useState(0);
   useEffect(() => { try { setFollowBottom(localStorage.getItem('mvp:followBottom') !== '0'); const w = Number(localStorage.getItem('mvp:chatWidth') ?? 0); if (w > 0) setChatWidth(w); } catch { /* ignore */ } }, []);
+  // Muse closure F-13: Discuss-in-chat handoff — other surfaces (Feed)
+  // stash a prefilled prompt + context ref in sessionStorage and navigate here.
+  useEffect(() => { try { const pre = sessionStorage.getItem('mvp:chat-prefill'); if (pre) { setInput(pre); sessionStorage.removeItem('mvp:chat-prefill'); sessionStorage.removeItem('mvp:chat-context-ref'); } } catch { /* ignore */ } }, []);
   useEffect(() => { try { localStorage.setItem('mvp:followBottom', followBottom ? '1' : '0'); } catch { /* ignore */ } }, [followBottom]);
   useEffect(() => { if (chatWidth > 0) { try { localStorage.setItem('mvp:chatWidth', String(chatWidth)); } catch { /* ignore */ } } }, [chatWidth]);
   // Ctrl+F opens the in-chat find bar (within the open thread only).

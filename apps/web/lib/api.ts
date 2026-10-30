@@ -1555,6 +1555,70 @@ export function unpublishPage(id: string): Promise<{ published: boolean }> {
 export const getPagePublication = (id: string): Promise<PagePublicationStatus> =>
   apiJson(`/api/pages/${encodeURIComponent(id)}/publication`);
 
+// ---- Page mini-app data collections (FL-5) -----------------------------------
+
+export interface PageCollection {
+  pageId: string;
+  name: string;
+  /** When true, published-page visitors can READ this collection at /p/<slug>/records/<name>. */
+  publicRead: boolean;
+  createdAt: number;
+  recordCount: number;
+}
+
+export const listPageCollections = (id: string): Promise<PageCollection[]> =>
+  apiJson(`/api/pages/${encodeURIComponent(id)}/collections`);
+
+export function createPageCollection(
+  id: string,
+  input: { name: string; publicRead?: boolean },
+): Promise<PageCollection> {
+  return apiJson(`/api/pages/${encodeURIComponent(id)}/collections`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+}
+
+export function setPageCollectionPublicRead(
+  id: string,
+  name: string,
+  publicRead: boolean,
+): Promise<PageCollection> {
+  return apiJson(
+    `/api/pages/${encodeURIComponent(id)}/collections/${encodeURIComponent(name)}`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ publicRead }),
+    },
+  );
+}
+
+export function deletePageCollection(id: string, name: string): Promise<{ ok: boolean }> {
+  return apiJson(`/api/pages/${encodeURIComponent(id)}/collections/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+  });
+}
+
+// ---- File metadata: pin / rename (FL-12) --------------------------------------
+
+export function pinWorkspaceFile(path: string, pinned: boolean): Promise<{ ok: boolean }> {
+  return apiJson('/api/files/meta/pin', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, pinned }),
+  });
+}
+
+export function renameWorkspaceFile(from: string, to: string): Promise<{ ok: boolean }> {
+  return apiJson('/api/files/meta/rename', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from, to }),
+  });
+}
+
 export function saveProviderKey(
   providerId: string,
   apiKey: string,

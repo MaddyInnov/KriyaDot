@@ -6,6 +6,11 @@ import {
   addPageComment,
   addPageMention,
   createPage,
+  createPageCollection,
+  deletePageCollection,
+  listPageCollections,
+  setPageCollectionPublicRead,
+  type PageCollection,
   deletePage,
   deletePageComment,
   authedFetch,
@@ -123,6 +128,10 @@ export function PagesPanel() {
   const [publishing, setPublishing] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
 
+  // FL-5: mini-app data collections for this page.
+  const [collections, setCollections] = useState<PageCollection[]>([]);
+  const [newCollectionName, setNewCollectionName] = useState('');
+
   const dirtyRef = useRef(false);
   dirtyRef.current = dirty;
   const selectedRef = useRef<string | null>(null);
@@ -158,6 +167,8 @@ export function PagesPanel() {
       setMentions(detail.mentions);
       setVersions(await listPageVersions(p.id));
       setPublication(await getPagePublication(p.id));
+      // FL-5 collections are an optional surface — never block opening a page.
+      setCollections(await listPageCollections(p.id).catch(() => []));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -621,6 +632,78 @@ export function PagesPanel() {
                   Not published — only people signed in to this KriyaDot server can see this page.
                 </p>
               )}
+            </div>
+          ) : null}
+
+          {selectedId ? (
+            <div className="mt" style={{ borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+              <div className="row-between">
+                <strong className="small">Data collections</strong>
+                <span className="small muted">mini-app records for this page</span>
+              </div>
+              {collections.length === 0 ? (
+                <p className="small muted" style={{ margin: '6px 0' }}>
+                  No collections yet. Agents and the page runtime store records under
+                  /api/pages/{selectedId}/records/&lt;name&gt;.
+                </p>
+              ) : (
+                <ul style={{ margin: '6px 0', paddingLeft: 16 }}>
+                  {collections.map((c) => (
+                    <li key={c.name} className="small" style={{ marginBottom: 4 }}>
+                      <span className="mono">{c.name}</span>
+                      <span className="muted"> · {c.recordCount} record{c.recordCount === 1 ? '' : 's'} · </span>
+                      <label className="small">
+                        <input
+                          type="checkbox"
+                          checked={c.publicRead}
+                          onChange={(e) => {
+                            void setPageCollectionPublicRead(selectedId, c.name, e.target.checked)
+                              .then((next) =>
+                                setCollections((prev) => prev.map((x) => (x.name === next.name ? next : x))),
+                              )
+                              .catch((err) => setError(err instanceof Error ? err.message : String(err)));
+                          }}
+                        />{' '}
+                        public read
+                      </label>{' '}
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => {
+                          void deletePageCollection(selectedId, c.name)
+                            .then(() => setCollections((prev) => prev.filter((x) => x.name !== c.name)))
+                            .catch((err) => setError(err instanceof Error ? err.message : String(err)));
+                        }}
+                      >
+                        Delete
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
+                <input
+                  className="input"
+                  style={{ flex: 1 }}
+                  placeholder="new collection name (e.g. todos)"
+                  value={newCollectionName}
+                  onChange={(e) => setNewCollectionName(e.target.value)}
+                />
+                <button
+                  className="btn btn-sm"
+                  disabled={!newCollectionName.trim()}
+                  onClick={() => {
+                    if (!selectedId) return;
+                    void createPageCollection(selectedId, { name: newCollectionName.trim() })
+                      .then((created) => {
+                        setCollections((prev) => [...prev.filter((x) => x.name !== created.name), created]);
+                        setNewCollectionName('');
+                      })
+                      .catch((err) => setError(err instanceof Error ? err.message : String(err)));
+                  }}
+                >
+                  Add collection
+                </button>
+              </div>
             </div>
           ) : null}
 

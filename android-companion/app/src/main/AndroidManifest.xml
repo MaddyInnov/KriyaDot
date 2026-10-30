@@ -43,5 +43,16 @@
                 <action android:name="com.google.firebase.MESSAGING_EVENT" />
             </intent-filter>
         </service>
+
+        <!-- Shade Allow/Deny actions on approval pushes (P-2). Not
+             exported: only this app's own immutable PendingIntents can
+             trigger a decision. -->
+        <receiver
+            android:name=".core.ApprovalActionReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.kriyadot.companion.action.APPROVAL_DECIDE" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

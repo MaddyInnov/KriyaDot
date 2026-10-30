@@ -116,6 +116,30 @@ export class ArtifactStore {
     return rows.map((r) => ({ version: r.version, content: r.content, createdAt: r.created_at }));
   }
 
+  /**
+   * FL-8: delete an artifact and ALL of its versions atomically (single
+   * transaction — content never survives its artifact row or vice versa).
+   * Public shares / mini-app data for page-backed artifacts live in the
+   * API layer's pages.db and are removed by AtomicArtifactDeleter in the
+   * same operation from the caller's perspective.
+   */
+  remove(id: string): void {
+    this.get(id); // throws NotFoundError for unknown artifacts
+    this.mdb.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.mdb.db.prepare('DELETE FROM mm_artifact_versions WHERE artifact_id = ?').run(id);
+      this.mdb.db.prepare('DELETE FROM mm_artifacts WHERE id = ?').run(id);
+      this.mdb.db.exec('COMMIT');
+    } catch (err) {
+      try {
+        this.mdb.db.exec('ROLLBACK');
+      } catch {
+        // ignore
+      }
+      throw err;
+    }
+  }
+
   getVersion(id: string, version: number): ArtifactVersion {
     this.get(id);
     const row = this.mdb.db

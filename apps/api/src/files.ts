@@ -16,6 +16,12 @@ export interface FileNode {
   type: 'file' | 'dir';
   size?: number;
   children?: FileNode[];
+  /** FL-12: pinned files sort first (stamped from file_meta by file-metadata.ts). */
+  pinned?: boolean;
+  /** FL-12: manual order within the listing (lower first), when set. */
+  sortOrder?: number;
+  /** FL-12: optional display label override kept on the file record. */
+  displayName?: string;
 }
 
 const MAX_FILES = 2000;

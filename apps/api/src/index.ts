@@ -259,6 +259,15 @@ import { composioToolPolicies, registerComposioTools } from './composio-tools.js
 // it into the bot's browser. The code value never reaches the model, a
 // tool result, or an audit entry.
 import { registerSignInCodeTools, signInCodePolicyRules } from './sign-in-code-tools.js';
+// Muse closure (Wave 1): consumer work panel (Activity §4.1), permissions
+// pane + inspection tools (§4.7), file-lifecycle public serving (§4.8).
+import { registerWorkPanelRoutes } from './work-panel.js';
+import { registerPermissionsPaneRoutes } from './permissions-pane.js';
+import { registerPermissionsTools } from './permissions-tools.js';
+import { FileLinkService, registerFileLinkServing } from './file-links.js';
+import { registerPageRecordPublicRoutes } from './page-records.js';
+import { registerGatedPublicServing } from './publish-gate.js';
+import { runTrashPurge } from './workspace-trash.js';
 // Approval-gated purchasing (W6): request_purchase tool + policy (always
 // require-approval), purchase intent service with Stripe Link / browser
 // executors, and the billing-area purchases routes (mounted via routes.ts).
@@ -812,6 +821,14 @@ async function boot(): Promise<void> {
     resolveUserId: () => 'default-user',
     resolveOS: resolveBotComputerOS,
     audit: (action, fields) => governance.audit(action, fields),
+  });
+  // Permissions inspection tools (Muse closure §4.7, P-17): read-only
+  // pending-approvals / active-grants / allowances lookups for agents.
+  registerPermissionsTools({
+    registry: toolRegistry,
+    dataDir: config.dataDir,
+    listApprovals: (status) => governance.listApprovals(status),
+    bots: seed.bots,
   });
   // Phone-app operation (W14a): phone_* tools dispatch approved actions
   // to the paired phone over the phone hub and await its ack. Governance
@@ -3550,6 +3567,64 @@ async function boot(): Promise<void> {
     });
     app.use('/api', notificationRouter);
   }
+  // Consumer work panel (Muse closure §4.1): live status sentence,
+  // day-grouped plain-language work list, run summary, permissions summary.
+  {
+    const workRouter = express.Router();
+    registerWorkPanelRoutes(workRouter, {
+      spanStore,
+      listRoutineRuns: (limit) => {
+        const all: ReturnType<typeof routineRunStore.listByRoutine> = [];
+        for (const r of routineStore.list()) {
+          for (const run of routineRunStore.listByRoutine(r.id, limit)) all.push(run);
+        }
+        return all
+          .sort((a, b) => b.createdAt - a.createdAt)
+          .slice(0, limit) as never;
+      },
+      listBackgroundRuns: () => agentRuntime.backgroundRuns.list() as never,
+      getFirstUserMessage: (sessionId) => {
+        try {
+          const msg = agentRuntime.sessionStore
+            .listThreadMessages(sessionId)
+            .find((m) => m.role === 'user');
+          if (!msg) return undefined;
+          const c: unknown = (msg as { content?: unknown }).content;
+          if (typeof c === 'string') return c;
+          if (Array.isArray(c)) {
+            const text = c
+              .map((p) =>
+                p && typeof p === 'object' && 'text' in p
+                  ? String((p as { text?: unknown }).text ?? '')
+                  : '',
+              )
+              .join(' ')
+              .trim();
+            return text || undefined;
+          }
+          return undefined;
+        } catch {
+          return undefined;
+        }
+      },
+      bots: () => seed.bots,
+      dataDir: config.dataDir,
+      countPendingApprovals: () => governance.listApprovals('pending').length,
+    });
+    app.use('/api', workRouter);
+  }
+  // Permissions & identity pane (Muse closure §4.7): overview/reset,
+  // per-connector action trees, allowances, per-item overrides, protocols.
+  {
+    const permissionsRouter = express.Router();
+    registerPermissionsPaneRoutes(permissionsRouter, {
+      dataDir: config.dataDir,
+      bots: seed.bots,
+      audit: (action, fields) => governance.audit(action, fields),
+      listApprovals: (status) => governance.listApprovals(status),
+    });
+    app.use('/api', permissionsRouter);
+  }
   // n8n workflow import/export.
   app.use('/api', createWorkflowN8nRouter({ workflowRunner }));
   // Git worktrees (OpenCode parity).
@@ -3993,7 +4068,30 @@ async function boot(): Promise<void> {
   // Public page publishing (W3): GET /p/<slug> serves published pages with
   // NO auth (non-/api paths are loopback-auth exempt by design; unknown or
   // unpublished slugs 404). Mounted before the SPA fallback.
-  registerPublicPageServing(app, { dataDir: config.dataDir });
+  // Muse closure §4.8: publish-gated serving (FL-6) replaces plain serving —
+  // gated pages serve their approved snapshot; legacy-published pages keep
+  // live-content behaviour. Plus expiring file links (FL-7, GET /f/:token)
+  // and mini-app public record reads (FL-5).
+  const closureFileLinks = new FileLinkService(config.dataDir, { governance });
+  registerGatedPublicServing(app, { dataDir: config.dataDir, governance });
+  registerFileLinkServing(app, {
+    dataDir: config.dataDir,
+    workspaceRoot: config.workspaceDir,
+    service: closureFileLinks,
+  });
+  registerPageRecordPublicRoutes(app, { dataDir: config.dataDir });
+  // Workspace trash (FL-13): purge entries past the 30-day retention daily.
+  {
+    const purgeTrash = () => {
+      try {
+        runTrashPurge(config.dataDir);
+      } catch {
+        // Purge must never break boot or the server loop.
+      }
+    };
+    setTimeout(purgeTrash, 60_000).unref();
+    setInterval(purgeTrash, 24 * 60 * 60 * 1000).unref();
+  }
   app.get('/_kriyadot/', (_req, res) => {
     try {
       res.type('html').send(

@@ -93,6 +93,23 @@ export interface GovernanceAdapterOptions {
    */
   getPreference?: (botId: string, toolName: string) => 'deny' | 'allow' | undefined;
   /**
+   * Permissions pane allowances (Muse parity P-6/P-15/P-16): exact-match
+   * user allowances ({kind: website|recipient|task, target, actions} —
+   * see permissions-pane.ts). The hook returns the covering allowance for
+   * a call, or undefined. Evaluation converts Ask → Allow ONLY: the hook
+   * is consulted after hard floors and learned-deny preferences, skipped
+   * for privileged tools, and a side-effect-free policy simulation must
+   * say the call would otherwise be 'require-approval' — a policy deny,
+   * a hard floor, a denylist hit, or a domain-bound denial is NEVER
+   * widened by an allowance. HOST WIRING: pass
+   * `getAllowance: createAllowanceLookup({ dataDir, bots })` from
+   * permissions-pane.ts in index.ts.
+   */
+  getAllowance?: (
+    call: ToolCall,
+    ctx: ToolContext,
+  ) => { id: string; kind: string; target: string } | undefined;
+  /**
    * W6 purchases: observer fired whenever evaluation mints a REAL gateway
    * approval (require-approval). The purchase wiring uses it to register
    * the pending purchase intent against the gateway's approval, so the
@@ -114,6 +131,7 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
   private readonly workspaceDirForBot?: (botId: string) => string | undefined;
   private readonly globalPolicy: Policy;
   private readonly getPreference?: (botId: string, toolName: string) => 'deny' | 'allow' | undefined;
+  private readonly getAllowance?: GovernanceAdapterOptions['getAllowance'];
   private readonly approvalObserver?: GovernanceAdapterOptions['approvalObserver'];
   /** Runtime-facing approval id → real gateway approval id. */
   private readonly idMap = new Map<string, string>();
@@ -133,6 +151,7 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
     this.workspaceDirForBot = opts.workspaceDirForBot;
     this.globalPolicy = opts.globalPolicy ?? DEFAULT_POLICY;
     this.getPreference = opts.getPreference;
+    this.getAllowance = opts.getAllowance;
     this.approvalObserver = opts.approvalObserver;
   }
 
@@ -333,6 +352,40 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
           return { decision: 'allow', reason: 'Learned preference: you have approved this tool multiple times.' };
         }
         // Privileged tools ignore learned allow — fall through to policy.
+      }
+    }
+    // Permissions pane allowances (P-6/P-15/P-16): an exact-match user
+    // allowance converts Ask → Allow and nothing else. Hard floors have
+    // already returned above; learned-deny preferences have already
+    // returned above; privileged tools (the same probe set as the
+    // learned-allow path — purchases included) are skipped; and the
+    // conversion only fires when a side-effect-free simulation of the
+    // full policy stack says this call would otherwise require approval
+    // (never when it would deny). Lookup failures fail closed to normal
+    // policy evaluation.
+    if (this.getAllowance) {
+      try {
+        const hit = this.getAllowance(call, ctx);
+        if (hit) {
+          const privileged = /^(mcp:|run_command$|exec$|shell$|write_file$|edit_file$|create_file$|delete_file$|remove_file$|request_purchase$)/.test(call.name)
+            || /delete|remove|drop|exec/.test(call.name);
+          if (!privileged) {
+            const sim = await this.simulatePolicy(
+              ctx.botId,
+              call.name,
+              call.args,
+              // The gateway accepts rich history entries at runtime; the
+              // wrapper's declared type is the legacy string[] shape.
+              ctx.sessionToolHistory as unknown as string[] | undefined,
+            );
+            if (sim.effect === 'require-approval' && !sim.hardFloor && !sim.denylist && !sim.domainDenied) {
+              this.audit({ type: 'policy', botId: ctx.botId, sessionId: ctx.sessionId, call, detail: `Allowance ${hit.id} (${hit.kind}: ${hit.target}) allow (audited)`, ts: new Date().toISOString() });
+              return { decision: 'allow', reason: `Allowance: you allowed ${hit.kind} "${hit.target}" for this action.` };
+            }
+          }
+        }
+      } catch {
+        // Allowances must never break evaluation — fall through to policy.
       }
     }
     // Per-bot policy: merge the calling bot's rules ahead of the global

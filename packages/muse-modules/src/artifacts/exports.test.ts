@@ -81,6 +81,21 @@ describe('renderArtifactPdf', () => {
     }
   });
 
+  it('typesets: multiple fonts, bold headings, wrapped text, page numbers', () => {
+    const longPara = 'word '.repeat(60).trim();
+    const bytes = renderArtifactPdf(
+      makeArtifact(`# Section\n\n${longPara}\n\n- item one\n\n\`\`\`\nconst a = 1;\n\`\`\`\n`),
+    );
+    const text = Buffer.from(bytes).toString('latin1');
+    expect(text).toContain('/BaseFont /Helvetica-Bold');
+    expect(text).toContain('/BaseFont /Courier');
+    expect(text).toContain('(Page 1 of 1)');
+    expect(text).toContain('(Test Doc)'); // footer title
+    expect(text).toContain('(const a = 1;)');
+    // The 60-word paragraph wrapped onto more than one display line.
+    expect(text.match(/\(word/g)!.length).toBeGreaterThan(1);
+  });
+
   it('paginates long documents', () => {
     const long = Array.from({ length: 200 }, (_, i) => `Line number ${i} of the document.`).join('\n');
     const bytes = renderArtifactPdf(makeArtifact(long));
@@ -110,6 +125,16 @@ describe('exportArtifact', () => {
   });
 
   it('rejects unknown formats', () => {
-    expect(() => exportArtifact(makeArtifact('x'), 'docx' as never)).toThrow(ValidationError);
+    expect(() => exportArtifact(makeArtifact('x'), 'rtf' as never)).toThrow(ValidationError);
+  });
+
+  it('offers docx/xlsx content types and filenames', () => {
+    const a = makeArtifact('| x |\n|---|\n| 1 |\n', 'My Report!');
+    const docx = exportArtifact(a, 'docx');
+    expect(docx.contentType).toContain('wordprocessingml.document');
+    expect(docx.filename).toBe('my-report.docx');
+    const xlsx = exportArtifact(a, 'xlsx');
+    expect(xlsx.contentType).toContain('spreadsheetml.sheet');
+    expect(xlsx.filename).toBe('my-report.xlsx');
   });
 });

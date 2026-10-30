@@ -104,19 +104,55 @@ class KriyaDotMessagingService : FirebaseMessagingService() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
-        val notification = NotificationCompat.Builder(this, channelId(kind))
+        val builder = NotificationCompat.Builder(this, channelId(kind))
             .setContentTitle(title)
             .setContentText(body)
             .setStyle(NotificationCompat.BigTextStyle().bigText(body))
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentIntent(pending)
             .setAutoCancel(true)
+
+        // P-2: approval pushes carry Allow / Deny shade actions that call
+        // the companion's approval-decide path via ApprovalActionReceiver
+        // — no need to open the app to decide.
+        if (!approvalId.isNullOrBlank()) {
+            builder.addAction(
+                android.R.drawable.ic_input_add,
+                "Allow",
+                approvalDecisionIntent(approvalId, approve = true),
+            )
+            builder.addAction(
+                android.R.drawable.ic_delete,
+                "Deny",
+                approvalDecisionIntent(approvalId, approve = false),
+            )
+        }
+
+        val notification = builder
             .setPriority(
                 if (kind == "needsInput") NotificationCompat.PRIORITY_HIGH
                 else NotificationCompat.PRIORITY_DEFAULT,
             )
             .build()
         nm.notify(notificationId(kind, approvalId ?: chatId ?: botId), notification)
+    }
+
+    /** Explicit, immutable broadcast intent for one shade decision button. */
+    private fun approvalDecisionIntent(approvalId: String, approve: Boolean): PendingIntent {
+        val intent = Intent(this, ApprovalActionReceiver::class.java).apply {
+            action = ApprovalActionReceiver.ACTION_DECIDE
+            putExtra(ApprovalActionReceiver.EXTRA_APPROVAL_ID, approvalId)
+            putExtra(ApprovalActionReceiver.EXTRA_APPROVE, approve)
+        }
+        // Distinct request code per (approval, decision) so Allow and Deny
+        // never collapse into one PendingIntent.
+        val requestCode = ("approval|" + approvalId + "|" + approve).hashCode()
+        return PendingIntent.getBroadcast(
+            this,
+            requestCode,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
     }
 
     private fun channelId(kind: String) =
@@ -138,6 +174,14 @@ class KriyaDotMessagingService : FirebaseMessagingService() {
     }
 
     companion object {
+        /**
+         * Notification id used for an approval push (kind "needsInput",
+         * keyed by approval id — the same formula notificationId() uses in
+         * showNotification). ApprovalActionReceiver cancels by this id
+         * after a shade decision.
+         */
+        fun approvalNotificationId(approvalId: String): Int = ("needsInput|" + approvalId).hashCode()
+
         const val CHANNEL_ALERTS = "kriyadot_alerts"
         const val CHANNEL_ALERTS_HIGH = "kriyadot_alerts_high"
         const val EXTRA_KIND = "push_kind"

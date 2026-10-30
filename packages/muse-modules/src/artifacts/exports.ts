@@ -1,18 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
-// Artifact export formats (Muse parity, P3-E).
+// Artifact export formats (Muse parity, P3-E; OOXML added for FL-1/FL-2).
 //
 // ArtifactStore keeps versioned markdown. This module turns a markdown
 // artifact into shippable formats with zero dependencies and zero paid APIs:
 //   - html: self-contained web page (web artifact) with inline CSS
 //   - csv:  first markdown table → CSV (spreadsheet interchange)
-//   - pdf:  hand-rolled single-font PDF 1.4 (document export)
+//   - pdf:  hand-rolled, typeset PDF 1.4 (document export; see PDF section)
+//   - docx: real Word document (see ./docx.ts)
+//   - xlsx: real workbook, one sheet per markdown table (see ./xlsx.ts)
+// PPTX for slide decks lives in ./pptx.ts (exportDeckPptx).
 // All renderers are pure functions over strings/bytes, so they are cheaply
 // unit-testable and never touch the network.
 
 import { ValidationError } from '../errors.js';
+import { parseInline, parseMarkdown, plainText } from './markdown.js';
+import { renderArtifactDocx } from './docx.js';
+import { renderArtifactXlsx } from './xlsx.js';
 import type { Artifact } from './index.js';
 
-export type ArtifactExportFormat = 'html' | 'csv' | 'pdf';
+export type ArtifactExportFormat = 'html' | 'csv' | 'pdf' | 'docx' | 'xlsx';
+
+export const ARTIFACT_EXPORT_FORMATS: ArtifactExportFormat[] = ['html', 'csv', 'pdf', 'docx', 'xlsx'];
 
 /** Minimal HTML escaping. */
 function escHtml(s: string): string {
@@ -193,8 +201,17 @@ export function renderArtifactCsv(artifact: Artifact): string {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal PDF writer (PDF 1.4, single Helvetica font, no dependencies).
-// Lays the artifact out as wrapped text lines across letter-size pages.
+// Hand-rolled PDF writer (PDF 1.4, no dependencies), improved typesetting:
+//   - 56pt margins on letter pages, 500pt text column
+//   - four base-14 fonts: Helvetica, Helvetica-Bold, Helvetica-Oblique,
+//     Courier (code blocks, shaded, 9pt)
+//   - title 20pt bold, headings 16/14/12.5pt bold with space before,
+//     body 11pt with 1.35 leading, paragraph spacing, bullet/numbered
+//     lists with hanging prefixes, tables as bold-header ruled text rows
+//   - footer on every page: artifact title (left) + "Page X of Y" (right)
+// No stronger in-repo PDF path exists to reuse: the Pages pipeline renders
+// HTML, and apps/api's document-extract only *reads* PDFs (pdfjs). Keeping
+// this writer dependency-free preserves the module's zero-dep contract.
 // ---------------------------------------------------------------------------
 
 const PDF_CHAR_MAP: Record<string, string> = {
@@ -235,7 +252,11 @@ function wrapLine(line: string, maxChars: number): string[] {
   const out: string[] = [];
   let cur = '';
   for (const w of words) {
-    if ((cur + ' ' + w).trim().length > maxChars && cur) {
+    if (w.length > maxChars) {
+      if (cur) out.push(cur);
+      for (let k = 0; k < w.length; k += maxChars) out.push(w.slice(k, k + maxChars));
+      cur = '';
+    } else if ((cur + ' ' + w).trim().length > maxChars && cur) {
       out.push(cur);
       cur = w;
     } else {
@@ -246,112 +267,200 @@ function wrapLine(line: string, maxChars: number): string[] {
   return out.length > 0 ? out : [''];
 }
 
-/**
- * Render the artifact as PDF bytes (Uint8Array). Headings get a larger bold
- * treatment via a second font size; everything else is 11pt Helvetica.
- */
-export function renderArtifactPdf(artifact: Artifact): Uint8Array {
-  const lines: Array<{ text: string; size: number }> = [
-    { text: artifact.title, size: 18 },
-    { text: '', size: 11 },
+type PdfFont = 'F1' | 'F2' | 'F3' | 'F4';
+interface PdfLine {
+  text: string;
+  size: number;
+  font: PdfFont;
+  indent?: number;
+  spaceBefore?: number;
+  shade?: boolean;
+}
+
+/** Approx character budget for a font size: Helvetica averages ~0.5em. */
+function charsFor(size: number, font: PdfFont, indent = 0): number {
+  const perChar = font === 'F3' ? size * 0.6 : size * (font === 'F2' ? 0.53 : 0.5);
+  return Math.max(10, Math.floor((500 - indent) / perChar));
+}
+
+function pdfLinesForArtifact(artifact: Artifact): PdfLine[] {
+  const lines: PdfLine[] = [
+    { text: artifact.title, size: 20, font: 'F2' },
+    { text: '', size: 8, font: 'F1' },
   ];
-  for (const raw of artifact.content.split('\n')) {
-    const h = /^(#{1,3})\s+(.*)$/.exec(raw);
-    if (h) {
-      lines.push({ text: '', size: 11 });
-      lines.push({ text: h[2].replace(/[*_`]/g, ''), size: h[1].length === 1 ? 15 : 13 });
-      continue;
-    }
-    const clean = raw.replace(/[*_`]/g, '').replace(/^[-*]\s+/, '• ').replace(/^>\s?/, '');
-    for (const w of wrapLine(clean, 95)) {
-      lines.push({ text: w, size: 11 });
+  const pushWrapped = (
+    text: string,
+    size: number,
+    font: PdfFont,
+    opts: { indent?: number; prefix?: string; shade?: boolean; spaceBefore?: number } = {},
+  ): void => {
+    const prefix = opts.prefix ?? '';
+    const budget = charsFor(size, font, opts.indent ?? 0) - prefix.length;
+    const wrapped = wrapLine(text, Math.max(10, budget));
+    wrapped.forEach((w, idx) => {
+      lines.push({
+        text: (idx === 0 ? prefix : ' '.repeat(prefix.length)) + w,
+        size,
+        font,
+        indent: opts.indent,
+        shade: opts.shade,
+        spaceBefore: idx === 0 ? opts.spaceBefore : undefined,
+      });
+    });
+  };
+
+  for (const block of parseMarkdown(artifact.content)) {
+    switch (block.kind) {
+      case 'heading': {
+        const size = block.level === 1 ? 16 : block.level === 2 ? 14 : 12.5;
+        pushWrapped(block.text, size, 'F2', { spaceBefore: 10 });
+        break;
+      }
+      case 'paragraph':
+        pushWrapped(block.text, 11, 'F1', { spaceBefore: 4 });
+        break;
+      case 'quote':
+        pushWrapped(block.text, 11, 'F4', { indent: 18, spaceBefore: 4 });
+        break;
+      case 'list':
+        block.items.forEach((item, idx) => {
+          pushWrapped(item.text, 11, 'F1', {
+            indent: 14,
+            prefix: block.ordered ? `${idx + 1}. ` : '- ',
+          });
+        });
+        lines.push({ text: '', size: 5, font: 'F1' });
+        break;
+      case 'code':
+        for (const raw of block.text.split('\n')) {
+          for (const chunk of wrapLine(raw, charsFor(9, 'F3'))) {
+            lines.push({ text: chunk || ' ', size: 9, font: 'F3', indent: 8, shade: true });
+          }
+        }
+        lines.push({ text: '', size: 5, font: 'F1' });
+        break;
+      case 'table':
+        block.rows.forEach((row, ri) => {
+          pushWrapped(row.map((c) => plainText(parseInline(c))).join('  |  '), 10.5, ri === 0 ? 'F2' : 'F1', {
+            spaceBefore: ri === 0 ? 6 : undefined,
+          });
+        });
+        lines.push({ text: '', size: 5, font: 'F1' });
+        break;
+      case 'rule':
+        lines.push({ text: '-'.repeat(72), size: 9, font: 'F1', spaceBefore: 6 });
+        break;
     }
   }
+  return lines;
+}
 
-  // Paginate: letter 612x792, 50pt margins, line height = size * 1.35.
-  const pages: Array<Array<{ text: string; size: number }>> = [[]];
-  let y = 742;
-  for (const ln of lines) {
+/** Render the artifact as typeset PDF bytes (Uint8Array). */
+export function renderArtifactPdf(artifact: Artifact): Uint8Array {
+  const MARGIN = 56;
+  const TOP = 792 - MARGIN;
+  const BOTTOM = MARGIN + 14; // keep clear of the footer at y=32
+
+  interface PlacedLine extends PdfLine {
+    y: number;
+  }
+  const pages: PlacedLine[][] = [[]];
+  let y = TOP;
+  for (const ln of pdfLinesForArtifact(artifact)) {
     const lh = ln.size * 1.35;
-    if (y - lh < 50) {
+    let need = lh + (ln.spaceBefore ?? 0);
+    if (y - need < BOTTOM && pages[pages.length - 1]!.length > 0) {
       pages.push([]);
-      y = 742;
+      y = TOP;
+      need = lh; // no leading space at the top of a fresh page
     }
-    pages[pages.length - 1].push(ln);
+    y -= ln.spaceBefore && pages[pages.length - 1]!.length > 0 ? ln.spaceBefore : 0;
     y -= lh;
+    pages[pages.length - 1]!.push({ ...ln, y });
   }
 
-  const objects: string[] = [];
-  // 1: catalog, 2: pages, 3..: page + content pairs in creation order, then font.
+  const FONT_BASE: Record<PdfFont, string> = {
+    F1: 'Helvetica',
+    F2: 'Helvetica-Bold',
+    F3: 'Courier',
+    F4: 'Helvetica-Oblique',
+  };
+  const fontObjStart = 3 + pages.length * 2;
+  const fontObj = (f: PdfFont): number => fontObjStart + (['F1', 'F2', 'F3', 'F4'] as PdfFont[]).indexOf(f);
+  const fontRes = (['F1', 'F2', 'F3', 'F4'] as PdfFont[])
+    .map((f) => `/${f} ${fontObj(f)} 0 R`)
+    .join(' ');
+
+  const objects: Array<{ id: number; body: string }> = [];
   const pageObjNums: number[] = [];
   let nextObj = 3;
-  for (const page of pages) {
+  pages.forEach((page, pageIdx) => {
     const pageObj = nextObj++;
     const contentObj = nextObj++;
     pageObjNums.push(pageObj);
-    let cy = 742;
     const ops: string[] = [];
     for (const ln of page) {
-      ops.push(`BT /F1 ${ln.size} Tf 50 ${cy.toFixed(1)} Td (${pdfEscape(ln.text)}) Tj ET`);
-      cy -= ln.size * 1.35;
+      const x = MARGIN + (ln.indent ?? 0);
+      if (ln.shade) {
+        ops.push(`0.93 g ${MARGIN} ${(ln.y - 2.5).toFixed(1)} 500 ${(ln.size * 1.35).toFixed(1)} re f 0 g`);
+      }
+      if (ln.text) {
+        ops.push(`BT /${ln.font} ${ln.size} Tf ${x.toFixed(1)} ${ln.y.toFixed(1)} Td (${pdfEscape(ln.text)}) Tj ET`);
+      }
     }
+    // Footer: title left, page number right, 8pt gray.
+    const footerTitle = artifact.title.length > 60 ? artifact.title.slice(0, 57) + '...' : artifact.title;
+    ops.push(`BT /F1 8 Tf 0.45 g ${MARGIN} 32 Td (${pdfEscape(footerTitle)}) Tj ET`);
+    const pageLabel = `Page ${pageIdx + 1} of ${pages.length}`;
+    ops.push(`BT /F1 8 Tf 0.45 g ${(612 - MARGIN - pageLabel.length * 4.2).toFixed(1)} 32 Td (${pageLabel}) Tj ET`);
     const stream = ops.join('\n');
-    // Emit page dict and its content stream back-to-back so `objects` stays
-    // in creation order: [page1, stream1, page2, stream2, ..., font].
     objects.push(
-      `${pageObj} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 ${nextObj} 0 R >> >> /Contents ${contentObj} 0 R >>\nendobj\n`,
-      `${contentObj} 0 obj\n<< /Length ${Buffer.byteLength(stream, 'latin1')} >>\nstream\n${stream}\nendstream\nendobj\n`,
+      {
+        id: pageObj,
+        body: `${pageObj} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << ${fontRes} >> >> /Contents ${contentObj} 0 R >>\nendobj\n`,
+      },
+      {
+        id: contentObj,
+        body: `${contentObj} 0 obj\n<< /Length ${Buffer.byteLength(stream, 'latin1')} >>\nstream\n${stream}\nendstream\nendobj\n`,
+      },
     );
+  });
+  for (const f of ['F1', 'F2', 'F3', 'F4'] as PdfFont[]) {
+    const id = fontObj(f);
+    objects.push({
+      id,
+      body: `${id} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /${FONT_BASE[f]} >>\nendobj\n`,
+    });
   }
-  const fontObj = nextObj++;
-  objects.push(
-    `${fontObj} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n`,
-  );
 
   const header = '%PDF-1.4\n';
   const catalog = `1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n`;
   const pagesObj =
     `2 0 obj\n<< /Type /Pages /Kids [${pageObjNums.map((n) => `${n} 0 R`).join(' ')}] /Count ${pageObjNums.length} >>\nendobj\n`;
+  const totalObjs = fontObj('F4');
+  const byId = new Map(objects.map((o) => [o.id, o.body]));
+  const parts = [header, catalog, pagesObj];
+  for (let n = 3; n <= totalObjs; n++) parts.push(byId.get(n)!);
 
-  const parts = [header, catalog, pagesObj, ...objects];
-  const offsets: number[] = [];
+  const offsets = new Map<number, number>();
   let pos = 0;
   const latin1len = (s: string): number => Buffer.byteLength(s, 'latin1');
-  for (const p of parts) {
-    offsets.push(pos);
-    pos += latin1len(p);
+  offsets.set(1, latin1len(header));
+  pos = latin1len(header) + latin1len(catalog);
+  offsets.set(2, offsets.get(1)! + latin1len(catalog));
+  pos = offsets.get(2)! + latin1len(pagesObj);
+  for (let n = 3; n <= totalObjs; n++) {
+    offsets.set(n, pos);
+    pos += latin1len(byId.get(n)!);
   }
   const xrefPos = pos;
-  const totalObjs = fontObj; // highest object number
-
-  // Object creation order: [page1, content1, page2, content2, ..., font].
-  // parts[0] = header (no object), parts[1] = obj 1, parts[2] = obj 2,
-  // parts[3 + k] = k-th created object.
-  const createdOrder: number[] = [];
-  {
-    let n = 3;
-    for (let p = 0; p < pages.length; p++) {
-      createdOrder.push(n++); // page dict obj
-      createdOrder.push(n++); // content stream obj
-    }
-    createdOrder.push(n++); // font obj
-  }
-  const objPos = new Map<number, number>();
-  objPos.set(1, offsets[1]);
-  objPos.set(2, offsets[2]);
-  for (let k = 0; k < createdOrder.length; k++) {
-    objPos.set(createdOrder[k], offsets[3 + k]);
-  }
   let xrefBody = `xref\n0 ${totalObjs + 1}\n0000000000 65535 f \n`;
   for (let n = 1; n <= totalObjs; n++) {
-    const off = objPos.get(n) ?? 0;
-    xrefBody += `${String(off).padStart(10, '0')} 00000 n \n`;
+    xrefBody += `${String(offsets.get(n) ?? 0).padStart(10, '0')} 00000 n \n`;
   }
   const trailer =
     `trailer\n<< /Size ${totalObjs + 1} /Root 1 0 R >>\nstartxref\n${xrefPos}\n%%EOF\n`;
-
-  const full = parts.join('') + xrefBody + trailer;
-  return new Uint8Array(Buffer.from(full, 'latin1'));
+  return new Uint8Array(Buffer.from(parts.join('') + xrefBody + trailer, 'latin1'));
 }
 
 /**
@@ -391,7 +500,23 @@ export function exportArtifact(
         filename: `${slug}.pdf`,
       };
     }
+    case 'docx': {
+      return {
+        bytes: renderArtifactDocx(artifact),
+        contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        filename: `${slug}.docx`,
+      };
+    }
+    case 'xlsx': {
+      return {
+        bytes: renderArtifactXlsx(artifact),
+        contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        filename: `${slug}.xlsx`,
+      };
+    }
     default:
-      throw new ValidationError(`unknown export format: ${String(format)} (want html | csv | pdf)`);
+      throw new ValidationError(
+        `unknown export format: ${String(format)} (want html | csv | pdf | docx | xlsx)`,
+      );
   }
 }

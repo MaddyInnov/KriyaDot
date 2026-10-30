@@ -27,6 +27,7 @@
 // signInCodePolicyRules() (prepended to the global policy in index.ts,
 // first match wins — same pattern as publishPagePolicyRules()).
 
+import { randomUUID } from 'node:crypto';
 import type { BotPolicyRule, ToolContext, ToolDefinition } from '@mvp/agent-runtime';
 import { MockOSScreenLayer, type OSScreenLayer } from '@mvp/agent-runtime/dist/tools/computer.js';
 import type { ComposioClient } from './composio.js';
@@ -517,6 +518,282 @@ export function createEnterSignInCodeTool(deps: Omit<SignInCodeToolDeps, 'regist
         );
       }
       return finish('entered', search.sourcesSearched, search.messages.length);
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Opaque code handoff (P-13): reference + ~10-min hold + approval-gated
+// delivery + resend-once.
+//
+// The direct tool above reads a code and types it in one motion, inside a
+// single governance-approved call. The handoff flow splits that in two
+// for browser tasks: (1) ISSUE — a fresh code is located and held
+// server-side under an OPAQUE REFERENCE (a bare UUID); the reference is
+// all that ever travels to the browser task / chat / logs. (2) DELIVER —
+// presenting the reference TOGETHER with a human approval types the held
+// code into the focused field, exactly once. The code value lives only
+// in this service's in-memory map (never persisted, never returned,
+// never audited) and is dropped the moment the hold is delivered,
+// invalidated, or expires.
+//
+// Resend semantics: a held reference may be RESENT ONCE — the old
+// reference is invalidated, a fresh code is located, and a NEW reference
+// is issued in the 'awaiting-approval' state (the resend does NOT carry
+// the original approval over; delivery of the new reference needs a
+// fresh approval). A second resend attempt invalidates the whole lineage
+// and reports 'resend-exhausted': the caller must start over with a
+// fresh issue (and a fresh approval card).
+// ---------------------------------------------------------------------------
+
+/** Default hold for an issued reference: ~10 minutes. */
+export const DEFAULT_CODE_HANDOFF_HOLD_MS = 10 * 60 * 1000;
+
+export type CodeHandoffState = 'awaiting-approval' | 'delivered' | 'expired' | 'invalidated';
+
+interface CodeHandoffEntry {
+  ref: string;
+  lineageId: string;
+  site: string;
+  service?: string;
+  botId: string;
+  userId: string;
+  /** The code value — memory only, cleared on delivery/invalidation/expiry. */
+  code: string;
+  createdAt: number;
+  expiresAt: number;
+  resendCount: number;
+  state: CodeHandoffState;
+}
+
+/** Public view of a hold: metadata only, NEVER the code. */
+export interface CodeHandoffStatus {
+  ref: string;
+  site: string;
+  state: CodeHandoffState;
+  createdAt: number;
+  expiresAt: number;
+  resendCount: number;
+}
+
+export type CodeHandoffIssueResult =
+  | { status: 'held'; ref: string; site: string; expiresAt: number }
+  | { status: 'ambiguous' | 'not-found' | 'stale' | 'no-source' | 'search-failed'; site: string };
+
+export type CodeHandoffDeliverResult =
+  | { status: 'delivered'; site: string }
+  | {
+      status: 'unknown' | 'expired' | 'invalidated' | 'already-delivered' | 'approval-required' | 'type-failed';
+      site?: string;
+    };
+
+export type CodeHandoffResendResult =
+  | { status: 'held'; ref: string; site: string; expiresAt: number; resendCount: number }
+  | {
+      status: 'unknown' | 'expired' | 'invalidated' | 'already-delivered' | 'resend-exhausted' | 'ambiguous' | 'not-found' | 'stale' | 'no-source' | 'search-failed';
+      site?: string;
+    };
+
+export interface SignInCodeHandoffDeps {
+  /** Message searcher (default: the Composio Gmail searcher). */
+  searcher: SignInMessageSearcher;
+  /** Clock (tests inject a fake). */
+  now?: () => number;
+  /** Hold duration override (default ~10 min). */
+  holdMs?: number;
+  /** Freshness window for locating the code (default ~10 min). */
+  freshnessMs?: number;
+  /** OS layer whose focused field receives the code on delivery. */
+  resolveOS?: (input: { botId: string; userId: string; site: string }) => OSScreenLayer | Promise<OSScreenLayer>;
+  /** Audit sink. NEVER receives a code value. */
+  audit?: (
+    action: string,
+    fields: { actor?: string; toolName?: string; detail?: unknown },
+  ) => void;
+}
+
+export interface SignInCodeHandoffService {
+  issue(input: { botId: string; userId: string; site: string; service?: string }): Promise<CodeHandoffIssueResult>;
+  deliver(
+    ref: string,
+    input: { approved: boolean },
+  ): Promise<CodeHandoffDeliverResult>;
+  resend(ref: string): Promise<CodeHandoffResendResult>;
+  status(ref: string): CodeHandoffStatus | undefined;
+}
+
+export function createSignInCodeHandoffService(deps: SignInCodeHandoffDeps): SignInCodeHandoffService {
+  const now = deps.now ?? Date.now;
+  const holdMs = deps.holdMs ?? DEFAULT_CODE_HANDOFF_HOLD_MS;
+  const freshnessMs = deps.freshnessMs ?? DEFAULT_SIGN_IN_CODE_FRESHNESS_MS;
+  const fallbackOS = new MockOSScreenLayer();
+  const entries = new Map<string, CodeHandoffEntry>();
+
+  const audit = (action: string, entry: CodeHandoffEntry | undefined, extra?: Record<string, unknown>) => {
+    try {
+      deps.audit?.(action, {
+        actor: entry?.botId,
+        toolName: ENTER_SIGN_IN_CODE_TOOL,
+        // Metadata only: site, hold state, resend count. NEVER a code value.
+        detail: entry
+          ? { site: entry.site, state: entry.state, resendCount: entry.resendCount, ...extra }
+          : { ...extra },
+      });
+    } catch {
+      // Audit must never break the handoff.
+    }
+  };
+
+  /** Lazily expire holds whose window has passed (and drop their codes). */
+  const sweep = (entry: CodeHandoffEntry): CodeHandoffEntry => {
+    if (entry.state === 'awaiting-approval' && now() >= entry.expiresAt) {
+      entry.state = 'expired';
+      entry.code = '';
+    }
+    return entry;
+  };
+
+  const locate = async (input: {
+    botId: string;
+    userId: string;
+    site: string;
+    service?: string;
+  }): Promise<{ status: 'found'; code: string } | { status: Exclude<CodeHandoffIssueResult['status'], 'held'> }> => {
+    let search: SignInSearchResult;
+    try {
+      search = await deps.searcher({ botId: input.botId, userId: input.userId, site: input.site, service: input.service, nowMs: now() });
+    } catch {
+      return { status: 'search-failed' };
+    }
+    if (search.sourcesSearched.length === 0) return { status: 'no-source' };
+    const extraction = extractSignInCode(search.messages, {
+      site: input.site,
+      service: input.service,
+      nowMs: now(),
+      freshnessMs,
+    });
+    if (extraction.status === 'found') return { status: 'found', code: extraction.code };
+    return { status: extraction.status };
+  };
+
+  const hold = (
+    input: { botId: string; userId: string; site: string; service?: string },
+    code: string,
+    lineageId: string,
+    resendCount: number,
+  ): CodeHandoffEntry => {
+    const createdAt = now();
+    const entry: CodeHandoffEntry = {
+      ref: randomUUID(),
+      lineageId,
+      site: input.site,
+      ...(input.service ? { service: input.service } : {}),
+      botId: input.botId,
+      userId: input.userId,
+      code,
+      createdAt,
+      expiresAt: createdAt + holdMs,
+      resendCount,
+      state: 'awaiting-approval',
+    };
+    entries.set(entry.ref, entry);
+    // Bound the map: held codes are short-lived by design.
+    if (entries.size > 500) {
+      const first = entries.keys().next();
+      if (!first.done) entries.delete(first.value);
+    }
+    return entry;
+  };
+
+  return {
+    async issue(input) {
+      const site = domainOfSite(input.site) || input.site.trim();
+      const located = await locate({ ...input, site });
+      if (located.status !== 'found') return { status: located.status, site };
+      const entry = hold({ ...input, site }, located.code, randomUUID(), 0);
+      audit('sign_in_code.handoff_issued', entry);
+      return { status: 'held', ref: entry.ref, site, expiresAt: entry.expiresAt };
+    },
+
+    async deliver(ref, input) {
+      const entry = entries.get(ref);
+      if (!entry) return { status: 'unknown' };
+      sweep(entry);
+      if (entry.state === 'expired') return { status: 'expired', site: entry.site };
+      if (entry.state === 'invalidated') return { status: 'invalidated', site: entry.site };
+      if (entry.state === 'delivered') return { status: 'already-delivered', site: entry.site };
+      if (!input.approved) {
+        // Approval-gated: without the human's approval nothing is typed
+        // and the hold stays alive until it expires.
+        return { status: 'approval-required', site: entry.site };
+      }
+      const code = entry.code;
+      try {
+        const os = deps.resolveOS
+          ? await deps.resolveOS({ botId: entry.botId, userId: entry.userId, site: entry.site })
+          : fallbackOS;
+        await os.type(code);
+      } catch {
+        audit('sign_in_code.handoff_type_failed', entry);
+        return { status: 'type-failed', site: entry.site };
+      }
+      entry.state = 'delivered';
+      entry.code = '';
+      audit('sign_in_code.handoff_delivered', entry);
+      return { status: 'delivered', site: entry.site };
+    },
+
+    async resend(ref) {
+      const entry = entries.get(ref);
+      if (!entry) return { status: 'unknown' };
+      sweep(entry);
+      if (entry.state === 'expired') return { status: 'expired', site: entry.site };
+      if (entry.state === 'invalidated') return { status: 'invalidated', site: entry.site };
+      if (entry.state === 'delivered') return { status: 'already-delivered', site: entry.site };
+      if (entry.resendCount >= 1) {
+        // Resend-once: a second resend kills the whole lineage. The user
+        // starts a fresh issue (with a fresh approval) instead.
+        for (const e of entries.values()) {
+          if (e.lineageId === entry.lineageId && e.state === 'awaiting-approval') {
+            e.state = 'invalidated';
+            e.code = '';
+          }
+        }
+        audit('sign_in_code.handoff_resend_exhausted', entry);
+        return { status: 'resend-exhausted', site: entry.site };
+      }
+      // Invalidate the old reference first — it can never be delivered.
+      entry.state = 'invalidated';
+      entry.code = '';
+      const located = await locate({
+        botId: entry.botId,
+        userId: entry.userId,
+        site: entry.site,
+        service: entry.service,
+      });
+      if (located.status !== 'found') return { status: located.status, site: entry.site };
+      const next = hold(
+        { botId: entry.botId, userId: entry.userId, site: entry.site, service: entry.service },
+        located.code,
+        entry.lineageId,
+        entry.resendCount + 1,
+      );
+      audit('sign_in_code.handoff_resent', next);
+      return { status: 'held', ref: next.ref, site: next.site, expiresAt: next.expiresAt, resendCount: next.resendCount };
+    },
+
+    status(ref) {
+      const entry = entries.get(ref);
+      if (!entry) return undefined;
+      sweep(entry);
+      return {
+        ref: entry.ref,
+        site: entry.site,
+        state: entry.state,
+        createdAt: entry.createdAt,
+        expiresAt: entry.expiresAt,
+        resendCount: entry.resendCount,
+      };
     },
   };
 }

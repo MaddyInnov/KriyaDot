@@ -12,8 +12,12 @@
 //
 // Sub-routers (paths relative to the mount point):
 //   /overview
-//   /feed        GET /brief · PUT /brief · GET /posts · POST /posts/generate
-//                POST /posts/:id/dismiss · POST /schedule
+//   /feed        GET /brief · PUT /brief (regen on change) · GET /posts
+//                (?q=&order=usefulness) · POST /posts/generate
+//                POST /posts/:id/dismiss · DELETE /posts/:id · POST /schedule
+//                POST /posts/:id/react · GET /posts/:id/reactions
+//                POST /posts/:id/seen · POST /posts/:id/discuss
+//                GET /taste · POST /taste/refresh · DELETE /taste
 //   /reminders   GET / · POST / · GET /due · GET /:id · POST /:id/cancel
 //                POST /:id/done · POST /:id/fire
 //   /goals       GET / · POST / · GET /:id · POST /:id/progress
@@ -37,7 +41,7 @@
 //                GET /digest
 //   /meetings    GET / · POST /upload { fileName, audioBase64, title? }
 //   /slides      GET / · POST / · GET /:id · PUT /:id · DELETE /:id
-//                POST /:id/export { format: 'html' | 'markdown' }
+//                POST /:id/export { format: 'html' | 'markdown' | 'pptx' }
 //   /kb          POST /documents (octet-stream, ?fileName=&title=&mimeType=&corpusId=)
 //                GET /documents · DELETE /documents/:id
 //                POST /query { query, topK?, corpusIds? } · POST /answer
@@ -62,6 +66,14 @@ import {
   messageForError,
   FeedStore,
   MockFeedGenerator,
+  LlmFeedGenerator,
+  FeedTasteStore,
+  ensureSeedPosts,
+  updateBriefAndRegenerate,
+  refreshFeedTaste,
+  SearchToolSourceProvider,
+  SocialSearchSourceProvider,
+  CompositeSourceProvider,
   generateFeedPosts,
   scheduleFeedGeneration,
   ReminderStore,
@@ -98,6 +110,7 @@ import {
   SlideDeckStore,
   exportDeckMarkdown,
   exportDeckHtml,
+  exportDeckPptx,
   KnowledgeBaseStore,
   LocalEmbedder,
   extractText,
@@ -177,6 +190,52 @@ export function registerMuseModuleRoutes(router: Router, deps: RouteDeps): void 
   });
 
   // ---- Feed ---------------------------------------------------------------
+  // Real generator wiring (audit F-1/F-4/F-5): when a bot is configured, the
+  // feed generator is LlmFeedGenerator backed by the platform's existing
+  // agent runtime (same runTurn pattern as meetings/KB below — no new
+  // provider stack), the research search tool + social search as source
+  // providers, and goals + past posts + the private taste summary as
+  // personal context. MockFeedGenerator remains ONLY as the offline
+  // fallback for installs with no bot/LLM configured.
+  const feedTaste = new FeedTasteStore(mdb);
+  ensureSeedPosts(feed);
+  const feedBot = deps.bots[0];
+  const runFeedLlm = async (prompt: string): Promise<string> => {
+    if (!feedBot) throw new Error('no bots configured for feed generation');
+    let out = '';
+    await deps.agentRuntime.runTurn({
+      bot: feedBot,
+      message: prompt,
+      sessionId: `feed-${Date.now()}`,
+      onEvent: async (event) => {
+        if (event.type === 'token') out += event.content;
+      },
+    });
+    return out;
+  };
+  const feedGenerator = feedBot
+    ? new LlmFeedGenerator({
+        llm: runFeedLlm,
+        sourceProvider: new CompositeSourceProvider([
+          new SearchToolSourceProvider(searchTool),
+          new SocialSearchSourceProvider(socialSearch),
+        ]),
+        contextProvider: {
+          getContext: () => ({
+            // F-5 personal context: profile line from the primary bot's
+            // identity; memory snippets plug in here when the tiered-memory
+            // store is plumbed into RouteDeps (interface already supports it).
+            profile: feedBot
+              ? `${feedBot.name}${feedBot.persona ? ` — ${feedBot.persona}` : ''}`
+              : undefined,
+            goals: goals.list('active').map((g) => `${g.title} (${g.progress}%)`),
+            pastPosts: feed.listPosts(true).slice(0, 10).map((p) => ({ title: p.title })),
+          }),
+        },
+        tasteStore: feedTaste,
+      })
+    : new MockFeedGenerator();
+
   const feedRouter = Router();
   feedRouter.get('/brief', (_req, res) => {
     try {
@@ -185,23 +244,36 @@ export function registerMuseModuleRoutes(router: Router, deps: RouteDeps): void 
       sendError(res, err, 'failed to read feed brief');
     }
   });
-  feedRouter.put('/brief', (req, res) => {
+  // F-9: a changed brief triggers a fresh generation appended to the feed.
+  // Generation failure never loses the saved brief.
+  feedRouter.put('/brief', async (req, res) => {
+    const briefText = String(body(req).brief ?? '');
     try {
-      res.json(feed.setBrief(String(body(req).brief ?? '')));
+      const { brief: saved, generated } = await updateBriefAndRegenerate(feed, feedGenerator, briefText);
+      res.json({ ...saved, generated: generated.length });
     } catch (err) {
-      sendError(res, err, 'failed to set feed brief');
+      // updateBriefAndRegenerate saves before generating; a generation
+      // failure must not lose the saved brief.
+      const saved = feed.getBrief();
+      if (saved && saved.brief === briefText.trim()) {
+        res.json({ ...saved, generated: 0 });
+      } else {
+        sendError(res, err, 'failed to set feed brief');
+      }
     }
   });
   feedRouter.get('/posts', (req, res) => {
     try {
-      res.json(feed.listPosts(req.query.includeDismissed === '1'));
+      const order = req.query.order === 'usefulness' ? 'usefulness' : 'chronological';
+      const q = typeof req.query.q === 'string' ? req.query.q : undefined;
+      res.json(feed.listPostsQuery({ includeDismissed: req.query.includeDismissed === '1', q, order }));
     } catch (err) {
       sendError(res, err, 'failed to list feed posts');
     }
   });
   feedRouter.post('/posts/generate', async (_req, res) => {
     try {
-      res.status(201).json(await generateFeedPosts(feed, new MockFeedGenerator()));
+      res.status(201).json(await generateFeedPosts(feed, feedGenerator));
     } catch (err) {
       sendError(res, err, 'failed to generate feed posts');
     }
@@ -211,6 +283,70 @@ export function registerMuseModuleRoutes(router: Router, deps: RouteDeps): void 
       res.json(feed.dismissPost(req.params.id));
     } catch (err) {
       sendError(res, err, 'failed to dismiss feed post');
+    }
+  });
+  feedRouter.delete('/posts/:id', (req, res) => {
+    try {
+      feed.deletePost(req.params.id);
+      res.json({ ok: true });
+    } catch (err) {
+      sendError(res, err, 'failed to delete feed post');
+    }
+  });
+  // F-13: per-post reactions + discuss-in-chat seed payload.
+  feedRouter.post('/posts/:id/react', (req, res) => {
+    try {
+      res.status(201).json(feed.recordReaction(req.params.id, body(req).reaction as 'like' | 'dislike' | 'discussed'));
+    } catch (err) {
+      sendError(res, err, 'failed to record feed reaction');
+    }
+  });
+  feedRouter.get('/posts/:id/reactions', (req, res) => {
+    try {
+      res.json(feed.listReactions(req.params.id));
+    } catch (err) {
+      sendError(res, err, 'failed to list feed reactions');
+    }
+  });
+  feedRouter.post('/posts/:id/seen', (req, res) => {
+    try {
+      res.json(feed.markSeen(req.params.id));
+    } catch (err) {
+      sendError(res, err, 'failed to mark feed post seen');
+    }
+  });
+  feedRouter.post('/posts/:id/discuss', (req, res) => {
+    try {
+      res.json(feed.discuss(req.params.id));
+    } catch (err) {
+      sendError(res, err, 'failed to build discuss payload');
+    }
+  });
+  // F-7: the private taste summary — view / refresh / reset (user's own only).
+  feedRouter.get('/taste', (_req, res) => {
+    try {
+      res.json(feedTaste.getTaste());
+    } catch (err) {
+      sendError(res, err, 'failed to read feed taste');
+    }
+  });
+  feedRouter.post('/taste/refresh', async (_req, res) => {
+    try {
+      if (!feedBot) {
+        res.status(503).json({ error: 'no bots configured for taste refresh' });
+        return;
+      }
+      res.json(await refreshFeedTaste(feedTaste, feed, runFeedLlm));
+    } catch (err) {
+      sendError(res, err, 'failed to refresh feed taste');
+    }
+  });
+  feedRouter.delete('/taste', (_req, res) => {
+    try {
+      feedTaste.resetTaste();
+      res.json({ ok: true });
+    } catch (err) {
+      sendError(res, err, 'failed to reset feed taste');
     }
   });
   feedRouter.post('/schedule', (req, res) => {
@@ -422,12 +558,13 @@ export function registerMuseModuleRoutes(router: Router, deps: RouteDeps): void 
       sendError(res, err, 'failed to list artifact versions');
     }
   });
-  // Export the latest version as html (web page), csv (first table), or pdf.
+  // Export the latest version as html, csv (first table), pdf, docx, or xlsx
+  // (xlsx carries ALL markdown tables, one sheet per table).
   artifactsRouter.get('/:id/export', (req, res) => {
     try {
-      const format = req.query.format as 'html' | 'csv' | 'pdf' | undefined;
-      if (format !== 'html' && format !== 'csv' && format !== 'pdf') {
-        res.status(400).json({ error: 'query "format" must be one of: html, csv, pdf' });
+      const format = req.query.format as 'html' | 'csv' | 'pdf' | 'docx' | 'xlsx' | undefined;
+      if (format !== 'html' && format !== 'csv' && format !== 'pdf' && format !== 'docx' && format !== 'xlsx') {
+        res.status(400).json({ error: 'query "format" must be one of: html, csv, pdf, docx, xlsx' });
         return;
       }
       const artifact = artifacts.get(req.params.id);
@@ -1064,7 +1201,12 @@ export function registerMuseModuleRoutes(router: Router, deps: RouteDeps): void 
     try {
       const deck = slides.get(req.params.id);
       const format = String(body(req).format ?? 'html');
-      if (format === 'markdown' || format === 'md') {
+      if (format === 'pptx') {
+        const { bytes, contentType, filename } = exportDeckPptx(deck);
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.send(Buffer.from(bytes));
+      } else if (format === 'markdown' || format === 'md') {
         res.json({ format: 'markdown', content: exportDeckMarkdown(deck) });
       } else {
         res.json({ format: 'html', content: exportDeckHtml(deck) });

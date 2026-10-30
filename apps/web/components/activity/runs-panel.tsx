@@ -396,14 +396,14 @@ function RunDetailView({ runId, onBack }: { runId: string; onBack: () => void })
   );
 }
 
-export function RunsPanel() {
+export function RunsPanel({ initialRunId }: { initialRunId?: string } = {}) {
   const [runs, setRuns] = useState<ObsRun[]>([]);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
   const [botFilter, setBotFilter] = useState('');
   const [outcomeFilter, setOutcomeFilter] = useState('');
   const [tagFilter, setTagFilter] = useState('');
-  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(initialRunId ?? null);
 
   const load = useCallback(async () => {
     setLoading(true);

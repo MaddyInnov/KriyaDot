@@ -3,6 +3,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { MODULES_BASE, api, PageHeader, ErrorBox, EmptyState } from '../lib';
+import { authedFetch } from '../../../lib/api';
 
 interface Slide {
   id: string;
@@ -97,8 +98,26 @@ export default function SlidesPage() {
     if (selected?.id === id) setSelected(null);
   };
 
-  const exportDeck = async (format: 'html' | 'markdown') => {
+  const exportDeck = async (format: 'html' | 'markdown' | 'pptx') => {
     if (!selected) return;
+    const slug = selected.title.replace(/[^a-z0-9]+/gi, '-').toLowerCase();
+    if (format === 'pptx') {
+      // Binary download — the JSON `api()` helper cannot carry it.
+      const res = await authedFetch(`${MODULES_BASE}/slides/${selected.id}/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ format }),
+      });
+      if (!res.ok) return;
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${slug}.pptx`;
+      a.click();
+      URL.revokeObjectURL(url);
+      return;
+    }
     const res = (await api(`${MODULES_BASE}/slides/${selected.id}/export`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -108,7 +127,7 @@ export default function SlidesPage() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${selected.title.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.${format === 'html' ? 'html' : 'md'}`;
+    a.download = `${slug}.${format === 'html' ? 'html' : 'md'}`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -203,6 +222,9 @@ export default function SlidesPage() {
                   </button>
                   <button className="btn small" onClick={() => exportDeck('markdown')}>
                     Export MD
+                  </button>
+                  <button className="btn small" onClick={() => exportDeck('pptx')}>
+                    Export PPTX
                   </button>
                   <button className="btn small" onClick={() => saveDeck(selected)} disabled={busy}>
                     Save

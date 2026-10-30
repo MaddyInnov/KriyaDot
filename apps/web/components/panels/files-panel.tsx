@@ -6,7 +6,7 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { CodeBlock } from '../code/CodeBlock';
-import { authedFetch } from '../../lib/api';
+import { authedFetch, pinWorkspaceFile, renameWorkspaceFile } from '../../lib/api';
 
 export interface FileNode {
   name: string;
@@ -14,6 +14,8 @@ export interface FileNode {
   type: 'file' | 'dir';
   size?: number;
   children?: FileNode[];
+  /** FL-12: pinned files sort first (stamped server-side from file_meta). */
+  pinned?: boolean;
 }
 
 function formatBytes(n?: number): string {
@@ -202,6 +204,34 @@ export function FilesPanel() {
                   <span className={i === crumbs.length - 1 ? 'crumb current' : 'crumb'}>{c}</span>
                 </React.Fragment>
               ))}
+              {/* FL-12: pin / rename act on the file record (endpoints in
+                  file-metadata.ts; harmless error until the host wires them). */}
+              <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 6 }}>
+                <button
+                  className="btn btn-sm"
+                  title="Pin this file (pinned files sort first in the Library)"
+                  onClick={() => {
+                    void pinWorkspaceFile(selected.path, !selected.pinned)
+                      .then(() => setSelected({ ...selected, pinned: !selected.pinned }))
+                      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+                  }}
+                >
+                  {selected.pinned ? 'Unpin' : 'Pin'}
+                </button>
+                <button
+                  className="btn btn-sm"
+                  title="Rename this file"
+                  onClick={() => {
+                    const next = window.prompt('Rename file', selected.path);
+                    if (!next || next === selected.path) return;
+                    void renameWorkspaceFile(selected.path, next)
+                      .then(() => window.location.reload())
+                      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+                  }}
+                >
+                  Rename
+                </button>
+              </span>
             </nav>
             {loading && <div className="muted">Loading…</div>}
             {!loading && content !== null && (

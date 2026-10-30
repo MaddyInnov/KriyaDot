@@ -3,6 +3,7 @@
 
 import { useCallback, useState } from 'react';
 import { MODULES_BASE, api, fmtTs, PageHeader, ErrorBox, EmptyState, Markdown, useModuleData } from '../lib';
+import { authedFetch } from '../../../lib/api';
 
 interface Artifact {
   id: string;
@@ -69,6 +70,19 @@ export default function ArtifactsPage() {
     refresh();
     const v = (await api(`${MODULES_BASE}/artifacts/${selected.id}/versions`)) as ArtifactVersion[];
     setVersions(v);
+  };
+
+  const downloadExport = async (format: 'html' | 'csv' | 'pdf' | 'docx' | 'xlsx') => {
+    if (!selected) return;
+    const res = await authedFetch(`${MODULES_BASE}/artifacts/${selected.id}/export?format=${format}`);
+    if (!res.ok) return;
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${selected.title.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.${format}`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const shownVersion = viewVersion === null ? null : versions.find((v) => v.version === viewVersion);
@@ -162,15 +176,28 @@ export default function ArtifactsPage() {
                     </button>
                   ))}
                 </div>
-                <button
-                  className="btn btn-sm"
-                  onClick={() => {
-                    setEditContent(selected.content);
-                    setEditing(true);
-                  }}
-                >
-                  Edit
-                </button>
+                <span>
+                  <span className="small muted">Export: </span>
+                  {(['html', 'pdf', 'docx', 'xlsx', 'csv'] as const).map((f) => (
+                    <button
+                      key={f}
+                      className="btn btn-sm"
+                      style={{ marginRight: 4 }}
+                      onClick={() => void downloadExport(f)}
+                    >
+                      {f.toUpperCase()}
+                    </button>
+                  ))}
+                  <button
+                    className="btn btn-sm"
+                    onClick={() => {
+                      setEditContent(selected.content);
+                      setEditing(true);
+                    }}
+                  >
+                    Edit
+                  </button>
+                </span>
               </div>
             </div>
           )}

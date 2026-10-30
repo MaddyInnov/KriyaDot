@@ -15,6 +15,7 @@ import { promisify } from 'node:util';
 import { unzipSync, strFromU8 } from 'fflate';
 import { findExecutable, resolveOcrProvider, type OcrProvider } from './ocr.js';
 import { parseImageMetadata } from './vision-pipeline.js';
+import { detectImageContainer, UnsupportedImageFormatError } from './file-intake.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -245,6 +246,19 @@ export function isImageInput(mimeType: string, fileName: string): boolean {
   const mt = mimeType.toLowerCase();
   const ext = fileName.toLowerCase().split('.').pop() ?? '';
   return mt.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'tif', 'tiff', 'bmp'].includes(ext);
+}
+
+/**
+ * FL-10: HEIC/AVIF uploads cannot be OCR'd or thumbnailed by this build
+ * (no decoder in the dependency tree — see file-intake.ts). Returns the
+ * user-facing guidance message when the bytes/name are HEIC/AVIF, else
+ * null. The upload path surfaces this instead of a silent empty extract.
+ */
+export function unsupportedImageFormatNote(data: Uint8Array, fileName: string): string | null {
+  const format = detectImageContainer(data);
+  const byExt = /\.hei[cf]$/i.test(fileName) ? 'heic' : /\.avif$/i.test(fileName) ? 'avif' : format;
+  if (byExt === 'heic' || byExt === 'avif') return new UnsupportedImageFormatError(byExt).message;
+  return null;
 }
 
 const IMAGE_MIME_BY_EXT: Record<string, string> = {

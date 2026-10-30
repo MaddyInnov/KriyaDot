@@ -29,9 +29,28 @@ CREATE TABLE IF NOT EXISTS mm_feed_posts (
   body TEXT NOT NULL,
   source_note TEXT,
   dismissed INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  sources_json TEXT NOT NULL DEFAULT '[]',
+  seed INTEGER NOT NULL DEFAULT 0,
+  seen INTEGER NOT NULL DEFAULT 0,
+  actionable INTEGER NOT NULL DEFAULT 0,
+  deadline_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_mm_feed_posts_created ON mm_feed_posts (created_at DESC);
+-- Feed reactions (F-13/F-7): one row per reaction event on a post.
+CREATE TABLE IF NOT EXISTS mm_feed_reactions (
+  id TEXT PRIMARY KEY,
+  post_id TEXT NOT NULL,
+  reaction TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mm_feed_reactions_post ON mm_feed_reactions (post_id, created_at);
+-- Private per-user taste summary (F-7): never rendered as a post.
+CREATE TABLE IF NOT EXISTS mm_feed_taste (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  summary TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS mm_reminders (
   id TEXT PRIMARY KEY,
@@ -280,6 +299,21 @@ export class ModuleDb {
     this.path = dbPath;
     this.db = openDb(dbPath);
     this.db.exec(SCHEMA);
+    // Additive migrations for databases created before the feed columns
+    // existed (CREATE TABLE IF NOT EXISTS does not add columns).
+    for (const sql of [
+      `ALTER TABLE mm_feed_posts ADD COLUMN sources_json TEXT NOT NULL DEFAULT '[]'`,
+      `ALTER TABLE mm_feed_posts ADD COLUMN seed INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE mm_feed_posts ADD COLUMN seen INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE mm_feed_posts ADD COLUMN actionable INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE mm_feed_posts ADD COLUMN deadline_at INTEGER`,
+    ]) {
+      try {
+        this.db.exec(sql);
+      } catch {
+        // Column already present — nothing to do.
+      }
+    }
   }
 
   close(): void {

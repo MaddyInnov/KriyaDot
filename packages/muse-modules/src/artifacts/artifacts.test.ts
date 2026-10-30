@@ -41,6 +41,18 @@ describe('ArtifactStore', () => {
     expect(store.list().map((x) => x.id)).toEqual([a.id, b.id]);
   });
 
+  it('remove() deletes the artifact and all versions atomically', () => {
+    const a = store.create({ title: 'a', content: 'v1' });
+    store.update(a.id, 'v2');
+    store.remove(a.id);
+    expect(() => store.get(a.id)).toThrow(NotFoundError);
+    expect(store.list()).toEqual([]);
+    expect(() => store.remove(a.id)).toThrow(NotFoundError);
+    // A fresh artifact is unaffected.
+    const b = store.create({ title: 'b', content: 'x' });
+    expect(store.get(b.id).content).toBe('x');
+  });
+
   it('unknown version throws NotFoundError', () => {
     const a = store.create({ title: 'a', content: 'x' });
     expect(() => store.getVersion(a.id, 99)).toThrow(NotFoundError);
