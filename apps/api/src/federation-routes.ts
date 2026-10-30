@@ -141,7 +141,9 @@ type RunTurnShape = {
  *      immediately, so any tool that requires approval is DENIED AND
  *      REPORTED (the denial is fed back to the model as the tool result and
  *      collected into `deniedTools`), instead of minting a pending approval
- *      a peer could socially engineer a human into approving.
+ *      a peer could socially engineer a human into approving. (An audit
+ *      record of the attempt may still be written, born `expired` and
+ *      relayed — it is never pending or decidable. QA 2026-10-30.)
  *   2. Peer provenance (`origin: 'external'`, relayed) — the runtime's
  *      consent rule already bars auto-approve / bypass / reviewer paths
  *      from satisfying approvals on non-user-origin turns.
@@ -166,8 +168,11 @@ export function createRuntimePeerTurnExecutor(runtime: { runTurn: (opts: RunTurn
       },
       onEvent: (e) => {
         if (e.type === 'token' && typeof e.content === 'string') text += e.content;
-        if (e.type === 'tool_result' && e.denied && e.call?.name) deniedTools.push(e.call.name);
-        if (e.type === 'approval_required' && e.call?.name) deniedTools.push(e.call.name);
+        // One denial surfaces as BOTH an approval_required and a denied
+        // tool_result event — report each denied tool once.
+        if (((e.type === 'tool_result' && e.denied) || e.type === 'approval_required') && e.call?.name) {
+          if (!deniedTools.includes(e.call.name)) deniedTools.push(e.call.name);
+        }
       },
     });
     return { text, deniedTools };

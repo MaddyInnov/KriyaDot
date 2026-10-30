@@ -481,7 +481,7 @@ describe('OVHcloud anonymous lane (free-LLM #1)', () => {
     expect(res.content).toBe('hello from ovh');
     expect(seen).toHaveLength(2);
     expect(seen[0]!.body.model).toBe('gpt-oss-120b');
-    expect(seen[1]!.body.model).toBe('Qwen3-32B');
+    expect(seen[1]!.body.model).toBe('Qwen3.6-27B');
     for (const call of seen) {
       expect(call.headers).not.toHaveProperty('Authorization');
       expect(call.headers).not.toHaveProperty('authorization');
@@ -504,7 +504,7 @@ describe('OVHcloud anonymous lane (free-LLM #1)', () => {
     await provider.chat([{ role: 'user', content: 'a' }], [], { model: 'gpt-oss-120b' });
     await provider.chat([{ role: 'user', content: 'b' }], [], { model: 'gpt-oss-120b' });
     expect(seen[0]!.body.model).toBe('gpt-oss-120b');
-    expect(seen[1]!.body.model).toBe('Qwen3-32B');
+    expect(seen[1]!.body.model).toBe('Qwen3.6-27B');
   });
 
   it('preset metadata: keyless with the exact limits note', () => {
@@ -516,7 +516,7 @@ describe('OVHcloud anonymous lane (free-LLM #1)', () => {
     expect(preset?.baseUrl).toBe('https://oai.endpoints.kepler.ai.cloud.ovh.net/v1');
     expect(preset?.models.map((m) => m.id)).toEqual([
       'gpt-oss-120b',
-      'Qwen3-32B',
+      'Qwen3.6-27B',
       'Meta-Llama-3_3-70B-Instruct',
     ]);
     expect(createProvider('ovh-anonymous')).toBeInstanceOf(OvAnonymousProvider);

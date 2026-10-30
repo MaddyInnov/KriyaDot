@@ -76,7 +76,7 @@ export default function PluginsSection(): React.JSX.Element {
     try {
       await post('/api/plugins/install', { source, path: path.trim() });
       setPath('');
-      setNotice('Plugin installed. Executable plugins run as sandboxed stdio processes per invocation.');
+      setNotice('Plugin installed. Executable plugins run as separate stdio processes with a scrubbed environment, but with your OS user\'s file and network access — only install plugins you trust.');
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

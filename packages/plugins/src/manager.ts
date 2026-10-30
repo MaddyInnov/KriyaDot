@@ -323,7 +323,18 @@ export class PluginManager {
     const out: PluginToolDefinition[] = [];
     for (const rec of this.records.values()) {
       if (!rec.enabled || !rec.manifest.kinds.includes('tool')) continue;
-      out.push(...(await listPluginTools(rec, this.rpcOpts)));
+      try {
+        out.push(...(await listPluginTools(rec, this.rpcOpts)));
+      } catch (err) {
+        // Isolation (QA ws-d): one plugin that crashes/hangs on
+        // tools/list must not poison the aggregate listing — the boot
+        // path (buildPluginTools) awaits this unwrapped, so a throw
+        // here previously lost EVERY plugin's tools and could abort
+        // server startup after a full RPC timeout. Skip + warn.
+        console.warn(
+          `[plugins] skipping tools from plugin "${rec.id}": ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
     return out;
   }

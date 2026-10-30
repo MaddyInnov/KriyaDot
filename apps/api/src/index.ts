@@ -14,8 +14,21 @@
 import cors from 'cors';
 import express from 'express';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
+
+// Plain-Node compatibility (QA 2026-10-30): the supported runtime is
+// Bun, but the Docker image runs `node dist/index.js`. A number of
+// modules across the api + agent-runtime use a lazy bare `require(...)`
+// for builtins and optional deps (node:sqlite, node-pty, firebase-admin)
+// — legal under Bun, a ReferenceError under Node ESM. All call sites are
+// lazy (constructors/functions, never module top-level), so installing a
+// global require here, before any of them run, makes the compiled server
+// boot identically under Node. Under Bun this is a no-op guard.
+if (typeof (globalThis as { require?: unknown }).require !== 'function') {
+  (globalThis as { require?: unknown }).require = createRequire(import.meta.url);
+}
 import {
   AgentRuntime,
   SpanStore,
@@ -1945,16 +1958,27 @@ async function boot(): Promise<void> {
   // Subpath serving (Octop §2.x deployment polish): when KRIYADOT_BASE_PATH
   // is set, the whole app is served under that prefix; the middleware
   // strips it before auth/routing so everything below sees normal paths.
+  // serverBasePath is kept for the WebSocket upgrade handler at the end of
+  // boot(): upgrade requests bypass Express, so the handler strips the
+  // prefix itself (QA 2026-10-30: WS endpoints were unreachable under a
+  // base path because the upgrade switch only matched unprefixed paths).
+  let serverBasePath = '';
   {
     const { createBasePathMiddleware, basePathFromEnv } = await import('./base-path.js');
-    const basePath = basePathFromEnv();
-    if (basePath) {
-      app.use(createBasePathMiddleware(basePath));
-      console.log(`[api] serving under base path ${basePath}`);
+    serverBasePath = basePathFromEnv();
+    if (serverBasePath) {
+      app.use(createBasePathMiddleware(serverBasePath));
+      console.log(`[api] serving under base path ${serverBasePath}`);
     }
   }
   app.use(cors({ origin: corsOriginFn }));
-  app.use(requireLoopbackAuth(loopbackToken));
+  app.use(
+    requireLoopbackAuth(loopbackToken, {
+      // A paired phone may call POST /api/chat directly with its companion
+      // device token; the chat handler re-validates + audits it (routes.ts).
+      isCompanionChatToken: (bearer) => companionStore.findDeviceByToken(bearer) !== undefined,
+    }),
+  );
   // Token bootstrap for the browser UI (and other browser clients): returns
   // the token only when the Origin header is absent or allowlisted, so an
   // evil cross-origin page can never read it.
@@ -2358,6 +2382,9 @@ async function boot(): Promise<void> {
         }
       },
       companion: { store: companionStore, hub: companionHub },
+      // Per-boot loopback token: the companion /chat/send proxy presents it
+      // on its inner call to /api/chat (the proxy itself is device-authed).
+      loopbackToken,
       // Remote screen viewing (phone -> PC, Codync parity): approval-gated.
       remoteScreen: { store: companionStore, service: remoteScreenService, loopbackToken },
       // Realtime voice calls with bots (Codync parity): STT → bot turn →
@@ -3751,9 +3778,11 @@ async function boot(): Promise<void> {
   });
   mountWebAssets(app, config.webOutDir);
 
-  // Built-in TLS (Octop §2.x deployment polish): when KRIYADOT_TLS_* env
-  // (or ACME-provisioned certs in the data dir) yields options, serve
-  // HTTPS directly; otherwise plain HTTP as before.
+  // Built-in TLS (Octop §2.x deployment polish): when TLS_CERT_PATH +
+  // TLS_KEY_PATH (or ACME-provisioned certs via ACME_STORE_DIR) yield
+  // options, serve HTTPS directly; otherwise plain HTTP as before. An
+  // explicitly configured but unreadable static cert/key throws here
+  // instead of silently downgrading to HTTP (see tls-options.ts).
   const { buildTlsOptionsFromEnv } = await import('./tls-options.js');
   const tlsOptions = buildTlsOptionsFromEnv();
   const onListening = () => {
@@ -3796,7 +3825,13 @@ async function boot(): Promise<void> {
       socket.destroy();
       return;
     }
-    const path = req.url?.split('?')[0];
+    let path = req.url?.split('?')[0];
+    // Subpath deployments: the client connects to <base>/api/... — strip
+    // the prefix before matching (upgrades never pass through the Express
+    // base-path middleware).
+    if (serverBasePath && path && (path === serverBasePath || path.startsWith(`${serverBasePath}/`))) {
+      path = path.slice(serverBasePath.length) || '/';
+    }
     if (path === '/api/phone/ws') {
       phoneHub.handleUpgrade(req, socket, head);
     } else if (path === '/api/companion/ws') {

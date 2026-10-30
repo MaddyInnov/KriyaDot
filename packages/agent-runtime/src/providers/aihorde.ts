@@ -30,6 +30,8 @@ export const AIHORDE_BASE_URL = 'https://aihorde.net/api/v2';
 export const AIHORDE_ANONYMOUS_KEY = '0000000000';
 /** Anonymous response cap enforced by AI Horde clients. */
 export const AIHORDE_ANONYMOUS_MAX_TOKENS = 512;
+/** Default per-HTTP-request timeout for submit/status calls. */
+export const AIHORDE_REQUEST_TIMEOUT_MS = 30_000;
 
 export interface AiHordeOptions {
   baseUrl?: string;
@@ -105,6 +107,15 @@ export class AiHordeProvider implements LLMProvider {
       );
     }
     const maxTokens = this.effectiveMaxTokens(opts.maxTokens);
+    // Per-request timeout (QA 2026-10-30): the poll loop is bounded by
+    // maxPolls, but a single fetch against a silent endpoint never
+    // returns, so the bound never advances. Bound every HTTP call;
+    // opts.timeoutMs (when set) is the per-request budget.
+    const requestTimeoutMs = opts.timeoutMs && opts.timeoutMs > 0 ? opts.timeoutMs : AIHORDE_REQUEST_TIMEOUT_MS;
+    const requestSignal = (): AbortSignal => {
+      const t = AbortSignal.timeout(requestTimeoutMs);
+      return opts.signal ? AbortSignal.any([opts.signal, t]) : t;
+    };
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       apikey: this.apiKey,
@@ -124,7 +135,7 @@ export class AiHordeProvider implements LLMProvider {
         ...(opts.model && opts.model !== 'koboldcpp' ? { models: [opts.model] } : {}),
         slow_workers: true,
       }),
-      signal: opts.signal,
+      signal: requestSignal(),
     });
     if (!submit.ok) {
       const text = await submit.text().catch(() => '');
@@ -137,7 +148,7 @@ export class AiHordeProvider implements LLMProvider {
       if (poll > 0) await this.sleepFn(this.pollIntervalMs);
       const res = await this.fetchFn(`${this.baseUrl}/generate/text/status/${submitted.id}`, {
         headers,
-        signal: opts.signal,
+        signal: requestSignal(),
       });
       if (!res.ok) {
         const text = await res.text().catch(() => '');

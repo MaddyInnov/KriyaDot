@@ -94,10 +94,19 @@ describe('tls options', () => {
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-  it('returns undefined with no config or missing files', () => {
+  it('returns undefined with no config; an empty ACME store is not an error', () => {
     expect(buildTlsOptions({})).toBeUndefined();
-    expect(buildTlsOptions({ certPath: join(dir, 'no.pem'), keyPath: join(dir, 'no.key') })).toBeUndefined();
     expect(buildTlsOptions({ acmeStoreDir: join(dir, 'acme-empty') })).toBeUndefined();
+  });
+
+  it('explicit static TLS config never fails open (QA 2026-10-30)', () => {
+    // Missing files for explicitly configured paths: refuse, don't serve HTTP.
+    expect(() => buildTlsOptions({ certPath: join(dir, 'no.pem'), keyPath: join(dir, 'no.key') })).toThrow(
+      /refusing to boot/,
+    );
+    // Only one of the pair set: misconfiguration, also refused.
+    expect(() => buildTlsOptions({ certPath: join(dir, 'cert.pem') })).toThrow(/must be set together/);
+    expect(() => buildTlsOptions({ keyPath: join(dir, 'key.pem') })).toThrow(/must be set together/);
   });
 
   it('loads static paths and the ACME store layout', () => {

@@ -12,6 +12,7 @@ import { getMessageToolCalls } from '../types.js';
 import { getDefaultModel, getProviderPreset } from './catalog.js';
 import { shapeDeepSeekRequest } from './deepseek.js';
 import { parseOpenAIRateLimitHeaders, recordRateLimit } from './rate-limit.js';
+import { classifyProviderError } from '../failover.js';
 import { shapeReasoning } from '../reasoning-profiles.js';
 
 /** Native multimodal content parts (Octomind parity #38). */
@@ -39,6 +40,32 @@ interface SSEToolCallDelta {
 
 const MAX_RETRIES = 3;
 const BASE_BACKOFF_MS = 500;
+
+/** Default per-call timeout when neither timeoutMs nor replyTimeoutMs is set. */
+export const DEFAULT_PROVIDER_TIMEOUT_MS = 300_000;
+
+/**
+ * Local endpoints (Ollama / LM Studio on the user's own machine) keep the
+ * deliberate unbounded default: a slow local model is the user's call, and
+ * the local presets carry their own replyTimeoutMs when built via the
+ * factory. The bounded default exists for REMOTE endpoints, where a silent
+ * socket otherwise hangs a turn forever (QA 2026-10-30).
+ */
+export function isLocalBaseUrl(baseUrl: string): boolean {
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    return (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host === '::1' ||
+      host === '[::1]' ||
+      host === '0.0.0.0' ||
+      host.endsWith('.local')
+    );
+  } catch {
+    return false;
+  }
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -171,7 +198,39 @@ export class OpenAICompatibleProvider implements LLMProvider {
         continue; // network error: retry
       }
       if (res.ok) return res;
-      if (!isRetryable(res.status) || attempt === maxRetries) {
+      let hardLimit = false;
+      if (res.status === 429 && attempt < maxRetries) {
+        // A hard-quota 429 (insufficient_quota & friends) never clears
+        // inside the backoff window — retrying it only delays the
+        // failover machinery (QA 2026-10-30: four attempts burned ~4s
+        // before failover). Peek at the body via a clone (the throw path
+        // below still reads the original) and skip the retry when the
+        // error classifies as a usage limit.
+        let peek = '';
+        try {
+          peek = await res.clone().text();
+        } catch {
+          peek = '';
+        }
+        if (peek) {
+          let code: string | undefined;
+          let message = peek.slice(0, 300);
+          try {
+            const parsed = JSON.parse(peek) as {
+              error?: { code?: string; type?: string; message?: string };
+            };
+            code = parsed.error?.code ?? parsed.error?.type;
+            if (parsed.error?.message) message = parsed.error.message;
+          } catch {
+            // Non-JSON body: classify on the raw text.
+          }
+          const probe = new Error(message) as Error & { code?: string; status?: number };
+          probe.code = code;
+          probe.status = 429;
+          hardLimit = classifyProviderError(probe, { providerId: this.providerId }).kind === 'limit';
+        }
+      }
+      if (!isRetryable(res.status) || attempt === maxRetries || hardLimit) {
         const body = await res.text().catch(() => '');
         // Rate-limit headers ride along on error responses too — record
         // the snapshot so near-limit warnings + failover reset times work
@@ -263,9 +322,18 @@ export class OpenAICompatibleProvider implements LLMProvider {
     // Per-call timeout (purpose-profile knob): combine with the caller's
     // abort signal when both exist. The local drivers' replyTimeoutMs
     // (ENGINES pack, from bot modelOptions) is the fallback when no
-    // explicit per-call timeout was given.
+    // explicit per-call timeout was given. When neither is set, a default
+    // ceiling applies to REMOTE endpoints (QA 2026-10-30): a cloud endpoint
+    // that accepts the connection and never replies otherwise hangs the
+    // turn forever. LOCAL endpoints (Ollama/LM Studio on the user's own
+    // machine) stay unbounded by design — a slow local model is the user's
+    // call, and the local presets carry replyTimeoutMs when factory-built.
+    // Callers needing longer (huge generations) raise replyTimeoutMs.
     let signal = opts.signal;
-    const effectiveTimeoutMs = opts.timeoutMs ?? opts.replyTimeoutMs;
+    const effectiveTimeoutMs =
+      opts.timeoutMs ??
+      opts.replyTimeoutMs ??
+      (isLocalBaseUrl(this.baseUrl) ? undefined : DEFAULT_PROVIDER_TIMEOUT_MS);
     if (effectiveTimeoutMs && effectiveTimeoutMs > 0) {
       const timeoutSignal = AbortSignal.timeout(effectiveTimeoutMs);
       signal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;

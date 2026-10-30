@@ -80,8 +80,12 @@ export const MCP_DIRECTORY: MCPDirectoryEntry[] = [
     description: 'Fetch web pages and convert them to readable text for the agent.',
     category: 'web',
     kind: 'stdio',
-    command: 'npx',
-    args: ['-y', '@modelcontextprotocol/server-fetch'],
+    // The official Fetch MCP server is a Python package run via uvx
+    // (like mcp-server-git below). The previously listed npm package
+    // '@modelcontextprotocol/server-fetch' does not exist — npx 404'd
+    // on every install/boot (QA 2026-10-30).
+    command: 'uvx',
+    args: ['mcp-server-fetch'],
     permissions: ['network access'],
     tools: [{ name: 'fetch', description: 'Fetch a URL and return its content as markdown.' }],
   },
@@ -565,7 +569,7 @@ export class LazyMcpServerStore {
 // format (JSON, since the tree's MCP config is JSON): the file body is
 // either a bare server config —
 //
-//   { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-fetch"], "env": { "X": "1" } }
+//   { "command": "uvx", "args": ["mcp-server-fetch"], "env": { "X": "1" } }
 //   { "url": "https://mcp.example.com/mcp", "oauth": true }
 //
 // — or the seed-shaped wrapper `{ "mcpServers": { "<name>": { ... } } }`.

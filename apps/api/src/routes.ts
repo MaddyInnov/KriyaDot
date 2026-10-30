@@ -325,6 +325,13 @@ export interface RouteDeps {
     hub: CompanionHub;
   };
   /**
+   * Per-boot loopback token (set by index.ts). Used only as the credential
+   * on the companion /chat/send proxy's inner call to /api/chat — that
+   * proxy is itself device-token authed, and the chat handler must be able
+   * to tell its inner call apart from a phone's direct device-token call.
+   */
+  loopbackToken?: string;
+  /**
    * Encrypted push notifications (Codync parity). Optional: omitted in tests
    * that don't exercise push; created by index.ts otherwise.
    */
@@ -1531,14 +1538,23 @@ export function createRouter(deps: RouteDeps): express.Router {
   //   turn completes (queue-at-boundary). If no turn is in-flight, runs now.
   router.post('/chat', async (req, res) => {
     const body = (req.body ?? {}) as Partial<ChatRequestBody>;
-    // Companion app (phone → PC): optional device-token auth. Requests
-    // without an Authorization header behave exactly as before; a Bearer
-    // token is validated against the companion store when the module is
-    // configured, and rejected with 401 when invalid. The action is
-    // audit-logged (metadata only, never the message content).
+    // Companion app (phone → PC): optional device-token auth. A request
+    // that already authenticated with the loopback token (the local web
+    // UI, TUI, and the companion proxy's inner call all present it) is the
+    // instance owner — its Bearer must NOT be re-interpreted as a companion
+    // device token. Only a non-loopback request carrying a Bearer is
+    // treated as a phone calling directly: the token is validated against
+    // the companion store when the module is configured, and rejected with
+    // 401 when invalid. The action is audit-logged (metadata only, never
+    // the message content).
     let companionDevice: { id: string; name: string } | null = null;
     const authHeader = req.headers.authorization;
-    if (deps.companion && typeof authHeader === 'string' && /^Bearer\s+/i.test(authHeader)) {
+    if (
+      deps.companion &&
+      !req.loopbackAuthed &&
+      typeof authHeader === 'string' &&
+      /^Bearer\s+/i.test(authHeader)
+    ) {
       const presented = authHeader.replace(/^Bearer\s+/i, '').trim();
       const device = presented ? deps.companion.store.findDeviceByToken(presented) : undefined;
       if (!device) {
@@ -3552,6 +3568,7 @@ export function createRouter(deps: RouteDeps): express.Router {
       publicBaseUrl: config.publicBaseUrl,
       version: '0.1.0',
       localChatUrl: `http://127.0.0.1:${config.port}/api/chat`,
+      localChatToken: deps.loopbackToken,
       governance,
       idResolver: governanceAdapter,
       workflowRunner,

@@ -173,12 +173,26 @@ function pathIsExempt(reqPath: string): boolean {
   return false;
 }
 
+export interface LoopbackAuthOptions {
+  /**
+   * Companion device-token pass-through for POST /api/chat ONLY. A paired
+   * phone presents its device token (not the loopback token) when calling
+   * the chat route directly; when this validator accepts the presented
+   * bearer, the request proceeds WITHOUT loopbackAuthed set — the chat
+   * handler re-validates the device token against the companion store and
+   * audit-logs the device, so this hook only stops the middleware from
+   * rejecting a credential class the handler is designed to check. No
+   * other route or method is affected.
+   */
+  isCompanionChatToken?: (bearer: string) => boolean;
+}
+
 /**
  * Express middleware: requires `Authorization: Bearer <token>` (constant-
  * time compare) on every non-exempt route. Sets `req.loopbackAuthed = true`
  * on success.
  */
-export function requireLoopbackAuth(token: string) {
+export function requireLoopbackAuth(token: string, opts: LoopbackAuthOptions = {}) {
   const expected = Buffer.from(token, 'utf8');
   return function loopbackAuth(req: Request, res: Response, next: NextFunction): void {
     if (pathIsExempt(req.path)) {
@@ -195,6 +209,17 @@ export function requireLoopbackAuth(token: string) {
       ok = crypto.timingSafeEqual(Buffer.from(provided, 'utf8'), expected);
     }
     if (!ok) {
+      // Paired-companion pass-through for the chat route (see options doc).
+      if (
+        opts.isCompanionChatToken &&
+        req.method === 'POST' &&
+        req.path === '/api/chat' &&
+        provided.length > 0 &&
+        opts.isCompanionChatToken(provided)
+      ) {
+        next();
+        return;
+      }
       res.status(401).json({ ok: false, error: 'unauthorized' });
       return;
     }

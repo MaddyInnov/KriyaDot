@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Server image: single container serving API + web UI (secondary path; the
 # primary end-user distribution is the Tauri desktop app).
-FROM node:22-slim AS webbuild
+FROM node:24-slim AS webbuild
 WORKDIR /app
 COPY package.json package-lock.json* ./
 COPY packages ./packages
@@ -10,7 +10,11 @@ COPY tsconfig.base.json ./
 RUN npm ci --no-audit --no-fund
 RUN npm run build --workspace=@mvp/web
 
-FROM node:22-slim AS runner
+# Node 24 (not 22): the server uses node:sqlite, which is flag-gated
+# (--experimental-sqlite) on Node 22 and unflagged on 24; the entry point
+# also installs a createRequire shim so the Bun-first sources boot under
+# plain Node (see apps/api/src/index.ts).
+FROM node:24-slim AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 COPY package.json package-lock.json* ./

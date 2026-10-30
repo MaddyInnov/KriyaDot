@@ -67,14 +67,29 @@ export function validatePolicyRules(value: unknown): BotPolicyRule[] {
     };
     // Local-first safety: per-bot rules can never auto-allow privileged tools.
     // A bot-policy writer could otherwise prepend allow:^mcp: and bypass the
-    // global deny-by-default floor (first-match-wins).
+    // global deny-by-default floor (first-match-wins). The probe list mirrors
+    // the privileged set in rememberAllowedTool below — including
+    // request_purchase: purchases must NEVER be always-allowed (QA 2026-10-30:
+    // this probe was missing, so `allow ^request_purchase$` saved cleanly and
+    // policy simulation reported purchases as allowed).
     if (r.effect === 'allow') {
       try {
         const re = new RegExp(r.toolPattern, 'i');
-        const probes = ['mcp:server:tool', 'run_command', 'exec', 'shell', 'write_file', 'delete_file'];
+        const probes = [
+          'mcp:server:tool',
+          'run_command',
+          'exec',
+          'shell',
+          'write_file',
+          'edit_file',
+          'create_file',
+          'delete_file',
+          'remove_file',
+          'request_purchase',
+        ];
         if (probes.some((p) => re.test(p))) {
           throw new Error(
-            `policy.rules[${i}]: "allow" must never match privileged tools (mcp:*, run_command/exec/shell, file writes). Use "require-approval" instead.`,
+            `policy.rules[${i}]: "allow" must never match privileged tools (mcp:*, run_command/exec/shell, file writes, request_purchase). Use "require-approval" instead.`,
           );
         }
       } catch (err) {

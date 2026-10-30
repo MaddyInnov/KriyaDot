@@ -713,8 +713,8 @@
           "contextLength": 131072
         },
         {
-          "id": "Qwen3-32B",
-          "name": "Qwen3 32B (OVH anonymous)",
+          "id": "Qwen3.6-27B",
+          "name": "Qwen3.6 27B (OVH anonymous)",
           "contextLength": 131072
         },
         {

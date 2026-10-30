@@ -25,8 +25,18 @@
  * protocol against a scripted fake server — zero network in tests.
  */
 
-import { connect as netConnect, type Socket } from 'node:net';
+import { connect as netConnect, isIP, type Socket } from 'node:net';
 import { connect as tlsConnect } from 'node:tls';
+
+/**
+ * TLS SNI servername for a mail host, or undefined when the host is an IP
+ * literal: TLS stacks (Node/Bun) throw "Setting the TLS ServerName to an
+ * IP address is not permitted" when SNI is set to an IP, which would make
+ * every TLS/STARTTLS connection to an IP-configured mail server fail.
+ */
+function sniServername(host: string): string | undefined {
+  return isIP(host) ? undefined : host;
+}
 
 // ---------------------------------------------------------------------------
 // Channel seam
@@ -55,7 +65,7 @@ type ConnectFn = (host: string, port: number, secure: boolean) => Promise<MailCh
 export const defaultMailConnect: ConnectFn = (host, port, secure) =>
   new Promise((resolve, reject) => {
     let socket: Socket = secure
-      ? tlsConnect({ host, port, servername: host })
+      ? tlsConnect({ host, port, servername: sniServername(host) })
       : netConnect({ host, port });
     let buffer = Buffer.alloc(0);
     const lineWaiters: Array<{ resolve: (line: string) => void; reject: (e: Error) => void }> = [];
@@ -132,7 +142,7 @@ export const defaultMailConnect: ConnectFn = (host, port, secure) =>
             // Any plaintext bytes buffered beyond the STARTTLS reply are
             // protocol garbage post-upgrade; drop them (see interface doc).
             buffer = Buffer.alloc(0);
-            const tlsSocket = tlsConnect({ socket: plain, servername });
+            const tlsSocket = tlsConnect({ socket: plain, servername: sniServername(servername) });
             tlsSocket.once('secureConnect', () => {
               socket = tlsSocket as unknown as Socket;
               attach(socket);

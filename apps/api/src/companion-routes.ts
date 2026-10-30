@@ -130,6 +130,13 @@ export interface CompanionRouteDeps {
   version: string;
   /** Local URL of the chat SSE endpoint, for the /chat/send proxy. */
   localChatUrl: string;
+  /**
+   * Per-boot loopback token, presented as the Bearer on the proxy's inner
+   * call to /api/chat (which is loopback-auth protected). The proxy route
+   * itself is authenticated by the companion device token; without this
+   * credential the inner call is rejected by the auth middleware.
+   */
+  localChatToken?: string;
   governance: CompanionGovernance;
   /** Resolves runtime-issued approval ids to real gateway ids. */
   idResolver: { resolveApprovalId(id: string): string };
@@ -755,7 +762,10 @@ export function registerCompanionRoutes(router: Router, deps: CompanionRouteDeps
     try {
       upstream = await fetch(deps.localChatUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(deps.localChatToken ? { Authorization: `Bearer ${deps.localChatToken}` } : {}),
+        },
         body: JSON.stringify(body),
       });
     } catch (e) {

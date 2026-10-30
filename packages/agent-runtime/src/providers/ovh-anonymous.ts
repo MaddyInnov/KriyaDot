@@ -30,12 +30,15 @@ export const OVH_ANONYMOUS_BASE_URL = 'https://oai.endpoints.kepler.ai.cloud.ovh
 /** Catalog model ids on the anonymous lane (gpt-oss / Qwen3 / Llama 3.3 class). */
 export const OVH_ANONYMOUS_MODELS: readonly string[] = [
   'gpt-oss-120b',
-  'Qwen3-32B',
+  'Qwen3.6-27B',
   'Meta-Llama-3_3-70B-Instruct',
 ];
 
 /** 2 requests/min per model ⇒ one call per model per 30 s window. */
 export const OVH_ANONYMOUS_MIN_INTERVAL_MS = 30_000;
+
+/** Default per-call timeout when the caller sets none (bounds silent hangs). */
+export const OVH_DEFAULT_TIMEOUT_MS = 60_000;
 
 export interface OvAnonymousOptions {
   baseUrl?: string;
@@ -93,6 +96,14 @@ export class OvAnonymousProvider implements LLMProvider {
   private readonly minIntervalMs: number;
   /** Per-model last-call timestamps (in-process pacing state). */
   private readonly lastCallByModel = new Map<string, number>();
+  /**
+   * Models that answered 404 (not served on the anonymous lane). They are
+   * skipped by later rotations in this process: the anonymous catalog and
+   * the models actually served can drift (QA 2026-10-30: Qwen3-32B was
+   * listed but OVH answered model_not_found), and re-asking a dead model
+   * first on every call wastes the turn.
+   */
+  private readonly unavailableModels = new Set<string>();
 
   constructor(opts: OvAnonymousOptions = {}) {
     this.baseUrl = (opts.baseUrl ?? OVH_ANONYMOUS_BASE_URL).replace(/\/+$/, '');
@@ -106,7 +117,11 @@ export class OvAnonymousProvider implements LLMProvider {
   /** Models in the order this call should try them (pacing-aware). */
   private rotationOrder(requested: string): string[] {
     const now = this.now();
-    const candidates = [...new Set([requested, ...this.models])];
+    const all = [...new Set([requested, ...this.models])];
+    // Skip models known-unavailable on this lane, unless that would leave
+    // nothing to try (the lane may have started serving them again).
+    const live = all.filter((m) => !this.unavailableModels.has(m));
+    const candidates = live.length > 0 ? live : all;
     const fresh = candidates.filter((m) => {
       const last = this.lastCallByModel.get(m);
       return last === undefined || now - last >= this.minIntervalMs;
@@ -129,44 +144,67 @@ export class OvAnonymousProvider implements LLMProvider {
     tools: ToolDefinition[],
     opts: Parameters<LLMProvider['chat']>[2],
   ): Promise<{ content: string; toolCalls: ToolCall[]; usage: TokenUsage }> {
+    // Default per-call timeout (QA 2026-10-30): without one, a silent
+    // endpoint (accepts the connection, never replies) hung the turn
+    // forever. Callers can override via opts.timeoutMs.
+    const timeoutMs = opts.timeoutMs && opts.timeoutMs > 0 ? opts.timeoutMs : OVH_DEFAULT_TIMEOUT_MS;
     let signal = opts.signal;
-    if (opts.timeoutMs && opts.timeoutMs > 0) {
-      const timeoutSignal = AbortSignal.timeout(opts.timeoutMs);
-      signal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-    }
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    signal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
     const order = this.rotationOrder(opts.model);
     let lastError: Error | null = null;
     for (let i = 0; i < order.length; i++) {
       const model = order[i]!;
       this.lastCallByModel.set(model, this.now());
-      const res = await this.fetchFn(`${this.baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          // Keyless lane: deliberately NO Authorization header.
-        },
-        body: JSON.stringify({
-          model,
-          messages: toOpenAIMessages(messages),
-          ...(tools.length > 0
-            ? {
-                tools: tools.map((t) => ({
-                  type: 'function',
-                  function: { name: t.name, description: t.description, parameters: t.parameters },
-                })),
-              }
-            : {}),
-          ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
-          ...(opts.maxTokens !== undefined ? { max_tokens: opts.maxTokens } : {}),
-          stream: false,
-        }),
-        signal,
-      });
-      if (res.status === 429 && i < order.length - 1) {
-        // Per-model cap hit — rotate to the next model (pacing state
-        // above already marks this model as just-used).
+      let res: Response;
+      try {
+        res = await this.fetchFn(`${this.baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            // Keyless lane: deliberately NO Authorization header.
+          },
+          body: JSON.stringify({
+            model,
+            messages: toOpenAIMessages(messages),
+            ...(tools.length > 0
+              ? {
+                  tools: tools.map((t) => ({
+                    type: 'function',
+                    function: { name: t.name, description: t.description, parameters: t.parameters },
+                  })),
+                }
+              : {}),
+            ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
+            ...(opts.maxTokens !== undefined ? { max_tokens: opts.maxTokens } : {}),
+            stream: false,
+          }),
+          signal,
+        });
+      } catch (err) {
+        // Network-level failure (unreachable, reset, timeout abort):
+        // record and try the next rotation model; the last error surfaces
+        // if every model fails this way.
+        lastError = err instanceof Error ? err : new Error(String(err));
+        if (i < order.length - 1) {
+          try {
+            opts.onRetry?.(i + 1, lastError);
+          } catch {
+            // Retry notification must never break rotation.
+          }
+          continue;
+        }
+        throw lastError;
+      }
+      // Rotate — don't fail the turn — when the failure is specific to
+      // this model: 429 (per-model cap), 404 (model not served on the
+      // anonymous lane), or a 5xx from the model router.
+      if ((res.status === 429 || res.status === 404 || res.status >= 500) && i < order.length - 1) {
+        if (res.status === 404) this.unavailableModels.add(model);
         lastError = new Error(
-          `OVHcloud anonymous lane rate-limited model "${model}" (429); rotating to the next model.`,
+          res.status === 429
+            ? `OVHcloud anonymous lane rate-limited model "${model}" (429); rotating to the next model.`
+            : `OVHcloud anonymous lane could not serve model "${model}" (${res.status}); rotating to the next model.`,
         );
         try {
           opts.onRetry?.(i + 1, lastError);
@@ -177,6 +215,7 @@ export class OvAnonymousProvider implements LLMProvider {
         continue;
       }
       if (!res.ok) {
+        if (res.status === 404) this.unavailableModels.add(model);
         const text = await res.text().catch(() => '');
         const err = new Error(
           `OVHcloud AI Endpoints (anonymous) request failed: ${res.status} ${res.statusText}${text ? ` — ${text.slice(0, 300)}` : ''}`,

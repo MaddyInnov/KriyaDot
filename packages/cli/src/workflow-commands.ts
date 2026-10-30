@@ -84,7 +84,7 @@ async function runWorkflow(deps: CommandDeps, p: ParsedArgs): Promise<number> {
       return EXIT_USAGE;
     }
   }
-  const res = await deps.api.request<{ id?: string; status?: string }>(
+  const res = await deps.api.request<{ runId?: string; id?: string; status?: string }>(
     `/workflows/${encodeURIComponent(def.id)}/run`,
     {
       method: 'POST',
@@ -96,7 +96,10 @@ async function runWorkflow(deps: CommandDeps, p: ParsedArgs): Promise<number> {
     out(deps, `${JSON.stringify(res, null, 2)}\n`);
     return 0;
   }
-  out(deps, `Started workflow "${def.name}" (${def.id})${res.id ? ` — run ${res.id}` : ''}${res.status ? ` [${res.status}]` : ''}\n`);
+  // The API returns { runId } (QA 2026-10-30: the CLI read `res.id` and
+  // so never printed the run id it had just started).
+  const runId = res.runId ?? res.id;
+  out(deps, `Started workflow "${def.name}" (${def.id})${runId ? ` — run ${runId}` : ''}${res.status ? ` [${res.status}]` : ''}\n`);
   return 0;
 }
 

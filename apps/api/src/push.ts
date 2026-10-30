@@ -349,7 +349,10 @@ export class PushService {
       return;
     }
     const cfg = this.apnsConfig();
-    if (!cfg) return;
+    // Same honesty rule as the FCM path: a missing config here means the
+    // send cannot happen — never return silently and let notify() count
+    // an undelivered message as sent.
+    if (!cfg) throw new Error('APNs not configured');
     if (!this.apnsSession) {
       const factory = this.deps.apnsSessionFactory ?? defaultApnsSessionFactory;
       this.apnsSession = factory(cfg.env === 'sandbox' ? APNS_SANDBOX_HOST : APNS_PRODUCTION_HOST);
@@ -395,8 +398,14 @@ export class PushService {
     }
     const messaging = await getFcmMessaging();
     if (!messaging) {
-      this.warnOnce('FCM not configured — push notifications disabled (set FCM_SERVICE_ACCOUNT_JSON).');
-      return;
+      // Reachable only when FCM looked configured (env credentials present
+      // or this path would have been filtered out in notify()) but the
+      // Firebase client failed to initialize — e.g. the service-account
+      // file is missing or malformed. That is a broken configuration, not
+      // a successful send: throw so notify() does not count this device
+      // as `sent` for a message that was never delivered.
+      this.warnOnce('FCM credentials are set but Firebase failed to initialize — push notifications disabled (check FCM_SERVICE_ACCOUNT_JSON).');
+      throw new Error('FCM not initialized (credentials configured but Firebase init failed)');
     }
     await messaging.send({ token, data });
   }

@@ -35,14 +35,26 @@ export interface TlsConfig {
 
 /** Returns { key, cert } buffers for https.createServer, or undefined for plain HTTP. */
 export function buildTlsOptions(config: TlsConfig): { key: Buffer; cert: Buffer } | undefined {
-  if (config.certPath && config.keyPath) {
-    if (existsSync(config.certPath) && existsSync(config.keyPath)) {
-      return {
-        cert: readFileSync(config.certPath),
-        key: readFileSync(config.keyPath),
-      };
+  if (config.certPath || config.keyPath) {
+    // Explicit static TLS configuration must never fail open (QA
+    // 2026-10-30): an operator who set TLS_CERT_PATH/TLS_KEY_PATH asked
+    // for HTTPS — silently serving plain HTTP because a path is wrong
+    // exposes the instance (and its tokens) in cleartext. Fail loudly.
+    if (!config.certPath || !config.keyPath) {
+      throw new Error(
+        '[tls] TLS_CERT_PATH and TLS_KEY_PATH must be set together (only one was provided) — refusing to boot rather than serve plain HTTP.',
+      );
     }
-    return undefined;
+    const missing = [config.certPath, config.keyPath].filter((p) => !existsSync(p));
+    if (missing.length > 0) {
+      throw new Error(
+        `[tls] configured TLS file(s) not found: ${missing.join(', ')} — refusing to boot rather than serve plain HTTP. Fix the path(s) or unset TLS_CERT_PATH/TLS_KEY_PATH.`,
+      );
+    }
+    return {
+      cert: readFileSync(config.certPath),
+      key: readFileSync(config.keyPath),
+    };
   }
   if (config.acmeStoreDir) {
     const stored = loadCertificateFromStore(config.acmeStoreDir);
