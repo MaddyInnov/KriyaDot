@@ -4,5 +4,12 @@
 <dict>
 	<key>aps-environment</key>
 	<string>development</string>
+	<!-- Wave-6 (DV-2): HealthKit + HomeKit capabilities for
+	     HealthKitManager / HomeKitManager. The App ID must have both
+	     capabilities enabled in the developer portal at signing time. -->
+	<key>com.apple.developer.healthkit</key>
+	<true/>
+	<key>com.apple.developer.homekit</key>
+	<true/>
 </dict>
 </plist>

@@ -14,6 +14,7 @@ import { RulesPanel } from '../../components/activity/rules-panel';
 import { WatchPanel } from '../../components/activity/watch-panel';
 import { NotificationPanel } from '../../components/activity/notification-panel';
 import { HealthPanel } from '../../components/activity/health-panel';
+import { ServicesPanel } from '../../components/activity/services-panel';
 import { RoutingPanel } from '../../components/activity/routing-panel';
 import { RecoveryPanel } from '../../components/activity/recovery-panel';
 import { RunsPanel } from '../../components/activity/runs-panel';
@@ -39,6 +40,7 @@ const TABS = [
   { id: 'routing', label: 'Routing', pro: false },
   { id: 'recovery', label: 'Recovery', pro: false },
   { id: 'health', label: 'Health', pro: false },
+  { id: 'services', label: 'Services', pro: false },
   { id: 'cost', label: 'Cost', pro: true },
   { id: 'audit', label: 'Audit log', pro: false },
 ] as const;
@@ -124,6 +126,7 @@ export default function ActivityPage() {
             {activeTab === "routing" && <RoutingPanel />}
             {activeTab === "recovery" && <RecoveryPanel />}
             {activeTab === "health" && <HealthPanel />}
+            {activeTab === "services" && <ServicesPanel />}
             {activeTab === "cost" && <CostPanel />}
             {activeTab === "audit" && <AuditPanel hideHeader />}
           </div>

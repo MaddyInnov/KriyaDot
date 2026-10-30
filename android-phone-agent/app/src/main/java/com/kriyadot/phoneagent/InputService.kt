@@ -9,11 +9,16 @@ import android.graphics.Rect
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
+import android.provider.AlarmClock
+import java.util.ArrayList
 import android.os.Looper
 import android.telephony.SmsManager
+import android.util.Base64
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import androidx.core.content.FileProvider
 import org.json.JSONObject
+import java.io.File
 import java.util.concurrent.ConcurrentLinkedQueue
 
 /**
@@ -164,7 +169,48 @@ class InputService : AccessibilityService() {
                 scrollBy(direction, amount)
                 respond(id, true, null)
             }
+            // Wave-6 (DV-3): packaged alarm command. AlarmClock ACTION_SET_ALARM
+            // with EXTRA_SKIP_UI — the system clock records the alarm without
+            // fronting any app (background-safe, DV-6). Server validated the
+            // hour/minute/days and the user approved the exact arguments.
+            "set_alarm" -> {
+                val hour = params.optInt("hour", -1)
+                val minute = params.optInt("minute", -1)
+                if (hour !in 0..23 || minute !in 0..59) {
+                    respond(id, false, "bad_alarm_time")
+                    return
+                }
+                try {
+                    val intent = Intent(AlarmClock.ACTION_SET_ALARM).apply {
+                        putExtra(AlarmClock.EXTRA_HOUR, hour)
+                        putExtra(AlarmClock.EXTRA_MINUTES, minute)
+                        putExtra(AlarmClock.EXTRA_SKIP_UI, params.optBoolean("skipUi", true))
+                        val label = params.optString("label", "")
+                        if (label.isNotEmpty()) putExtra(AlarmClock.EXTRA_MESSAGE, label)
+                        if (params.has("vibrate")) putExtra(AlarmClock.EXTRA_VIBRATE, params.optBoolean("vibrate"))
+                        val daysJson = params.optJSONArray("days")
+                        if (daysJson != null && daysJson.length() > 0) {
+                            val days = ArrayList<Int>()
+                            for (i in 0 until daysJson.length()) {
+                                val d = daysJson.optInt(i, -1)
+                                if (d in 1..7) days.add(d)
+                            }
+                            if (days.isNotEmpty()) putExtra(AlarmClock.EXTRA_DAYS, days)
+                        }
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    startActivity(intent)
+                    respond(id, true, null)
+                } catch (e: Exception) {
+                    respond(id, false, "alarm_failed")
+                }
+            }
             "send_message" -> sendMessage(id, params, respond)
+            // ADD-5: send a file through the REAL WhatsApp app — the bytes
+            // arrive base64 in the approved action params, are written to
+            // the app's cache, and WhatsApp's own share sheet + Send
+            // button do the sending (driven via accessibility).
+            "send_file" -> sendFile(id, params, respond)
             // Wave-4 (CT-7): direct SMS through SmsManager — no app driving.
             // The exact text was approved server-side before dispatch.
             "sms_send" -> sendSmsDirect(id, params, respond)
@@ -344,6 +390,84 @@ class InputService : AccessibilityService() {
                 }, 600)
             }, 800)
         }, 1200)
+    }
+
+    /**
+     * ADD-5 file send through the real WhatsApp app. Steps:
+     *   1. Decode the approved bytes and write them under cacheDir/shared
+     *      with EXACTLY the approved file name (sanitized again here —
+     *      the phone never trusts the wire for a path).
+     *   2. Fire an ACTION_SEND intent targeted at WhatsApp with a
+     *      FileProvider URI (read grant) — WhatsApp opens its share UI
+     *      with the file attached.
+     *   3. Accessibility-drive the share UI: tap the approved contact,
+     *      then (on the preview screen) tap Send.
+     * The ack fires once Send has been tapped, or with the failing step's
+     * error. Nothing is composed on-device beyond what was approved.
+     */
+    private fun sendFile(id: String, params: JSONObject, respond: (id: String, ok: Boolean, error: String?) -> Unit) {
+        val packageName = params.optString("packageName", "com.whatsapp")
+        val contact = params.optString("contact", "")
+        val rawName = params.optString("fileName", "")
+        val mimeType = params.optString("mimeType", "application/octet-stream")
+        val contentBase64 = params.optString("contentBase64", "")
+        val caption = params.optString("caption", "")
+        // Plain file name only: strip anything that could escape the dir.
+        val fileName = rawName.substringAfterLast('/').substringAfterLast('\\')
+        if (contact.isEmpty() || fileName.isEmpty() || fileName == "." || fileName == ".." || contentBase64.isEmpty()) {
+            respond(id, false, "missing_send_file_params")
+            return
+        }
+        val bytes = try {
+            Base64.decode(contentBase64, Base64.DEFAULT)
+        } catch (e: Exception) {
+            respond(id, false, "bad_base64")
+            return
+        }
+        // Server caps at 5 MB; re-check on-device so a rogue payload
+        // cannot fill the cache.
+        if (bytes.isEmpty() || bytes.size > 5 * 1024 * 1024) {
+            respond(id, false, "file_size_out_of_range")
+            return
+        }
+        val file = try {
+            val dir = File(cacheDir, "shared").apply { mkdirs() }
+            File(dir, fileName).apply { writeBytes(bytes) }
+        } catch (e: Exception) {
+            respond(id, false, "file_write_failed")
+            return
+        }
+        val uri = try {
+            FileProvider.getUriForFile(this, "${applicationContext.packageName}.fileprovider", file)
+        } catch (e: Exception) {
+            respond(id, false, "file_uri_failed")
+            return
+        }
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = mimeType
+            setPackage(packageName)
+            putExtra(Intent.EXTRA_STREAM, uri)
+            if (caption.isNotEmpty()) putExtra(Intent.EXTRA_TEXT, caption)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            respond(id, false, "share_intent_failed")
+            return
+        }
+        // WhatsApp's share UI loads asynchronously: pick the contact,
+        // then confirm on the preview screen with its Send control.
+        mainHandler.postDelayed({
+            if (!tapByText(contact)) {
+                respond(id, false, "conversation_not_found")
+                return@postDelayed
+            }
+            mainHandler.postDelayed({
+                val sent = tapByText("Send")
+                respond(id, sent, if (sent) null else "send_button_not_found")
+            }, 1200)
+        }, 1500)
     }
 
     private fun tap(x: Float, y: Float) {

@@ -243,6 +243,13 @@ export interface PerBotComputerManagerDeps {
     botId: string,
   ) => OSScreenLayer | Promise<OSScreenLayer>;
   /**
+   * ADD-5: host override for the LOCAL backend only (other surfaces
+   * keep their defaults). The API host wires the setup-aware layer:
+   * setup-required until the user completes the computer-use setup
+   * flow, the real verified OS adapter once enabled.
+   */
+  localLayerFor?: (botId: string) => OSScreenLayer | Promise<OSScreenLayer>;
+  /**
    * VPS layer factory: builds the OSScreenLayer for a bot whose surface
    * resolves to 'vps'. The host wires this to a VpsConnectionPool backed by
    * the bot's VPS profile. Throw VpsNotConfiguredError when the bot has no
@@ -437,6 +444,7 @@ export class PerBotComputerManager {
   private readonly clock: () => number;
   private readonly onRealAction?: (action: string, detail: unknown) => void;
   private readonly createBackendOverride?: PerBotComputerManagerDeps['createBackend'];
+  private readonly localLayerFor?: PerBotComputerManagerDeps['localLayerFor'];
   private readonly vpsLayerFor?: PerBotComputerManagerDeps['vpsLayerFor'];
   private readonly profileRoot: string;
   private readonly onProfileWipe?: PerBotComputerManagerDeps['onProfileWipe'];
@@ -447,6 +455,7 @@ export class PerBotComputerManager {
     this.clock = deps.clock ?? Date.now;
     this.onRealAction = deps.onRealAction;
     this.createBackendOverride = deps.createBackend;
+    this.localLayerFor = deps.localLayerFor;
     this.vpsLayerFor = deps.vpsLayerFor;
     this.onProfileWipe = deps.onProfileWipe;
     this.browserHolds = deps.browserHolds ?? defaultBrowserHoldRegistry;
@@ -661,6 +670,8 @@ export class PerBotComputerManager {
         ...(onRealAction ? { onRealAction: (a, d) => onRealAction(a, d) } : {}),
       });
     }
+    // ADD-5: the host's setup-aware local layer wins when provided.
+    if (this.localLayerFor) return this.localLayerFor(botId);
     return new LocalComputerSandbox(onRealAction ? { onRealAction } : {});
   }
 

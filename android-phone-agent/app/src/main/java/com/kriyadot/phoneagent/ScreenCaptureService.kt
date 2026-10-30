@@ -139,7 +139,14 @@ class ScreenCaptureService : Service() {
             val params = msg.optJSONObject("params") ?: org.json.JSONObject()
             scope.launch {
                 try {
-                    val data = PhoneDataHandlers.execute(this@ScreenCaptureService, query, params)
+                    // Wave-6 (DV-4): Health Connect reads are suspend-based
+                    // and live in their own handler; everything else goes
+                    // through the synchronous PhoneDataHandlers dispatch.
+                    val data = if (query == "health_sync") {
+                        HealthConnectHandlers.readSyncBatch(this@ScreenCaptureService, params)
+                    } else {
+                        PhoneDataHandlers.execute(this@ScreenCaptureService, query, params)
+                    }
                     client.sendDataResult(id, true, null, data)
                 } catch (e: PhoneDataException) {
                     client.sendDataResult(id, false, e.code, null)

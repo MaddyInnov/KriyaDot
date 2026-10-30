@@ -60,6 +60,25 @@ import {
 import { GovernanceAdapter } from './governance-adapter.js';
 import { PauseRegistry, pauseGate, registerSystemPauseRoutes } from './system-pause.js';
 import { createHubPhoneActionDispatcher, phoneActionPolicyRules, registerPhoneActionTools } from './phone-actions.js';
+import { phoneDataPolicyRules, registerPhoneDataTools } from './phone-data-tools.js';
+import { phonePackagedPolicyRules, registerPhonePackagedTools } from './phone-packaged.js';
+import { phoneBackgroundPolicyRules, registerPhoneBackgroundTools } from './phone-background.js';
+import { CameraCaptureService, cameraCapturePolicyRules, registerCameraCaptureTools } from './camera-capture.js';
+import {
+  BindingConfigStore,
+  BoundPersonalDataService,
+  createKriyaDotProvider,
+  createPhoneOsProvider,
+  osBindingPolicyRules,
+  registerOsBindingRoutes,
+  registerOsBindingTools,
+} from './os-data-binding.js';
+import { WhatsappLocalStoreSearch, registerWhatsappLocalTools, whatsappLocalPolicyRules } from './whatsapp-local-store.js';
+import { LanDiscoveryService, registerLanDiscoveryTools } from './lan-discovery.js';
+import { HomeControlProxy, HostGrantStore, proxyTransport, registerHomeProxyRoutes, registerHomeProxyTools } from './home-control-proxy.js';
+import { ShellyClient, registerShellyTools, shellyPolicyRules } from './shelly.js';
+import { IppClient, ippPolicyRules, registerIppTools } from './ipp-print.js';
+import { CalendarEventStore } from './tasks.js';
 import {
   NotificationStore,
   NotificationTriageService,
@@ -264,12 +283,14 @@ import { registerSignInCodeTools, signInCodePolicyRules } from './sign-in-code-t
 // pane + inspection tools (§4.7), file-lifecycle public serving (§4.8).
 import { registerWorkPanelRoutes } from './work-panel.js';
 import { registerPermissionsPaneRoutes } from './permissions-pane.js';
+import { computerUsePaneSummary, createSetupAwareLocalLayer } from './computer-use-setup.js';
 import { registerPermissionsTools } from './permissions-tools.js';
 import { FileLinkService, registerFileLinkServing } from './file-links.js';
 import { registerPageRecordPublicRoutes } from './page-records.js';
 import { registerGatedPublicServing } from './publish-gate.js';
 import { runTrashPurge } from './workspace-trash.js';
 // Muse closure (Wave 2): capability awareness (ADD-2) + user guide (ADD-3).
+import { resolvePrincipal } from './principal.js';
 import { createCapabilityService, PRODUCT_FEATURES } from './capabilities.js';
 import {
   registerGoogleWorkspaceProvider,
@@ -526,7 +547,7 @@ async function boot(): Promise<void> {
   // so deny-by-default is preserved and extended.
   const globalPolicy: Policy = {
     ...DEFAULT_POLICY,
-    rules: [...publishPagePolicyRules(), ...interconnectionPolicyRules(), ...computerUsePolicyRules(), ...museModuleToolPolicies(), ...composioToolPolicies(), ...signInCodePolicyRules(), ...purchasePolicyRules(), ...phoneActionPolicyRules(), ...outboundCallPolicyRules(), ...phoneSmsPolicyRules(), ...googleWorkspaceToolPolicies(), ...capabilityToolsPolicyRules(), ...DEFAULT_POLICY.rules],
+    rules: [...publishPagePolicyRules(), ...interconnectionPolicyRules(), ...computerUsePolicyRules(), ...museModuleToolPolicies(), ...composioToolPolicies(), ...signInCodePolicyRules(), ...purchasePolicyRules(), ...phoneActionPolicyRules(), ...phoneDataPolicyRules(), ...phonePackagedPolicyRules(), ...phoneBackgroundPolicyRules(), ...cameraCapturePolicyRules(), ...osBindingPolicyRules(), ...whatsappLocalPolicyRules(), ...shellyPolicyRules(), ...ippPolicyRules(), ...outboundCallPolicyRules(), ...phoneSmsPolicyRules(), ...googleWorkspaceToolPolicies(), ...capabilityToolsPolicyRules(), ...DEFAULT_POLICY.rules],
   };
   const governance = new GovernanceGateway({
     dbPath: `${config.dataDir}/governance.db`,
@@ -615,6 +636,23 @@ async function boot(): Promise<void> {
   };
   const computerManager = new PerBotComputerManager({
     onRealAction: auditComputerAction,
+    // ADD-5: the local layer is setup-aware — until the user completes
+    // the first-run setup flow, local computer tools answer with the
+    // setup prompt (never a silent mock); once enabled, the real
+    // verified adapter serves, with post-action screenshot verification
+    // records audited here.
+    localLayerFor: (botId: string) =>
+      createSetupAwareLocalLayer({
+        dataDir: config.dataDir,
+        userId: botsById.get(botId)?.ownerId ?? 'you',
+        onVerification: (rec) => {
+          try {
+            governance.audit('tool.computer_verify', { actor: botId, toolName: rec.step, detail: rec });
+          } catch {
+            // Audit must never break input.
+          }
+        },
+      }),
     // W4: per-bot persistent browser profiles live under
     // <dataDir>/browser-profiles/<botId>/; wipes are audited (metadata only).
     dataDir: config.dataDir,
@@ -718,6 +756,30 @@ async function boot(): Promise<void> {
     // the pending purchase intent against it (one card per purchase).
     approvalObserver: purchaseWiring.onApprovalMinted,
   });
+
+  // CA-25: MCP channel hub — server-pushed events gated by governance
+  // (synthetic tool mcp_channel_event; anything but an explicit allow
+  // denies — no human sits in a push path) and injected into the bound
+  // live session's steer queue with external-source framing.
+  {
+    const { McpChannelHub, channelGateFromClassifier } = await import('@mvp/agent-runtime');
+    const { setMcpChannelHub } = await import('./mcp-channel-hub.js');
+    setMcpChannelHub(
+      new McpChannelHub({
+        inject: ({ sessionId, text }) => {
+          agentRuntime.enqueueSteer(sessionId, text);
+        },
+        gate: channelGateFromClassifier(async (info) => {
+          const decision = await governance.evaluate('mcp_channel_event', {}, {
+            botId: 'mcp-channel',
+            sessionId: info.sessionId,
+            actor: info.channel.serverLabel,
+          });
+          return decision.effect === 'allow' ? 'allow' : 'deny';
+        }),
+      }),
+    );
+  }
 
   // Platform embedder (Octomind parity #13): probed ONCE at boot —
   // neural (configured endpoint) > onnx seam > trigram hash fallback —
@@ -897,7 +959,102 @@ async function boot(): Promise<void> {
       audit: (action, fields) => governance.audit(action, fields),
       isPaused,
     });
+    // Phone DATA tools (calendar/contacts/messages/location) — built in
+    // an earlier wave but never host-registered; registered here with
+    // the DV-4 health-sync ingest loop closed (samples → health store).
+    const { createHubPhoneDataDispatcher } = await import('./phone-data-tools.js');
+    const { HealthSyncStore } = await import('./health-sync.js');
+    const healthSyncStore = new HealthSyncStore(config.dataDir);
+    const dataDispatcher = createHubPhoneDataDispatcher(phoneHub, phoneStore);
+    registerPhoneDataTools(toolRegistry, {
+      dispatcher: dataDispatcher.dispatcher,
+      resolveDeviceId: dataDispatcher.resolveDeviceId,
+      audit: (action, fields) => governance.audit(action, fields),
+      isPaused,
+      onHealthSync: (deviceId, samples) => healthSyncStore.ingest(deviceId, samples),
+    });
   }
+  // §4.14 devices & home rails (Wave 6): packaged phone commands (DV-3),
+  // background-control report (DV-6), desktop camera (DV-7), OS data
+  // binding (DV-9), WhatsApp desktop-store search (DV-10), LAN discovery
+  // (DV-12), home-control proxy (DV-13) with Shelly (DV-15) + IPP
+  // printing (DV-16) riding its per-host grants. DV-14 Lutron/HAP tools
+  // stay unregistered until a paired session transport exists.
+  const wave6PhoneDispatcher = {
+    dispatchAction: (d: string, a: string, p: Record<string, unknown>, t?: number) => phoneHub.dispatchAction(d, a, p, t),
+    dispatchDataQuery: (d: string, q: string, p: Record<string, unknown>, t?: number) => phoneHub.dispatchDataQuery(d, q as never, p, t),
+    isOnline: (d: string) => phoneHub.isOnline(d),
+  };
+  const wave6ResolveDeviceId = (requested?: string) =>
+    requested ?? phoneStore.listDevices().find((d) => phoneHub.isOnline(d.id))?.id;
+  registerPhonePackagedTools(toolRegistry, {
+    actionDispatcher: wave6PhoneDispatcher,
+    dataDispatcher: wave6PhoneDispatcher,
+    resolveDeviceId: wave6ResolveDeviceId,
+    audit: (action, fields) => governance.audit(action, fields),
+    isPaused,
+  });
+  registerPhoneBackgroundTools(toolRegistry, {
+    dataDispatcher: wave6PhoneDispatcher,
+    resolveDeviceId: wave6ResolveDeviceId,
+    audit: (action, fields) => governance.audit(action, fields),
+    isPaused,
+  });
+  registerCameraCaptureTools(toolRegistry, {
+    service: new CameraCaptureService({ dataDir: config.dataDir }),
+    audit: (action, fields) => governance.audit(action, fields),
+    isPaused,
+  });
+  const osBindingConfig = new BindingConfigStore(config.dataDir);
+  const boundData = new BoundPersonalDataService(
+    {
+      os: createPhoneOsProvider({ dispatcher: wave6PhoneDispatcher, resolveDeviceId: wave6ResolveDeviceId }),
+      kriyadot: createKriyaDotProvider({
+        listLocalEvents: () =>
+          new CalendarEventStore(config.dataDir)
+            .list()
+            .map((e) => ({ title: e.title, startsAt: e.startsAt, endsAt: e.endsAt })),
+      }),
+    },
+    osBindingConfig,
+  );
+  registerOsBindingTools(toolRegistry, {
+    service: boundData,
+    audit: (action, fields) => governance.audit(action, fields),
+    isPaused,
+  });
+  registerWhatsappLocalTools(toolRegistry, {
+    search: new WhatsappLocalStoreSearch(),
+    audit: (action, fields) => governance.audit(action, fields),
+    isPaused,
+  });
+  registerLanDiscoveryTools(toolRegistry, { service: new LanDiscoveryService() });
+  const hostGrantStore = new HostGrantStore(config.dataDir);
+  const homeProxy = new HomeControlProxy(hostGrantStore, undefined, (action, fields) => governance.audit(action, fields));
+  registerHomeProxyTools(toolRegistry, {
+    proxy: homeProxy,
+    audit: (action, fields) => governance.audit(action, fields),
+    isPaused,
+  });
+  registerShellyTools(toolRegistry, {
+    createClient: (host) => new ShellyClient({ host, transport: proxyTransport(homeProxy) }),
+    audit: (action, fields) => governance.audit(action, fields),
+    isPaused,
+  });
+  const ippTransportViaProxy = async (url: string, body: Buffer) => {
+    const res = await proxyTransport(homeProxy)({
+      method: 'POST',
+      url,
+      headers: { 'Content-Type': 'application/ipp' },
+      body: body.toString('latin1'),
+    });
+    return Buffer.from(res.bodyText, 'latin1');
+  };
+  registerIppTools(toolRegistry, {
+    client: new IppClient(ippTransportViaProxy),
+    audit: (action, fields) => governance.audit(action, fields),
+    isPaused,
+  });
   // Approval-gated purchasing (W6): request_purchase — require-approval
   // ALWAYS via purchasePolicyRules above. The handler only records /
   // claims the purchase intent; execution runs solely after the human
@@ -1619,6 +1776,10 @@ async function boot(): Promise<void> {
   // the routine store exists.
   const { EventTriggerStore } = await import('./routine-events.js');
   const routineEventStore = new EventTriggerStore(config.dataDir);
+  // SCH-13: routine self-pause on durable blocks. The policy is built
+  // once the routine store exists (below); the executor wrap is applied
+  // after registerRoutineRoutes returns — see the self-pause block
+  // further down.
   const { routineStore, triggerStore: routineTriggerStore } = registerRoutineRoutes(
     routinesRouter,
     {
@@ -1689,6 +1850,37 @@ async function boot(): Promise<void> {
     getBots: () => seed.bots,
     runExecutor: routineRunExecutor,
   });
+
+  // SCH-13: wrap the executor so EVERY settled run passes the
+  // self-pause policy (durable blocks pause on first failure; transient
+  // failures at 3 consecutive). The policy + its router are shared with
+  // the Wave-6 mount block below.
+  const { RoutineSelfPausePolicy, createSelfPauseSettler } = await import('./routine-self-pause.js');
+  const selfPausePolicy = new RoutineSelfPausePolicy(config.dataDir, {
+    routines: routineStore,
+    runs: routineRunStore,
+    failureThreshold: 3,
+  });
+  {
+    const settler = createSelfPauseSettler(
+      selfPausePolicy,
+      (runId) => routineRunStore.get(runId)?.routineId,
+      routineRunStore,
+    );
+    const originalExecute = routineRunExecutor.execute.bind(routineRunExecutor);
+    routineRunExecutor.execute = (opts) =>
+      originalExecute({
+        ...opts,
+        onSettled: (result) => {
+          try {
+            settler(result);
+          } catch {
+            // Self-pause must never break a run's settle path.
+          }
+          opts.onSettled?.(result);
+        },
+      });
+  }
 
   // Companion app (phone → PC remote control). The hub is created here (not
   // in routes.ts) so the WebSocket upgrade handler below shares the same
@@ -2788,6 +2980,318 @@ async function boot(): Promise<void> {
       }
     }, 60_000);
     quietTimer.unref();
+  }
+
+  // ---- Wave-6 surfaces (§4.14 devices/home, §4.15 platform, ADD-5,
+  // ADD-7 leftovers) — mounted before the main router like Wave 5. ----
+  {
+    const audit = (action: string, fields: Record<string, unknown>) => governance.audit(action, fields as never);
+    // DV-9 binding settings + DV-13 grant management (user surfaces).
+    const osBindingRouter = express.Router();
+    registerOsBindingRoutes(osBindingRouter, { config: osBindingConfig, audit });
+    app.use('/api/os-binding', osBindingRouter);
+    const homeProxyRouter = express.Router();
+    registerHomeProxyRoutes(homeProxyRouter, { proxy: homeProxy, store: hostGrantStore });
+    app.use('/api/home-proxy', homeProxyRouter);
+    // DV-17/18/19 network connector + DV-4 health sync.
+    const { TailscaleConnector } = await import('./tailscale-connector.js');
+    const { TailnetApprovalStore } = await import('./tailnet-tcp.js');
+    const { registerNetworkRoutes } = await import('./network-routes.js');
+    const networkRouter = express.Router();
+    registerNetworkRoutes(networkRouter, {
+      connector: new TailscaleConnector({ stateDir: path.join(config.dataDir, 'network'), audit }),
+      approvals: new TailnetApprovalStore(path.join(config.dataDir, 'network')),
+      audit,
+    });
+    app.use('/api/network', networkRouter);
+    const { registerHealthSyncRoutes } = await import('./health-sync-routes.js');
+    const healthSyncRouter = express.Router();
+    registerHealthSyncRoutes(healthSyncRouter, {
+      store: new (await import('./health-sync.js')).HealthSyncStore(config.dataDir),
+      audit,
+    });
+    app.use('/api/health-sync', healthSyncRouter);
+    // DA-1 data export (FL-7 link rail) + DA-2 full reset (real
+    // active-turn counter — reset refuses mid-turn unless forced).
+    const { createDataExportRouter } = await import('./data-export.js');
+    const { FileLinkService } = await import('./file-links.js');
+    app.use(
+      '/api',
+      createDataExportRouter({
+        dataDir: config.dataDir,
+        workspaceDir: config.workspaceDir,
+        fileLinks: new FileLinkService(config.dataDir),
+      }),
+    );
+    const { createFullResetRouter } = await import('./full-reset.js');
+    app.use(
+      '/api',
+      createFullResetRouter({
+        dataDir: config.dataDir,
+        workspaceDir: config.workspaceDir,
+        activeTurns: () => turnTracker.listActive().length,
+      }),
+    );
+    // SCH-13 pauses surface (policy + executor wrap live further up).
+    const { createRoutineSelfPauseRouter } = await import('./routine-self-pause.js');
+    app.use('/api', createRoutineSelfPauseRouter({ policy: selfPausePolicy }));
+    // SCH-14 hook lifecycle: registry + routes. Bot-config script hooks
+    // are registered as managed records (start disabled, secret-scanned);
+    // their existing unmanaged bus installs keep firing unchanged —
+    // lifecycle management is opt-in per the registry's own surface.
+    const { HookLifecycleRegistry, createHookLifecycleRouter } = await import('./hook-lifecycle.js');
+    const hookLifecycle = new HookLifecycleRegistry(config.dataDir, { maxConsecutiveFailures: 3 });
+    try {
+      const { hooksFromConfig } = await import('@mvp/agent-runtime');
+      const scriptEntries = seed.bots.flatMap((bot) => {
+        try {
+          return hooksFromConfig(bot as { hooks?: unknown }).entries.filter(
+            (e) => (e as { kind?: string }).kind === 'script' || typeof (e as { command?: unknown }).command === 'string',
+          );
+        } catch {
+          return [];
+        }
+      });
+      if (scriptEntries.length > 0) hookLifecycle.registerScriptHooks(scriptEntries as never);
+    } catch {
+      // Lifecycle registration is best-effort at boot.
+    }
+    app.use('/api', createHookLifecycleRouter({ registry: hookLifecycle }));
+    // SCH-5 supervised services: real handles only; no restart seams
+    // exist in-process, so the panel honestly shows "restarts with the
+    // app" for every entry.
+    const { SupervisedServiceRegistry, SUPERVISED_SERVICE_IDS, createSupervisedServicesRouter } = await import('./supervised-services.js');
+    const supervisedServices = new SupervisedServiceRegistry({});
+    supervisedServices.register({
+      id: SUPERVISED_SERVICE_IDS.routines,
+      name: 'Routines engine',
+      description: 'Fires scheduled routines and webhook triggers.',
+      probe: () => ({
+        status: 'running',
+        detail: `${routineStore.list().filter((r) => r.enabled).length} routines enabled`,
+      }),
+    });
+    supervisedServices.register({
+      id: SUPERVISED_SERVICE_IDS.dreamer,
+      name: 'Dreamer',
+      description: 'Nightly dreaming + reflective synthesis and idea curation.',
+      probe: () => ({ status: 'running', detail: `${dreamStore.list(undefined, 500).length} dreams stored` }),
+    });
+    supervisedServices.register({
+      id: SUPERVISED_SERVICE_IDS.connectors,
+      name: 'Connector sync',
+      description: 'Per-connector background sync gates + reauth surfacing.',
+      probe: () => ({ status: 'running', detail: 'sync engine mounted; toggles in the Permissions pane' }),
+    });
+    supervisedServices.register({
+      id: SUPERVISED_SERVICE_IDS.sync,
+      name: 'Account sync',
+      description: 'History sync through the user\'s own instance (front-door build).',
+      probe: () => ({ status: 'running', detail: 'sync endpoints mounted on this instance' }),
+    });
+    app.use('/api', createSupervisedServicesRouter({ registry: supervisedServices }));
+    // ADD-5: computer-use setup flow routes (explainer → OS checks →
+    // self-test → enable). Grants no standing allow.
+    const { registerComputerUseSetupRoutes } = await import('./computer-use-setup.js');
+    registerComputerUseSetupRoutes(app, { dataDir: config.dataDir, audit, loopbackToken });
+    // CA-31 projects + CA-36 analysis (router + bot tool).
+    const { createProjectsRouter } = await import('./projects.js');
+    app.use(
+      '/api/projects',
+      createProjectsRouter({
+        dataDir: config.dataDir,
+        bindSession: (sessionId, projectId) => agentRuntime.sessionStore.setSessionProject(sessionId, projectId),
+      }),
+    );
+    const { createAnalysisRouter, createAnalysisTool } = await import('./analysis.js');
+    app.use('/api', createAnalysisRouter({}));
+    const analysisTool = createAnalysisTool({});
+    if (!toolRegistry.has(analysisTool.name)) toolRegistry.set(analysisTool.name, analysisTool as never);
+    // CA-34 folder sessions (export/validate/plan; materialize seam
+    // intentionally unbound — plans are produced, host stores apply).
+    const { registerFolderSessionRoutes } = await import('./folder-session.js');
+    const folderSessionRouter = express.Router();
+    registerFolderSessionRoutes(folderSessionRouter, { allowedRoot: config.workspaceDir, audit });
+    app.use('/api/folder-sessions', folderSessionRouter);
+    // CA-24 plugin UI contributions (default OFF; manifest + CSP gate).
+    const { registerPluginUiRoutes } = await import('./plugin-ui-routes.js');
+    const { pluginManifestToUnified } = await import('@mvp/plugins');
+    const pluginUiRouter = express.Router();
+    registerPluginUiRoutes(pluginUiRouter, {
+      enabled: process.env.PLUGIN_UI_ENABLED,
+      resolveContribution: (pluginId) => {
+        const plugin = pluginManager.list().find((p) => p.id === pluginId && p.enabled);
+        if (!plugin) return undefined;
+        let unified;
+        try {
+          unified = pluginManifestToUnified(plugin.manifest as never);
+        } catch {
+          return undefined;
+        }
+        if (!unified.uiContribution) return undefined;
+        const entryPath = path.join(plugin.dir, unified.uiContribution.entry);
+        if (!entryPath.startsWith(plugin.dir)) return undefined;
+        try {
+          return { contribution: unified.uiContribution, html: fs.readFileSync(entryPath, 'utf8') };
+        } catch {
+          return undefined;
+        }
+      },
+      audit,
+    });
+    app.use('/api/plugin-ui', pluginUiRouter);
+    // CA-33 .mcpb import: same governance prompt as directory installs
+    // (deny-by-default when no approval is granted).
+    const { importMcpbBundle } = await import('@mvp/agent-runtime');
+    const mcpbRouter = express.Router();
+    mcpbRouter.post('/import-mcpb', async (req, res) => {
+      try {
+        const base64 = typeof req.body?.bundleBase64 === 'string' ? req.body.bundleBase64 : '';
+        if (!base64) {
+          res.status(400).json({ error: 'bundleBase64 is required' });
+          return;
+        }
+        const result = await importMcpbBundle(Buffer.from(base64, 'base64'), {
+          approve: async (info) => {
+            const approvalId = governance.requestApproval(
+              'mcp_install',
+              { label: info.label, manifest: info.manifest as never },
+              { sessionId: 'mcpb-import', botId: 'mcpb-import', actor: 'user' },
+            );
+            const verdict = await governance.awaitDecision(approvalId, 120_000);
+            return verdict === 'approved';
+          },
+          store: lazyMcpManager.store,
+          audit,
+        });
+        res.json({ ok: true, bundle: result.bundle, installed: result.installed ?? null });
+      } catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+    app.use('/api/mcp-directory', mcpbRouter);
+  }
+  {
+    const audit = (action: string, fields: Record<string, unknown>) => governance.audit(action, fields as never);
+    // CA-22 GitHub-native agent: signed comment webhooks → governed
+    // routine runs; reviews post only under an explicit policy allow
+    // for the synthetic tool github_submit_review (approval-gated by
+    // default — the webhook flow never bypasses governance).
+    const { registerGithubAgentRoutes } = await import('./github-agent.js');
+    const { submitReview } = await import('./github.js');
+    const ghAgentRouter = express.Router();
+    registerGithubAgentRoutes(ghAgentRouter, {
+      secret: process.env.GITHUB_WEBHOOK_SECRET ?? '',
+      dispatchRun: async ({ repo, number, task }) => {
+        const bot = seed.bots[0];
+        if (!bot) throw new Error('no bot configured for GitHub agent runs');
+        const routine = routineStore.create({
+          name: `GitHub ${repo}#${number}`,
+          botId: bot.id,
+          promptTemplate: task,
+        });
+        const runId = await routineRunExecutor.execute({ routine, trigger: 'webhook', message: task });
+        return { runId };
+      },
+      reviewPullRequest: async ({ repo, number, instruction }) => {
+        const bot = seed.bots[0];
+        if (!bot) throw new Error('no bot configured for GitHub reviews');
+        let out = '';
+        await agentRuntime.runTurn({
+          bot,
+          sessionId: `github-review-${repo.replace(/\//g, '-')}-${number}-${Date.now()}`,
+          message:
+            `You are reviewing pull request ${repo}#${number} on GitHub. The maintainer's instruction: ${instruction}\n\n` +
+            'You do not have the diff in this flow — review the request itself: state what you would check, any risks you can identify from the instruction, and finish with exactly one verdict line: "VERDICT: COMMENT", "VERDICT: APPROVE", or "VERDICT: REQUEST_CHANGES".',
+          onEvent: async (event) => {
+            if (event.type === 'token') out += event.content;
+          },
+        });
+        const verdict = /VERDICT:\s*(APPROVE|REQUEST_CHANGES|COMMENT)/.exec(out)?.[1] ?? 'COMMENT';
+        return { body: out.replace(/VERDICT:\s*(APPROVE|REQUEST_CHANGES|COMMENT)/, '').trim(), event: verdict as 'COMMENT' | 'APPROVE' | 'REQUEST_CHANGES' };
+      },
+      postReview: async ({ repo, number, body, event }) => {
+        const decision = await governance.evaluate('github_submit_review', { repo, number }, { botId: 'github-agent', sessionId: 'github-agent', actor: 'github-agent' });
+        if (decision.effect !== 'allow') {
+          throw new Error(
+            'posting GitHub reviews is approval-gated: add an allow rule for github_submit_review or post reviews from the app',
+          );
+        }
+        const [owner, repoName] = repo.split('/');
+        return submitReview({ owner: owner ?? '', repo: repoName ?? '', number, body, event });
+      },
+      audit,
+    });
+    app.use('/api/github-agent', ghAgentRouter);
+    // CA-32 artifact model calls: host-brokered (artifacts never hold a
+    // key), per-user vault key when configured, daily spend cap via the
+    // shared cost ledger, fail-closed. NOTE: public artifact pages keep
+    // their script-less CSP — the bridge is for app-side surfaces; the
+    // public-page CSP amendment is deliberately NOT taken in this build.
+    const { registerArtifactModelRoutes } = await import('./artifact-model.js');
+    const { PagePublicationStore } = await import('./public-pages.js');
+    const { SecureVault } = await import('@mvp/vault');
+    const { CostTracker } = await import('@mvp/billing');
+    const artifactCostTracker = new CostTracker(path.join(config.dataDir, 'billing.db'));
+    const artifactRouter = express.Router();
+    const pagePublications = new PagePublicationStore(config.dataDir);
+    registerArtifactModelRoutes(
+      artifactRouter,
+      {
+        findPublication: (slug) => pagePublications.getBySlug(slug),
+        resolveProviderKey: (userId) => {
+          try {
+            return new SecureVault(config.dataDir).get(`artifact-provider-key-${userId}`)?.value;
+          } catch {
+            return undefined;
+          }
+        },
+        callProvider: async ({ apiKey, prompt, system, maxOutputTokens }) => {
+          const bot = seed.bots[0];
+          const provider = createProvider(bot?.provider ?? 'groq', apiKey ? { apiKey } : undefined);
+          const res = await provider.chat(
+            [
+              ...(system ? [{ role: 'system' as const, content: system }] : []),
+              { role: 'user' as const, content: prompt },
+            ],
+            [],
+            { model: bot?.model ?? 'default', maxTokens: maxOutputTokens },
+          );
+          const usage = (res.usage ?? {}) as { inputTokens?: number; outputTokens?: number; promptTokens?: number; completionTokens?: number };
+          const inputTokens = usage.inputTokens ?? usage.promptTokens ?? 0;
+          const outputTokens = usage.outputTokens ?? usage.completionTokens ?? 0;
+          return {
+            text: res.content ?? '',
+            model: bot?.model ?? 'default',
+            inputTokens,
+            outputTokens,
+            costCents: Math.max(1, Math.round((inputTokens + outputTokens) / 1000)),
+          };
+        },
+        checkCap: ({ userId }) => {
+          const budget = Number(process.env.ARTIFACT_MODEL_DAILY_BUDGET_CENTS ?? 500);
+          const startOfDay = new Date();
+          startOfDay.setHours(0, 0, 0, 0);
+          const spent = artifactCostTracker.spentCents({ since: startOfDay.getTime(), until: Date.now(), botId: userId });
+          return spent < budget
+            ? { allowed: true }
+            : { allowed: false, message: `artifact model daily budget reached (${spent}/${budget} cents)` };
+        },
+        recordCost: (e) =>
+          artifactCostTracker.record({
+            feature: 'artifact-model',
+            step: e.slug,
+            botId: e.userId,
+            model: e.model,
+            inputTokens: e.inputTokens,
+            outputTokens: e.outputTokens,
+            costCents: e.costCents,
+          }),
+        audit,
+      },
+      (req) => resolvePrincipal(req as never, { dataDir: config.dataDir, loopbackToken })?.userId ?? '',
+    );
+    app.use('/api/artifacts', artifactRouter);
   }
 
   // CN-3: widen the google OAuth preset to the core-suite scopes BEFORE
@@ -4225,6 +4729,8 @@ async function boot(): Promise<void> {
       bots: seed.bots,
       audit: (action, fields) => governance.audit(action, fields),
       listApprovals: (status) => governance.listApprovals(status),
+      // ADD-5: computer-use setup state rides the single pane.
+      computerUseStatus: (userId) => computerUsePaneSummary(config.dataDir, userId),
     });
     app.use('/api', permissionsRouter);
   }

@@ -198,10 +198,10 @@ describe('phone action tool handlers', () => {
     await expect(open.handler({ packageName: 'com.whatsapp' }, ctx())).rejects.toThrow(/unknown_action/);
   });
 
-  it('all six tools are mutating', () => {
+  it('all seven tools are mutating (phone_send_file added by ADD-5)', () => {
     const tools = createPhoneActionTools({ dispatcher: new MockDispatcher() });
     expect(tools.map((t) => t.name).sort()).toEqual(
-      ['phone_call', 'phone_open_app', 'phone_scroll', 'phone_send_message', 'phone_tap', 'phone_type'].sort(),
+      ['phone_call', 'phone_open_app', 'phone_scroll', 'phone_send_file', 'phone_send_message', 'phone_tap', 'phone_type'].sort(),
     );
     expect(tools.every((t) => t.mutating === true)).toBe(true);
   });

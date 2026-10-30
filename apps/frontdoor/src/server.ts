@@ -28,6 +28,7 @@ import {
   whatsNewPage,
 } from './pages.js';
 import { FrontdoorStore, hashToken, type Account, type Workspace } from './store.js';
+import { ReferralStore, handleReferralRequest } from './referrals.js';
 
 export interface FrontdoorConfig {
   /** Directory holding frontdoor-state.json. */
@@ -140,6 +141,8 @@ export function createFrontdoor(config: FrontdoorConfig): Frontdoor {
   const log = config.log ?? ((msg: string) => console.log(msg));
   const fetchFn: FetchFn = config.fetchFn ?? fetch;
   const store = new FrontdoorStore(config.stateDir);
+  // DA-5/DA-6: referral invites + redemption, bound to these accounts.
+  const referralStore = new ReferralStore(config.stateDir);
   const handoffKeys = loadHandoffKeys({
     pem: config.handoffPrivateKeyPem,
     keyFile: config.handoffKeyFile,
@@ -512,6 +515,9 @@ export function createFrontdoor(config: FrontdoorConfig): Frontdoor {
       }
       return;
     }
+
+    // DA-5/DA-6 referrals (session-gated inside the handler).
+    if (await handleReferralRequest(req, res, { store: referralStore, accountFor: (r) => sessionAccount(r) })) return;
 
     if (path.startsWith('/api/')) {
       sendJson(res, 404, { error: 'not-found' });

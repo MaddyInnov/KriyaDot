@@ -24,6 +24,8 @@ export interface ChatRequestBody {
   taskType?: 'code' | 'chat' | 'reasoning' | 'simple-qa';
   /** Session auto-approve: skip approval cards for this turn (audited). */
   autoApprove?: boolean;
+  /** CA-21: `kriyadot run --bare` — skip all auto-discovery for this turn. */
+  bare?: boolean;
   /** Plan mode: read-only exploration, mutating tools denied. */
   planMode?: boolean;
   /** Max USD spend for this turn; stops fail-closed when exceeded. */

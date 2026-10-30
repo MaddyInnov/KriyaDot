@@ -442,6 +442,12 @@ export type FetchFn = (url: string, init?: RequestInit) => Promise<Response>;
 
 export interface WhatsAppTransport {
   sendPayload(payload: Record<string, unknown>): Promise<{ ok: true; id?: string }>;
+  /**
+   * Upload local file bytes to the Graph media endpoint and return the
+   * provider media id (ADD-5: this is what makes "send a FILE" possible —
+   * sendMedia alone can only reference a link or a previously-uploaded id).
+   */
+  uploadMedia(bytes: Uint8Array, opts: { mimeType: string; filename?: string }): Promise<{ ok: true; id: string }>;
   sendText(to: string, body: string, opts?: { quotedProviderMessageId?: string }): Promise<{ ok: true; id?: string }>;
   sendMedia(to: string, input: WhatsAppMediaInput): Promise<{ ok: true; id?: string }>;
   sendButtons(to: string, bodyText: string, buttons: WhatsAppButtonSpec[], opts?: { headerText?: string; footerText?: string }): Promise<{ ok: true; id?: string }>;
@@ -481,8 +487,45 @@ export function createWhatsAppTransport(opts: {
     return { ok: true, id: messages?.[0]?.id };
   }
 
+  const mediaEndpoint = `https://graph.facebook.com/${version}/${encodeURIComponent(opts.phoneNumberId)}/media`;
+
+  async function uploadMedia(
+    bytes: Uint8Array,
+    uploadOpts: { mimeType: string; filename?: string },
+  ): Promise<{ ok: true; id: string }> {
+    if (!bytes || bytes.length === 0) throw new Error('WhatsApp media upload: file bytes are required');
+    if (!uploadOpts.mimeType) throw new Error('WhatsApp media upload: mimeType is required');
+    // Multipart form upload per the Cloud API media endpoint. The file
+    // part's filename is what recipients see for documents.
+    const form = new FormData();
+    form.append('messaging_product', 'whatsapp');
+    form.append('type', uploadOpts.mimeType);
+    form.append(
+      'file',
+      new Blob([Buffer.from(bytes)], { type: uploadOpts.mimeType }),
+      uploadOpts.filename ?? 'file',
+    );
+    const res = await fetchFn(mediaEndpoint, {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + opts.token },
+      body: form,
+    });
+    let body: Record<string, unknown> = {};
+    try {
+      body = (await res.json()) as Record<string, unknown>;
+    } catch {
+      // fall through to the error below
+    }
+    if (!res.ok || typeof body.id !== 'string') {
+      const err = body.error as { message?: string } | undefined;
+      throw new Error(`WhatsApp media upload failed: ${err?.message ?? `HTTP ${res.status}`}`);
+    }
+    return { ok: true, id: body.id };
+  }
+
   return {
     sendPayload,
+    uploadMedia,
     sendText: (to, body, o) => sendPayload(buildWhatsAppTextPayload(to, body, o)),
     sendMedia: (to, input) => sendPayload(buildWhatsAppMediaPayload(to, input)),
     sendButtons: (to, bodyText, buttons, o) => sendPayload(buildWhatsAppButtonsPayload(to, bodyText, buttons, o)),

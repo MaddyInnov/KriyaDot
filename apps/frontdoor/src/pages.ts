@@ -194,7 +194,14 @@ ${API_HELPERS}
 export function planPage(): string {
   const body = `
 <h1>Your plan</h1>
-<section class="fd-card" id="plan-card"><p class="fd-muted">Loading…</p></section>`;
+<section class="fd-card" id="plan-card"><p class="fd-muted">Loading…</p></section>
+<section class="fd-card">
+  <h2>Your data stays yours</h2>
+  <p>KriyaDot is <strong>local-first</strong>: this front door stores only your account identity
+  and your workspace addresses — never your chats, files, or credentials. Your content lives in
+  your own instance, and it is <strong>never used to train models</strong>. From inside your
+  instance you can download everything in one archive, or run a full reset, at any time.</p>
+</section>`;
   const script = `
 ${API_HELPERS}
 (async () => {

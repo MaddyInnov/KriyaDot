@@ -38,4 +38,8 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("org.json:json:20240303")
+    // Wave-6 (DV-4): Health Connect read bridge (HealthConnectHandlers.kt).
+    // Source-level only on the build VM — no Android SDK there; this must
+    // resolve + compile in a real Android build.
+    implementation("androidx.health.connect:connect-client:1.1.0-alpha06")
 }

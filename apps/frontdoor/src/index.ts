@@ -10,6 +10,18 @@ import { createFrontdoor } from './server.js';
 export { createFrontdoor, createFrontdoorServer, type Frontdoor, type FrontdoorConfig } from './server.js';
 export { FrontdoorStore, hashToken, type Account, type LinkCode, type SessionRecord, type Workspace } from './store.js';
 export {
+  ReferralStore,
+  generateReferralCode,
+  normalizeReferralCode,
+  handleReferralRequest,
+  REFERRAL_CODE_PREFIX,
+  DEFAULT_INVITE_TTL_MS,
+  DEFAULT_INVITE_MAX_USES,
+  type ReferralInvite,
+  type ReferralRedemption,
+  type ReferralHttpDeps,
+} from './referrals.js';
+export {
   loadHandoffKeys,
   mintHandoffToken,
   verifyHandoffToken,

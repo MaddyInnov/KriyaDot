@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- ADD-5: FileProvider paths for the send_file action. ONLY the shared
+     staging directory inside the app cache is exposed — nothing else on
+     the device can be reached through this provider. -->
+<paths>
+    <cache-path name="shared" path="shared/" />
+</paths>

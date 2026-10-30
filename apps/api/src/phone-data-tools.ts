@@ -25,6 +25,7 @@ export const PHONE_DATA_TOOL_NAMES = [
   'phone_contacts',
   'phone_messages_recent',
   'phone_location',
+  'phone_health_sync',
 ] as const;
 export type PhoneDataToolName = (typeof PHONE_DATA_TOOL_NAMES)[number];
 
@@ -33,6 +34,7 @@ const QUERY_BY_TOOL: Record<PhoneDataToolName, PhoneDataQueryName> = {
   phone_contacts: 'contacts',
   phone_messages_recent: 'messages_recent',
   phone_location: 'location',
+  phone_health_sync: 'health_sync',
 };
 
 /** Governance: every phone data read needs human approval (privacy). */
@@ -40,10 +42,10 @@ export function phoneDataPolicyRules(): BotPolicyRule[] {
   return [
     {
       id: 'phone-data-approval',
-      toolPattern: '^phone_(calendar|contacts|messages_recent|location)$',
+      toolPattern: '^phone_(calendar|contacts|messages_recent|location|health_sync)$',
       effect: 'require-approval',
       reason:
-        'Reading calendar, contacts, recent messages or location from the user\'s paired phone exposes personal data; needs human approval. The approval card shows the exact query.',
+        'Reading calendar, contacts, recent messages, location or health data from the user\'s paired phone exposes personal data; needs human approval. The approval card shows the exact query.',
     },
   ];
 }
@@ -111,6 +113,8 @@ export function validatePhoneDataQuery(toolName: string, args: Record<string, un
       return { query, params: { limit: boundedInt(args, 'limit', 20, 1, 100) }, deviceId };
     case 'phone_location':
       return { query, params: {}, deviceId };
+    case 'phone_health_sync':
+      return { query, params: { hours: boundedInt(args, 'hours', 24, 1, 168) }, deviceId };
   }
 }
 
@@ -144,6 +148,14 @@ const SPECS: Record<PhoneDataToolName, { description: string; properties: Record
       deviceId: { type: 'string', description: 'Paired device id (optional)' },
     },
   },
+  phone_health_sync: {
+    description:
+      'Sync recent health samples (Health Connect on Android) from the user\'s paired phone into the local health store (DV-4). Requires human approval (personal data). Returns ingest counts; sample values stay in the health store, not the chat.',
+    properties: {
+      hours: { type: 'number', description: 'How many hours back to sync (1-168, default 24)' },
+      deviceId: { type: 'string', description: 'Paired device id (optional)' },
+    },
+  },
 };
 
 export interface PhoneDataToolDeps {
@@ -152,6 +164,13 @@ export interface PhoneDataToolDeps {
   audit?: (action: string, fields: { actor?: string; toolName?: string; detail?: unknown; sessionId?: string }) => void;
   isPaused?: () => boolean;
   timeoutMs?: number;
+  /**
+   * DV-4 loop closure: when a health_sync result lands, ingest its
+   * samples into the health store and report counts. Without this dep
+   * the tool still returns the phone's payload metadata (no samples
+   * are echoed into the chat either way).
+   */
+  onHealthSync?: (deviceId: string, samples: unknown[]) => { inserted: number; duplicates: number };
 }
 
 export function createPhoneDataTools(deps: PhoneDataToolDeps): ToolDefinition[] {
@@ -181,6 +200,22 @@ export function createPhoneDataTools(deps: PhoneDataToolDeps): ToolDefinition[] 
               ? 'the phone did not answer the data query in time (the phone-agent may be an older build without data-query support)'
               : `phone data query failed: ${result.error ?? 'unknown error'}`,
           );
+        }
+        if (validated.query === 'health_sync') {
+          // DV-4: samples go to the health store; only counts and the
+          // skipped-type list come back into the conversation.
+          const payload = (result.data ?? {}) as { samples?: unknown[]; skippedTypes?: unknown };
+          const samples = Array.isArray(payload.samples) ? payload.samples : [];
+          const ingest = deps.onHealthSync ? deps.onHealthSync(deviceId, samples) : null;
+          return {
+            ok: true,
+            query: validated.query,
+            deviceId,
+            received: samples.length,
+            inserted: ingest?.inserted ?? 0,
+            duplicates: ingest?.duplicates ?? 0,
+            skippedTypes: payload.skippedTypes ?? [],
+          };
         }
         return { ok: true, query: validated.query, deviceId, data: result.data ?? null };
       },

@@ -46,6 +46,8 @@ import {
   runDaemonLoop,
   unregisterDaemon,
 } from './daemon.js';
+import { bareModeNote, resolveDiscoveryPlan, runDiscovery } from './bare.js';
+import type { DiscoveryPlan } from './bare.js';
 import { buildRepairMessage, parseSchemaFlag, validateReplyAgainstSpec, SchemaFlagError } from './json-schema.js';
 import type { StructuredOutputSpec } from './json-schema.js';
 import { defaultConfigTemplate, validateConfigObject } from './config-files.js';
@@ -125,6 +127,8 @@ interface ChatRunOpts {
   schema?: StructuredOutputSpec;
   /** Dotted `-c` overrides (#110) forwarded per-run. */
   configOverrides?: Record<string, unknown>;
+  /** Bare mode (CA-21): skip ALL auto-discovery; forwarded to the server. */
+  bare?: boolean;
 }
 
 /**
@@ -165,6 +169,7 @@ async function oneShotTurn(deps: CommandDeps, o: ChatRunOpts): Promise<number> {
     autoApprove: o.autoApprove,
     ...(o.schema ? { responseFormat: o.schema } : {}),
     ...(o.configOverrides ? { configOverrides: o.configOverrides } : {}),
+    ...(o.bare ? { bare: true } : {}),
     ...(jsonl
       ? {
           onEvent: (ev: ChatEvent) => {
@@ -346,6 +351,32 @@ export async function resolveMostRecentSession(
   return null;
 }
 
+/**
+ * --continue resolution under a discovery plan (CA-21): finding the
+ * most recent session IS auto-discovery (the memory source), so it
+ * runs through runDiscovery — in bare mode the loader never runs and
+ * --continue is a usage error naming the deterministic alternative.
+ */
+async function resolveContinueSession(
+  deps: CommandDeps,
+  botId: string,
+  plan: DiscoveryPlan,
+): Promise<{ sessionId: string }> {
+  const discovered = await runDiscovery(plan, {
+    memory: () => resolveMostRecentSession(deps, botId),
+  });
+  const recent = discovered.memory;
+  if (!recent) {
+    throw new UsageError(
+      plan.bare
+        ? '--continue needs auto-discovery (memory), which --bare disables. Pass --session <id> for a deterministic run.'
+        : 'No recent session to continue for this bot.',
+    );
+  }
+  err(deps, `[session] continuing ${recent.source} session "${recent.label}" (${recent.sessionId})\n`);
+  return { sessionId: recent.sessionId };
+}
+
 /** Persist a daemon record and announce it on stderr (stdout stays clean). */
 function recordDaemonSession(deps: CommandDeps, name: string, sessionId: string, botId: string): void {
   const record: NamedSession = { name, sessionId, botId, updatedAt: Date.now() };
@@ -356,6 +387,9 @@ function recordDaemonSession(deps: CommandDeps, name: string, sessionId: string,
 async function doChat(deps0: CommandDeps, p: ParsedArgs, ov: ConfigOverrides): Promise<number> {
   const deps = withApiOverride(deps0, ov);
   const format = ov.format ?? p.global.format;
+  // CA-21: --bare discovery plan (note on stderr; flag forwarded per turn).
+  const bareNote = bareModeNote(resolveDiscoveryPlan(flagBool(p.flags, 'bare')));
+  if (bareNote) err(deps, bareNote);
   // `chat <bot> [message...]` — subcommand slot holds the bot ref.
   let botRef = ov.bot ?? p.subcommand;
   if (!botRef && deps.isTTY) {
@@ -379,10 +413,7 @@ async function doChat(deps0: CommandDeps, p: ParsedArgs, ov: ConfigOverrides): P
     // resumes the most recent session (#32).
     let sess = resolveSessionFlags(deps, p, bot, randomUUID());
     if (flagBool(p.flags, 'continue')) {
-      const recent = await resolveMostRecentSession(deps, bot.id);
-      if (!recent) throw new Error('No recent session to continue for this bot.');
-      err(deps, `[session] continuing ${recent.source} session "${recent.label}" (${recent.sessionId})\n`);
-      sess = { sessionId: recent.sessionId };
+      sess = await resolveContinueSession(deps, bot.id, resolveDiscoveryPlan(flagBool(p.flags, 'bare')));
     }
     if (sess.daemonName) recordDaemonSession(deps, sess.daemonName, sess.sessionId, bot.id);
     return runRepl(
@@ -394,16 +425,18 @@ async function doChat(deps0: CommandDeps, p: ParsedArgs, ov: ConfigOverrides): P
         lines: deps.createLineSource(),
         clearScreen: deps.clearScreen,
       },
-      { botId: bot.id, sessionId: sess.sessionId, ...(model ? { model } : {}) },
+      {
+        botId: bot.id,
+        sessionId: sess.sessionId,
+        ...(model ? { model } : {}),
+        ...(flagBool(p.flags, 'bare') ? { bare: true } : {}),
+      },
     );
   }
 
   let sess = resolveSessionFlags(deps, p, bot, randomUUID());
   if (flagBool(p.flags, 'continue')) {
-    const recent = await resolveMostRecentSession(deps, bot.id);
-    if (!recent) throw new Error('No recent session to continue for this bot.');
-    err(deps, `[session] continuing ${recent.source} session "${recent.label}" (${recent.sessionId})\n`);
-    sess = { sessionId: recent.sessionId };
+    sess = await resolveContinueSession(deps, bot.id, resolveDiscoveryPlan(flagBool(p.flags, 'bare')));
   }
   if (sess.daemonName) recordDaemonSession(deps, sess.daemonName, sess.sessionId, bot.id);
   return oneShotTurn(deps, {
@@ -416,21 +449,22 @@ async function doChat(deps0: CommandDeps, p: ParsedArgs, ov: ConfigOverrides): P
     format,
     ...(resolveSchemaFlag(p) ? { schema: resolveSchemaFlag(p)! } : {}),
     ...(ov.nested ? { configOverrides: ov.nested } : {}),
+    ...(flagBool(p.flags, 'bare') ? { bare: true } : {}),
   });
 }
 
 async function doRun(deps0: CommandDeps, p: ParsedArgs, ov: ConfigOverrides): Promise<number> {
   const deps = withApiOverride(deps0, ov);
+  // CA-21: --bare discovery plan (note on stderr; flag forwarded per turn).
+  const bareNote = bareModeNote(resolveDiscoveryPlan(flagBool(p.flags, 'bare')));
+  if (bareNote) err(deps, bareNote);
   const botRef = ov.bot ?? requireFlag(p.flags, 'bot', 'Example: kriyadot run --bot coder --message "hi"');
   const bot = await resolveBot(deps, botRef);
   const message = await resolveMessage(deps, p, p.positional);
   if (message === null) throw new Error('No message given. Pass --message or pipe stdin.');
   let sess = resolveSessionFlags(deps, p, bot, randomUUID());
   if (flagBool(p.flags, 'continue')) {
-    const recent = await resolveMostRecentSession(deps, bot.id);
-    if (!recent) throw new Error('No recent session to continue for this bot.');
-    err(deps, `[session] continuing ${recent.source} session "${recent.label}" (${recent.sessionId})\n`);
-    sess = { sessionId: recent.sessionId };
+    sess = await resolveContinueSession(deps, bot.id, resolveDiscoveryPlan(flagBool(p.flags, 'bare')));
   }
   if (sess.daemonName) recordDaemonSession(deps, sess.daemonName, sess.sessionId, bot.id);
   const model = ov.model ?? flagString(p.flags, 'model');
@@ -445,6 +479,7 @@ async function doRun(deps0: CommandDeps, p: ParsedArgs, ov: ConfigOverrides): Pr
     format: ov.format ?? p.global.format,
     ...(resolveSchemaFlag(p) ? { schema: resolveSchemaFlag(p)! } : {}),
     ...(ov.nested ? { configOverrides: ov.nested } : {}),
+    ...(flagBool(p.flags, 'bare') ? { bare: true } : {}),
   });
 }
 

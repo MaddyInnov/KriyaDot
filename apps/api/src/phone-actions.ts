@@ -8,6 +8,8 @@
 //   phone_type         { text }                       (into the focused field)
 //   phone_scroll       { direction, amount? }
 //   phone_send_message { contact, text, app? }        (WhatsApp/SMS)
+//   phone_send_file    { contact, fileName, contentBase64, mimeType?, caption? }
+//                                                     (WhatsApp share sheet, ADD-5)
 //   phone_call         { number, contact? }
 //
 // Governance + safety contract (never weakened):
@@ -36,6 +38,7 @@ export type PhoneActionName =
   | 'type'
   | 'scroll'
   | 'send_message'
+  | 'send_file'
   | 'call';
 
 export const PHONE_ACTION_TOOL_NAMES = [
@@ -44,6 +47,7 @@ export const PHONE_ACTION_TOOL_NAMES = [
   'phone_type',
   'phone_scroll',
   'phone_send_message',
+  'phone_send_file',
   'phone_call',
 ] as const;
 
@@ -52,10 +56,10 @@ export function phoneActionPolicyRules(): BotPolicyRule[] {
   return [
     {
       id: 'phone-actions-approval',
-      toolPattern: '^phone_(open_app|tap|type|scroll|send_message|call)$',
+      toolPattern: '^phone_(open_app|tap|type|scroll|send_message|send_file|call)$',
       effect: 'require-approval',
       reason:
-        'Operating apps on the user\'s paired phone (opening apps, tapping, typing, sending messages, calling) changes state on a personal device; needs human approval. The approval card shows the exact action arguments.',
+        'Operating apps on the user\'s paired phone (opening apps, tapping, typing, sending messages and files, calling) changes state on a personal device; needs human approval. The approval card shows the exact action arguments.',
     },
   ];
 }
@@ -109,6 +113,14 @@ export interface ValidatedPhoneAction {
 const PACKAGE_RE = /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/;
 const PHONE_NUMBER_RE = /^\+?[0-9][0-9 ()-]{4,24}$/;
 export const MAX_PHONE_TEXT_LEN = 1024;
+/**
+ * Phone file-send ceiling (ADD-5): the bytes travel inside the action
+ * WebSocket message as base64, so the cap is deliberately modest — 5 MB
+ * of file content (≈6.7 MB of base64). Bigger files belong on the
+ * WhatsApp Cloud path (16 MB upload) or a link.
+ */
+export const MAX_PHONE_FILE_BYTES = 5 * 1024 * 1024;
+export const MAX_PHONE_FILE_BASE64_LEN = Math.ceil(MAX_PHONE_FILE_BYTES / 3) * 4 + 4;
 
 function reqString(args: Record<string, unknown>, name: string, max: number): string {
   const v = args[name];
@@ -219,6 +231,52 @@ export function validatePhoneAction(
         contactName: contact,
       };
     }
+    case 'phone_send_file': {
+      const contact = reqString(args, 'contact', 100);
+      const fileName = reqString(args, 'fileName', 200);
+      // The name becomes a file name on the phone — no paths, no tricks.
+      if (/[/\\]/.test(fileName) || fileName === '.' || fileName === '..' || fileName.includes('\0')) {
+        throw new Error('"fileName" must be a plain file name (no path separators)');
+      }
+      const contentBase64 = args['contentBase64'];
+      if (typeof contentBase64 !== 'string' || contentBase64.length === 0) {
+        throw new Error('"contentBase64" is required (the file bytes, base64-encoded)');
+      }
+      if (contentBase64.length > MAX_PHONE_FILE_BASE64_LEN || !/^[A-Za-z0-9+/=\s]+$/.test(contentBase64)) {
+        throw new Error(`"contentBase64" must be valid base64 of at most ${MAX_PHONE_FILE_BYTES} bytes of file content`);
+      }
+      const byteLength = Buffer.from(contentBase64, 'base64').length;
+      if (byteLength === 0 || byteLength > MAX_PHONE_FILE_BYTES) {
+        throw new Error(`file must be between 1 byte and ${MAX_PHONE_FILE_BYTES} bytes`);
+      }
+      let mimeType = 'application/octet-stream';
+      if (args['mimeType'] !== undefined) {
+        if (typeof args['mimeType'] !== 'string' || args['mimeType'].length > 100 || !/^[\w.+-]+\/[\w.+-]+$/.test(args['mimeType'])) {
+          throw new Error('"mimeType" must look like "application/pdf"');
+        }
+        mimeType = args['mimeType'];
+      }
+      const caption = typeof args['caption'] === 'string' && (args['caption'] as string).trim()
+        ? (args['caption'] as string).trim().slice(0, MAX_PHONE_TEXT_LEN)
+        : undefined;
+      return {
+        action: 'send_file',
+        // The exact approved bytes travel in params to the phone only —
+        // the audit label below carries the file NAME and contact, never
+        // the content.
+        params: {
+          packageName: MESSAGING_APP_PACKAGES['whatsapp'],
+          contact,
+          fileName,
+          mimeType,
+          contentBase64,
+          ...(caption ? { caption } : {}),
+        },
+        deviceId,
+        auditLabel: `Sent file ${fileName} to ${contact}`,
+        contactName: contact,
+      };
+    }
     case 'phone_call': {
       const number = reqString(args, 'number', 32);
       if (!PHONE_NUMBER_RE.test(number)) throw new Error('"number" must be a phone number (digits, optional leading +)');
@@ -304,6 +362,19 @@ const TOOL_DESCRIPTIONS: Record<string, { description: string; properties: Recor
       deviceId: { type: 'string', description: 'Paired device id (optional)' },
     },
     required: ['contact', 'text'],
+  },
+  phone_send_file: {
+    description:
+      'Send a FILE to a WhatsApp contact from the user\'s paired phone: the phone agent saves the approved bytes on the phone, opens WhatsApp\'s share sheet with the file attached, picks the contact and taps Send. Requires human approval — the approval card shows the contact and the file name. Max 5 MB.',
+    properties: {
+      contact: { type: 'string', description: 'Contact name as shown in WhatsApp' },
+      fileName: { type: 'string', description: 'Plain file name, e.g. "report.pdf" (no path separators)' },
+      contentBase64: { type: 'string', description: 'The file bytes, base64-encoded (max 5 MB of content)' },
+      mimeType: { type: 'string', description: 'MIME type, e.g. "application/pdf" (default application/octet-stream)' },
+      caption: { type: 'string', description: 'Optional caption sent with the file' },
+      deviceId: { type: 'string', description: 'Paired device id (optional)' },
+    },
+    required: ['contact', 'fileName', 'contentBase64'],
   },
   phone_call: {
     description: 'Place a phone call from the user\'s paired phone to the given number. Requires human approval.',

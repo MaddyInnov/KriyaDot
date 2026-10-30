@@ -188,6 +188,12 @@ export interface ChatRequest {
   };
   /** Dotted `-c` overrides (#110) forwarded for the runtime to apply per-run. */
   configOverrides?: Record<string, unknown>;
+  /**
+   * Bare mode (CA-21, `kriyadot run --bare`): the server maps this to
+   * RunTurnOptions.bare — skip ALL auto-discovery (hooks/skills/
+   * commands/agents/MCP/memory) for a deterministic CI run.
+   */
+  bare?: boolean;
 }
 
 export interface ChatCallbacks {

@@ -31,6 +31,16 @@ use tauri_plugin_shell::ShellExt;
 // CI compiles it (no cargo toolchain on the build VM).
 mod dictation;
 
+// DV-5 quick chat: the tray "Quick Chat" item (below, in both menu
+// builders) opens the CA-27 quick-entry companion window from
+// quick_entry.rs; the global shortcut + kriyadot:// deep links live
+// there too. SOURCE-LEVEL ONLY — unverified until CI compiles it.
+
+// CA-27: quick-entry companion window + kriyadot:// deep links
+// (src/quick_entry.rs). SOURCE-LEVEL ONLY — same unverified status as
+// dictation.rs until CI compiles it (no cargo toolchain on the build VM).
+mod quick_entry;
+
 /// Fixed loopback port the desktop backend listens on.
 /// The bundled frontend detects Tauri (`window.__TAURI__`) and calls
 /// `http://127.0.0.1:DESKTOP_API_PORT` for all API traffic.
@@ -141,14 +151,17 @@ fn refresh_tray_menu(app: &AppHandle, state: &SidecarState) {
         "Start API server"
     };
     let show = MenuItem::with_id(app, "show", "Show KriyaDot", true, None::<&str>);
+    let quickchat_item = MenuItem::with_id(app, "quickchat", "Quick Chat", true, None::<&str>);
     let status = MenuItem::with_id(app, "status", status_label, false, None::<&str>);
     let restart = MenuItem::with_id(app, "restart", restart_label, true, None::<&str>);
     let quit = MenuItem::with_id(app, "quit", "Quit KriyaDot", true, None::<&str>);
     // If any item fails to build (shouldn't), keep the old menu.
-    let (Ok(show), Ok(status), Ok(restart), Ok(quit)) = (show, status, restart, quit) else {
+    let (Ok(show), Ok(quickchat_item), Ok(status), Ok(restart), Ok(quit)) =
+        (show, quickchat_item, status, restart, quit)
+    else {
         return;
     };
-    let Ok(menu) = Menu::with_items(app, &[&show, &status, &restart, &quit]) else {
+    let Ok(menu) = Menu::with_items(app, &[&show, &quickchat_item, &status, &restart, &quit]) else {
         return;
     };
     if let Some(tray) = app.tray_by_id("main") {
@@ -189,11 +202,16 @@ fn start_health_watch(app: AppHandle, state: SidecarState) {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        // V-5: global push-to-talk hotkey (see dictation.rs).
+        // CA-27: kriyadot:// deep links (scheme declared in tauri.conf.json).
+        .plugin(tauri_plugin_deep_link::init())
+        // V-5 + CA-27: one global-shortcut plugin, two handlers —
+        // dictation owns Ctrl/Cmd+Shift+Space, quick entry owns
+        // Ctrl/Cmd+Alt+K; each handler ignores the other's chord.
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
                     dictation::on_shortcut_event(app, shortcut, event);
+                    quick_entry::on_quick_entry_shortcut(app, shortcut, event);
                 })
                 .build(),
         )
@@ -231,14 +249,34 @@ fn main() {
             // dictation.rs logs it and in-app/web dictation still works.
             dictation::register_push_to_talk(app.handle());
 
-            // System tray: Show / status / Restart API / Quit.
+            // CA-27: register the quick-entry shortcut and route
+            // kriyadot:// deep links into the web shell
+            // (apps/web/lib/desktop-bridge.ts wireDeepLinks).
+            quick_entry::register_quick_entry(app.handle());
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    let urls: Vec<String> =
+                        event.urls().iter().map(|u| u.to_string()).collect();
+                    quick_entry::handle_deep_links(&handle, urls);
+                });
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                {
+                    let _ = app.deep_link().register_all();
+                }
+            }
+
+            // System tray: Show / Quick Chat (DV-5) / status / Restart API / Quit.
             let show = MenuItem::with_id(app, "show", "Show KriyaDot", true, None::<&str>)?;
+            let quickchat_item =
+                MenuItem::with_id(app, "quickchat", "Quick Chat", true, None::<&str>)?;
             let status =
                 MenuItem::with_id(app, "status", "API server: starting…", false, None::<&str>)?;
             let restart =
                 MenuItem::with_id(app, "restart", "Restart API server", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit KriyaDot", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &status, &restart, &quit])?;
+            let menu = Menu::with_items(app, &[&show, &quickchat_item, &status, &restart, &quit])?;
 
             let tray_state = state.clone();
             // tauri 2.x Image has no from_bytes: decode the bundled PNG to
@@ -261,6 +299,9 @@ fn main() {
                             let _ = w.set_focus();
                         }
                     }
+                    // DV-5: tray entry point to the quick-chat surface —
+                    // toggles the CA-27 companion window (quick_entry.rs).
+                    "quickchat" => quick_entry::toggle_companion_window(app),
                     "restart" => {
                         // Drop the old child handle (killing it if still
                         // alive) and spawn a fresh sidecar.

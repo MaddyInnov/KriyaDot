@@ -17,6 +17,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { kriyadotFetch } from '../../lib/kriyadot-api';
 import { RoutineAnchorSection } from './routine-anchor-section';
+import { RoutineSelfPauseBanner } from './routine-self-pause-banner';
 import type { RoutineAnchor, RoutineReporting } from '../../lib/frontdoor';
 
 type EventAppId = 'gmail' | 'slack' | 'github' | 'stripe' | 'googlecalendar';
@@ -1068,6 +1069,7 @@ function RunHistorySection({ routine }: { routine: Routine }) {
           </button>
         </div>
       </div>
+      <RoutineSelfPauseBanner routineId={routine.id} />
       {streak.consecutiveFailures > 0 && (
         <p className={`streak-banner${autoPaused ? ' paused' : ''}`}>
           ⚠️ {streak.consecutiveFailures} consecutive failure{streak.consecutiveFailures === 1 ? '' : 's'}

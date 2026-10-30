@@ -2301,6 +2301,9 @@ export function createRouter(deps: RouteDeps): express.Router {
         const executeTurn = async (): Promise<boolean> => {
           turnUsage = await agentRuntime.runTurn({
           bot: turnBot,
+          // CA-21: `kriyadot run --bare` — skip all auto-discovery
+          // (skills/MCP auto-activation + memory/context injection).
+          ...(body.bare === true ? { bare: true } : {}),
           message: messageWithFiles,
           // Native media parts (#38) for the stored user message.
           media: turnMedia,

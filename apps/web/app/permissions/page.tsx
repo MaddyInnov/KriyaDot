@@ -7,6 +7,7 @@
 'use client';
 
 import PermissionsPanel from '../../components/panels/permissions-panel';
+import ComputerUseSetupPanel from '../../components/panels/computer-use-setup-panel';
 
 export default function PermissionsPage() {
   return (
@@ -18,6 +19,7 @@ export default function PermissionsPage() {
         and change the choices that feed it.
       </p>
       <PermissionsPanel />
+      <ComputerUseSetupPanel />
     </div>
   );
 }

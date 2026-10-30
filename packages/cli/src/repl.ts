@@ -88,6 +88,8 @@ export interface TurnOpts {
   responseFormat?: StructuredOutputSpec;
   /** Dotted `-c` overrides (#110) forwarded per-run. */
   configOverrides?: Record<string, unknown>;
+  /** Bare mode (CA-21): forwarded as the chat request's `bare` flag. */
+  bare?: boolean;
   /**
    * MCP elicitation handler (#51): answers 'elicitation' events delivered
    * on the turn stream. Without one, elicitations are declined with a
@@ -138,6 +140,7 @@ export async function runStreamingTurn(
       ...(opts.autoApprove ? { autoApprove: true } : {}),
       ...(opts.responseFormat ? { responseFormat: opts.responseFormat } : {}),
       ...(opts.configOverrides ? { configOverrides: opts.configOverrides } : {}),
+      ...(opts.bare ? { bare: true } : {}),
     },
     {
       onEvent: (ev: ChatEvent) => {
@@ -364,6 +367,8 @@ export interface ReplOpts {
   botId: string;
   model?: string;
   sessionId?: string;
+  /** Bare mode (CA-21): every REPL turn forwards `bare: true`. */
+  bare?: boolean;
 }
 
 /** Run the interactive session. Returns the process exit code. */
@@ -448,6 +453,7 @@ export async function runRepl(deps: ReplDeps, opts: ReplOpts): Promise<number> {
         ...(model ? { model } : {}),
         autoApprove,
         elicitationHandler,
+        ...(opts.bare ? { bare: true } : {}),
       },
       askApproval,
       () => undefined, // tokens are buffered; the rendered message prints at turn end

@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+# CA-22: KriyaDot GitHub Action (composite) — runs a governed KriyaDot
+# task inside CI and, when the `review` input is set, asks the instance
+# to post its review through the approval-gated PR endpoint.
+name: KriyaDot Agent
+description: Run a KriyaDot agent task or PR review from a GitHub Actions workflow.
+inputs:
+  task:
+    description: Task prompt for the KriyaDot bot.
+    required: true
+  kriyadot-url:
+    description: Base URL of the KriyaDot instance (e.g. a tunnel URL for a local instance).
+    required: true
+  bot:
+    description: Bot id to run.
+    default: coder
+  review-pr:
+    description: When set to a PR number, post the result as a PR review instead of a job summary.
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Run KriyaDot task
+      shell: bash
+      env:
+        KRIYADOT_URL: ${{ inputs.kriyadot-url }}
+        KRIYADOT_TASK: ${{ inputs.task }}
+        KRIYADOT_BOT: ${{ inputs.bot }}
+        KRIYADOT_REVIEW_PR: ${{ inputs.review-pr }}
+        # The instance's loopback/API token is supplied by the repo
+        # owner as a secret; it is never printed.
+        KRIYADOT_TOKEN: ${{ env.KRIYADOT_TOKEN }}
+      run: node "${{ github.action_path }}/run.mjs"

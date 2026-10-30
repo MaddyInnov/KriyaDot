@@ -12,6 +12,11 @@
     "vitest": "^2.1.5"
   },
   "license": "Apache-2.0",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./sdk": { "types": "./dist/sdk.d.ts", "default": "./dist/sdk.js" },
+    "./dist/*": { "types": "./dist/*.d.ts", "default": "./dist/*" }
+  },
   "main": "dist/index.js",
   "name": "@mvp/agent-runtime",
   "private": true,

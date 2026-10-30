@@ -85,6 +85,17 @@ export {
   type RunFinishedEvent,
 } from './run-events.js';
 export {
+  JS_WORKFLOW_FORMAT,
+  JS_WORKFLOW_VERSION,
+  JS_WORKFLOW_TRIGGER_ID,
+  parseJsWorkflow,
+  compileJsWorkflow,
+  parseAndCompileJsWorkflow,
+  type JsWorkflowDefinition,
+  type JsWorkflowStep,
+} from './js-format.js';
+export { JsWorkflowRunner } from './js-runner.js';
+export {
   WORKFLOW_TEMPLATES,
   workflowTemplatesById,
   sequentialPipelineTemplate,

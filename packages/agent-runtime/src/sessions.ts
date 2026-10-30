@@ -44,6 +44,15 @@ export interface SessionRecord {
    * copies never see incognito content in the database.
    */
   incognito?: boolean;
+  /**
+   * Project binding (CA-31): the id of the Project (apps/api projects.ts)
+   * this session is grouped under, when the host bound it. Absent/null =
+   * ungrouped (all pre-CA-31 rows). The Project entity itself (name,
+   * knowledge refs, instructions, memory scope) lives in the API layer;
+   * the session store only carries the binding so listings can filter
+   * by project and hosts can resolve the project's context per turn.
+   */
+  projectId?: string;
 }
 
 /** Memory-write gate (CA-37): incognito sessions never write memory. */
@@ -495,6 +504,12 @@ export class SessionStore {
     } catch {
       // Column already exists.
     }
+    // CA-31 migration: project binding (nullable; null = ungrouped).
+    try {
+      this.db.exec('ALTER TABLE sessions ADD COLUMN project_id TEXT');
+    } catch {
+      // Column already exists.
+    }
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -591,11 +606,11 @@ export class SessionStore {
     this.db.prepare('DELETE FROM messages_fts WHERE rowid NOT IN (SELECT id FROM messages)').run();
   }
 
-  createSession(botId: string, opts: { ownerPersonId?: string; incognito?: boolean } = {}): string {
+  createSession(botId: string, opts: { ownerPersonId?: string; incognito?: boolean; projectId?: string } = {}): string {
     const id = newId();
     this.db
-      .prepare('INSERT INTO sessions (id, bot_id, created_at, owner_person_id, incognito) VALUES (?, ?, ?, ?, ?)')
-      .run(id, botId, new Date().toISOString(), opts.ownerPersonId ?? null, opts.incognito ? 1 : 0);
+      .prepare('INSERT INTO sessions (id, bot_id, created_at, owner_person_id, incognito, project_id) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(id, botId, new Date().toISOString(), opts.ownerPersonId ?? null, opts.incognito ? 1 : 0, opts.projectId ?? null);
     if (opts.incognito) {
       this.ephemeralMessages.set(id, []);
       this.ephemeralNextId.set(id, 1);
@@ -608,10 +623,10 @@ export class SessionStore {
   getSession(id: string): SessionRecord | undefined {
     const row = this.db
       .prepare(
-        'SELECT id, bot_id AS botId, created_at AS createdAt, owner_person_id AS ownerPersonId, incognito FROM sessions WHERE id = ?',
+        'SELECT id, bot_id AS botId, created_at AS createdAt, owner_person_id AS ownerPersonId, incognito, project_id AS projectId FROM sessions WHERE id = ?',
       )
       .get(id) as
-      | { id: string; botId: string; createdAt: string; ownerPersonId: string | null; incognito: number | null }
+      | { id: string; botId: string; createdAt: string; ownerPersonId: string | null; incognito: number | null; projectId: string | null }
       | undefined;
     if (!row) return undefined;
     return {
@@ -620,7 +635,24 @@ export class SessionStore {
       createdAt: row.createdAt,
       ...(row.ownerPersonId ? { ownerPersonId: row.ownerPersonId } : {}),
       ...(row.incognito ? { incognito: true } : {}),
+      ...(row.projectId ? { projectId: row.projectId } : {}),
     };
+  }
+
+  /**
+   * CA-31: bind a session to a project (or clear the binding with null).
+   * Returns false when the session is unknown.
+   */
+  setSessionProject(sessionId: string, projectId: string | null): boolean {
+    const res = this.db
+      .prepare('UPDATE sessions SET project_id = ? WHERE id = ?')
+      .run(projectId, sessionId);
+    return res.changes > 0;
+  }
+
+  /** CA-31: the project a session is bound to, or undefined. */
+  sessionProjectId(sessionId: string): string | undefined {
+    return this.getSession(sessionId)?.projectId;
   }
 
   /**
@@ -669,7 +701,7 @@ export class SessionStore {
    * fetching every thread's messages.
    */
   listSessions(
-    opts: { botId?: string; limit?: number; ownerPersonId?: string } = {},
+    opts: { botId?: string; limit?: number; ownerPersonId?: string; projectId?: string } = {},
   ): SessionSummary[] {
     const limit = Math.min(Math.max(Math.floor(opts.limit ?? 50), 1), 200);
     const botId = typeof opts.botId === 'string' && opts.botId.trim() ? opts.botId.trim() : null;
@@ -684,18 +716,22 @@ export class SessionStore {
       : owner === DEFAULT_CHAT_OWNER_PERSON_ID
         ? ' AND (s.owner_person_id = ? OR s.owner_person_id IS NULL)'
         : ' AND s.owner_person_id = ?';
+    // CA-31: project filter — only sessions bound to the given project.
+    const project = typeof opts.projectId === 'string' && opts.projectId.trim() ? opts.projectId.trim() : null;
+    const projectClause = project === null ? '' : ' AND s.project_id = ?';
     const params: Array<string | number | null> = [botId, botId];
     if (owner !== null) params.push(owner);
+    if (project !== null) params.push(project);
     params.push(limit);
     const rows = this.db
       .prepare(
         `SELECT s.id AS id, s.bot_id AS botId, s.created_at AS createdAt,
-                s.owner_person_id AS ownerPersonId, s.incognito AS incognito,
+                s.owner_person_id AS ownerPersonId, s.incognito AS incognito, s.project_id AS projectId,
                 COUNT(m.id) AS messageCount,
                 MAX(m.ts) AS lastMessageTs
          FROM sessions s
          LEFT JOIN messages m ON m.session_id = s.id
-         WHERE (? IS NULL OR s.bot_id = ?)${ownerClause}
+         WHERE (? IS NULL OR s.bot_id = ?)${ownerClause}${projectClause}
          GROUP BY s.id
          ORDER BY COALESCE(MAX(m.ts), s.created_at) DESC, MAX(m.id) DESC, s.created_at DESC
          LIMIT ?`,
@@ -706,6 +742,7 @@ export class SessionStore {
       createdAt: string;
       ownerPersonId: string | null;
       incognito: number | null;
+      projectId: string | null;
       messageCount: number;
       lastMessageTs: string | null;
     }>;
@@ -718,6 +755,7 @@ export class SessionStore {
         createdAt: r.createdAt,
         ...(r.ownerPersonId ? { ownerPersonId: r.ownerPersonId } : {}),
         ...(r.incognito ? { incognito: true } : {}),
+        ...(r.projectId ? { projectId: r.projectId } : {}),
         messageCount: eph ? eph.length : r.messageCount,
         lastMessageTs: eph && eph.length > 0 ? eph[eph.length - 1]!.ts : r.lastMessageTs,
       };

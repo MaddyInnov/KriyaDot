@@ -72,6 +72,9 @@ function errorBody(error: string, detail?: string): { error: string; detail?: st
   return detail ? { error, detail } : { error };
 }
 
+/** WhatsApp Cloud media-upload ceiling (16 MB) for the send-file route. */
+export const WHATSAPP_FILE_MAX_BYTES = 16 * 1024 * 1024;
+
 export interface ChannelParityHandle {
   router: Router;
   sideChats: ChannelSideChatStore;
@@ -307,6 +310,70 @@ export function createChannelParityRouter(deps: ChannelParityDeps): ChannelParit
       res.json({ ok: true, approvalId, id: result.id });
     } catch (err) {
       res.status(500).json(errorBody('Failed to send media', err instanceof Error ? err.message : String(err)));
+    }
+  });
+
+  // ---- WhatsApp FILE send (ADD-5, approval-gated) ----------------------------
+  // Send a local file as a WhatsApp document: validate → approval (same
+  // deny-by-default message.send gate as text/media sends) → upload the
+  // bytes to the Graph media endpoint → send by media id → mirror into
+  // the side chat with its typed attachment record.
+  router.post('/whatsapp/send-file', async (req, res) => {
+    const body = (req.body ?? {}) as {
+      to?: unknown; fileName?: unknown; mimeType?: unknown; contentBase64?: unknown; caption?: unknown; waitMs?: unknown;
+    };
+    if (typeof body.to !== 'string' || !body.to || typeof body.fileName !== 'string' || !body.fileName) {
+      res.status(400).json(errorBody('to and fileName are required'));
+      return;
+    }
+    if (typeof body.contentBase64 !== 'string' || !body.contentBase64) {
+      res.status(400).json(errorBody('contentBase64 (the file bytes, base64-encoded) is required'));
+      return;
+    }
+    const bytes = Buffer.from(body.contentBase64, 'base64');
+    // WhatsApp's media-upload ceiling is 16 MB — reject before an
+    // approval is ever raised for an unsendable file.
+    if (bytes.length === 0 || bytes.length > WHATSAPP_FILE_MAX_BYTES) {
+      res.status(400).json(errorBody(`file must be between 1 byte and ${WHATSAPP_FILE_MAX_BYTES} bytes (WhatsApp media-upload limit)`));
+      return;
+    }
+    const mimeType = typeof body.mimeType === 'string' && body.mimeType ? body.mimeType : 'application/octet-stream';
+    const caption = typeof body.caption === 'string' ? body.caption : undefined;
+    try {
+      const { approvalId } = requestSendApproval(deps.governance, {
+        providerId: 'whatsapp',
+        to: body.to,
+        text: `[file:${body.fileName}] ${caption ?? ''}`.trim(),
+      });
+      const waitMs = Math.min(Math.max(Number(body.waitMs) || 60_000, 0), 120_000);
+      const decision = await deps.governance.awaitDecision(approvalId, waitMs);
+      if (decision !== 'approved') {
+        res.status(403).json({ error: 'File send was not approved', approvalId, status: 'denied' });
+        return;
+      }
+      let uploadedMediaId = '';
+      const result = await deliverApprovedSend(deps.governance, approvalId, async () => {
+        const uploaded = await transport().uploadMedia(new Uint8Array(bytes), { mimeType, filename: body.fileName as string });
+        uploadedMediaId = uploaded.id;
+        return transport().sendMedia(body.to as string, {
+          kind: 'document',
+          mediaId: uploaded.id,
+          filename: body.fileName as string,
+          ...(caption ? { caption } : {}),
+        });
+      });
+      sideChats.mirrorMessage({
+        providerId: 'whatsapp',
+        externalChatId: body.to,
+        providerMessageId: result.id,
+        direction: 'out',
+        kind: 'document',
+        text: caption,
+        attachment: { kind: 'document', mediaId: uploadedMediaId, filename: body.fileName },
+      });
+      res.json({ ok: true, approvalId, id: result.id });
+    } catch (err) {
+      res.status(500).json(errorBody('Failed to send file', err instanceof Error ? err.message : String(err)));
     }
   });
 

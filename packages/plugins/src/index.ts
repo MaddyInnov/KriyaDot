@@ -4,3 +4,5 @@ export * from './zip.js';
 export * from './rpc.js';
 export * from './runtime.js';
 export * from './manager.js';
+export * from './bundle.js';
+export * from './plugin-eval.js';

@@ -39,6 +39,12 @@
 	<string>KriyaDot uses the camera only to scan the pairing QR code shown on your PC. Deny it and you can still pair by entering the host, port and token manually.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>KriyaDot connects to your KriyaDot instance on your local network to show runs, approvals, chat and your daily briefing.</string>
+	<key>NSHealthShareUsageDescription</key>
+	<string>KriyaDot reads the health data you choose to share (steps, heart rate, sleep and the other types listed in Health) and syncs it only to your own KriyaDot instance. It never writes health data and never sends it anywhere else. (Wave-6 DV-2/DV-4; source-level until the signed build ships.)</string>
+	<key>NSHomeKitUsageDescription</key>
+	<string>KriyaDot reads your home's accessories and their current state so your assistant can answer questions about your home. It does not control accessories from the companion app. (Wave-6 DV-2; source-level until the signed build ships.)</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>KriyaDot reads your reminders so your assistant can include them in briefings and answers. It does not create, complete or delete reminders from the companion app. (Wave-6 DV-2; source-level until the signed build ships.)</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_http._tcp</string>

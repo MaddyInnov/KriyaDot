@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { ElicitRequestSchema, ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
+import { ElicitRequestSchema, NotificationSchema, ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { ToolCall, ToolContext, ToolDefinition } from './types.js';
 import type { McpServerToolFilter } from './mcp-scopes.js';
@@ -157,6 +157,14 @@ export interface MCPClientOptions {
   approvalTimeoutMs?: number;
   /** Test seam: build the underlying MCP Client (defaults to the real SDK client). */
   createClient?: () => Client;
+  /**
+   * CA-25 MCP channels: when set, server-pushed channel events
+   * (notifications/kriyadot/channel) route into the hub, which gates,
+   * rate-limits, and injects them into the bound live session.
+   */
+  channelHub?: import('./mcp-channels.js').McpChannelHub;
+  /** Server label the channel hub keys this connection under. */
+  channelServerLabel?: string;
   /**
    * Elicitation (Octomind parity — MCP completion): how this client
    * answers server-initiated `elicitation/create` requests.
@@ -507,6 +515,18 @@ export class MCPClient {
     anyClient.setNotificationHandler?.(ToolListChangedNotificationSchema, async () => {
       await this.fetchToolMetas().catch(() => undefined);
     });
+    // CA-25: MCP channel events from this server route into the hub
+    // (governance-gated + rate-limited there; fail-closed by default).
+    if (this.options.channelHub) {
+      // This SDK version has no FallbackNotificationSchema export; the
+      // base NotificationSchema plays that role (the hub validates the
+      // channel payload itself and drops everything else).
+      this.options.channelHub.attachToClient(
+        client as never,
+        this.options.channelServerLabel ?? this.label,
+        NotificationSchema,
+      );
+    }
     try {
       await client.connect(transport);
     } catch (err) {

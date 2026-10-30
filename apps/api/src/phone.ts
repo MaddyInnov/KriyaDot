@@ -617,7 +617,7 @@ export interface PhoneActionResult {
   data?: unknown;
 }
 
-export type PhoneDataQueryName = 'calendar' | 'contacts' | 'messages_recent' | 'location';
+export type PhoneDataQueryName = 'calendar' | 'contacts' | 'messages_recent' | 'location' | 'health_sync';
 
 interface PendingAction {
   deviceId: string;

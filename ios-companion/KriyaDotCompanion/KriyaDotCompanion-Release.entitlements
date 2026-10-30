@@ -11,5 +11,11 @@
 <dict>
 	<key>aps-environment</key>
 	<string>production</string>
+	<!-- Wave-6 (DV-2): same HealthKit + HomeKit capabilities as the
+	     debug entitlements; the App ID must have both enabled. -->
+	<key>com.apple.developer.healthkit</key>
+	<true/>
+	<key>com.apple.developer.homekit</key>
+	<true/>
 </dict>
 </plist>

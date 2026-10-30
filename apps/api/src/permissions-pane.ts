@@ -157,6 +157,15 @@ export const PERMISSION_SURFACES: PermissionSurface[] = [
     overridable: true,
   },
   {
+    id: 'computer-use',
+    label: 'Computer use (your real desktop)',
+    description:
+      'Real control uses YOUR mouse cursor, in the foreground, on the screen you are looking at — there is no background mode for real mouse control (background-safe work uses a browser, an API, or the sandbox). Real control is off until the one-time setup in this pane is finished and its self-test passes. Setup never grants a standing allow: every click, keystroke and typed text still asks for approval, one action at a time.',
+    defaultEffect: 'ask',
+    source: 'computerUsePolicyRules() (require-approval) + computer-use-setup.ts setup state (ADD-5)',
+    overridable: false,
+  },
+  {
     id: 'purchases',
     label: 'Purchases',
     description: 'Every purchase is approved individually, every time. This cannot be changed — there is no always-allow for buying (product rule, QA-verified).',
@@ -783,6 +792,13 @@ export const PROTOCOL_PANE_ENTRIES: ProtocolPaneEntry[] = [
 
 export interface PermissionsOverview {
   surfaces: Array<PermissionSurface & { currentEffect: PaneEffect; overridden: boolean }>;
+  /**
+   * ADD-5: real-desktop computer-use setup summary, present only when
+   * the host wires `computerUseStatus` (computer-use-setup.ts). The full
+   * flow (explainer, OS checks, self-test, enable/disable) lives on the
+   * /computer-use-setup routes; this is its state, visible in the pane.
+   */
+  computerUse?: unknown;
   counts: {
     pendingApprovals: number;
     allowances: number;
@@ -810,6 +826,8 @@ export interface PermissionsPaneDeps {
   listApprovals?: (status?: 'pending' | 'approved' | 'denied' | 'expired') => unknown[];
   /** Injected in tests; defaults to the real fetch client (loaded lazily). */
   composioClient?: ComposioClient;
+  /** ADD-5: computer-use setup summary provider (computer-use-setup.ts's computerUsePaneSummary). */
+  computerUseStatus?: (userId: string) => unknown;
   loopbackToken?: string;
   jwtSecret?: string;
   now?: () => number;
@@ -823,12 +841,19 @@ export function buildOverview(deps: PermissionsPaneDeps, userId: string): Permis
   } catch {
     pendingApprovals = 0;
   }
+  let computerUse: unknown;
+  try {
+    computerUse = deps.computerUseStatus?.(userId);
+  } catch {
+    computerUse = undefined;
+  }
   return {
     surfaces: PERMISSION_SURFACES.map((s) => ({
       ...s,
       currentEffect: overrides[s.id] ?? s.defaultEffect,
       overridden: overrides[s.id] !== undefined,
     })),
+    ...(computerUse !== undefined ? { computerUse } : {}),
     counts: {
       pendingApprovals,
       allowances: listAllowances(deps.dataDir, userId).length,

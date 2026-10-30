@@ -110,6 +110,8 @@ class MainActivity : AppCompatActivity() {
                     android.Manifest.permission.READ_CALENDAR,
                     android.Manifest.permission.READ_CONTACTS,
                     android.Manifest.permission.READ_SMS,
+                    // Wave-6 (DV-3): call-history search (phone_call_history).
+                    android.Manifest.permission.READ_CALL_LOG,
                     // Wave-4 (CT-7): direct SMS send (phone_sms_send action).
                     android.Manifest.permission.SEND_SMS,
                     android.Manifest.permission.ACCESS_FINE_LOCATION,

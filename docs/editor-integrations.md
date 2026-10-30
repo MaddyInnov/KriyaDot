@@ -190,3 +190,24 @@ works, independent of any editor.
 - **Wrong personality/tools** — you are probably on the default
   `helper` bot. Editor coding work wants `--bot coder` (or
   `--bot code-reviewer` for review-only sessions).
+
+## VS Code (Wave-6, CA-29)
+
+VS Code does not embed ACP in the core editor, so KriyaDot ships a
+minimal extension in [`examples/editors/vscode/`](../examples/editors/vscode/)
+(sideload `.vsix` only — `bash build-vsix.sh`, then
+`code --install-extension kriyadot-vscode-0.1.0.vsix`; no marketplace
+publish). It spawns the same `mvp-server acp --bot coder` command and
+speaks ACP over stdio, adding the VS Code-native surfaces:
+
+- **KriyaDot: Ask About Selection** — the current selection (or file)
+  is attached as embedded context to the prompt.
+- **KriyaDot: Review Proposal as Diff** — proposed content opens in the
+  native `vscode.diff` editor against the original file.
+- **KriyaDot: Send Diagnostics to Agent** — pushes the Problems panel
+  diagnostics (`vscode.languages.getDiagnostics()`) to the agent.
+- ACP `session/request_permission` requests surface as VS Code modal
+  Approve/Reject prompts — the governance approval, in-editor.
+
+JetBrains remains configuration-only via ACP (see above and
+`examples/editors/jetbrains/README.md`).

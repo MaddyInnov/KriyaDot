@@ -23,8 +23,37 @@
          action (user-approved on the server before dispatch; requested at
          runtime from MainActivity and checked again in InputService). -->
     <uses-permission android:name="android.permission.SEND_SMS" />
+    <!-- Wave-6 (DV-3): packaged commands — call-history search reads the call
+         log (runtime-requested, checked again in PhoneDataHandlers);
+         SET_ALARM is a normal permission for the AlarmClock intent. -->
+    <uses-permission android:name="android.permission.READ_CALL_LOG" />
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Wave-6 (DV-4): Health Connect read bridge (HealthConnectHandlers.kt).
+         These are Health Connect permissions, granted by the user inside
+         the Health Connect app UI — the app can only check them, never
+         grant them itself. Read-only: no WRITE_* health permissions. -->
+    <uses-permission android:name="android.permission.health.READ_STEPS" />
+    <uses-permission android:name="android.permission.health.READ_DISTANCE" />
+    <uses-permission android:name="android.permission.health.READ_HEART_RATE" />
+    <uses-permission android:name="android.permission.health.READ_RESTING_HEART_RATE" />
+    <uses-permission android:name="android.permission.health.READ_SLEEP" />
+    <uses-permission android:name="android.permission.health.READ_WEIGHT" />
+    <uses-permission android:name="android.permission.health.READ_HEIGHT" />
+    <uses-permission android:name="android.permission.health.READ_OXYGEN_SATURATION" />
+    <uses-permission android:name="android.permission.health.READ_BLOOD_PRESSURE" />
+    <uses-permission android:name="android.permission.health.READ_BLOOD_GLUCOSE" />
+    <uses-permission android:name="android.permission.health.READ_ACTIVE_CALORIES_BURNED" />
+    <uses-permission android:name="android.permission.health.READ_EXERCISE" />
+    <uses-permission android:name="android.permission.health.READ_RESPIRATORY_RATE" />
+    <uses-permission android:name="android.permission.health.READ_BODY_TEMPERATURE" />
+
+    <!-- Health Connect availability check on Android 13 and below, where
+         Health Connect ships as a separate app. -->
+    <queries>
+        <package android:name="com.google.android.apps.healthdata" />
+    </queries>
 
     <application
         android:label="KriyaDot Phone Agent"
@@ -41,10 +70,38 @@
             </intent-filter>
         </activity>
 
+        <!-- Health Connect requires a permissions-rationale surface:
+             Health Connect deep-links here when the user reviews this
+             app's health-data access. -->
+        <activity-alias
+            android:name="ViewPermissionUsageActivity"
+            android:exported="true"
+            android:permission="android.permission.START_VIEW_PERMISSION_USAGE"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="androidx.health.ACTION_SHOW_PERMISSIONS_RATIONALE" />
+                <action android:name="android.intent.action.VIEW_PERMISSION_USAGE" />
+                <category android:name="android.intent.category.HEALTH_PERMISSIONS" />
+            </intent-filter>
+        </activity-alias>
+
         <service
             android:name=".ScreenCaptureService"
             android:foregroundServiceType="mediaProjection"
             android:exported="false" />
+
+        <!-- ADD-5: FileProvider for the send_file action — grants WhatsApp
+             a read-only URI for exactly the one approved file staged in
+             cacheDir/shared (see res/xml/file_paths.xml). -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <!-- Input injection: the user must enable this manually in
              Settings → Accessibility. The app cannot enable it itself. -->

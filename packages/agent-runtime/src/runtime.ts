@@ -382,6 +382,23 @@ export interface RunTurnOptions {
    */
   ownerPersonId?: string;
   /**
+   * Project binding (CA-31): when the runtime creates a NEW session for
+   * this turn it is stamped with this project id (see SessionRecord.
+   * projectId). Existing sessions keep their binding; hosts rebind via
+   * SessionStore.setSessionProject. Absent → ungrouped session.
+   */
+  projectId?: string;
+  /**
+   * Bare mode (CA-21, `kriyadot run --bare`): skip ALL auto-discovery
+   * for this turn so CI runs are deterministic — no semantic skill
+   * auto-activation, no MCP catalog auto-activation, no memory/context
+   * injection (call-site memoryContext AND registered turn context
+   * providers are both skipped). Explicit configuration still applies:
+   * the bot's named skills/tools/MCP servers, governance, approvals and
+   * hooks are NOT discovery and are never weakened or skipped.
+   */
+  bare?: boolean;
+  /**
    * Conversation id for per-conversation overrides (P1 #14: pinned computer
    * surface). Defaults to sessionId when the call site doesn't set it.
    */
@@ -1388,6 +1405,8 @@ ${record.priorContext ?? ''}`;
     opts: RunTurnOptions,
     sessionId: string,
   ): Promise<string | undefined> {
+    // CA-21 bare mode: no memory/context auto-discovery at all.
+    if (opts.bare) return undefined;
     const parts: string[] = [];
     if (opts.memoryContext?.trim()) parts.push(opts.memoryContext.trim());
     for (const provider of this.contextProviders) {
@@ -1662,7 +1681,8 @@ ${record.priorContext ?? ''}`;
     }
 
     const sessionId =
-      opts.sessionId ?? this.store.createSession(opts.bot.id, { ownerPersonId: opts.ownerPersonId });
+      opts.sessionId ??
+      this.store.createSession(opts.bot.id, { ownerPersonId: opts.ownerPersonId, projectId: opts.projectId });
     if (opts.sessionId === undefined && this.hooks) {
       // session.created hook — never blocks a turn.
       await this.hooks.emit('session.created', { sessionId, botId: opts.bot.id }).catch(() => undefined);
@@ -1798,7 +1818,9 @@ ${record.priorContext ?? ''}`;
     // to activate for the turn. No LLM is involved in the decision.
     let autoActivatedSkills: string[] = [];
     const autoActivatedMcpTools: ToolDefinition[] = [];
-    if (opts.bot.autoActivateSkills) {
+    // CA-21 bare mode skips this whole auto-discovery block (skills +
+    // MCP catalog); explicit bot configuration is unaffected.
+    if (opts.bot.autoActivateSkills && !opts.bare) {
       // #163: declarative frontmatter activation rules (keywords /
       // patterns / exclude) are evaluated against the raw message and
       // unioned with the embedding-based set computed below.

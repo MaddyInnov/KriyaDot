@@ -60,3 +60,26 @@ Per the work order, no un-compilable Rust was committed. `main.rs` and
 
 - Push-to-talk event name: **`push-to-talk`**, payload `{ "source": "hotkey" }`.
 - Deep-link scheme: **`kriyadot://`** (`kriyadot://chat/<chatId>` routes to a chat).
+
+## Wave-6 update (2026-10-30, CA-27 + CA-35)
+
+The posture changed with the dictation precedent (V-5): source-level
+Rust is now committed with an explicit UNVERIFIED banner, to be compiled
+by CI before any claim of working.
+
+- CA-27: `src/quick_entry.rs` added (companion window toggle,
+  Ctrl/Cmd+Alt+K, `kriyadot://` deep-link forwarding as
+  `deep-link://new-url` payloads), `main.rs` wires
+  `tauri_plugin_deep_link::init()` + `on_open_url` + `register_all()`
+  (Linux/Windows), `Cargo.toml` gains `tauri-plugin-deep-link = "2"`,
+  capabilities gain `deep-link:default`. Web half (tested):
+  `apps/web/lib/desktop-bridge.ts` + `apps/web/app/quick/`.
+- CA-35: dictation was already source-level in `dictation.rs` (V-5);
+  Wave-6 adds the missing WEB receiver: `wireDesktopDictation()` in
+  `apps/web/lib/desktop-bridge.ts` subscribes to `dictation://press` /
+  `dictation://release` / `push-to-talk`, drives the existing Web
+  Speech/STT stack behind a recognizer seam, and calls the Tauri
+  `dictation_insert_text` command on a final transcript.
+- Still required on a Tauri machine: `cargo check`, then a real
+  deep-link + companion-window smoke test. Nothing here is claimed
+  compiled.
