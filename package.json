@@ -10,7 +10,7 @@
   "name": "mvp-all-in-one-ai-agent-platform",
   "private": true,
   "scripts": {
-    "build": "npm run build --workspace=@mvp/governance && npm run build --workspace=@mvp/agent-runtime && npm run build --workspace=@mvp/redteam && npm run build --workspace=@mvp/workflows && npm run build --workspace=@mvp/run-health && npm run build --workspace=@mvp/marketplace && npm run build --workspace=@mvp/billing && npm run build --workspace=@mvp/tenancy && npm run build --workspace=@mvp/vault && npm run build --workspace=@mvp/protocols && npm run build --workspace=@mvp/voice && npm run build --workspace=@mvp/plugins && npm run build --workspace=@mvp/muse-modules && npm run build --workspace=@mvp/web && npm run build --workspace=@mvp/api && npm run build --workspace=@mvp/tui && npm run build --workspace=@mvp/cli",
+    "build": "npm run build --workspace=@mvp/governance && npm run build --workspace=@mvp/agent-runtime && npm run build --workspace=@mvp/redteam && npm run build --workspace=@mvp/workflows && npm run build --workspace=@mvp/run-health && npm run build --workspace=@mvp/marketplace && npm run build --workspace=@mvp/billing && npm run build --workspace=@mvp/tenancy && npm run build --workspace=@mvp/vault && npm run build --workspace=@mvp/protocols && npm run build --workspace=@mvp/voice && npm run build --workspace=@mvp/plugins && npm run build --workspace=@mvp/muse-modules && npm run build --workspace=@mvp/web && npm run build --workspace=@mvp/api && npm run build --workspace=@mvp/tui && npm run build --workspace=@mvp/cli && npm run build --workspace=@mvp/frontdoor",
     "dev": "npm run dev --workspace=@mvp/api & npm run dev --workspace=@mvp/web",
     "dev:api": "npm run dev --workspace=@mvp/api",
     "dev:web": "npm run dev --workspace=@mvp/web",

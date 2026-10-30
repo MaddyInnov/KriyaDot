@@ -39,7 +39,7 @@ import {
 
 export type UniversalPath = 'direct' | 'specialist' | 'split';
 
-export type UniversalRouteVia = 'mention' | 'split-rules' | 'keyword-score' | 'default';
+export type UniversalRouteVia = 'mention' | 'split-rules' | 'keyword-score' | 'default' | 'cloud';
 
 export interface UniversalRouteDecision {
   path: UniversalPath;

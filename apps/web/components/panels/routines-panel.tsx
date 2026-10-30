@@ -16,6 +16,8 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { kriyadotFetch } from '../../lib/kriyadot-api';
+import { RoutineAnchorSection } from './routine-anchor-section';
+import type { RoutineAnchor, RoutineReporting } from '../../lib/frontdoor';
 
 type EventAppId = 'gmail' | 'slack' | 'github' | 'stripe' | 'googlecalendar';
 
@@ -127,6 +129,11 @@ interface Routine {
   enabled: boolean;
   schedule?: RoutineSchedule | null;
   nextRunAt?: number | null;
+  /** Front Door Part 5: resolved execution anchor + honest local warning. */
+  anchor?: RoutineAnchor;
+  anchorWarning?: boolean;
+  /** Front Door Part 5: run reporting (instant / daily digest / both + quiet hours). */
+  reporting?: RoutineReporting;
 }
 
 interface NextRun {
@@ -1423,6 +1430,11 @@ function RoutineRow({ routine, botId, onChanged }: { routine: Routine; botId: st
           {busy && !hook && <p className="muted">Loading…</p>}
           {error && <p className="error">{error}</p>}
           <ScheduleSection routine={routine} onChanged={onChanged} />
+          <hr className="section-sep" />
+          <RoutineAnchorSection
+            routine={routine}
+            onChanged={(patch) => onChanged({ ...routine, ...patch })}
+          />
           {routine.schedule?.kind === 'limit-reset' && (
             <>
               <hr className="section-sep" />

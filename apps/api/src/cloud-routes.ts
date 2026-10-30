@@ -33,6 +33,7 @@
 //   GET  /cloud/lightning/plans       tier descriptors, NO prices
 //   GET  /cloud/lightning/supervisor  wake-on-traffic supervisor state
 
+import { randomBytes } from 'node:crypto';
 import express, { type Request, type Router } from 'express';
 import {
   CliLightningClient,
@@ -294,10 +295,20 @@ export function createCloudLightningRouter(deps: CloudRouteDeps): Router {
       const providerEnv = deps.providerEnvForUser
         ? await deps.providerEnvForUser(caller(req))
         : {};
+      // Sync provisioning (front-door Part 4): generate the sync link
+      // token HERE (locally, in the owner's own app) and pass it into the
+      // deploy — the Studio receives only its SHA-256 hash seeded into
+      // its sync-hub.json, and the successful result carries
+      // { syncPairing: { instanceUrl, linkToken } } back so the local app
+      // can store it as its sync target (POST /api/sync/target). See
+      // cloud-deploy.ts for why generation is local rather than in-Studio.
+      const syncLinkToken = randomBytes(32).toString('base64url');
       const result: DeployResult = await deployKriyadot(found.client, {
         repoUrl,
         studioName,
         providerEnv,
+        syncLinkToken,
+        syncOwnerUserId: caller(req),
         ...(ollama ? { ollama } : {}),
       });
       res.status(result.ok ? 200 : 502).json({ ok: result.ok, deploy: result });

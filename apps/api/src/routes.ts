@@ -302,6 +302,14 @@ export interface RouteDeps {
    */
   pauseRegistry?: PauseRegistry;
   /**
+   * Cloud-only placement gate (front-door Part 5): returns true when the
+   * bot must NOT execute on this instance (placement 'cloud-only' and
+   * this server is not the cloud instance). The chat route then refuses
+   * locally with a clear error; the web layer proxies such turns to the
+   * instance instead. Optional — unset means no gate.
+   */
+  isCloudOnlyBot?: (botId: string) => boolean;
+  /**
    * W14c/W14b briefing sources (GitHub signals + notification digest),
    * forwarded to the briefing routes. Optional in tests.
    */
@@ -1576,6 +1584,13 @@ export function createRouter(deps: RouteDeps): express.Router {
     const bot = bots.find((b) => b.id === body.botId);
     if (!bot) {
       res.status(404).json(errorBody(`Unknown bot "${body.botId}"`));
+      return;
+    }
+    // Cloud-only placement gate (front-door Part 5): this bot executes
+    // only on the user's cloud instance; refuse locally rather than
+    // double-executing. The web layer proxies the turn in that case.
+    if (deps.isCloudOnlyBot?.(bot.id)) {
+      res.status(409).json(errorBody(`cloud-only-bot: "${bot.name}" runs on your cloud instance, not on this device`));
       return;
     }
     const chatMessage0 = body.message;

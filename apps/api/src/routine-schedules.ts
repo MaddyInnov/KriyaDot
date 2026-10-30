@@ -1083,6 +1083,21 @@ export interface RoutineSchedulerDeps {
   /** Global pause gate (W14d): while paused, ticks skip entirely. */
   isPaused?: () => boolean;
   /**
+   * Executor gate (front-door Part 5): when set, this server fires a
+   * routine only when shouldExecute(routine) is true — i.e. the routine's
+   * anchor matches this server's role. Non-executor routines stay stored
+   * and visible but never fire here.
+   */
+  shouldExecute?: (routine: BotRoutine) => boolean;
+  /**
+   * Reporting hook (front-door Part 5): called once when a scheduled run
+   * settles (not for skips), with the same shape as onFire. The host wires
+   * its ReportingService (sync activity + instant push / quiet hours).
+   */
+  onRunReported?: (info: RoutineFireInfo) => void;
+  /** Called at the end of every tick (host: flush deferred notices, digests). */
+  onSchedulerTick?: (now: number) => void;
+  /**
    * Idle triggers (Octomind parity): the bot's last turn-activity time
    * (UTC ms), or undefined when the bot has never been active. Without
    * this source, idle schedules simply never fire.
@@ -1161,6 +1176,11 @@ export class RoutineScheduler {
       }
       await this.tickLimitResetResumes(now);
       this.booted = true;
+      try {
+        this.deps.onSchedulerTick?.(now);
+      } catch (err) {
+        console.error('[routine-scheduler] onSchedulerTick threw:', err instanceof Error ? err.message : err);
+      }
     } finally {
       this.ticking = false;
     }
@@ -1229,6 +1249,7 @@ export class RoutineScheduler {
         store.cancel(resume.id);
         continue;
       }
+      if (this.deps.shouldExecute && !this.deps.shouldExecute(routine)) continue;
       if (routine.schedule?.overlap === 'skip' && this.inFlight.has(routine.id)) continue;
       if (!store.claim(resume.id)) continue;
       try {
@@ -1291,6 +1312,9 @@ export class RoutineScheduler {
   private async tickRoutine(routine: BotRoutine, now: number): Promise<void> {
     const schedule = routine.schedule;
     if (!routine.enabled || !schedule || !schedule.enabled) return;
+    // Executor gate (front-door Part 5): the non-designated side stores
+    // the routine (visible, labelled) but NEVER fires it.
+    if (this.deps.shouldExecute && !this.deps.shouldExecute(routine)) return;
     // Event schedules are fired by the EventTriggerPoller
     // (routine-events.ts), which owns their cursors — never by this
     // time-grid tick.
@@ -1383,6 +1407,7 @@ export class RoutineScheduler {
     for (const routine of this.deps.routineStore.list()) {
       const schedule = routine.schedule;
       if (!routine.enabled || !schedule || !schedule.enabled) continue;
+      if (this.deps.shouldExecute && !this.deps.shouldExecute(routine)) continue;
       // Event triggers reconcile through their own cursor catch-up in
       // the EventTriggerPoller (bounded, per routine-events.ts).
       if (schedule.kind === 'event') continue;
@@ -1521,7 +1546,15 @@ export class RoutineScheduler {
     this.inFlight.add(routine.id);
     const settle = (ok: boolean, error?: string): void => {
       this.inFlight.delete(routine.id);
-      this.emit({ routine, at, ok, error });
+      const info: RoutineFireInfo = { routine, at, ok, error };
+      this.emit(info);
+      // Reporting (front-door Part 5): a settled run — not a skip — is
+      // reported through the host's reporting channel.
+      try {
+        this.deps.onRunReported?.(info);
+      } catch (err) {
+        console.error('[routine-scheduler] onRunReported threw:', err instanceof Error ? err.message : err);
+      }
     };
     try {
       if (this.executor) {

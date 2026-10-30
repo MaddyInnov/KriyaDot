@@ -26,6 +26,7 @@
 // The supervisor script itself contains NO secrets; it sources the env
 // file at start.
 
+import { createHash } from 'node:crypto';
 import {
   DEFAULT_STUDIO_NAME,
   DEFAULT_STUDIO_PORT,
@@ -84,6 +85,20 @@ export interface DeployOptions {
   providerEnv?: Record<string, string>;
   ollama?: OllamaDeployOptions;
   studioName?: string;
+  /**
+   * Sync pairing (front-door Part 4): a link token generated LOCALLY by
+   * the caller (cloud-routes). Only its SHA-256 hash is written into the
+   * Studio — the deploy step seeds <studio data>/sync-hub.json with
+   * { linkTokenHash, ownerUserId } exactly as the instance's own
+   * mintLinkToken() would store it, so the deployed instance accepts the
+   * token from first boot. The plaintext never leaves the deploy result
+   * (returned to the owner as `syncPairing`) and never lands in the
+   * Studio. Generating it locally (instead of inside the Studio) keeps
+   * the whole flow mock-testable through the same run channel.
+   */
+  syncLinkToken?: string;
+  /** KriyaDot user id recorded as the sync owner inside the Studio. */
+  syncOwnerUserId?: string;
 }
 
 export interface DeployStep {
@@ -103,6 +118,8 @@ export interface DeployResult {
     /** Honest storage note surfaced to the user with every Ollama deploy. */
     driveNote: string;
   };
+  /** Sync pairing for the local app to store as its sync target (Part 4). */
+  syncPairing?: { instanceUrl: string; linkToken: string };
   warnings: string[];
 }
 
@@ -241,7 +258,12 @@ export async function deployKriyadot(
   //    decoded only inside the Studio. The Ollama registration below is
   //    how the deployed instance learns its local provider: Ollama on
   //    loopback inside the same Studio, with the one pulled model.
-  const envLines: string[] = [`PORT=${opts.port}`, 'KRIYADOT_CLOUD=lightning'];
+  const envLines: string[] = [
+    `PORT=${opts.port}`,
+    'KRIYADOT_CLOUD=lightning',
+    // A deployed Studio IS the cloud side (front-door Part 5 executor gate).
+    'KRIYADOT_INSTANCE_ROLE=cloud',
+  ];
   for (const [k, v] of Object.entries(opts.providerEnv ?? {})) envLines.push(`${k}=${v}`);
   if (ollamaModel) {
     envLines.push('OLLAMA_HOST=http://127.0.0.1:11434');
@@ -255,6 +277,27 @@ export async function deployKriyadot(
     ))
   )
     return finish();
+
+  // 5b. Sync pairing seed (only when the caller supplied a link token):
+  //     write ONLY the token's SHA-256 hash (+ owner id) into the Studio's
+  //     data dir sync-hub.json, 0600 — the exact file the instance's sync
+  //     hub verifies link tokens against. The Studio's data dir is
+  //     ~/kriyadot/data (the deploy checkout runs with cwd ~/kriyadot and
+  //     no DATA_DIR override in .env.cloud).
+  if (opts.syncLinkToken) {
+    const seed = JSON.stringify({
+      linkTokenHash: createHash('sha256').update(opts.syncLinkToken).digest('hex'),
+      ...(opts.syncOwnerUserId ? { ownerUserId: opts.syncOwnerUserId } : {}),
+      createdAt: Date.now(),
+    });
+    if (
+      !(await run(
+        'sync-pairing',
+        `mkdir -p ${CLOUD_APP_DIR}/data && printf %s ${shellQuote(b64(seed))} | base64 -d > ${CLOUD_APP_DIR}/data/sync-hub.json && chmod 600 ${CLOUD_APP_DIR}/data/sync-hub.json`,
+      ))
+    )
+      return finish();
+  }
 
   // 6. Supervisor script (0700, secret-free).
   if (
@@ -282,6 +325,9 @@ export async function deployKriyadot(
       ok,
       steps,
       ...(publicUrl ? { publicUrl } : {}),
+      ...(ok && publicUrl && opts.syncLinkToken
+        ? { syncPairing: { instanceUrl: publicUrl, linkToken: opts.syncLinkToken } }
+        : {}),
       port: opts.port,
       ...(ollamaModel
         ? {

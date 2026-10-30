@@ -39,6 +39,7 @@ import {
 import type { LimitResetResumeStore } from './limit-reset-resumes.js';
 import { composioCallerOf } from './composio.js';
 import { readAccountCache } from './composio-accounts.js';
+import { validateReporting } from './placement.js';
 import { eventDayKey, type EventTriggerStore } from './routine-events.js';
 
 import { openDb as openSqliteDb } from '@mvp/agent-runtime';
@@ -69,6 +70,18 @@ export interface BotRoutine {
    * under Teams → Group goals.
    */
   goalMode?: boolean;
+  /**
+   * Execution anchor (front-door Part 5): which side fires this routine.
+   * Resolved at create/update (see placement.ts resolveRoutineAnchor):
+   * time-based schedules default 'cloud' when a cloud instance is
+   * connected, else 'local'; manual/webhook-only routines default to the
+   * bot's placement executor side. Explicit values win.
+   */
+  anchor?: 'local' | 'cloud';
+  /** True when anchor=local, the schedule is time-based, and no cloud is connected. */
+  anchorWarning?: boolean;
+  /** Per-automation reporting (front-door Part 5): instant / daily digest / both, with quiet hours. */
+  reporting?: { mode: 'instant' | 'daily' | 'both'; quietStart?: string; quietEnd?: string };
   /** Per-routine run timeout in ms (item 4b). Unset = no timeout. */
   timeoutMs?: number;
   /** Automatic retry once on failure (item 4c). Default true. */
@@ -105,6 +118,9 @@ interface RoutineRow {
   timeout_ms: number | null;
   auto_retry: number | null;
   use_prev_summary: number | null;
+  anchor: string | null;
+  anchor_warning: number | null;
+  reporting: string | null;
 }
 
 interface TriggerRow {
@@ -138,6 +154,17 @@ function rowToRoutine(r: RoutineRow): BotRoutine {
     timeoutMs: r.timeout_ms ?? undefined,
     autoRetry: r.auto_retry === null || r.auto_retry === undefined ? undefined : r.auto_retry === 1,
     usePreviousRunSummary: r.use_prev_summary === null || r.use_prev_summary === undefined ? undefined : r.use_prev_summary === 1,
+    anchor: r.anchor === 'cloud' ? 'cloud' : r.anchor === 'local' ? 'local' : undefined,
+    anchorWarning: r.anchor_warning === 1 ? true : undefined,
+    reporting: (() => {
+      if (!r.reporting) return undefined;
+      try {
+        const parsed = JSON.parse(r.reporting) as BotRoutine['reporting'];
+        return parsed && (parsed.mode === 'instant' || parsed.mode === 'daily' || parsed.mode === 'both') ? parsed : undefined;
+      } catch {
+        return undefined;
+      }
+    })(),
     enabled: r.enabled === 1,
     createdAt: r.created_at,
   };
@@ -207,6 +234,10 @@ function openDb(dataDir: string): DatabaseSync {
   if (!cols.some((c) => c.name === 'timeout_ms')) db.exec('ALTER TABLE bot_routines ADD COLUMN timeout_ms INTEGER');
   if (!cols.some((c) => c.name === 'auto_retry')) db.exec('ALTER TABLE bot_routines ADD COLUMN auto_retry INTEGER');
   if (!cols.some((c) => c.name === 'use_prev_summary')) db.exec('ALTER TABLE bot_routines ADD COLUMN use_prev_summary INTEGER');
+  // Migration: execution anchor + reporting (front-door Part 5).
+  if (!cols.some((c) => c.name === 'anchor')) db.exec('ALTER TABLE bot_routines ADD COLUMN anchor TEXT');
+  if (!cols.some((c) => c.name === 'anchor_warning')) db.exec('ALTER TABLE bot_routines ADD COLUMN anchor_warning INTEGER');
+  if (!cols.some((c) => c.name === 'reporting')) db.exec('ALTER TABLE bot_routines ADD COLUMN reporting TEXT');
   return db;
 }
 
@@ -231,6 +262,9 @@ export class RoutineStore {
     timeoutMs?: number;
     autoRetry?: boolean;
     usePreviousRunSummary?: boolean;
+    anchor?: 'local' | 'cloud';
+    anchorWarning?: boolean;
+    reporting?: BotRoutine['reporting'];
   }): BotRoutine {
     const name = input.name.trim().slice(0, 120);
     if (!name) throw new Error('name is required');
@@ -256,12 +290,15 @@ export class RoutineStore {
       timeoutMs: input.timeoutMs && input.timeoutMs > 0 ? Math.floor(input.timeoutMs) : undefined,
       autoRetry: input.autoRetry,
       usePreviousRunSummary: input.usePreviousRunSummary,
+      anchor: input.anchor,
+      anchorWarning: input.anchorWarning === true ? true : undefined,
+      reporting: input.reporting,
       enabled: true,
       createdAt: Date.now(),
     };
     this.db
       .prepare(
-        'INSERT INTO bot_routines (id, name, bot_id, prompt_template, session_id, schedule, goal_mode, enabled, created_at, webhook_secret, timeout_ms, auto_retry, use_prev_summary) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)',
+        'INSERT INTO bot_routines (id, name, bot_id, prompt_template, session_id, schedule, goal_mode, enabled, created_at, webhook_secret, timeout_ms, auto_retry, use_prev_summary, anchor, anchor_warning, reporting) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         routine.id,
@@ -276,8 +313,65 @@ export class RoutineStore {
         routine.timeoutMs ?? null,
         routine.autoRetry === undefined ? null : routine.autoRetry ? 1 : 0,
         routine.usePreviousRunSummary === undefined ? null : routine.usePreviousRunSummary ? 1 : 0,
+        routine.anchor ?? null,
+        routine.anchorWarning ? 1 : null,
+        routine.reporting ? JSON.stringify(routine.reporting) : null,
       );
     return routine;
+  }
+
+  /**
+   * Sync import (front-door Parts 4+5): insert a routine definition received
+   * from the user's other side PRESERVING its id (identity is what makes
+   * the two sides' copies the same routine), or refresh the mutable fields
+   * when the id already exists. `lastFiredAt` and the webhook secret are
+   * per-side state and are never overwritten by an import — the secret is
+   * minted fresh on the importing side.
+   */
+  importRoutine(def: BotRoutine): 'created' | 'updated' {
+    const schedule =
+      def.schedule === undefined || def.schedule === null ? null : validateRoutineSchedule(def.schedule);
+    if (this.get(def.id)) {
+      this.update(def.id, {
+        name: def.name,
+        botId: def.botId,
+        promptTemplate: def.promptTemplate,
+        sessionId: def.sessionId ?? null,
+        schedule,
+        goalMode: def.goalMode === true,
+        enabled: def.enabled !== false,
+        timeoutMs: def.timeoutMs ?? null,
+        autoRetry: def.autoRetry,
+        usePreviousRunSummary: def.usePreviousRunSummary,
+        anchor: def.anchor ?? null,
+        anchorWarning: def.anchorWarning === true,
+        reporting: def.reporting ?? null,
+      });
+      return 'updated';
+    }
+    this.db
+      .prepare(
+        'INSERT INTO bot_routines (id, name, bot_id, prompt_template, session_id, schedule, goal_mode, enabled, created_at, webhook_secret, timeout_ms, auto_retry, use_prev_summary, anchor, anchor_warning, reporting) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(
+        def.id,
+        def.name.slice(0, 120),
+        def.botId,
+        def.promptTemplate,
+        def.sessionId ?? null,
+        schedule ? JSON.stringify(schedule) : null,
+        def.goalMode === true ? 1 : null,
+        def.enabled !== false ? 1 : 0,
+        typeof def.createdAt === 'number' ? def.createdAt : Date.now(),
+        randomBytes(32).toString('hex'),
+        def.timeoutMs ?? null,
+        def.autoRetry === undefined ? null : def.autoRetry ? 1 : 0,
+        def.usePreviousRunSummary === undefined ? null : def.usePreviousRunSummary ? 1 : 0,
+        def.anchor ?? null,
+        def.anchorWarning ? 1 : null,
+        def.reporting ? JSON.stringify(def.reporting) : null,
+      );
+    return 'created';
   }
 
   get(id: string): BotRoutine | undefined {
@@ -303,6 +397,9 @@ export class RoutineStore {
       timeoutMs?: number | null;
       autoRetry?: boolean;
       usePreviousRunSummary?: boolean;
+      anchor?: 'local' | 'cloud' | null;
+      anchorWarning?: boolean;
+      reporting?: BotRoutine['reporting'] | null;
     },
   ): BotRoutine | undefined {
     const cur = this.get(id);
@@ -336,9 +433,12 @@ export class RoutineStore {
     if (patch.timeoutMs !== undefined) next.timeoutMs = patch.timeoutMs && patch.timeoutMs > 0 ? Math.floor(patch.timeoutMs) : undefined;
     if (patch.autoRetry !== undefined) next.autoRetry = patch.autoRetry;
     if (patch.usePreviousRunSummary !== undefined) next.usePreviousRunSummary = patch.usePreviousRunSummary;
+    if (patch.anchor !== undefined) next.anchor = patch.anchor ?? undefined;
+    if (patch.anchorWarning !== undefined) next.anchorWarning = patch.anchorWarning === true ? true : undefined;
+    if (patch.reporting !== undefined) next.reporting = patch.reporting ?? undefined;
     this.db
       .prepare(
-        'UPDATE bot_routines SET name = ?, bot_id = ?, prompt_template = ?, session_id = ?, schedule = ?, last_fired_at = ?, goal_mode = ?, enabled = ?, timeout_ms = ?, auto_retry = ?, use_prev_summary = ? WHERE id = ?',
+        'UPDATE bot_routines SET name = ?, bot_id = ?, prompt_template = ?, session_id = ?, schedule = ?, last_fired_at = ?, goal_mode = ?, enabled = ?, timeout_ms = ?, auto_retry = ?, use_prev_summary = ?, anchor = ?, anchor_warning = ?, reporting = ? WHERE id = ?',
       )
       .run(
         next.name,
@@ -352,6 +452,9 @@ export class RoutineStore {
         next.timeoutMs ?? null,
         next.autoRetry === undefined ? null : next.autoRetry ? 1 : 0,
         next.usePreviousRunSummary === undefined ? null : next.usePreviousRunSummary ? 1 : 0,
+        next.anchor ?? null,
+        next.anchorWarning ? 1 : null,
+        next.reporting ? JSON.stringify(next.reporting) : null,
         id,
       );
     return this.get(id);
@@ -492,6 +595,17 @@ export interface RoutineRouteDeps {
     userId: string;
     botId: string;
   }) => string | null;
+  /**
+   * Anchor resolver (front-door Part 5, placement.ts): the host wires
+   * resolveRoutineAnchor with its placement store + cloud-connected
+   * signal. When set, create/update resolve anchor + anchorWarning;
+   * an explicit body anchor always wins inside the resolver.
+   */
+  resolveAnchor?: (args: {
+    schedule: RoutineSchedule | null;
+    botId: string;
+    explicitAnchor?: 'local' | 'cloud';
+  }) => { anchor: 'local' | 'cloud'; anchorWarning: boolean };
 }
 
 function errorBody(message: string, detail?: string): Record<string, unknown> {
@@ -611,15 +725,26 @@ export function registerRoutineRoutes(
       return;
     }
     try {
+      const scheduleInput =
+        body.schedule === null || body.schedule === undefined ? null : (body.schedule as RoutineSchedule);
+      const explicitAnchor =
+        (body as { anchor?: unknown }).anchor === 'cloud' || (body as { anchor?: unknown }).anchor === 'local'
+          ? ((body as { anchor: 'local' | 'cloud' }).anchor)
+          : undefined;
+      const resolved = deps.resolveAnchor
+        ? deps.resolveAnchor({ schedule: scheduleInput, botId, explicitAnchor })
+        : explicitAnchor
+          ? { anchor: explicitAnchor, anchorWarning: false }
+          : undefined;
       const routine = routineStore.create({
         name: typeof body.name === 'string' ? body.name : '',
         botId,
         promptTemplate: typeof body.promptTemplate === 'string' ? body.promptTemplate : '',
         sessionId: typeof body.sessionId === 'string' && body.sessionId ? body.sessionId : undefined,
-        schedule:
-          body.schedule === null || body.schedule === undefined
-            ? null
-            : (body.schedule as RoutineSchedule),
+        schedule: scheduleInput,
+        anchor: resolved?.anchor,
+        anchorWarning: resolved?.anchorWarning,
+        reporting: validateReporting((body as { reporting?: unknown }).reporting),
         goalMode: body.goalMode === true,
         timeoutMs: typeof (body as {timeoutMs?: unknown}).timeoutMs === 'number' ? (body as {timeoutMs: number}).timeoutMs : undefined,
         autoRetry: typeof (body as {autoRetry?: unknown}).autoRetry === 'boolean' ? (body as {autoRetry: boolean}).autoRetry : undefined,
@@ -673,10 +798,42 @@ export function registerRoutineRoutes(
       return;
     }
     try {
+      const explicitAnchorPatch =
+        (body as { anchor?: unknown }).anchor === 'cloud' || (body as { anchor?: unknown }).anchor === 'local'
+          ? ((body as { anchor: 'local' | 'cloud' }).anchor)
+          : undefined;
+      // Re-resolve when the schedule, bot or anchor changes; explicit wins.
+      // `anchor: null` in the body is the client's "Automatic" — it must
+      // also trigger re-resolution, or a previously explicit anchor could
+      // never be returned to automatic.
+      const shouldResolve =
+        deps.resolveAnchor &&
+        (body.schedule !== undefined ||
+          body.botId !== undefined ||
+          explicitAnchorPatch !== undefined ||
+          (body as { anchor?: unknown }).anchor === null);
+      const resolvedPatch = shouldResolve
+        ? deps.resolveAnchor!({
+            schedule:
+              body.schedule === null
+                ? null
+                : body.schedule === undefined
+                  ? (routine.schedule ?? null)
+                  : (body.schedule as RoutineSchedule),
+            botId: typeof body.botId === 'string' ? body.botId : routine.botId,
+            explicitAnchor: explicitAnchorPatch,
+          })
+        : undefined;
       const updated = routineStore.update(routine.id, {
         name: typeof body.name === 'string' ? body.name : undefined,
         botId: typeof body.botId === 'string' ? body.botId : undefined,
         promptTemplate: typeof body.promptTemplate === 'string' ? body.promptTemplate : undefined,
+        anchor: resolvedPatch?.anchor ?? explicitAnchorPatch,
+        anchorWarning: resolvedPatch?.anchorWarning,
+        reporting:
+          (body as { reporting?: unknown }).reporting === undefined
+            ? undefined
+            : validateReporting((body as { reporting?: unknown }).reporting) ?? null,
         sessionId:
           body.sessionId === null
             ? null

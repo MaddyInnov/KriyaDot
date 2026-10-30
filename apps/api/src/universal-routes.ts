@@ -77,7 +77,10 @@ import {
   type TokenUsage,
 } from '@mvp/agent-runtime';
 import { FusionRunStore } from './fusion.js';
-import { resolvePrincipal, type PrincipalContext } from './principal.js';
+import { resolvePrincipal, type Principal, type PrincipalContext } from './principal.js';
+import { resolveSyncServicePrincipal } from './sync-hub.js';
+import { readSyncTarget, type SyncTarget } from './sync-client.js';
+import { instanceRole, type InstanceRole, type PlacementStore } from './placement.js';
 import {
   UniversalChatStore,
   decideUniversalRoute,
@@ -110,6 +113,21 @@ export interface UniversalRoutesDeps {
   fusionStore?: FusionRunStore;
   /** Injectable planner/fusion LLM (tests). Default: bot provider with keyless fallback. */
   callLlm?: UniversalLlmCaller;
+  /**
+   * Placement store (front-door Part 5). When wired, a bot whose
+   * placement is 'cloud-only' is refused on a non-cloud instance (the
+   * web proxies the turn to the instance instead; the API refuses to
+   * execute it locally). Unset → no placement gate (previous behavior).
+   */
+  placementStore?: Pick<PlacementStore, 'isCloudOnly'>;
+  /** This server's role for the executor gate. Default: env-derived. */
+  instanceRole?: InstanceRole;
+  /** Sync target for per-task cloud placement. Default: <dataDir>/sync-target.json. */
+  getSyncTarget?: () => SyncTarget | null;
+  /** Injectable fetch for the cloud proxy (tests stub the instance). */
+  fetchFn?: (url: string, init?: Record<string, unknown>) => Promise<Awaited<ReturnType<typeof fetch>>>;
+  /** Resolve a sync link-token bearer to the owner (proxied turns). Default: sync-hub helper. */
+  resolveServicePrincipal?: (authorizationHeader: string | undefined) => { userId: string } | null;
 }
 
 function errorBody(message: string): Record<string, unknown> {
@@ -227,13 +245,26 @@ export function createUniversalRouter(deps: UniversalRoutesDeps): Router {
     });
   });
 
-  router.post('/chat', async (req: Request, res: Response) => {
-    const principal = resolvePrincipal(req, pctx);
+  const handleChat = async (req: Request, res: Response) => {
+    // Auth: a verified principal, OR the sync link token as a service
+    // credential for proxied turns (front-door Part 5) — the token maps
+    // to the instance owner it was minted for, never to an asserted id.
+    let principal: Principal | null = resolvePrincipal(req, pctx);
+    let serviceAuthed = false;
+    if (!principal) {
+      const svc = (deps.resolveServicePrincipal ?? ((h: string | undefined) => resolveSyncServicePrincipal(deps.dataDir, h)))(
+        req.headers.authorization,
+      );
+      if (svc) {
+        principal = { kind: 'sso-session', userId: svc.userId, assertedProfile: false };
+        serviceAuthed = true;
+      }
+    }
     if (!principal) {
       res.status(401).json(errorBody('unauthenticated: a verified credential is required'));
       return;
     }
-    const body = (req.body ?? {}) as { message?: unknown; fileIds?: unknown };
+    const body = (req.body ?? {}) as { message?: unknown; fileIds?: unknown; placement?: unknown };
     if (typeof body.message !== 'string' || !body.message.trim()) {
       res.status(400).json(errorBody('message is required'));
       return;
@@ -258,6 +289,22 @@ export function createUniversalRouter(deps: UniversalRoutesDeps): Router {
     const bots = deps.getBots();
     const sessionId = ensureSession(principal.userId, anchor);
 
+    // ---- Per-task cloud placement (front-door Part 5) ----
+    // placement:'cloud' executes the turn on the user's cloud instance:
+    // the same payload is proxied to the instance's universal endpoint
+    // with the sync link token as the service credential, its SSE stream
+    // is piped back verbatim, and the exchange is mirrored into the local
+    // universal thread with a "(cloud)" attribution.
+    if (body.placement === 'cloud') {
+      const target = (deps.getSyncTarget ?? (() => readSyncTarget(deps.dataDir)))();
+      if (!target) {
+        res.status(409).json(errorBody('cloud-not-connected'));
+        return;
+      }
+      await proxyCloudTurn({ deps, store, target, message, fileIds, sessionId, anchor, res, userId: principal.userId });
+      return;
+    }
+
     // ---- Route (deterministic, rules-only — see universal.ts) ----
     let decision: UniversalRouteDecision;
     try {
@@ -272,6 +319,22 @@ export function createUniversalRouter(deps: UniversalRoutesDeps): Router {
         confidence: 0,
         via: 'default',
       };
+    }
+
+    // Executor gate (front-door Part 5): a cloud-only bot never executes
+    // on a non-cloud instance. Service-authed (proxied) turns are exempt
+    // here — they ARE the cloud execution path arriving at the instance.
+    if (
+      !serviceAuthed &&
+      deps.placementStore?.isCloudOnly(decision.botId) &&
+      (deps.instanceRole ?? instanceRole()) !== 'cloud'
+    ) {
+      res.status(409).json({
+        ok: false,
+        error: 'cloud-only-bot',
+        message: `${decision.botName} is cloud-only — it runs on your cloud instance, not on this device.`,
+      });
+      return;
     }
 
     // Attribution record (powers the session endpoint + Pro inspector).
@@ -416,9 +479,119 @@ export function createUniversalRouter(deps: UniversalRoutesDeps): Router {
         }
       }
     }
-  });
+  };
+
+  router.post('/chat', handleChat);
+  // Alias used by the sync proxy (front-door contract names this path).
+  router.post('/message', handleChat);
 
   return router;
+}
+
+/**
+ * Per-task cloud placement proxy: POST the same payload to the instance's
+ * universal endpoint with the sync link token, stream its SSE back
+ * through, and mirror the exchange into the local universal thread.
+ */
+async function proxyCloudTurn(args: {
+  deps: UniversalRoutesDeps;
+  store: UniversalChatStore;
+  target: SyncTarget;
+  message: string;
+  fileIds: string[];
+  sessionId: string;
+  anchor: BotConfig;
+  res: Response;
+  userId: string;
+}): Promise<void> {
+  const { deps, store, target, message, fileIds, sessionId, anchor, res, userId } = args;
+  const fetchFn = deps.fetchFn ?? ((url: string, init?: Record<string, unknown>) => fetch(url, init as RequestInit));
+  let upstream: Awaited<ReturnType<typeof fetch>>;
+  try {
+    upstream = await fetchFn(`${target.instanceUrl.replace(/\/+$/, '')}/api/universal/message`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${target.linkToken}` },
+      body: JSON.stringify({ message, ...(fileIds.length > 0 ? { fileIds } : {}) }),
+    });
+  } catch (err) {
+    res.status(502).json(errorBody(`cloud instance unreachable: ${err instanceof Error ? err.message : String(err)}`));
+    return;
+  }
+  if (!upstream.ok || !upstream.body) {
+    let detail = '';
+    try {
+      const parsed = (await upstream.json()) as { error?: unknown };
+      detail = typeof parsed.error === 'string' ? parsed.error : '';
+    } catch { /* non-JSON error body */ }
+    res.status(upstream.status >= 400 && upstream.status < 600 ? upstream.status : 502).json(
+      errorBody(detail || `cloud instance returned HTTP ${upstream.status}`),
+    );
+    return;
+  }
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders();
+  let reply = '';
+  let buffer = '';
+  const capture = (chunkText: string): void => {
+    buffer += chunkText;
+    let idx: number;
+    while ((idx = buffer.indexOf('\n\n')) >= 0) {
+      const frame = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      if (!frame.startsWith('data: ')) continue;
+      try {
+        const parsed = JSON.parse(frame.slice('data: '.length)) as { type?: string; content?: string };
+        if (parsed.type === 'token' && typeof parsed.content === 'string') reply += parsed.content;
+      } catch { /* passthrough frames are forwarded verbatim regardless */ }
+    }
+  };
+  try {
+    const reader = (upstream.body as unknown as { getReader: () => { read: () => Promise<{ done: boolean; value?: Uint8Array }> } }).getReader();
+    const decoder = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        const text = decoder.decode(value, { stream: true });
+        capture(text);
+        if (!res.writableEnded) res.write(text);
+      }
+    }
+  } catch (err) {
+    if (!res.writableEnded) {
+      try {
+        res.write(`data: ${JSON.stringify({ type: 'error', message: err instanceof Error ? err.message : String(err) })}\n\n`);
+      } catch { /* socket gone */ }
+    }
+  } finally {
+    // Mirror the exchange into the local universal thread (specialist-path
+    // style: user message first, then the assistant reply), attributed
+    // as a cloud execution.
+    try {
+      deps.agentRuntime.sessionStore.appendMessage(sessionId, { role: 'user', content: message });
+      if (reply.trim()) {
+        deps.agentRuntime.sessionStore.appendMessage(sessionId, { role: 'assistant', content: reply });
+      }
+      store.recordAttribution({
+        sessionId,
+        userId,
+        path: 'direct',
+        botId: anchor.id,
+        botName: `${anchor.name} (cloud)`,
+        reason: 'per-task cloud placement — executed on your cloud instance',
+        confidence: 1,
+        via: 'cloud',
+      });
+    } catch { /* mirroring is bookkeeping; the stream already delivered */ }
+    if (!res.writableEnded) {
+      try { res.end(); } catch { /* socket gone */ }
+    }
+  }
 }
 
 /**

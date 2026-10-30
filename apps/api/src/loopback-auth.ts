@@ -153,6 +153,23 @@ export const LOOPBACK_AUTH_EXEMPT_PATHS: string[] = [
   // envelope verified by the federation service. Local federation admin
   // routes (/api/federation/identity, /invites, /peers…) stay gated.
   '/api/federation/inbound',
+  // Front-door handoff exchange (Part 3): the browser arriving from the
+  // website cannot hold the loopback token; the exchange's own auth is
+  // the Ed25519-signed, single-use, <=120s handoff token verified by
+  // handoff.ts. (The /handoff page itself is a non-/api path, exempt
+  // like every static asset, and /api/frontdoor/* stays gated.)
+  '/api/handoff',
+  // Sync hub (Part 4): remote devices/instances authenticate with the
+  // sync link token (hash-compared in sync-routes.ts); local control
+  // endpoints in the same router require a verified principal, which the
+  // handler enforces itself via principal.ts.
+  '/api/sync',
+  // Universal Chat: the router enforces principal auth on every route
+  // itself, and (Part 5) additionally accepts the sync link token as a
+  // service credential for proxied turns from the owner's other device —
+  // a credential class the loopback middleware cannot know. Unauthenticated
+  // requests still 401 inside the router.
+  '/api/universal',
   // WebSocket upgrade paths (see comment above — in-protocol auth applies):
   '/api/phone/ws',
   '/api/companion/ws',

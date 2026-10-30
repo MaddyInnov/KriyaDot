@@ -1,0 +1,172 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* KriyaDot frontdoor app shell — jewel palette, glass/clay, light + dark. */
+
+:root {
+  --sapphire: #2563eb;
+  --emerald: #059669;
+  --ruby: #e11d48;
+  --amber: #d97706;
+  --violet: #7c3aed;
+  --ink: #17141f;
+  --ink-soft: #4c465e;
+  --bg: #f4f1fb;
+  --card: rgba(255, 255, 255, 0.72);
+  --card-border: rgba(23, 20, 31, 0.08);
+  --shadow: 0 18px 40px rgba(80, 60, 160, 0.14), inset 0 1px 0 rgba(255, 255, 255, 0.7);
+  --jewel-gradient: linear-gradient(120deg, var(--sapphire), var(--violet), var(--ruby));
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #f0edfa;
+    --ink-soft: #b3aac9;
+    --bg: #12101c;
+    --card: rgba(38, 33, 58, 0.72);
+    --card-border: rgba(240, 237, 250, 0.1);
+    --shadow: 0 18px 40px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: "Avenir Next", "Segoe UI", system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  line-height: 1.55;
+}
+
+a { color: var(--sapphire); }
+
+.fd-nav {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.8rem 1.25rem;
+  background: var(--card);
+  border-bottom: 1px solid var(--card-border);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+.fd-brand {
+  font-weight: 700;
+  font-size: 1.1rem;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.fd-jewel {
+  background: var(--jewel-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.fd-nav nav { display: flex; gap: 1rem; flex-wrap: wrap; }
+.fd-nav nav a { color: var(--ink-soft); text-decoration: none; font-size: 0.95rem; }
+.fd-nav nav a:hover { color: var(--ink); }
+
+.fd-main {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 1.5rem 1.25rem 3rem;
+}
+
+.fd-card {
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 22px;
+  box-shadow: var(--shadow);
+  padding: 1.4rem 1.6rem;
+  margin: 1.1rem 0;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+.fd-btn {
+  display: inline-block;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  color: #fff;
+  background: var(--jewel-gradient);
+  padding: 0.55rem 1.15rem;
+  border-radius: 999px;
+  text-decoration: none;
+  box-shadow: 0 8px 20px rgba(124, 58, 237, 0.3);
+}
+
+.fd-btn:hover { filter: brightness(1.07); }
+
+.fd-btn-big { font-size: 1.08rem; padding: 0.8rem 1.6rem; }
+
+.fd-btn-ghost {
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid var(--card-border);
+  box-shadow: none;
+}
+
+.fd-muted { color: var(--ink-soft); }
+
+.fd-code {
+  font-size: 1.35rem;
+  letter-spacing: 0.18em;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.fd-profile { display: flex; align-items: center; gap: 1rem; }
+
+.fd-avatar {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.fd-avatar-fallback {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--jewel-gradient);
+  color: #fff;
+  font-size: 1.3rem;
+}
+
+.fd-launcher {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.fd-actions { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+
+.fd-status {
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0.12rem 0.55rem;
+  border-radius: 999px;
+  vertical-align: middle;
+}
+
+.fd-status-online { background: rgba(5, 150, 105, 0.18); color: var(--emerald); }
+.fd-status-offline { background: rgba(225, 29, 72, 0.15); color: var(--ruby); }
+.fd-status-unknown { background: rgba(217, 119, 6, 0.18); color: var(--amber); }
+
+.fd-steps li { margin: 0.7rem 0; }
+
+@media (max-width: 560px) {
+  .fd-launcher { flex-direction: column; align-items: stretch; }
+  .fd-nav { flex-direction: column; align-items: flex-start; }
+}

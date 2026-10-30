@@ -96,6 +96,20 @@ import { createFusionRouter, shutdownFusionRuns } from './fusion-routes.js';
 import { FusionRunStore } from './fusion.js';
 import { createUniversalRouter } from './universal-routes.js';
 import { UniversalChatStore } from './universal.js';
+import { createFrontdoorRouter, handoffPageHandler } from './handoff.js';
+import { SyncHubStore } from './sync-hub.js';
+import {
+  PlacementStore,
+  ReportingService,
+  createPlacementRouter,
+  hasActiveRunForBot,
+  instanceRole,
+  resolveRoutineAnchor,
+  shouldExecuteForRole,
+} from './placement.js';
+import { createSyncRouter } from './sync-routes.js';
+import { SyncClientEngine, readSyncTarget } from './sync-client.js';
+import { createSyncApply } from './sync-apply.js';
 import { createEvalRouter, shutdownEvalRuns } from './eval-routes.js';
 import { EvalRunStore, EvalSuiteStore } from './evals.js';
 import { createSummarizer } from './summarizer.js';
@@ -1326,6 +1340,28 @@ async function boot(): Promise<void> {
   // the management API and the webhook ingress (shared SQLite). The routers
   // are mounted on `app` in the HTTP section below.
   const routinesRouter = express.Router();
+  // Front-door (Parts 3–5): placement store, sync hub store, and the
+  // reporting service are created here — before the routine routes (the
+  // anchor resolver reads placement) and the scheduler (the executor
+  // gate + reporting hooks read them). The reporting notifier is a holder
+  // filled once the PushService exists, exactly like notifyRoutinePaused.
+  const frontdoorRole = instanceRole();
+  const placementStore = new PlacementStore(config.dataDir);
+  const syncHubStore = new SyncHubStore(config.dataDir);
+  const reportingPushHolder: { svc?: import('./push.js').PushService } = {};
+  const reportingService = new ReportingService(config.dataDir, {
+    syncStore: syncHubStore,
+    notify: (notice) =>
+      reportingPushHolder.svc
+        ? reportingPushHolder.svc.notify({
+            kind: notice.kind,
+            botId: notice.botId,
+            botName: notice.botName,
+            title: notice.title,
+            body: notice.body,
+          })
+        : Promise.resolve({ attempted: 0, sent: 0 }),
+  });
   const routineHookStore = new RoutineHookStore(config.dataDir);
   // Routine run lifecycle (OpenMausBot parity P0 #7): every routine fire
   // leaves a run record in routine-runs.db. The executor is shared by the
@@ -1384,6 +1420,17 @@ async function boot(): Promise<void> {
       runStore: routineRunStore,
       resumeStore: limitResetResumeStore,
       eventStore: routineEventStore,
+      // Anchor resolution (Part 5): time-based schedules default to the
+      // cloud when one is connected. The operative "cloud connected"
+      // signal is a configured sync target (a deployed, paired instance);
+      // manual/webhook-only routines follow their bot's placement side.
+      resolveAnchor: ({ schedule, botId, explicitAnchor }) =>
+        resolveRoutineAnchor({
+          schedule,
+          explicitAnchor,
+          botPlacement: placementStore.getBot(botId).placement,
+          cloudConnected: readSyncTarget(config.dataDir) !== null,
+        }),
     },
   );
   const routineWebhookRouter = createRoutineWebhookRouter({
@@ -1704,6 +1751,44 @@ async function boot(): Promise<void> {
     getBots: () => seed.bots,
     renderPrompt: renderRoutinePrompt,
     onScheduleAutoPaused: (routine, streak) => notifyRoutinePaused?.(routine, streak),
+    // Executor gate (Part 5): this server fires a routine only when its
+    // anchor matches this server's role ('cloud' instance vs local).
+    shouldExecute: (routine) => shouldExecuteForRole(routine.anchor, frontdoorRole),
+    // Reporting (Part 5): settled runs go through the ReportingService —
+    // sync activity record + instant notice via the same PushService
+    // holder pattern as notifyRoutinePaused, quiet hours respected.
+    onRunReported: (info) => {
+      void reportingService
+        .reportRun({ routine: info.routine, ok: info.ok, error: info.error, at: info.at })
+        .catch(() => {});
+    },
+    // Per-tick reporting upkeep: flush notices deferred by quiet hours,
+    // and on the cloud role compose the once-a-day digest of anchored
+    // automation runs (stored as sync activity + a local record).
+    onSchedulerTick: (now) => {
+      void reportingService.flushPending(now).catch(() => {});
+      if (frontdoorRole === 'cloud') {
+        try {
+          // The digest summarizes a COMPLETED day: compose yesterday's
+          // digest (once — the service dedupes by date) from its runs.
+          const dayStart = new Date(now);
+          dayStart.setHours(0, 0, 0, 0);
+          const yStart = dayStart.getTime() - 24 * 60 * 60 * 1000;
+          const date = new Date(yStart).toISOString().slice(0, 10);
+          const runs: Array<{ routineId: string; routineName: string; status: string; error?: string | null }> = [];
+          for (const r of routineStore.list()) {
+            for (const run of routineRunStore.listByRoutine(r.id, 50)) {
+              if (run.createdAt >= yStart && run.createdAt < dayStart.getTime() && run.status !== 'queued' && run.status !== 'running') {
+                runs.push({ routineId: r.id, routineName: r.name, status: run.status, error: run.error });
+              }
+            }
+          }
+          reportingService.maybeCreateDailyDigest({ date, runs, now });
+        } catch {
+          // Digest composition must never break the scheduler tick.
+        }
+      }
+    },
     isPaused,
     // Idle triggers (Octomind parity): last message activity per bot
     // from the runtime's session store.
@@ -2143,6 +2228,7 @@ async function boot(): Promise<void> {
     },
   });
   notificationPushHolder.svc = pushService;
+  reportingPushHolder.svc = pushService;
   peerCardPush = (card) => {
     void pushService
       .notifyApprovalNeeded(
@@ -2384,6 +2470,9 @@ async function boot(): Promise<void> {
         }
       },
       companion: { store: companionStore, hub: companionHub },
+      // Cloud-only gate (Part 5): per-bot chat refuses locally when the
+      // bot's placement is cloud-only and this is not the cloud instance.
+      isCloudOnlyBot: (botId) => frontdoorRole !== 'cloud' && placementStore.isCloudOnly(botId),
       // Per-boot loopback token: the companion /chat/send proxy presents it
       // on its inner call to /api/chat (the proxy itself is device-authed).
       loopbackToken,
@@ -3291,8 +3380,127 @@ async function boot(): Promise<void> {
       loopbackToken,
       store: new UniversalChatStore(config.dataDir),
       fusionStore,
+      // Front-door Part 5: cloud-only gate + per-task cloud proxying.
+      placementStore,
+      instanceRole: frontdoorRole,
     }),
   );
+
+  // Front door (Parts 3–5): handoff exchange + frontdoor link, the sync
+  // hub + client engine, and placement. The /handoff page lives at the
+  // app root (the front door redirects to <instanceUrl>/handoff#t=…);
+  // /api/handoff and /api/sync are loopback-exempt because their own
+  // credentials (signed handoff token / sync link token / principal) are
+  // enforced inside the routers.
+  app.get('/handoff', handoffPageHandler);
+  app.use('/api', createFrontdoorRouter({ dataDir: config.dataDir, loopbackToken }));
+  // Apply-on-receive (front-door Parts 4+5): definitions that arrive via
+  // sync become live on this server only where it is their executor —
+  // cloud-anchored routines import into the scheduler, pushed bots join
+  // the roster; echoes of own definitions are ignored.
+  const syncApply = createSyncApply({
+    dataDir: config.dataDir,
+    store: syncHubStore,
+    routineStore,
+    bots: seed.bots,
+    role: frontdoorRole,
+  });
+  const syncClientEngine = new SyncClientEngine({
+    dataDir: config.dataDir,
+    store: syncHubStore,
+    sessionStore: agentRuntime.sessionStore,
+    getBots: () => seed.bots,
+    placementStore,
+    getRoutines: () => routineStore.list(),
+    origin: frontdoorRole === 'cloud' ? 'cloud' : 'local',
+    applyPulled: (items) => {
+      syncApply.applyPull(items);
+    },
+  });
+  // Daily digest (Part 5): on the cloud role, once per day, compose the
+  // digest of the day's settled automation runs as sync activity (kind
+  // 'daily-digest') so it reaches every surface. Checked shortly after
+  // boot and on a slow timer; maybeCreateDailyDigest no-ops when the
+  // digest already exists for today or nothing ran.
+  if (frontdoorRole === 'cloud') {
+    const runDailyDigestCheck = (): void => {
+      try {
+        const now = new Date();
+        const pad = (n: number): string => String(n).padStart(2, '0');
+        const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+        const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+        const runs: Array<{ routineId: string; routineName: string; status: string; error?: string | null }> = [];
+        for (const r of routineStore.list()) {
+          for (const run of routineRunStore.listByRoutine(r.id, 100)) {
+            const at = run.endedAt ?? run.startedAt ?? 0;
+            if (at >= dayStart && run.status !== 'queued' && run.status !== 'running') {
+              runs.push({ routineId: run.routineId, routineName: run.routineName, status: run.status, error: run.error });
+            }
+          }
+        }
+        reportingService.maybeCreateDailyDigest({ date: today, runs });
+      } catch {
+        /* the digest is best-effort */
+      }
+    };
+    setTimeout(runDailyDigestCheck, 20_000).unref?.();
+    setInterval(runDailyDigestCheck, 60_000).unref?.();
+  }
+  app.use(
+    '/api',
+    createSyncRouter({
+      dataDir: config.dataDir,
+      store: syncHubStore,
+      engine: syncClientEngine,
+      loopbackToken,
+      applyPush: (payload) => {
+        syncApply.applyPush(payload);
+      },
+      getLocalSessions: () => {
+        const out = new Map<string, { sessionId: string; botId: string; messageCount: number; lastMessageTs: string | null }>();
+        for (const s of agentRuntime.sessionStore.listSessions({ limit: 200 })) {
+          out.set(s.id, { sessionId: s.id, botId: s.botId, messageCount: s.messageCount, lastMessageTs: s.lastMessageTs });
+        }
+        return [...out.values()];
+      },
+    }),
+  );
+  app.use(
+    '/api',
+    createPlacementRouter({
+      dataDir: config.dataDir,
+      store: placementStore,
+      loopbackToken,
+      getBots: () => seed.bots,
+      getRoutinesForBot: (botId) => routineStore.list().filter((r) => r.botId === botId),
+      hasActiveRunForBot: (botId) =>
+        hasActiveRunForBot({
+          routines: routineStore.list(),
+          listRunsByRoutine: (id, limit) => routineRunStore.listByRoutine(id, limit),
+          botId,
+        }),
+      isSyncConfigured: () => readSyncTarget(config.dataDir) !== null,
+      pushPlacement: async ({ botId, bot, placement, executorHere, routines }) => {
+        await syncClientEngine.pushPayloadNow({
+          bots: [
+            {
+              botId,
+              config: (bot ?? { id: botId }) as Record<string, unknown>,
+              placement,
+              executorHere,
+            },
+          ],
+          routines: routines.map((r) => ({
+            routineId: r.id,
+            def: r as unknown as Record<string, unknown>,
+            ...(r.anchor ? { anchor: r.anchor } : {}),
+          })),
+        });
+      },
+      role: frontdoorRole,
+    }),
+  );
+  syncClientEngine.start();
 
   app.use('/api/routines', routinesRouter);
   app.use('/webhooks/routines', routineWebhookRouter);

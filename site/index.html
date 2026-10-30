@@ -4,32 +4,47 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>KriyaDot — universal intelligence · all-in-one AI agent platform</title>
-<meta name="description" content="KriyaDot is the open-source, all-in-one AI agent platform: chat with 3D companion pets, bot teams, visual workflows, live code sessions, approvals, notes, computer use, Android companion apps, and 180+ models behind one key.">
+<title>KriyaDot — your own AI agent team, on your machine and your cloud</title>
+<meta name="description" content="KriyaDot is the open-source, local-first AI agent platform: a team of governed specialist bots in one Universal Chat, running on your machine and in your own cloud — never on our servers.">
 <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+<script>
+  // Theme bootstrap (runs before first paint): a saved choice wins,
+  // otherwise follow the OS. Kept inline so there is no flash of the
+  // wrong theme; the toggle in site.js persists changes to localStorage.
+  (function () {
+    var t = null;
+    try { t = window.localStorage.getItem('kriyadot-theme'); } catch (e) { /* private mode */ }
+    if (t !== 'light' && t !== 'dark') {
+      t = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    document.documentElement.setAttribute('data-theme', t);
+  })();
+</script>
 <link rel="stylesheet" href="styles.css">
-<!-- three.js is vendored locally (assets/vendor/) so the 3D hero works offline and on GitHub Pages. -->
 </head>
 <body>
-<canvas id="pet-canvas" aria-label="Animated 3D KriyaDot companion pet" role="img"></canvas>
 <a class="skip" href="#main">Skip to content</a>
 
 <!-- ============ NAV ============ -->
 <header class="nav" id="top">
   <div class="nav-inner">
     <a class="brand" href="#top" aria-label="KriyaDot home">
-      <img class="brand-logo" src="assets/logo.svg" alt="KriyaDot bot logo">
+      <img class="brand-logo" src="assets/logo.svg" alt="" width="34" height="34">
       <span class="brand-name">KriyaDot</span>
     </a>
     <nav class="nav-links" aria-label="Sections">
-      <a href="#product">Product</a>
-      <a href="#screenshots">Screenshots</a>
+      <a href="#how-it-works">How it works</a>
+      <a href="#universal-chat">Universal Chat</a>
+      <a href="#platform">Platform</a>
+      <a href="#governance">Governance</a>
       <a href="#downloads">Downloads</a>
-      <a href="#first-run">First run</a>
-      <a href="#docs">Docs</a>
+      <a href="#pricing">Pricing</a>
       <a href="#faq">FAQ</a>
-      <a href="#blog">Blog</a>
     </nav>
+    <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Switch colour theme" aria-pressed="false">
+      <span class="theme-icon theme-icon-sun" aria-hidden="true">☀️</span>
+      <span class="theme-icon theme-icon-moon" aria-hidden="true">🌙</span>
+    </button>
     <a class="btn btn-github" href="https://github.com/MaddyInnov/KriyaDot" target="_blank" rel="noopener">
       <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
       <span class="star-count" data-stars>Star</span>
@@ -39,238 +54,265 @@
 </header>
 
 <main id="main">
-<!-- ============ HERO ============ -->
+<!-- ============ 1. HERO ============ -->
 <section class="hero" id="hero">
   <div class="hero-glow" aria-hidden="true"></div>
-  <div class="hero-copy">
-    <p class="kicker">Open-source · Apache-2.0 · local-first ready</p>
-    <h1>KriyaDot <span class="grad">— universal intelligence</span></h1>
-    <p class="lede">One platform for every AI agent you run. Chat with 3D companion pets, field bot teams, draw n8n-style workflows, watch agents write code live, gate every tool call with approvals — with 180+ models behind a single key.</p>
-    <div class="cta-row">
-      <a class="btn btn-primary" href="#downloads">Download KriyaDot</a>
-      <a class="btn btn-ghost" href="https://github.com/MaddyInnov/KriyaDot" target="_blank" rel="noopener">View on GitHub</a>
+  <div class="wrap hero-inner">
+    <div class="hero-copy">
+      <p class="kicker">Open source · Apache-2.0 · Local-first</p>
+      <h1>Your own AI agent team — <span class="grad">on your machine, in your cloud.</span></h1>
+      <p class="lede">KriyaDot gives you a team of specialist AI bots in one chat: local-first, governed by approvals and hard safety fences, and multi-bot by design. Run it on your own computer, deploy it to your own cloud — it never runs on our servers.</p>
+      <div class="cta-row">
+        <a class="btn btn-primary" id="cta-primary" href="auth/google">Create your workspace</a>
+        <a class="btn btn-ghost" href="#downloads">Download the app</a>
+      </div>
+      <p class="hero-note" id="cta-note">Sign in with Google and your workspace is created in your own cloud account. Prefer fully local? The desktop app needs no account at all.</p>
     </div>
-    <p class="pronounce">Pronounced <strong>SAR-vik</strong> — from Sanskrit <em>Sarva</em> (all) + IQ.</p>
+    <figure class="hero-shot">
+      <img class="shot-light" src="assets/screenshots/universal-light-active-chip.png" width="1440" height="1000" alt="KriyaDot Universal Chat in the light theme: a bot roster on the left, and an answer from the Scout bot carrying a routing chip that names the bot that handled the message">
+      <img class="shot-dark" src="assets/screenshots/universal-midnight-active-chip.png" width="1440" height="1000" alt="KriyaDot Universal Chat in the midnight theme: a bot roster on the left, and an answer from the Scout bot carrying a routing chip that names the bot that handled the message" loading="lazy">
+      <figcaption>Universal Chat, captured from the real app — note the <strong>✦ Scout</strong> chip on the answer: you always see which bot handled your message.</figcaption>
+    </figure>
   </div>
-  <div class="scroll-hint" aria-hidden="true">↓</div>
 </section>
 
-<!-- ============ STATS ============ -->
-<section class="stats" aria-label="KriyaDot at a glance">
-  <div class="stat"><strong data-stars-num>–</strong><span>GitHub stars</span></div>
-  <div class="stat"><strong>180+</strong><span>models, one key</span></div>
-  <div class="stat"><strong>6</strong><span>3D companion pets</span></div>
-  <div class="stat"><strong>5</strong><span>hand-crafted themes</span></div>
-  <div class="stat"><strong>BYOK</strong><span>+ local models</span></div>
-</section>
-
-<!-- ============ PRODUCT / FEATURES ============ -->
-<section class="section" id="product">
+<!-- ============ 2. HOW IT WORKS ============ -->
+<section class="section" id="how-it-works">
   <div class="wrap">
-    <p class="kicker">Product</p>
-    <h2>Everything agents do, in one calm place</h2>
-    <p class="section-lede">Six destinations. Zero tab-switching. Every feature is wired into the others — bots run workflows, workflows request approvals, notes feed your briefing.</p>
+    <p class="kicker">How it works</p>
+    <h2>Three steps to a workspace that is yours</h2>
+    <p class="section-lede">No servers of ours in the middle. You bring the accounts; KriyaDot brings the team.</p>
+    <ol class="steps">
+      <li>
+        <h3>Sign in with Google</h3>
+        <p>One sign-in creates your KriyaDot account. This website remembers just two things: who you are, and the address of your workspace — so any device can find its way back to it.</p>
+      </li>
+      <li>
+        <h3>Connect your Lightning account</h3>
+        <p>Lightning AI is where your cloud workspace will live. It uses the same Google login, so connecting is a single tap — no new password, no keys to copy around.</p>
+      </li>
+      <li>
+        <h3>Your workspace deploys to <em>your</em> cloud</h3>
+        <p>KriyaDot deploys into your Lightning account and your bots run there — on your cloud, under your account, billed (if at all) by Lightning to you. Not on our servers, ever.</p>
+      </li>
+    </ol>
+    <div class="note-card">
+      <h3>The honest free-tier note</h3>
+      <p>Lightning's free tier genuinely works with KriyaDot: your workspace stays reachable and self-healing — it sleeps when idle and wakes when you visit. If you want it uninterrupted and always on, that comes with your own Lightning plan, paid by you directly to Lightning. We would rather tell you that up front than surprise you later.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 3. UNIVERSAL CHAT ============ -->
+<section class="section section-alt" id="universal-chat">
+  <div class="wrap">
+    <p class="kicker">Universal Chat</p>
+    <h2>One chat. No bot picking.</h2>
+    <p class="section-lede">You used to have to choose which bot to talk to before you could ask anything. Universal Chat removes that step: just ask. KriyaDot works out — openly, in the same thread — how each message should be handled.</p>
+    <div class="grid routes-grid">
+      <article class="card route-card">
+        <h3>Direct answer</h3>
+        <div class="route-flow" aria-hidden="true">
+          <span class="flow-node">You ask</span><span class="flow-arrow">→</span><span class="flow-node flow-answer">Answer</span>
+        </div>
+        <p>Everyday questions are answered straight away in the thread. No ceremony, no detours.</p>
+      </article>
+      <article class="card route-card">
+        <h3>Specialist routing</h3>
+        <div class="route-flow" aria-hidden="true">
+          <span class="flow-node">You ask</span><span class="flow-arrow">→</span><span class="flow-node flow-chip">✦ Handled by Coder</span><span class="flow-arrow">→</span><span class="flow-node flow-answer">Answer</span>
+        </div>
+        <p>When a message clearly belongs to a specialist — code to Coder, research to Scout, data to Data Analyst — it is routed there, and a chip on the answer tells you exactly who handled it.</p>
+      </article>
+      <article class="card route-card">
+        <h3>Task splitting</h3>
+        <div class="route-flow" aria-hidden="true">
+          <span class="flow-node">Big ask</span><span class="flow-arrow">→</span><span class="flow-node flow-split">Split into sub-tasks</span><span class="flow-arrow">→</span><span class="flow-node flow-answer">One answer</span>
+        </div>
+        <p>A multi-part request is split into sub-tasks that run in parallel, then fused into a single synthesized answer — one reply, not five fragments.</p>
+      </article>
+    </div>
+    <figure class="section-shot">
+      <img class="shot-light" src="assets/screenshots/universal-light-empty-hero.png" width="1440" height="1000" alt="Universal Chat's empty state in the light theme: a single composer that reads 'Ask anything — routed automatically', with the bot roster beside it" loading="lazy">
+      <img class="shot-dark" src="assets/screenshots/universal-dark-empty-hero.png" width="1440" height="1000" alt="Universal Chat's empty state in the dark theme: a single composer that reads 'Ask anything — routed automatically', with the bot roster beside it" loading="lazy">
+      <figcaption>The whole interface is one composer: “Ask anything — routed automatically.”</figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- ============ 4. PLATFORM BREADTH ============ -->
+<section class="section" id="platform">
+  <div class="wrap">
+    <p class="kicker">Platform</p>
+    <h2>A team, a workflow engine, and a marketplace — one platform</h2>
+    <p class="section-lede">Universal Chat is the front room. Behind it sits a full agent platform, and every part shares the same bots, memory, and governance.</p>
     <div class="grid">
-      <article class="card"><div class="icon">💬</div><h3>Chat with 3D pets</h3><p>Six interactive WebGL companions — KriyaDot, Ocky, Nubi, Plip, Bolt, Wisp — react to your conversation: thinking, working, happy, sleeping. Click one; it bounces.</p></article>
-      <article class="card"><div class="icon">🤖</div><h3>Bot teams</h3><p>Specialist bots (Coder, Scout, Reviewer…) with per-bot governance policies, team import/export, delegation with peer approval, and shared workspaces.</p></article>
-      <article class="card"><div class="icon">🔀</div><h3>Visual workflows</h3><p>n8n-style canvas with if/set/code nodes. Import n8n JSON directly — unmapped nodes are reported, never silently dropped.</p></article>
-      <article class="card"><div class="icon">⌨️</div><h3>Live code sessions</h3><p>Watch agents write code as it happens — animated diffs stream in line by line, green additions, red removals, per-file bot badges.</p></article>
-      <article class="card"><div class="icon">🛡️</div><h3>Approvals &amp; governance</h3><p>Deny-by-default tool registry, inline approval cards, full audit trail, encrypted credential vault, policy simulator.</p></article>
-      <article class="card"><div class="icon">🗒️</div><h3>Notes &amp; databases</h3><p>Notion-style notes with table and kanban views. Notion ZIP/HTML import. Notes attach to bot context and feed your morning briefing.</p></article>
-      <article class="card"><div class="icon">🖥️</div><h3>Computer use</h3><p>Per-bot live screen view — watch the agent drive, click and type yourself, or teach it by recording your own actions into reusable workflows.</p></article>
-      <article class="card"><div class="icon">📱</div><h3>Android companion</h3><p>Two apps: Companion (drive your PC from your phone) and Phone Agent (drive your phone from your PC). Pair in seconds with a QR code.</p></article>
-      <article class="card"><div class="icon">🧠</div><h3>180+ models, one key</h3><p>OpenRouter-style routing across frontier models plus local Ollama and BYO-CLI engines (Claude Code, Codex, Grok…). Cost-aware fast router included.</p></article>
-      <article class="card"><div class="icon">🎨</div><h3>5 themes</h3><p>Light, dark, midnight, porcelain, ocean — claymorphism + glassmorphism, subtle 135° gradients, Simple and Pro modes, reduced-motion respected.</p></article>
+      <article class="card"><div class="icon" aria-hidden="true">🤖</div><h3>A bot team, led by a Chief of Staff</h3><p>Specialist bots — Coder, Scout, Data Analyst, Copywriter, Code Reviewer and more — each with its own persona, workspace, and tool policy. A Chief of Staff coordinates the team and keeps the whole picture in view.</p></article>
+      <article class="card"><div class="icon" aria-hidden="true">🔀</div><h3>Visual workflow engine</h3><p>Draw automations on a canvas, run them on schedules or triggers, and let bots call workflows — and workflows call bots — as steps in a larger job.</p></article>
+      <article class="card"><div class="icon" aria-hidden="true">🧩</div><h3>Marketplace of bots &amp; skills</h3><p>Install ready-made bots, skills, and workflows from the marketplace, or package your own and share them with your team.</p></article>
+      <article class="card"><div class="icon" aria-hidden="true">🌐</div><h3>Federation between instances</h3><p>Separate KriyaDot instances — yours, a teammate's, another machine's — can discover each other and delegate work across the boundary, each still governed by its own policies.</p></article>
+      <article class="card phone-card"><div class="icon" aria-hidden="true">📱</div><h3>Android phone companion</h3><p>Carry your team in your pocket: chat with your bots, approve or deny pending actions, and check on running work from your phone.</p><img class="phone-shot" src="assets/screenshots/universal-ocean-mobile-hero.png" width="780" height="1688" alt="KriyaDot Universal Chat on an Android phone in the ocean theme, showing the same routed chat in a mobile layout" loading="lazy"></article>
+      <article class="card"><div class="icon" aria-hidden="true">⌨️</div><h3>Live code sessions &amp; computer use</h3><p>Watch agents write code as animated diffs, and let bots drive a real desktop under the same approval rules — you can watch, step in, or teach by demonstration.</p></article>
     </div>
-  </div>
-</section>
-
-<!-- ============ WATCH IT WRITE CODE ============ -->
-<section class="section section-alt" id="live-code">
-  <div class="wrap">
-    <p class="kicker">Live code sessions</p>
-    <h2>Watch it write code</h2>
-    <p class="section-lede">This is a live re-creation of KriyaDot's code session view — the agent's edits stream in as animated diffs while it works.</p>
-    <div class="demo-window glass">
-      <div class="demo-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="demo-title">Live code session · greet.ts · <em>KriyaDot</em></span></div>
-      <pre class="demo-code" id="demo-code" aria-label="Animated code writing demo"></pre>
-    </div>
-  </div>
-</section>
-
-<!-- ============ SCREENSHOTS ============ -->
-<section class="section" id="screenshots">
-  <div class="wrap">
-    <p class="kicker">Screenshots</p>
-    <h2>The real app, unretouched</h2>
-    <p class="section-lede">Captured live from the current build — midnight theme, real bots, real workflows.</p>
     <div class="shots">
-      <figure class="shot"><img src="assets/screenshots/shot-chat.png" alt="KriyaDot chat with the 3D KriyaDot pet and bot roster" loading="lazy"><figcaption>Chat — 3D companion pet &amp; bot roster</figcaption></figure>
-      <figure class="shot"><img src="assets/screenshots/shot-code-session.png" alt="Live code session view with animated diff" loading="lazy"><figcaption>Live code session — animated diffs</figcaption></figure>
-      <figure class="shot"><img src="assets/screenshots/shot-workflows.png" alt="Workflow definitions with n8n import" loading="lazy"><figcaption>Workflows — n8n import/export</figcaption></figure>
-      <figure class="shot"><img src="assets/screenshots/shot-bots.png" alt="Bot governance policies and personas" loading="lazy"><figcaption>Bots — per-bot governance</figcaption></figure>
-      <figure class="shot"><img src="assets/screenshots/shot-marketplace.png" alt="Marketplace of bots and workflows" loading="lazy"><figcaption>Marketplace</figcaption></figure>
-      <figure class="shot"><img src="assets/screenshots/shot-workspace.png" alt="Workspace notes and databases" loading="lazy"><figcaption>Workspace — notes &amp; databases</figcaption></figure>
-      <figure class="shot"><img src="assets/screenshots/shot-activity.png" alt="Activity feed of agent runs" loading="lazy"><figcaption>Activity — run history</figcaption></figure>
+      <figure class="shot"><img src="assets/screenshots/shot-bots.png" alt="The Bots screen: specialist bots with their governance policies and personas" loading="lazy"><figcaption>Bots — per-bot governance &amp; personas</figcaption></figure>
+      <figure class="shot"><img src="assets/screenshots/shot-workflows.png" alt="The Workflows screen listing visual workflow definitions" loading="lazy"><figcaption>Workflows — visual automation</figcaption></figure>
+      <figure class="shot"><img src="assets/screenshots/shot-marketplace.png" alt="The Marketplace screen with installable bots and workflows" loading="lazy"><figcaption>Marketplace — bots &amp; skills</figcaption></figure>
+      <figure class="shot"><img src="assets/screenshots/shot-workspace.png" alt="The Workspace screen with notes and databases" loading="lazy"><figcaption>Workspace — notes &amp; databases</figcaption></figure>
+      <figure class="shot"><img src="assets/screenshots/shot-code-session.png" alt="A live code session with an animated diff streaming in" loading="lazy"><figcaption>Live code session — animated diffs</figcaption></figure>
+      <figure class="shot"><img src="assets/screenshots/shot-activity.png" alt="The Activity screen: a feed of agent runs and approvals" loading="lazy"><figcaption>Activity — run history &amp; audit</figcaption></figure>
     </div>
   </div>
 </section>
 
-<!-- ============ DOWNLOADS ============ -->
+<!-- ============ 5. GOVERNANCE & SAFETY ============ -->
+<section class="section section-alt" id="governance">
+  <div class="wrap">
+    <p class="kicker">Governance &amp; safety</p>
+    <h2>Real authority, behind real fences</h2>
+    <p class="section-lede">An agent that can actually do things — run code, move files, call tools — is only useful if its power is fenced in by design, not by hope. KriyaDot's fences are structural:</p>
+    <div class="grid">
+      <article class="card"><div class="icon" aria-hidden="true">✋</div><h3>Approvals before consequences</h3><p>Consequential actions pause for your explicit approval — in chat, or from your phone. Nothing sensitive runs silently in the background.</p></article>
+      <article class="card"><div class="icon" aria-hidden="true">⛔</div><h3>Hard denials, not warnings</h3><p>Catastrophic commands are denied outright by policy. They don't get a “are you sure?” dialog — they don't run.</p></article>
+      <article class="card"><div class="icon" aria-hidden="true">📦</div><h3>Sandboxed by default</h3><p>Execution happens inside a sandbox with per-bot tool policies: each bot can only touch the tools, files, and folders its policy allows.</p></article>
+      <article class="card"><div class="icon" aria-hidden="true">🪪</div><h3>Verified identity</h3><p>Your workspace knows who is asking. Sign-in identity is verified end to end — a request that merely <em>claims</em> to be you is not treated as you.</p></article>
+      <article class="card"><div class="icon" aria-hidden="true">🧾</div><h3>A full audit trail</h3><p>Every routing decision, tool call, approval, and denial is logged. If a bot did it, you can see it, when it happened, and under whose approval.</p></article>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 6. YOUR CLOUD, YOUR DATA ============ -->
+<section class="section" id="your-cloud">
+  <div class="wrap">
+    <p class="kicker">Your cloud, your data</p>
+    <h2>This website is a front door — nothing more</h2>
+    <p class="section-lede">The architecture is deliberately boring, because boring is what keeps your workspace yours:</p>
+    <div class="arch" role="img" aria-label="Architecture diagram: this website only introduces you and launches your workspace. After that, your browser talks directly to your own KriyaDot instance in your cloud or on your machine.">
+      <div class="arch-box">
+        <h3>🌐 This website</h3>
+        <p>The front door. It introduces KriyaDot, signs you in, and launches your workspace. It never carries your chat traffic and never runs your bots.</p>
+      </div>
+      <div class="arch-arrow" aria-hidden="true">→<span>launches</span></div>
+      <div class="arch-box">
+        <h3>💻 Your browser</h3>
+        <p>After launch, your browser talks <strong>directly</strong> to your instance. There is no KriyaDot server relaying your conversations.</p>
+      </div>
+      <div class="arch-arrow" aria-hidden="true">→<span>direct</span></div>
+      <div class="arch-box arch-box-own">
+        <h3>🏠 Your instance</h3>
+        <p>Your KriyaDot workspace — in your Lightning cloud, or on your own machine. Your bots, your data, your rules.</p>
+      </div>
+    </div>
+    <div class="note-card">
+      <h3>Site down ≠ workspace down</h3>
+      <p>If this website ever goes offline, existing workspaces keep working exactly as before — you lose only the sign-in launcher. Bookmark your instance's address and you never need this site to reach your team.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 7. DOWNLOADS ============ -->
 <section class="section section-alt" id="downloads">
   <div class="wrap">
     <p class="kicker">Downloads</p>
-    <h2>Get KriyaDot</h2>
-    <p class="section-lede">Free and open-source (Apache-2.0). Pick your platform — every build is the full KriyaDot: chat, bots, workflows, code sessions, approvals, computer use.</p>
+    <h2>Get KriyaDot v0.1.0-alpha</h2>
+    <p class="section-lede">Free and open source (Apache-2.0). The current release ships desktop builds for Windows, macOS, and Linux, plus the Android companion. Every build is the full platform — chat, bots, workflows, governance, marketplace.</p>
     <div class="dl-grid">
       <article class="card dl-card">
-        <div class="icon">🪟</div>
+        <div class="icon" aria-hidden="true">🪟</div>
         <h3>Windows</h3>
-        <p><strong>KriyaDot Setup.exe</strong> — Windows 10/11, 64-bit. Double-click, install, launch.</p>
-        <p class="dl-note">First time? <a href="#first-run">Follow the Windows first-run guide</a>.</p>
-        <a class="btn btn-primary" href="https://github.com/MaddyInnov/KriyaDot/releases/download/v0.1.0-alpha/KriyaDot_0.1.0_x64-setup.exe">Download .exe</a>
-        <p class="dl-note">Prefer browsing? <a href="https://github.com/MaddyInnov/KriyaDot/releases" target="_blank" rel="noopener">All files on GitHub Releases</a>.</p>
+        <p>Desktop installer for Windows 10/11 (64-bit). Download, install, launch — no account needed for fully local use.</p>
+        <a class="btn btn-primary" href="https://github.com/MaddyInnov/KriyaDot/releases" target="_blank" rel="noopener">Get it from Releases</a>
       </article>
       <article class="card dl-card">
-        <div class="icon">🐧</div>
+        <div class="icon" aria-hidden="true">🍎</div>
+        <h3>macOS</h3>
+        <p>Desktop build for Mac. Grab the current release from GitHub and drag KriyaDot into your Applications folder.</p>
+        <a class="btn btn-primary" href="https://github.com/MaddyInnov/KriyaDot/releases" target="_blank" rel="noopener">Get it from Releases</a>
+      </article>
+      <article class="card dl-card">
+        <div class="icon" aria-hidden="true">🐧</div>
         <h3>Linux</h3>
-        <p><strong>KriyaDot .deb</strong> — Debian/Ubuntu (also ships as AppImage). <code>sudo dpkg -i</code> and you're in.</p>
-        <p class="dl-note">First time? <a href="#first-run">Follow the Linux first-run guide</a>.</p>
-        <a class="btn btn-primary" href="https://github.com/MaddyInnov/KriyaDot/releases/download/v0.1.0-alpha/KriyaDot_0.1.0_amd64.deb">Download .deb</a>
-        <a class="btn btn-ghost" href="https://github.com/MaddyInnov/KriyaDot/releases/download/v0.1.0-alpha/KriyaDot_0.1.0_amd64.AppImage">AppImage (portable)</a>
-        <p class="dl-note">Prefer browsing? <a href="https://github.com/MaddyInnov/KriyaDot/releases" target="_blank" rel="noopener">All files on GitHub Releases</a>.</p>
+        <p>Debian/Ubuntu package, plus a portable AppImage that runs without installing anything.</p>
+        <a class="btn btn-primary" href="https://github.com/MaddyInnov/KriyaDot/releases" target="_blank" rel="noopener">Get it from Releases</a>
       </article>
       <article class="card dl-card">
-        <div class="icon">📱</div>
+        <div class="icon" aria-hidden="true">📱</div>
         <h3>Android</h3>
-        <p><strong>Which one do I need?</strong> Want to <em>control your PC from your phone</em>? → <strong>Companion</strong>. Want your <em>PC to drive your phone</em>? → <strong>Phone Agent</strong>. Most people start with Companion.</p>
-        <div class="dl-apks">
-          <a class="btn btn-primary" href="https://github.com/MaddyInnov/KriyaDot/releases/download/v0.1.0-alpha/kriyadot-companion.apk">Companion APK</a>
-          <a class="btn btn-primary" href="https://github.com/MaddyInnov/KriyaDot/releases/download/v0.1.0-alpha/kriyadot-phone-agent.apk">Phone Agent APK</a>
-        </div>
-        <p class="dl-note">Android 8+. When installing, allow “Install unknown apps” for your browser — these are direct APKs, not from the Play Store. v0.1.0-alpha.</p>
+        <p>The companion app: chat with your team and clear approvals from your phone. Direct APK from the releases page.</p>
+        <a class="btn btn-primary" href="https://github.com/MaddyInnov/KriyaDot/releases" target="_blank" rel="noopener">Get it from Releases</a>
       </article>
     </div>
-    <p class="dl-note dl-macos">On macOS? The signed .dmg build is coming — meanwhile run from source (<code>npm install</code> in <code>apps/api</code> and <code>apps/web</code>) or watch the <a href="https://github.com/MaddyInnov/KriyaDot/releases" target="_blank" rel="noopener">releases page</a>.</p>
+    <p class="dl-note">Building from source instead? The full repository — code, docs, and issues — lives at <a href="https://github.com/MaddyInnov/KriyaDot" target="_blank" rel="noopener">github.com/MaddyInnov/KriyaDot</a>.</p>
   </div>
 </section>
 
-<!-- ============ FIRST RUN ============ -->
-<section class="section" id="first-run">
+<!-- ============ 8. PRICING ============ -->
+<section class="section" id="pricing">
   <div class="wrap">
-    <p class="kicker">First run</p>
-    <h2>New to KriyaDot? Start here</h2>
-    <p class="section-lede">Install the desktop app, connect any AI provider (Groq, OpenAI, OpenRouter, Anthropic, Ollama…), and have your first agentic conversation in under five minutes. No account, no subscription.</p>
-    <div class="grid first-run-grid">
-      <article class="card">
-        <div class="icon">🪟</div>
-        <h3>Windows (.exe) — first run</h3>
-        <ol class="mini-steps">
-          <li><strong>Install.</strong> Double-click <code>KriyaDot_0.1.0_x64-setup.exe</code> and follow the wizard. If SmartScreen says “unknown publisher”, click <em>More info → Run anyway</em> (alpha builds aren’t code-signed yet).</li>
-          <li><strong>Launch.</strong> Open <em>KriyaDot</em> from the Start menu. You’ll land in <strong>Chat</strong> — the sidebar holds the six destinations: Chat, Bots, Workflows, Marketplace, Workspace, Activity.</li>
-          <li><strong>Add your AI key (BYOK).</strong> Open <strong>Accounts &amp; API keys</strong> (settings) and add any provider you like — <strong>Groq</strong> (free tier at <a href="https://console.groq.com" target="_blank" rel="noopener">console.groq.com</a>), <strong>OpenAI</strong>, <strong>OpenRouter</strong>, <strong>Anthropic</strong>, <strong>OpenCode Zen</strong> — or point KriyaDot at <strong>Ollama</strong> running locally. Keys stay on your machine; they only go to the provider you chose.</li>
-          <li><strong>Say hello.</strong> Type in Chat and pick a bot (try Scout). When the bot wants to run a tool, an <strong>approval card</strong> appears — approve or deny inline. Nothing runs without your say-so.</li>
-          <li><strong>Make it yours.</strong> In <strong>Preferences</strong>: five themes, Simple/Pro modes, English + Hindi UI, and your 3D companion pet.</li>
-        </ol>
+    <p class="kicker">Pricing</p>
+    <h2>Free locally. Your cloud is billed by your cloud.</h2>
+    <p class="section-lede">There is no KriyaDot subscription hiding in this page. Here is every cost, and who it goes to:</p>
+    <div class="dl-grid pricing-grid">
+      <article class="card price-card">
+        <h3>💻 Local use</h3>
+        <p class="price-big">Free</p>
+        <p>KriyaDot is open source under the <strong>Apache-2.0</strong> license. Download it, run it on your machine, modify it, ship with it — no fees, no license keys, no expiry.</p>
       </article>
-      <article class="card">
-        <div class="icon">🐧</div>
-        <h3>Linux (.deb / AppImage) — first run</h3>
-        <ol class="mini-steps">
-          <li><strong>Install the .deb.</strong> <code>sudo dpkg -i KriyaDot_0.1.0_amd64.deb</code> — or double-click it and open with Software Install. If it asks for missing packages, run <code>sudo apt-get install -f</code>.</li>
-          <li><strong>…or go portable.</strong> Prefer no install? <code>chmod +x KriyaDot_0.1.0_amd64.AppImage &amp;&amp; ./KriyaDot_0.1.0_amd64.AppImage</code> — runs from anywhere, leaves your system untouched. Needs the system WebKitGTK: <code>sudo apt install libwebkit2gtk-4.1-0</code> on Debian/Ubuntu, <code>sudo dnf install webkit2gtk4.1</code> on Fedora.</li>
-          <li><strong>Launch.</strong> Find <em>KriyaDot</em> in your app menu. First screen is <strong>Chat</strong>; the sidebar holds the six destinations: Chat, Bots, Workflows, Marketplace, Workspace, Activity.</li>
-          <li><strong>Add your AI key (BYOK).</strong> Open <strong>Accounts &amp; API keys</strong> (settings) and add any provider — <strong>Groq</strong> (free tier), <strong>OpenAI</strong>, <strong>OpenRouter</strong>, <strong>Anthropic</strong>, <strong>OpenCode Zen</strong>, or local <strong>Ollama</strong>. Keys stay on your machine.</li>
-          <li><strong>Say hello, then make it yours.</strong> Chat with a bot (approval cards gate every tool call), then pick your theme, mode, language and 3D pet in <strong>Preferences</strong>.</li>
-        </ol>
+      <article class="card price-card">
+        <h3>☁️ Cloud workspace</h3>
+        <p class="price-big">Your Lightning plan</p>
+        <p>Your cloud workspace runs in <strong>your own Lightning AI account</strong>, on one of Lightning's own tiers:</p>
+        <ul class="tier-list">
+          <li>Free</li>
+          <li>Pro</li>
+          <li>Teams</li>
+          <li>Enterprise</li>
+        </ul>
+        <p>You pay Lightning directly, at Lightning's prices — we never mark it up and never see your bill.</p>
+        <a class="btn btn-ghost" href="https://lightning.ai/pricing" target="_blank" rel="noopener">See Lightning's pricing</a>
       </article>
     </div>
-    <p class="dl-note">Want the full tour first? <a href="https://github.com/MaddyInnov/KriyaDot/releases/download/v0.1.0-alpha/kriyadot-video-guide.mp4" target="_blank" rel="noopener">Watch the 9-minute video guide</a> — it walks through chat, pets, bots, workflows, code sessions and the Android apps.</p>
+    <p class="dl-note">Platform note: KriyaDot charges no subscription today. If platform tiers are ever introduced, they will be announced openly before anything changes — existing local use stays free and open source regardless.</p>
   </div>
 </section>
 
-<!-- ============ FAQ ============ -->
-<section class="section" id="faq">
+<!-- ============ 9. FAQ ============ -->
+<section class="section section-alt" id="faq">
   <div class="wrap">
     <p class="kicker">FAQ</p>
-    <h2>No confusion, promise</h2>
+    <h2>Straight answers</h2>
     <div class="grid faq-grid">
-      <article class="card"><h3>Is KriyaDot free?</h3><p>Yes. The apps are free and open-source (Apache-2.0). You only ever pay your own AI provider for model usage — and you can dodge that entirely with free local models via Ollama.</p></article>
-      <article class="card"><h3>Do I need API keys?</h3><p>Only if you want cloud models. Paste a key once under Accounts &amp; API keys (Groq has a generous free tier; OpenRouter and OpenAI-compatible endpoints work too). Prefer zero keys? Point KriyaDot at local Ollama or a BYO-CLI engine instead.</p></article>
-      <article class="card"><h3>Which download do I need?</h3><p><strong>Windows PC</strong> → the .exe. <strong>Linux PC</strong> → the .deb. <strong>Control your PC from your phone</strong> → Companion APK. <strong>Automate your phone from your PC</strong> → Phone Agent APK. Start with desktop + Companion.</p></article>
-      <article class="card"><h3>Is my data private?</h3><p>KriyaDot is local-first: your keys, chats, and files live on your machine. Keys are only ever sent to the model provider you chose — never to us. Approvals gate every sensitive tool call.</p></article>
-      <article class="card"><h3>What does “alpha” mean?</h3><p>v0.1.0-alpha is an early build: the full feature set is there, but expect rough edges. Back up anything important, and report bugs on GitHub — every report shapes the beta.</p></article>
-      <article class="card"><h3>Where do I start after installing?</h3><p>Open the <a href="#docs">user guide</a> above: install → add a key (or Ollama) → create your first bot → run the Morning briefing workflow → pair your phone. Five minutes, end to end.</p></article>
-    </div>
-  </div>
-</section>
-
-<!-- ============ DOCS ============ -->
-<section class="section" id="docs">
-  <div class="wrap">
-    <p class="kicker">Docs</p>
-    <h2>User guide</h2>
-    <p class="section-lede">From zero to your first autonomous run in five steps.</p>
-    <ol class="steps">
-      <li><h3>Install</h3><p>Grab the desktop app for your OS from <a href="https://github.com/MaddyInnov/KriyaDot/releases" target="_blank" rel="noopener">GitHub Releases</a>, or run the web console + API from source with <code>npm install</code> in <code>apps/api</code> and <code>apps/web</code>.</p></li>
-      <li><h3>Add a provider key (BYOK)</h3><p>Open <strong>Accounts &amp; API keys</strong> and paste your key — Groq, OpenRouter, or any OpenAI-compatible endpoint. Prefer local? Point KriyaDot at Ollama or a BYO-CLI engine instead. No key ever leaves your machine except to the provider you chose.</p></li>
-      <li><h3>Create your first bot</h3><p>In <strong>Bots</strong>, pick a specialist (Coder, Scout, Reviewer…) or craft your own with a persona and per-bot tool policy. Chat with it in <strong>Chat</strong> — tool calls that need a human pause for an inline approval card.</p></li>
-      <li><h3>Run a workflow</h3><p>Open <strong>Workflows</strong>, run a built-in flow (try <em>Morning briefing</em>), or import your n8n JSON — common nodes map automatically. Bots can trigger workflows from chat, and workflows can call a bot turn as a node.</p></li>
-      <li><h3>Pair the Android app</h3><p>On desktop, open the companion panel to show the pairing QR code; scan it in the Android app. On your LAN it pairs directly; with <code>KRIYADOT_PUBLIC_URL</code> set, it pairs over HTTPS from anywhere.</p></li>
-      <li><h3>Make it yours</h3><p><strong>Preferences</strong> holds five themes (light, dark, midnight, porcelain, ocean), Simple/Pro modes, English + Hindi UI, voice notes, and your pet picker — six 3D companions to choose from.</p></li>
-    </ol>
-  </div>
-</section>
-
-<!-- ============ BLOG ============ -->
-<section class="section section-alt" id="blog">
-  <div class="wrap">
-    <p class="kicker">Blog &amp; vlog</p>
-    <h2>Learn the KriyaDot way</h2>
-    <div class="grid blog-grid">
-      <article class="card">
-        <div class="icon">🎬</div>
-        <h3>Video guide (9 min)</h3>
-        <p>A narrated walkthrough of the whole platform — chat, pets, bots, workflows, code sessions, and the Android apps.</p>
-        <a class="btn btn-ghost" href="https://github.com/MaddyInnov/KriyaDot/releases/download/v0.1.0-alpha/kriyadot-video-guide.mp4" target="_blank" rel="noopener">Watch the guide</a>
-      </article>
-      <article class="card">
-        <div class="icon">✍️</div>
-        <h3>Why one platform for agents</h3>
-        <p>Chatbots, workflow tools, note apps, and device controllers each solve a slice. KriyaDot's bet: the slices are the same agent wearing different hats — so they should share memory, approvals, and context.</p>
-      </article>
-      <article class="card">
-        <div class="icon">🎥</div>
-        <h3>Teach KriyaDot by recording your screen</h3>
-        <p>Show the agent how you do a repetitive task once — KriyaDot records the clicks, keystrokes, and decisions, then compiles them into a reusable workflow you can schedule, share, or hand to a bot.</p>
-      </article>
+      <article class="card"><h3>Where does my data live?</h3><p>On your machine and in your own cloud instance — your chats, files, keys, and bot workspaces stay there. This website stores only your account record and your instance addresses, so it can launch you back into your workspace. It never stores chat content.</p></article>
+      <article class="card"><h3>What happens if this site goes down?</h3><p>Your workspace keeps working. Existing instances run independently of this website; you lose only the sign-in launcher. A bookmarked instance address (or the desktop app) gets you straight back in.</p></article>
+      <article class="card"><h3>Do I need an API key?</h3><p>No. KriyaDot ships with a built-in keyless free lane, so you can chat and try the platform with zero setup. Adding a free key from a model provider is an optional upgrade for higher limits and more models — your keys stay in your instance's vault.</p></article>
+      <article class="card"><h3>Can I self-host, or skip this website entirely?</h3><p>Yes. The desktop app is fully local-first: install it, and everything runs on your machine with no account and no website involved. The cloud flow on this page is a convenience, never a requirement.</p></article>
+      <article class="card"><h3>Is KriyaDot open source?</h3><p>Yes — Apache-2.0. Read the code, audit the governance, file issues, or contribute at <a href="https://github.com/MaddyInnov/KriyaDot" target="_blank" rel="noopener">github.com/MaddyInnov/KriyaDot</a>.</p></article>
+      <article class="card"><h3>What does “alpha” mean?</h3><p>v0.1.0-alpha is an early, honest build: the full platform is there, but expect rough edges. Back up anything important, and report what you find on GitHub — reports shape what ships next.</p></article>
     </div>
   </div>
 </section>
 </main>
 
-<!-- ============ FOOTER ============ -->
+<!-- ============ 10. FOOTER ============ -->
 <footer class="footer">
   <div class="wrap footer-inner">
     <div class="footer-brand">
-      <img class="brand-logo" src="assets/logo.svg" alt="KriyaDot bot logo">
-      <strong>KriyaDot</strong>
-      <p>Universal intelligence, open-source.<br>Built with Apache-2.0 love.</p>
+      <span class="footer-brand-row"><img class="brand-logo" src="assets/logo.svg" alt="" width="30" height="30"><strong>KriyaDot</strong></span>
+      <p>Your own AI agent team — local-first, governed, open source.</p>
     </div>
     <nav aria-label="Footer">
       <a href="https://github.com/MaddyInnov/KriyaDot" target="_blank" rel="noopener">GitHub</a>
       <a href="https://github.com/MaddyInnov/KriyaDot/releases" target="_blank" rel="noopener">Releases</a>
-      <a href="#docs">Docs</a>
-      <a href="#faq">FAQ</a>
-      <a href="#blog">Blog</a>
+      <a href="https://github.com/MaddyInnov/KriyaDot/tree/main/docs" target="_blank" rel="noopener">Docs</a>
+      <a href="https://github.com/MaddyInnov/KriyaDot/blob/main/LICENSE" target="_blank" rel="noopener">License (Apache-2.0)</a>
       <a href="#downloads">Downloads</a>
+      <a href="#faq">FAQ</a>
     </nav>
   </div>
-  <p class="fine">© 2026 KriyaDot contributors · Apache-2.0 · “SAR-vik” — Sarva (all) + IQ</p>
+  <p class="fine">© 2026 KriyaDot contributors · Licensed under Apache-2.0</p>
 </footer>
 
 <script src="site.js" defer></script>
-<script type="module" src="hero-pet.js"></script>
 
 <!-- ============ LIGHTBOX ============ -->
 <div class="lightbox" id="lightbox" role="dialog" aria-modal="true" aria-label="Screenshot viewer" hidden>

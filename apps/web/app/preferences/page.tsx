@@ -11,6 +11,7 @@ import { LocalLlmPanel } from '../../components/panels/local-llm-panel';
 import { UpdatesPanel } from '../../components/panels/updates-panel';
 import { AutostartPanel } from '../../components/panels/autostart-panel';
 import { AgentImportPanel } from '../../components/panels/agent-import-panel';
+import { CloudSyncPanel } from '../../components/panels/cloud-sync-panel';
 import { useUxMode } from '../../lib/ux-mode';
 import { authedFetch } from '../../lib/api';
 
@@ -166,6 +167,16 @@ export default function PreferencesPage() {
           Coding-agent CLIs found on this computer's PATH. Bots can use any installed agent as a backend.
         </p>
         <DetectedAgentsPanel />
+      </section>
+
+      <section className="card">
+        <h2>Cloud sync & website</h2>
+        <p className="muted small">
+          Your chats and history sync to <strong>your own</strong> cloud instance — never to a
+          KriyaDot-operated server — so every signed-in device sees one history. Link this
+          instance to your KriyaDot website account so the site can launch your workspace.
+        </p>
+        <CloudSyncPanel />
       </section>
 
       <section className="card">

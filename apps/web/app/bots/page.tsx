@@ -15,6 +15,7 @@ import { RoutinesPanel } from '../../components/panels/routines-panel';
 import TeamsPanel from '../../components/panels/teams-panel';
 import PeoplePanel from '../../components/panels/people-panel';
 import { BotSetupPanel } from '../../components/panels/bot-setup-panel';
+import { BotPlacementPanel } from '../../components/panels/bot-placement-panel';
 import { LayersEditor } from '../../components/bots/layers-editor';
 import type { LayerStage } from '../../lib/octomind-api';
 
@@ -1056,6 +1057,7 @@ function BotsPageInner() {
               </div>
               {activeTab === 'policy' ? (
                 <>
+                  <BotPlacementPanel key={`placement-${selectedBot.id}`} botId={selectedBot.id} botName={selectedBot.name} />
                   <PersonaPicker key={`persona-${selectedBot.id}`} bot={selectedBot} onSaved={onPersonaSaved} />
                   <WorkspacePicker key={`workspace-${selectedBot.id}`} bot={selectedBot} onSaved={onWorkspaceSaved} />
                   <ApprovalModeSelector

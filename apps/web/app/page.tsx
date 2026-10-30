@@ -28,6 +28,7 @@ import {
   saveSlashCommand,
   streamChat,
   streamUniversalChat,
+  UniversalChatError,
   startFusionRun,
   streamFusionRun,
   uploadFile,
@@ -95,6 +96,9 @@ import { TokenCostChip } from '../components/chat/token-cost-chip';
 import { listPeople, type Person } from '../lib/people';
 import { applyUxMode, getStoredUxMode, useUxMode } from '../lib/ux-mode';
 import { RoutingChip } from '../components/chat/routing-chip';
+import { PlacementPill } from '../components/chat/placement-pill';
+import { CloudSessionsPanel } from '../components/chat/cloud-sessions';
+import { getSyncStatus, type TaskPlacement } from '../lib/frontdoor';
 import { THEMES, applyThemeChoice, getStoredThemeChoice } from '../lib/theme';
 import { FinishedSteps, NowCards, StepLine } from '../components/chat/step-line';
 import { applyStepEvent, type StepLineState } from '../components/chat/step-state';
@@ -612,6 +616,11 @@ function ChatPageInner() {
   const [uxMode] = useUxMode();
   const [universalMode, setUniversalMode] = useState(true);
   const [universalSession, setUniversalSession] = useState<UniversalSessionInfo | null>(null);
+  // Per-task placement (Front Door Part 5): the composer pill's value for
+  // the NEXT universal send only — not a global toggle.
+  const [taskPlacement, setTaskPlacement] = useState<TaskPlacement>('local');
+  const taskPlacementRef = useRef<TaskPlacement>('local');
+  const [syncConfigured, setSyncConfigured] = useState(false);
   const universalModeRef = useRef(true);
   const universalSessionRef = useRef<UniversalSessionInfo | null>(null);
   const setUniversalModePersist = useCallback((on: boolean) => {
@@ -882,6 +891,13 @@ function ChatPageInner() {
         if (prefOn && us.sessionId) setBlocks(loadBlocks(us.sessionId));
       } catch {
         // Universal Chat is best-effort — per-bot chat keeps working.
+      }
+      // Sync configuration gates the composer placement pill (best-effort).
+      try {
+        const ss = await getSyncStatus();
+        setSyncConfigured(ss.configured);
+      } catch {
+        setSyncConfigured(false);
       }
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : String(err));
@@ -1790,7 +1806,7 @@ function ChatPageInner() {
     const assistantId = assistantBlock.id;
     setBlocks((prev) => [...prev, userBlock, assistantBlock]);
     try {
-      for await (const event of streamUniversalChat({ message: text, fileIds: files, signal: controller.signal })) {
+      for await (const event of streamUniversalChat({ message: text, fileIds: files, placement: taskPlacementRef.current, signal: controller.signal })) {
         if (turnSeq.current !== seq) break; // superseded by a newer turn
         if (event.type === 'routing') {
           const routing: Omit<UniversalRouting, 'sessionId'> & { subtaskCount?: number } = {
@@ -1838,11 +1854,21 @@ function ChatPageInner() {
     } catch (err) {
       if (turnSeq.current !== seq) return; // superseded; the new turn owns the UI
       const aborted = err instanceof DOMException && err.name === 'AbortError';
+      const cloudConflict =
+        err instanceof UniversalChatError && err.status === 409 && err.code === 'cloud-not-connected';
       setBlocks((prev) => [
         ...prev,
         aborted
           ? { kind: 'interrupted', id: nextId(), text: 'Stopped. Send a new message to continue.' }
-          : { kind: 'error', id: nextId(), text: err instanceof Error ? err.message : String(err) },
+          : {
+              kind: 'error',
+              id: nextId(),
+              text: cloudConflict
+                ? 'Cloud isn\'t connected — this task was set to run in your cloud. Connect your cloud in Settings → Cloud sync & website, or switch the composer pill to "This device" and resend.'
+                : err instanceof Error
+                  ? err.message
+                  : String(err),
+            },
       ]);
     } finally {
       if (turnSeq.current === seq) {
@@ -2768,6 +2794,7 @@ function ChatPageInner() {
           </button>
         ))}
         {bots.length === 0 && <div className="small muted">Loading bots…</div>}
+        <CloudSessionsPanel />
       </aside>
       {sideOpen && <div className="side-scrim" onClick={() => setSideOpen(false)} aria-hidden="true" />}
       <div className="chat-width-handle" role="separator" aria-orientation="vertical" title="Drag to resize the chat column"
@@ -3755,6 +3782,17 @@ function ChatPageInner() {
               onClick={() => setFollowBottom((v) => !v)} title="Follow bottom: keep the view pinned to the newest messages">
               ⬇ Follow{followBottom ? ' on' : ''}
             </button>
+            {universalMode && (
+              <PlacementPill
+                value={taskPlacement}
+                onChange={(v) => {
+                  setTaskPlacement(v);
+                  taskPlacementRef.current = v;
+                }}
+                syncConfigured={syncConfigured}
+                disabled={sending}
+              />
+            )}
             <label className="small" title="Model for the NEXT turn only — after sending, the bot's model applies again">
               Turn model{' '}
               <select className="mp-select" value={turnModel} aria-label="Model for next turn"

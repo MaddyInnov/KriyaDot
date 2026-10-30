@@ -17,18 +17,47 @@ export function getApiBase(): string {
 }
 
 // ---- Auth (bearer bootstrap) --------------------------------------------------
-// Every API call must send `Authorization: Bearer <token>`. The token comes
-// from GET /api/auth/bootstrap (no auth header needed; the server only serves
-// it to allowlisted/absent Origin) and is stored IN MEMORY ONLY — a
-// module-level variable, never localStorage.
+// Every API call must send `Authorization: Bearer <token>`. Normally the
+// token comes from GET /api/auth/bootstrap (no auth header needed; the
+// server only serves it to allowlisted/absent Origin) and is stored IN
+// MEMORY ONLY — a module-level variable, never localStorage.
+//
+// ONE exception (front-door Part 3): when the user arrives on their cloud
+// instance through the website handoff, the instance's /handoff page stores
+// the SSO session token it minted under HANDOFF_SESSION_STORAGE_KEY in
+// localStorage. A stored token takes precedence over bootstrap (a published
+// instance does not hand its owner bootstrap token to remote browsers). If
+// the stored token is rejected (401 — e.g. expired), it is cleared and the
+// call retries once through the normal bootstrap path.
 //
 // All requests funnel through authedFetch() below, which awaits the single
 // shared bootstrap promise so concurrent early calls each wait for the token
 // exactly once. If bootstrap fails, callers surface the blocking
 // "Cannot reach the KriyaDot API" state.
 
+/** localStorage key written by the instance's /handoff page (see apps/api handoff.ts). */
+export const HANDOFF_SESSION_STORAGE_KEY = 'kriyadot:sessionToken';
+
 let authToken: string | null = null;
 let bootstrapPromise: Promise<string> | null = null;
+let tokenFromStorage = false;
+
+function readStoredSessionToken(): string | null {
+  try {
+    const value = globalThis.localStorage?.getItem(HANDOFF_SESSION_STORAGE_KEY);
+    return typeof value === 'string' && value.length > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearStoredSessionToken(): void {
+  try {
+    globalThis.localStorage?.removeItem(HANDOFF_SESSION_STORAGE_KEY);
+  } catch {
+    // Storage unavailable (SSR / privacy mode) — nothing to clear.
+  }
+}
 
 /** The in-memory bootstrap token (null until bootstrap completes). */
 export function getAuthToken(): string | null {
@@ -43,6 +72,12 @@ export function getAuthToken(): string | null {
 export function ensureApiReady(): Promise<string> {
   if (!bootstrapPromise) {
     bootstrapPromise = (async () => {
+      const stored = readStoredSessionToken();
+      if (stored) {
+        authToken = stored;
+        tokenFromStorage = true;
+        return authToken;
+      }
       let res: Response;
       try {
         res = await fetch(`${getApiBase()}/api/auth/bootstrap`);
@@ -69,6 +104,7 @@ export function ensureApiReady(): Promise<string> {
 export function resetApiBootstrap(): void {
   bootstrapPromise = null;
   authToken = null;
+  tokenFromStorage = false;
 }
 
 /** Merge `Authorization: Bearer <token>` into init headers (any HeadersInit shape). */
@@ -86,7 +122,16 @@ function withAuthHeader(init: RequestInit | undefined, token: string): RequestIn
  */
 export async function authedFetch(path: string, init?: RequestInit): Promise<Response> {
   const token = await ensureApiReady();
-  return fetch(`${getApiBase()}${path}`, withAuthHeader(init, token));
+  const res = await fetch(`${getApiBase()}${path}`, withAuthHeader(init, token));
+  if (res.status === 401 && tokenFromStorage) {
+    // Stored handoff session token was rejected (expired/revoked): drop it
+    // and retry exactly once through the normal bootstrap path.
+    clearStoredSessionToken();
+    resetApiBootstrap();
+    const retryToken = await ensureApiReady();
+    return fetch(`${getApiBase()}${path}`, withAuthHeader(init, retryToken));
+  }
+  return res;
 }
 
 // ---- Shared types (mirror the API wire shapes) ----------------------------
@@ -1759,26 +1804,51 @@ export const fetchUniversalSession = (): Promise<UniversalSessionInfo> =>
  * first frame is always the `routing` frame, optionally followed by a
  * `split_plan` frame (split path) and the turn's normal StreamEvents.
  */
+/** Error thrown when the universal-chat POST fails before streaming (e.g. a 409 placement conflict). */
+export class UniversalChatError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly code: string | undefined,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'UniversalChatError';
+  }
+}
+
 export async function* streamUniversalChat(req: {
   message: string;
   fileIds?: string[];
+  /** Per-task execution placement (Front Door Part 5): 'cloud' runs this turn on the user's instance. */
+  placement?: 'local' | 'cloud';
   signal?: AbortSignal;
 }): AsyncGenerator<StreamEvent> {
-  const { signal, message, fileIds } = req;
+  const { signal, message, fileIds, placement } = req;
   const res = await apiFetch('/api/universal/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(fileIds && fileIds.length > 0 ? { message, fileIds } : { message }),
+    body: JSON.stringify({
+      message,
+      ...(fileIds && fileIds.length > 0 ? { fileIds } : {}),
+      ...(placement ? { placement } : {}),
+    }),
     signal,
   });
   if (!res.ok || !res.body) {
     let detail = '';
+    let serverMessage = '';
     try {
-      detail = ((await res.json()) as { error?: string }).error ?? '';
+      const body = (await res.json()) as { error?: string; message?: string };
+      detail = body.error ?? '';
+      serverMessage = body.message ?? '';
     } catch {
       // ignore
     }
-    throw new Error(`Chat failed (${res.status}): ${detail || res.statusText}`);
+    throw new UniversalChatError(
+      res.status,
+      detail || undefined,
+      serverMessage || `Chat failed (${res.status}): ${detail || res.statusText}`,
+    );
   }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
