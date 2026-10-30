@@ -94,6 +94,8 @@ import { createSelfUpdateRouter } from './self-update-routes.js';
 import { IdleAutoUpdater, SelfUpdateManager } from '@mvp/agent-runtime';
 import { createFusionRouter, shutdownFusionRuns } from './fusion-routes.js';
 import { FusionRunStore } from './fusion.js';
+import { createUniversalRouter } from './universal-routes.js';
+import { UniversalChatStore } from './universal.js';
 import { createEvalRouter, shutdownEvalRuns } from './eval-routes.js';
 import { EvalRunStore, EvalSuiteStore } from './evals.js';
 import { createSummarizer } from './summarizer.js';
@@ -3271,6 +3273,24 @@ async function boot(): Promise<void> {
       onBotDeleted: async (botId) => {
         await perBotMcpManager.removeAllForBot(botId);
       },
+    }),
+  );
+
+  // Universal Chat: the bot-less front door. One well-known per-user
+  // thread anchored on the Chief (or first bot); messages route
+  // automatically — direct / specialist / fusion split — through the
+  // shared runtime, so governance is identical to per-bot chat.
+  app.use(
+    '/api/universal',
+    createUniversalRouter({
+      dataDir: config.dataDir,
+      getBots: () => seed.bots,
+      getChiefBotId: () => chiefWiring.store.getChiefConfig().chiefBotId,
+      agentRuntime,
+      audit: (action, fields) => governance.audit(action, fields),
+      loopbackToken,
+      store: new UniversalChatStore(config.dataDir),
+      fusionStore,
     }),
   );
 

@@ -23,9 +23,11 @@ import {
   getSlashCommands,
   markMessageThreadRead,
   replyInMessageThread,
+  fetchUniversalSession,
   resetApiBootstrap,
   saveSlashCommand,
   streamChat,
+  streamUniversalChat,
   startFusionRun,
   streamFusionRun,
   uploadFile,
@@ -62,6 +64,8 @@ import type {
   StreamEvent,
   TokenUsage,
   ToolCall,
+  UniversalRouting,
+  UniversalSessionInfo,
   UploadedFile,
 } from '../lib/api';
 import { COST_ESTIMATE_TOOLTIP, contextMeter, costOfUsage, formatTokens, formatUsd } from '../lib/usage';
@@ -89,7 +93,8 @@ import { MentionMenu, filterMentions, mentionQueryAt, type MentionEntry } from '
 import { AudioBubble, VoiceNoteRecordButton } from '../components/chat/voice-note-composer';
 import { TokenCostChip } from '../components/chat/token-cost-chip';
 import { listPeople, type Person } from '../lib/people';
-import { applyUxMode, getStoredUxMode } from '../lib/ux-mode';
+import { applyUxMode, getStoredUxMode, useUxMode } from '../lib/ux-mode';
+import { RoutingChip } from '../components/chat/routing-chip';
 import { THEMES, applyThemeChoice, getStoredThemeChoice } from '../lib/theme';
 import { FinishedSteps, NowCards, StepLine } from '../components/chat/step-line';
 import { applyStepEvent, type StepLineState } from '../components/chat/step-state';
@@ -120,7 +125,7 @@ import { CodingSessionStrip } from '../components/code/CodingSessionStrip';
 
 type ChatBlock =
   | { kind: 'user'; id: string; text: string; ts: number }
-  | { kind: 'assistant'; id: string; text: string; streaming: boolean; usage?: TokenUsage; costUsd?: number; ts: number; botName?: string; step?: StepLineState; citations?: unknown; finishedSteps?: string[] }
+  | { kind: 'assistant'; id: string; text: string; streaming: boolean; usage?: TokenUsage; costUsd?: number; ts: number; botName?: string; step?: StepLineState; citations?: unknown; finishedSteps?: string[]; routing?: Omit<UniversalRouting, 'sessionId'> & { subtaskCount?: number } }
   /** A `/goal` run started in this chat (W8f) — status polls the goal record. */
   | { kind: 'goal'; id: string; goalId: string; title: string }
   | { kind: 'tool'; id: string; call: ToolCall; result?: unknown; denied?: boolean }
@@ -572,6 +577,15 @@ const SUGGESTIONS = [
   'Review this code for bugs',
 ];
 
+/** Suggestion chips for the Universal Chat empty hero — clicking one sends it. */
+const UNIVERSAL_SUGGESTIONS = [
+  'Research a topic and summarize it',
+  'Draft an email for me',
+  'Explain a concept simply',
+  'Plan my week',
+  'Review this code idea',
+];
+
 function ChatPageInner() {
   const { t, locale } = useI18n();
   const [bots, setBots] = useState<BotConfig[]>([]);
@@ -592,6 +606,23 @@ function ChatPageInner() {
   // Queued messages waiting for the turn boundary (queue-at-boundary mode).
   const [queuedCount, setQueuedCount] = useState(0);
   const [blocks, setBlocks] = useState<ChatBlock[]>([]);
+  // Universal Chat: one "ask anything" session whose turns are routed to
+  // the right bot (or split) server-side. Default ON unless the stored
+  // preference says off ('mvp:universalMode' = '0').
+  const [uxMode] = useUxMode();
+  const [universalMode, setUniversalMode] = useState(true);
+  const [universalSession, setUniversalSession] = useState<UniversalSessionInfo | null>(null);
+  const universalModeRef = useRef(true);
+  const universalSessionRef = useRef<UniversalSessionInfo | null>(null);
+  const setUniversalModePersist = useCallback((on: boolean) => {
+    universalModeRef.current = on;
+    setUniversalMode(on);
+    try {
+      localStorage.setItem('mvp:universalMode', on ? '1' : '0');
+    } catch {
+      // ignore
+    }
+  }, []);
   const [convSheetPeer, setConvSheetPeer] = useState<string | null>(null);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
@@ -833,6 +864,25 @@ function ChatPageInner() {
       setSlashCommands(sc.commands ?? {});
       void listPeople().then(setPeople).catch(() => {});
       if (b.length > 0) setSelectedBotId(b[0].id);
+      // Universal Chat session (best-effort): when universal mode is on,
+      // the chat shows the universal session's stored blocks instead of
+      // the selected bot's conversation.
+      try {
+        const us = await fetchUniversalSession();
+        universalSessionRef.current = us;
+        setUniversalSession(us);
+        let prefOn = true;
+        try {
+          prefOn = localStorage.getItem('mvp:universalMode') !== '0';
+        } catch {
+          // ignore
+        }
+        universalModeRef.current = prefOn;
+        setUniversalMode(prefOn);
+        if (prefOn && us.sessionId) setBlocks(loadBlocks(us.sessionId));
+      } catch {
+        // Universal Chat is best-effort — per-bot chat keeps working.
+      }
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : String(err));
     }
@@ -842,6 +892,17 @@ function ChatPageInner() {
   useEffect(() => {
     void boot();
   }, [boot]);
+
+  // Restore the Universal Chat preference early (default on).
+  useEffect(() => {
+    try {
+      const on = localStorage.getItem('mvp:universalMode') !== '0';
+      universalModeRef.current = on;
+      setUniversalMode(on);
+    } catch {
+      // ignore
+    }
+  }, []);
 
   // Restore run-control prefs.
   useEffect(() => {
@@ -878,6 +939,12 @@ function ChatPageInner() {
     const prov = override?.provider || selectedBot.provider;
     setProviderId(prov);
     setModelId(override?.model || selectedBot.model || '');
+    if (universalModeRef.current) {
+      // Universal Chat owns the transcript right now — don't clobber its
+      // blocks with the selected bot's conversation.
+      closeThread();
+      return;
+    }
     const cid = activeConvoRef.current[selectedBot.id];
     const list = convosRef.current[selectedBot.id] ?? [];
     if (cid && list.some((c) => c.id === cid)) {
@@ -971,14 +1038,64 @@ function ChatPageInner() {
   }, []);
 
   // Persist blocks for the active conversation whenever a turn settles.
+  // Universal mode persists under the universal session id instead.
   useEffect(() => {
     if (sending) return;
+    if (universalModeRef.current) {
+      const sid = universalSessionRef.current?.sessionId;
+      if (sid && blocksRef.current.length > 0) saveBlocks(sid, blocksRef.current);
+      return;
+    }
     const cid = activeConvoRef.current[selectedBotId];
     if (cid && blocksRef.current.length > 0) saveBlocks(cid, blocksRef.current);
-  }, [blocks, sending, selectedBotId]);
+  }, [blocks, sending, selectedBotId, universalMode]);
+
+  /** Switch to Universal Chat: enable it and load its stored blocks. */
+  const enableUniversal = () => {
+    if (sending) stopTurn();
+    turnSeq.current++;
+    setUniversalModePersist(true);
+    setSideOpen(false);
+    closeThread();
+    const sid = universalSessionRef.current?.sessionId;
+    if (sid) {
+      setBlocks(loadBlocks(sid));
+    } else {
+      // Session not fetched yet (or boot fetch failed) — fetch it now.
+      setBlocks([]);
+      void fetchUniversalSession()
+        .then((us) => {
+          universalSessionRef.current = us;
+          setUniversalSession(us);
+          if (universalModeRef.current && us.sessionId) setBlocks(loadBlocks(us.sessionId));
+        })
+        .catch(() => {
+          // Best-effort — sending will retry the fetch.
+        });
+    }
+  };
+
+  /** Reload a bot's active-conversation blocks (the bot-change load logic). */
+  const reloadBotBlocks = (bot: BotConfig) => {
+    const cid = activeConvoRef.current[bot.id];
+    const list = convosRef.current[bot.id] ?? [];
+    if (cid && list.some((c) => c.id === cid)) {
+      setBlocks(loadBlocks(cid));
+      void loadThreadSummaries(cid); void loadMessageReactions(cid);
+    } else if (list.length > 0 && list[0]) {
+      persistActiveConvo({ ...activeConvoRef.current, [bot.id]: list[0].id });
+      setBlocks(loadBlocks(list[0].id));
+      void loadThreadSummaries(list[0].id); void loadMessageReactions(list[0].id);
+    } else {
+      setBlocks([]);
+      setThreadSummaries({});
+    }
+    closeThread();
+  };
 
   /** Switch to another conversation of the same bot. */
   const switchConvo = (botId: string, convoId: string) => {
+    if (universalModeRef.current) setUniversalModePersist(false);
     if (sending) stopTurn();
     turnSeq.current++;
     persistActiveConvo({ ...activeConvoRef.current, [botId]: convoId });
@@ -1116,6 +1233,7 @@ function ChatPageInner() {
     if (sending) return;
     const botId = r.botId && bots.some((b) => b.id === r.botId) ? r.botId : selectedBotId;
     if (!botId) return;
+    if (universalModeRef.current) setUniversalModePersist(false);
     await ensureLocalConvo(botId, r.sessionId, r.title);
     if (botId !== selectedBotId) setSelectedBotId(botId);
     persistActiveConvo({ ...activeConvoRef.current, [botId]: r.sessionId });
@@ -1630,6 +1748,114 @@ function ChatPageInner() {
   }, []);
 
   /**
+   * Run one Universal Chat turn. Mirrors sendImpl's turn bookkeeping
+   * (supersede, abort, streaming cleanup) but streams from
+   * /api/universal/chat: the FIRST `routing` frame names the bot the
+   * router picked (stored on the assistant block + shown as its author),
+   * a `split_plan` frame records the subtask count, and every other
+   * event flows through the normal applyEvent path.
+   */
+  const sendUniversalImpl = async (text: string, leadBlock?: ChatBlock, files: string[] = []) => {
+    if (!text && files.length === 0) return;
+    stopTurn();
+    codeSessionRef.current.reset();
+    dismissedThisTurn.current = false;
+    setCodeViewOpen(false);
+    const seq = ++turnSeq.current;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setSending(true);
+    // Make sure the universal session is known (boot fetch is best-effort).
+    let session = universalSessionRef.current;
+    if (!session) {
+      try {
+        session = await fetchUniversalSession();
+        universalSessionRef.current = session;
+        setUniversalSession(session);
+      } catch {
+        session = null;
+      }
+      if (turnSeq.current !== seq) return; // superseded while fetching
+    }
+    const anchorName = session?.anchorBotName ?? 'Universal';
+    const userBlock: ChatBlock = leadBlock ?? { kind: 'user', id: nextId(), text, ts: Date.now() };
+    const assistantBlock: ChatBlock = {
+      kind: 'assistant',
+      id: nextId(),
+      text: '',
+      streaming: true,
+      ts: Date.now(),
+      botName: anchorName,
+    };
+    const assistantId = assistantBlock.id;
+    setBlocks((prev) => [...prev, userBlock, assistantBlock]);
+    try {
+      for await (const event of streamUniversalChat({ message: text, fileIds: files, signal: controller.signal })) {
+        if (turnSeq.current !== seq) break; // superseded by a newer turn
+        if (event.type === 'routing') {
+          const routing: Omit<UniversalRouting, 'sessionId'> & { subtaskCount?: number } = {
+            path: event.path,
+            botId: event.botId,
+            botName: event.botName,
+            reason: event.reason,
+            confidence: event.confidence,
+            via: event.via,
+          };
+          setBlocks((prev) =>
+            prev.map((b) =>
+              b.id === assistantId && b.kind === 'assistant'
+                ? { ...b, botName: event.botName || b.botName, routing: { ...routing, subtaskCount: b.routing?.subtaskCount } }
+                : b,
+            ),
+          );
+          continue;
+        }
+        if (event.type === 'split_plan') {
+          const count = event.subtasks?.length ?? 0;
+          setBlocks((prev) =>
+            prev.map((b) => {
+              if (b.id !== assistantId || b.kind !== 'assistant') return b;
+              const routing: Omit<UniversalRouting, 'sessionId'> & { subtaskCount?: number } = b.routing
+                ? { ...b.routing, subtaskCount: count }
+                : {
+                    path: 'split',
+                    botId: session?.anchorBotId ?? '',
+                    botName: anchorName,
+                    reason: '',
+                    confidence: 0,
+                    via: '',
+                    subtaskCount: count,
+                  };
+              // Split turns keep the anchor as the author; only the chip
+              // records the decomposition.
+              return { ...b, routing };
+            }),
+          );
+          continue;
+        }
+        applyEvent(event);
+      }
+    } catch (err) {
+      if (turnSeq.current !== seq) return; // superseded; the new turn owns the UI
+      const aborted = err instanceof DOMException && err.name === 'AbortError';
+      setBlocks((prev) => [
+        ...prev,
+        aborted
+          ? { kind: 'interrupted', id: nextId(), text: 'Stopped. Send a new message to continue.' }
+          : { kind: 'error', id: nextId(), text: err instanceof Error ? err.message : String(err) },
+      ]);
+    } finally {
+      if (turnSeq.current === seq) {
+        setBlocks((prev) =>
+          prev.map((b) => (b.kind === 'assistant' ? { ...b, streaming: false } : b)),
+        );
+        if (abortRef.current === controller) abortRef.current = null;
+        setSending(false);
+      }
+    }
+  };
+
+  /**
    * Run one chat turn. `leadBlock` replaces the plain user-text block —
    * used by voice notes, which render as an audio bubble while the
    * transcript drives the turn.
@@ -1637,6 +1863,10 @@ function ChatPageInner() {
   const sendImpl = async (rawText: string, leadBlock?: ChatBlock, fileIds?: string[]) => {
     const text = rawText.trim();
     const files = fileIds ?? attachedFiles.map((f) => f.id);
+    if (universalModeRef.current) {
+      await sendUniversalImpl(text, leadBlock, files);
+      return;
+    }
     if ((!text && files.length === 0) || !selectedBot) return;
     // A new message supersedes any in-flight turn on this session
     // (backend aborts the previous turn; we drop our old reader).
@@ -1867,7 +2097,7 @@ function ChatPageInner() {
     const fileIds = attachedFiles.map((f) => f.id);
     setInput('');
     setAttachedFiles([]);
-    if (fusionModeRef.current && selectedBotRef.current) {
+    if (fusionModeRef.current && selectedBotRef.current && !universalModeRef.current) {
       void sendFusion(text);
       return;
     }
@@ -2089,6 +2319,22 @@ function ChatPageInner() {
   };
 
   const newConversation = () => {
+    if (universalModeRef.current) {
+      // Fresh Universal Chat: clear the universal session's stored blocks.
+      stopTurn();
+      turnSeq.current++;
+      const sid = universalSessionRef.current?.sessionId;
+      if (sid) {
+        try {
+          localStorage.removeItem(`mvp:blocks:${sid}`);
+        } catch {
+          // ignore
+        }
+      }
+      setBlocks([]);
+      setSideOpen(false);
+      return;
+    }
     if (!selectedBotId) return;
     stopTurn();
     turnSeq.current++;
@@ -2339,7 +2585,10 @@ function ChatPageInner() {
     { id: 'action:find', kind: 'action', label: 'Find in conversation', hint: 'action' },
   ];
   const onPaletteSelect = (item: PaletteItem) => {
-    if (item.id.startsWith('bot:')) setSelectedBotId(item.id.slice(4));
+    if (item.id.startsWith('bot:')) {
+      if (universalModeRef.current) setUniversalModePersist(false);
+      setSelectedBotId(item.id.slice(4));
+    }
     else if (item.id.startsWith('thread:') && selectedBotId) switchConvo(selectedBotId, item.id.slice(7));
     else if (item.id.startsWith('dest:')) window.location.href = item.id.slice(5);
     else if (item.id === 'action:new-thread') newConversation();
@@ -2362,8 +2611,18 @@ function ChatPageInner() {
       <PlacesRail />
       <CommandPalette open={paletteOpen} items={paletteItems} onClose={() => setPaletteOpen(false)} onSelect={onPaletteSelect} />
       <aside className={`bot-roster${sideOpen ? ' open' : ''}`} aria-label="Conversations and bots">
-        <button className="btn btn-primary new-chat-btn" onClick={newConversation} disabled={!selectedBotId}>
+        <button className="btn btn-primary new-chat-btn" onClick={newConversation} disabled={!selectedBotId && !universalMode}>
           {t('chat.newChat')}
+        </button>
+        <button
+          type="button"
+          className={`bot-item universal-item${universalMode ? ' selected' : ''}`}
+          onClick={enableUniversal}
+          aria-pressed={universalMode}
+          title="Ask anything — Universal Chat routes it to the right bot automatically"
+        >
+          <div className="bot-name">✦ Universal</div>
+          <div className="bot-desc">Ask anything — routed automatically</div>
         </button>
         {selectedBotId && (
           <>
@@ -2488,10 +2747,16 @@ function ChatPageInner() {
         {bots.map((b) => (
           <button
             key={b.id}
-            className={`bot-item${b.id === selectedBotId ? ' selected' : ''}`}
+            className={`bot-item${!universalMode && b.id === selectedBotId ? ' selected' : ''}`}
             onClick={() => {
+              const wasUniversal = universalModeRef.current;
+              if (wasUniversal) setUniversalModePersist(false);
               setSelectedBotId(b.id);
               setSideOpen(false);
+              // Same bot already selected: the bot-change effect won't
+              // rerun, so reload its blocks explicitly when leaving
+              // Universal Chat.
+              if (wasUniversal && b.id === botIdRef.current) reloadBotBlocks(b);
             }}
           >
             {b.avatarUrl && <img src={b.avatarUrl} alt="" width={28} height={28} style={{ borderRadius: '50%', objectFit: 'cover' }} />}
@@ -2516,7 +2781,7 @@ function ChatPageInner() {
           window.addEventListener('mouseup', up);
         }} />
 
-      <div className="chat-main" style={chatWidth > 0 ? { width: chatWidth, flex: 'none' } : undefined}>
+      <div className={`chat-main${blocks.length === 0 && chatMode === 'chat' ? ' chat-empty-hero' : ''}`} style={chatWidth > 0 ? { width: chatWidth, flex: 'none' } : undefined}>
         <div className="chat-header">
           <button
             className="icon-btn side-toggle"
@@ -2526,6 +2791,18 @@ function ChatPageInner() {
           >
             ☰
           </button>
+          {universalMode ? (
+            <div className="universal-header">
+              <span className="universal-title">✦ Universal</span>
+              <span className="small muted universal-anchor">
+                {universalSession
+                  ? `${universalSession.anchorBotName}${universalSession.chiefConfigured ? ' · Chief of Staff' : ''}`
+                  : 'Routing automatically'}
+              </span>
+              <span className="small muted universal-hint">Routing is automatic — @mention a bot to force it</span>
+            </div>
+          ) : (
+            <>
           {selectedBot?.avatarUrl && <img src={selectedBot.avatarUrl} alt={selectedBot.name} width={30} height={30} style={{ borderRadius: '50%', objectFit: 'cover' }} />}
           <div
             className="model-picker"
@@ -2603,6 +2880,8 @@ function ChatPageInner() {
             <span className="queued-badge" title={`${queuedCount} message(s) queued for the turn boundary`}>
               ⏳ {queuedCount} queued
             </span>
+          )}
+            </>
           )}
           {/* "Now" cards (W8a): what each busy bot is doing right now. */}
           <NowCards turns={nowTurns} />
@@ -2751,6 +3030,7 @@ function ChatPageInner() {
               <DiscoveryPanel
                 onPickBot={(botId) => {
                   if (bots.some((b) => b.id === botId)) {
+                    if (universalModeRef.current) setUniversalModePersist(false);
                     setSelectedBotId(botId);
                     setDiscoveryOpen(false);
                   } else {
@@ -2822,7 +3102,30 @@ function ChatPageInner() {
               </span>
             </div>
           )}
-          {blocks.length === 0 && (
+          {blocks.length === 0 && universalMode && (
+            <div className="empty-state universal-hero">
+              <div className="universal-hero-mark" aria-hidden="true">✦</div>
+              <h2 className="universal-greeting">What should we get done?</h2>
+              <p className="small muted universal-subline">
+                Ask anything — I&apos;ll route it to the right bot, or split it up.
+              </p>
+              <div className="chips universal-suggestions" role="group" aria-label="Suggestions">
+                {UNIVERSAL_SUGGESTIONS.map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    className="chip-btn"
+                    disabled={sending}
+                    onClick={() => void sendImpl(s)}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+              <p className="small muted">Routing is automatic — @mention a bot to force it.</p>
+            </div>
+          )}
+          {blocks.length === 0 && !universalMode && (
             <div className="empty-state">
               <LazyClayScene className="empty-3d" />
               <div className="empty-pet">
@@ -2935,12 +3238,13 @@ function ChatPageInner() {
                 const botLabel = b.botName ?? selectedBot?.name ?? 'Assistant';
                 const summary = threadSummaries[b.id];
                 return (
-                  <div key={b.id} data-block-id={b.id} className="msg assistant" title={new Date(b.ts).toLocaleString()}>
+                  <div key={b.id} data-block-id={b.id} className={`msg assistant${b.streaming ? ' streaming' : ''}`} title={new Date(b.ts).toLocaleString()}>
                     <div className="msg-head">
                       <span className="avatar bot" aria-hidden="true">
                         {botLabel.charAt(0).toUpperCase()}
                       </span>
                       <span className="msg-author">{botLabel}</span>
+                      {b.routing && <RoutingChip routing={b.routing} mode={uxMode} />}
                       <span className="msg-time">{fmtTime(b.ts)}</span>
                       {b.text.length > 0 && <CopyBtn text={b.text} />}
                       {!b.streaming && b.text.length > 0 && (
@@ -3419,8 +3723,8 @@ function ChatPageInner() {
                   void send();
                 }
               }}
-              placeholder={selectedBot ? t('chat.composerPlaceholder', { bot: selectedBot.name }) : t('chat.composerPlaceholderNoBot')}
-              disabled={!selectedBot}
+              placeholder={universalMode ? 'Ask anything — routed automatically…' : selectedBot ? t('chat.composerPlaceholder', { bot: selectedBot.name }) : t('chat.composerPlaceholderNoBot')}
+              disabled={!selectedBot && !universalMode}
               aria-label={t('chat.composerLabel')}
             />
             <VoiceNoteRecordButton

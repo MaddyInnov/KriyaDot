@@ -173,6 +173,11 @@ export class OvAnonymousProvider implements LLMProvider {
                     type: 'function',
                     function: { name: t.name, description: t.description, parameters: t.parameters },
                   })),
+                  // NOTE: no parallel_tool_calls flag — the endpoint
+                  // rejects the flag itself ("feature
+                  // 'parallel_tool_calls=false' is not currently
+                  // supported"). Its single-call constraint is handled by
+                  // rotation on the matching 400 below.
                 }
               : {}),
             ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
@@ -196,27 +201,37 @@ export class OvAnonymousProvider implements LLMProvider {
         }
         throw lastError;
       }
-      // Rotate — don't fail the turn — when the failure is specific to
-      // this model: 429 (per-model cap), 404 (model not served on the
-      // anonymous lane), or a 5xx from the model router.
-      if ((res.status === 429 || res.status === 404 || res.status >= 500) && i < order.length - 1) {
-        if (res.status === 404) this.unavailableModels.add(model);
-        lastError = new Error(
-          res.status === 429
-            ? `OVHcloud anonymous lane rate-limited model "${model}" (429); rotating to the next model.`
-            : `OVHcloud anonymous lane could not serve model "${model}" (${res.status}); rotating to the next model.`,
-        );
-        try {
-          opts.onRetry?.(i + 1, lastError);
-        } catch {
-          // Retry notification must never break rotation.
-        }
-        await res.text().catch(() => '');
-        continue;
-      }
       if (!res.ok) {
-        if (res.status === 404) this.unavailableModels.add(model);
         const text = await res.text().catch(() => '');
+        // Rotate — don't fail the turn — when the failure is specific to
+        // this model: 429 (per-model cap), 404 (model not served on the
+        // anonymous lane), a 5xx from the model router, or the endpoint's
+        // single-tool-call rejection (400 "This model only supports
+        // single tool-calls at once!"): the model attempted parallel
+        // tool calls, which this endpoint refuses to return — another
+        // rotation model may well answer with a single call. Observed
+        // live 2026-10-30 (universal-chat smoke: fusion workers on a
+        // tool-carrying bot; every worker hit it on the first model).
+        const singleCallRejection = res.status === 400 && text.includes('single tool-calls');
+        const rotatable =
+          res.status === 429 || res.status === 404 || res.status >= 500 || singleCallRejection;
+        if (rotatable && i < order.length - 1) {
+          if (res.status === 404) this.unavailableModels.add(model);
+          lastError = new Error(
+            res.status === 429
+              ? `OVHcloud anonymous lane rate-limited model "${model}" (429); rotating to the next model.`
+              : singleCallRejection
+                ? `OVHcloud anonymous lane model "${model}" attempted parallel tool calls, which the endpoint rejects; rotating to the next model.`
+                : `OVHcloud anonymous lane could not serve model "${model}" (${res.status}); rotating to the next model.`,
+          );
+          try {
+            opts.onRetry?.(i + 1, lastError);
+          } catch {
+            // Retry notification must never break rotation.
+          }
+          continue;
+        }
+        if (res.status === 404) this.unavailableModels.add(model);
         const err = new Error(
           `OVHcloud AI Endpoints (anonymous) request failed: ${res.status} ${res.statusText}${text ? ` — ${text.slice(0, 300)}` : ''}`,
         ) as Error & { status?: number };

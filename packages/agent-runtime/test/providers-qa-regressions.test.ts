@@ -7,6 +7,12 @@
 //    (accepts, never replies) hung a turn forever.
 //  - The OpenAI-compatible retry loop retried hard-quota 429s 3 extra
 //    times before the failover machinery could engage.
+//  - Universal-chat live smoke (2026-10-30): fusion workers running a
+//    tool-carrying bot on the OVH anonymous lane died with 400 "This
+//    model only supports single tool-calls at once!" (the model attempted
+//    parallel calls, which the endpoint refuses to return; the
+//    parallel_tool_calls flag itself is also rejected as unsupported).
+//    The driver now treats that 400 as model-specific and rotates.
 
 import { describe, expect, it } from 'vitest';
 import { OvAnonymousProvider } from '../src/providers/ovh-anonymous.js';
@@ -62,6 +68,63 @@ describe('OVH anonymous: rotation covers model_not_found', () => {
     const second = await provider.chat([{ role: 'user', content: 'again' }], [], { model: 'ghost-model' });
     expect(second.content).toContain('served by');
     expect(seenModels).not.toContain('ghost-model');
+  });
+
+  it('rotates past the single-tool-calls 400 instead of failing the turn', async () => {
+    const seenModels: string[] = [];
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchFn = (async (_url: unknown, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { model: string } & Record<string, unknown>;
+      bodies.push(body);
+      seenModels.push(body.model);
+      if (body.model === 'gpt-oss-120b') {
+        return realResponse(
+          {
+            message:
+              '{"error":{"message":"This model only supports single tool-calls at once!","type":"BadRequestError","param":null,"code":400}}',
+          },
+          400,
+        );
+      }
+      return realResponse({
+        choices: [{ message: { content: `served by ${body.model}` } }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      });
+    }) as typeof fetch;
+    const provider = new OvAnonymousProvider({
+      fetchFn,
+      models: ['gpt-oss-120b', 'Meta-Llama-3_3-70B-Instruct'],
+    });
+    const tool = {
+      name: 'web_search',
+      description: 'search the web',
+      parameters: { type: 'object', properties: {} },
+    } as Parameters<OvAnonymousProvider['chat']>[1][number];
+
+    const out = await provider.chat([{ role: 'user', content: 'research this' }], [tool], {
+      model: 'gpt-oss-120b',
+    });
+    expect(out.content).toBe('served by Meta-Llama-3_3-70B-Instruct');
+    expect(seenModels).toEqual(['gpt-oss-120b', 'Meta-Llama-3_3-70B-Instruct']);
+    // The endpoint rejects the parallel_tool_calls flag itself — it must
+    // never be sent.
+    expect(bodies.every((b) => !('parallel_tool_calls' in b))).toBe(true);
+  });
+
+  it('a non-rotatable 400 still fails immediately', async () => {
+    let calls = 0;
+    const fetchFn = (async () => {
+      calls++;
+      return realResponse({ error: { message: 'bad request: malformed messages' } }, 400);
+    }) as typeof fetch;
+    const provider = new OvAnonymousProvider({
+      fetchFn,
+      models: ['gpt-oss-120b', 'Meta-Llama-3_3-70B-Instruct'],
+    });
+    await expect(
+      provider.chat([{ role: 'user', content: 'hi' }], [], { model: 'gpt-oss-120b' }),
+    ).rejects.toThrow(/400/);
+    expect(calls).toBe(1);
   });
 
   it('a silent endpoint is bounded by the default timeout', async () => {

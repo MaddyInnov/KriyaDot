@@ -5078,3 +5078,358 @@ select.input-sm {
 .acp-untrusted { background: #f39c12; color: #fff; border-radius: 4px; padding: 0 6px; font-size: 0.7rem; }
 .acp-input { display: flex; gap: 8px; padding: 8px; border-top: 1px solid var(--border, #ddd); }
 .acp-input textarea { flex: 1; resize: vertical; }
+
+/* ================= Universal Chat + chat redesign =================
+ * Modern AI-assistant layout grammar over KriyaDot's clay/glass identity.
+ * Every color/shadow below comes from the theme variables — no hardcoded
+ * brand colors, no external assets. All selectors are chat-scoped so the
+ * other destinations are untouched. */
+
+/* --- Conversation column: centered, ~800px reading measure --- */
+.chat-layout .bot-roster {
+  width: 264px;
+}
+
+.chat-layout .chat-messages {
+  padding: 24px 32px;
+}
+
+.chat-layout .chat-messages > * {
+  width: 100%;
+  max-width: 800px;
+  margin-inline: auto;
+}
+
+/* Tool / approval / widget rows already stretch full width of the column. */
+.chat-layout .chat-messages > .tool-row,
+.chat-layout .chat-messages > .approval-card,
+.chat-layout .chat-messages > .widget {
+  align-self: center;
+}
+
+/* Centered pill notices keep their natural width inside the column. */
+.chat-layout .chat-messages > .msg.notice,
+.chat-layout .chat-messages > .msg.interrupted {
+  width: auto;
+}
+
+.chat-layout .chat-messages > .msg.error {
+  width: auto;
+  justify-self: flex-start;
+}
+
+/* --- User turns: right-aligned soft bubbles --- */
+.chat-layout .msg.user {
+  align-self: flex-end;
+  width: auto;
+  max-width: 75%;
+  margin-inline: auto 0;
+  background: var(--accent-soft);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  border-bottom-right-radius: 7px;
+  box-shadow: var(--clay-shadow-sm);
+}
+
+.chat-layout .msg.user .avatar.you {
+  background: var(--surface);
+  color: var(--accent);
+  box-shadow: var(--clay-shadow-sm);
+}
+
+.chat-layout .msg.user .msg-author,
+.chat-layout .msg.user .msg-time,
+.chat-layout .msg.user .copy-btn {
+  color: var(--text-2);
+  opacity: 1;
+}
+
+.chat-layout .msg.user .copy-btn:hover {
+  background: var(--surface);
+  color: var(--accent);
+}
+
+/* --- Assistant turns: full-width clean text, small header row --- */
+.chat-layout .msg.assistant {
+  align-self: stretch;
+  max-width: 800px;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  border-radius: 18px;
+  padding: 14px 18px;
+}
+
+.chat-layout .msg.assistant .msg-head {
+  flex-wrap: wrap;
+  row-gap: 4px;
+}
+
+/* Streaming shimmer on the in-flight assistant block (Pro motion only —
+ * the global Simple-mode and prefers-reduced-motion rules below and in
+ * the base sheet flatten animation durations to ~0). */
+html[data-ux='pro'] .chat-layout .msg.assistant.streaming {
+  animation: streamingPulse 1.6s ease-in-out infinite;
+}
+
+@keyframes streamingPulse {
+  0%,
+  100% {
+    background: color-mix(in srgb, var(--accent) 4%, transparent);
+  }
+  50% {
+    background: color-mix(in srgb, var(--accent) 9%, transparent);
+  }
+}
+
+html[data-ux='simple'] .chat-layout .msg.assistant.streaming {
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-layout .msg.assistant.streaming {
+    animation: none;
+  }
+}
+
+/* --- Routing chip --- */
+.routing-chip {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+  box-shadow: var(--clay-shadow-sm);
+}
+
+.routing-chip-reason {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+/* --- Sidebar: Universal entry as the primary row --- */
+.bot-roster .universal-item {
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  border-color: var(--border);
+  box-shadow: var(--clay-shadow-sm);
+  margin-bottom: 10px;
+}
+
+.bot-roster .universal-item .bot-name {
+  color: var(--accent);
+  font-size: 14px;
+}
+
+.bot-roster .universal-item.selected {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  box-shadow: var(--clay-pressed);
+}
+
+/* --- Header: Universal identity --- */
+.universal-header {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.universal-title {
+  font-size: 15px;
+  font-weight: 800;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.universal-anchor {
+  font-weight: 700;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.universal-hint {
+  color: var(--text-3);
+}
+
+/* --- Composer: large-radius glass/clay surface, jewel send --- */
+.chat-layout .chat-input-wrap {
+  padding: 12px 32px calc(12px + env(safe-area-inset-bottom));
+}
+
+.chat-layout .chat-input-wrap > * {
+  max-width: 800px;
+  margin-inline: auto;
+}
+
+.chat-layout .chat-input {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 27px;
+  box-shadow: var(--clay-shadow);
+  padding: 8px;
+  align-items: flex-end;
+}
+
+.chat-layout .chat-input .input.composer,
+.chat-layout .chat-input textarea.composer {
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  border-radius: 20px;
+  padding: 10px 12px;
+}
+
+.chat-layout .chat-input .input.composer:focus,
+.chat-layout .chat-input textarea.composer:focus {
+  outline: none;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.chat-layout .chat-input:focus-within {
+  border-color: var(--accent);
+  box-shadow: var(--clay-shadow), 0 0 0 3px var(--accent-soft);
+}
+
+.chat-layout .chat-input .btn {
+  border-radius: 999px;
+}
+
+.chat-layout .chat-input .btn-primary {
+  background: linear-gradient(135deg, var(--accent-from), var(--accent-to));
+  border-color: transparent;
+  color: var(--accent-ink);
+  box-shadow: 4px 4px 12px var(--clay-lo), inset 1px 1px 2px var(--clay-inset);
+}
+
+.chat-layout .chat-input .btn-primary:hover {
+  background: linear-gradient(135deg, var(--accent-from), var(--accent-to));
+  filter: brightness(1.07);
+}
+
+.chat-layout .chat-input .btn-primary:disabled {
+  filter: none;
+  opacity: 0.5;
+  box-shadow: var(--clay-shadow-sm);
+}
+
+.chat-layout .chat-input .btn-stop {
+  background: var(--red-soft);
+}
+
+/* --- Empty hero: greeting + suggestions centered, composer mid-screen --- */
+.chat-main.chat-empty-hero .chat-messages {
+  flex: 0 1 auto;
+  overflow: visible;
+  justify-content: center;
+  padding-bottom: 8px;
+}
+
+.chat-main.chat-empty-hero .chat-input-wrap {
+  border-top: none;
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  padding-top: 4px;
+  margin-bottom: auto;
+}
+
+.chat-main.chat-empty-hero .composer-footer {
+  justify-content: center;
+}
+
+.empty-state.universal-hero {
+  max-width: 640px;
+  padding: 24px 16px 8px;
+}
+
+.universal-hero-mark {
+  font-size: 34px;
+  color: var(--accent);
+  margin-bottom: 6px;
+}
+
+.universal-greeting {
+  margin: 0 0 8px;
+  font-size: 28px;
+  font-weight: 800;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+.universal-subline {
+  font-size: 14px;
+  color: var(--text-2);
+  margin: 0 0 6px;
+}
+
+.universal-suggestions {
+  margin: 18px 0 10px;
+}
+
+.universal-suggestions .chip-btn:hover {
+  transform: translateY(-2px);
+}
+
+/* --- Focus visibility on chat controls (accent outline) --- */
+.chat-layout .bot-item:focus-visible,
+.chat-layout .convo-title:focus-visible,
+.chat-layout .chip-btn:focus-visible,
+.chat-layout .chat-input .btn:focus-visible,
+.chat-layout .chat-input textarea:focus-visible,
+.chat-layout .fusion-toggle:focus-visible,
+.chat-layout .icon-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* --- Responsive: full-width column, docked composer --- */
+@media (max-width: 860px) {
+  .chat-layout .bot-roster {
+    width: 100%;
+  }
+
+  .chat-layout .chat-messages {
+    padding: 16px;
+  }
+
+  .chat-layout .chat-messages > * {
+    max-width: 100%;
+  }
+
+  .chat-layout .msg.user {
+    max-width: 88%;
+  }
+
+  .chat-layout .msg.assistant {
+    max-width: 100%;
+    padding: 10px 6px;
+  }
+
+  .chat-layout .chat-input-wrap {
+    padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
+  }
+
+  .chat-layout .chat-input {
+    border-radius: 26px;
+    width: 100%;
+  }
+
+  .universal-greeting {
+    font-size: 23px;
+  }
+
+  .universal-hint {
+    display: none;
+  }
+}

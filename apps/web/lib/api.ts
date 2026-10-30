@@ -237,6 +237,22 @@ export interface RateLimitSnapshot {
 
 export type StreamEvent =
   | { type: 'token'; content: string }
+  /**
+   * Universal Chat routing frame (always FIRST on /api/universal/chat):
+   * which bot the router picked for this turn and why.
+   */
+  | {
+      type: 'routing';
+      path: 'direct' | 'specialist' | 'split';
+      botId: string;
+      botName: string;
+      reason: string;
+      confidence: number;
+      via: string;
+      sessionId: string;
+    }
+  /** Universal Chat split plan (split path only): the subtasks the turn was decomposed into. */
+  | { type: 'split_plan'; runId?: string; subtasks: { id: string; title: string }[] }
   | { type: 'tool_call'; call: ToolCall; approvalRequired: boolean; approvalId?: string }
   | { type: 'tool_result'; call: ToolCall; result: unknown; denied?: boolean }
   | { type: 'done'; usage: TokenUsage | null }
@@ -1694,6 +1710,93 @@ export interface QueuedEvent {
   queueId: string;
   position: number;
   sessionId: string;
+}
+
+// ---- Universal Chat ---------------------------------------------------------
+
+/** One past routing decision recorded against the universal session. */
+export interface UniversalAttribution {
+  id: number;
+  sessionId: string;
+  path: 'direct' | 'specialist' | 'split';
+  botId: string;
+  botName: string;
+  reason: string;
+  confidence: number;
+  via: string;
+  /** ISO timestamp string (server record). */
+  ts: string;
+}
+
+/** GET /api/universal/session — the single "ask anything" session + its anchor bot. */
+export interface UniversalSessionInfo {
+  ok: boolean;
+  sessionId: string;
+  anchorBotId: string;
+  anchorBotName: string;
+  chiefConfigured: boolean;
+  attributions: UniversalAttribution[];
+}
+
+/** The routing decision frame that opens every universal-chat turn. */
+export interface UniversalRouting {
+  path: 'direct' | 'specialist' | 'split';
+  botId: string;
+  botName: string;
+  reason: string;
+  confidence: number;
+  via: string;
+  sessionId: string;
+}
+
+/** GET /api/universal/session via the shared authed fetch. */
+export const fetchUniversalSession = (): Promise<UniversalSessionInfo> =>
+  apiJson('/api/universal/session');
+
+/**
+ * POST /api/universal/chat { message } and yield each SSE `data:` payload
+ * as a parsed StreamEvent. Mirrors streamChat's SSE parsing exactly; the
+ * first frame is always the `routing` frame, optionally followed by a
+ * `split_plan` frame (split path) and the turn's normal StreamEvents.
+ */
+export async function* streamUniversalChat(req: {
+  message: string;
+  fileIds?: string[];
+  signal?: AbortSignal;
+}): AsyncGenerator<StreamEvent> {
+  const { signal, message, fileIds } = req;
+  const res = await apiFetch('/api/universal/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(fileIds && fileIds.length > 0 ? { message, fileIds } : { message }),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    let detail = '';
+    try {
+      detail = ((await res.json()) as { error?: string }).error ?? '';
+    } catch {
+      // ignore
+    }
+    throw new Error(`Chat failed (${res.status}): ${detail || res.statusText}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const chunks = buf.split('\n\n');
+    buf = chunks.pop() ?? '';
+    for (const chunk of chunks) {
+      for (const line of chunk.split('\n')) {
+        if (line.startsWith('data: ')) {
+          yield JSON.parse(line.slice('data: '.length)) as StreamEvent;
+        }
+      }
+    }
+  }
 }
 
 /** POST /api/chat and yield each SSE `data:` payload as a parsed StreamEvent. */
