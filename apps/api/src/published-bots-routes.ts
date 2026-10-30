@@ -12,7 +12,9 @@
 //   GET    /              ?orgId=  → entries the caller may view
 //   POST   /:id/install   { name? } → creates a copy in the live roster
 //   DELETE /:id           → unpublish (publisher only)
-// Identity: x-user-id header; org from body/query or x-org-id header.
+// Identity: the verified principal (principal.ts, OPEN-1 fix); org from
+// body/query or x-org-id header only SELECTS for the loopback owner — a
+// credential-bound principal is pinned to its own org.
 
 import { join } from 'node:path';
 import express, { type Router } from 'express';
@@ -20,17 +22,15 @@ import { TenancyExtrasStore } from '@mvp/tenancy';
 import type { BotConfig } from '@mvp/agent-runtime';
 import { appendRosterImport } from './bot-roster-routes.js';
 import { PublishedBotStore, canViewPublished, makeInstalledCopy } from './published-bots.js';
+import { effectiveOrgId, principalMiddleware, resolvePrincipal, type PrincipalContext } from './principal.js';
 
 export interface PublishedBotsDeps {
   dataDir: string;
   getBots: () => BotConfig[];
   tenancyDbPath?: string;
+  loopbackToken?: string;
+  jwtSecret?: string;
   audit?: (action: string, fields: { actor?: string; detail?: unknown }) => void;
-}
-
-function callerOf(req: express.Request): string {
-  const h = req.header('x-user-id');
-  return typeof h === 'string' && h ? h : 'default-user';
 }
 
 function err(res: express.Response, status: number, message: string): void {
@@ -41,9 +41,19 @@ export function createPublishedBotsRouter(deps: PublishedBotsDeps): Router {
   const router = express.Router();
   const store = new PublishedBotStore(deps.dataDir);
   const extras = new TenancyExtrasStore(deps.tenancyDbPath ?? join(deps.dataDir, 'tenancy.db'));
+  const pctx: PrincipalContext = { dataDir: deps.dataDir, loopbackToken: deps.loopbackToken, jwtSecret: deps.jwtSecret };
+  router.use(principalMiddleware(pctx));
+
+  function callerOf(req: express.Request): string {
+    const p = resolvePrincipal(req, pctx);
+    if (!p) throw new Error('unauthenticated');
+    return p.userId;
+  }
 
   function viewer(req: express.Request, orgId: string): { userId: string; orgId: string; groupIds: string[] } {
     const userId = callerOf(req);
+    const boundOrg = resolvePrincipal(req, pctx)?.orgId;
+    if (boundOrg) orgId = boundOrg;
     let groupIds: string[] = [];
     try {
       groupIds = extras.groupsForUser(orgId, userId).map((g) => g.id);
@@ -57,7 +67,9 @@ export function createPublishedBotsRouter(deps: PublishedBotsDeps): Router {
     const body = (req.body ?? {}) as { botId?: unknown; orgId?: unknown; visibility?: unknown; allowedGroupIds?: unknown };
     const bot = deps.getBots().find((b) => b.id === body.botId);
     if (!bot) return err(res, 404, `unknown bot "${String(body.botId)}"`);
-    const orgId = typeof body.orgId === 'string' && body.orgId ? body.orgId : req.header('x-org-id') || 'default-org';
+    const requestedOrg = typeof body.orgId === 'string' && body.orgId ? body.orgId : req.header('x-org-id') || 'default-org';
+    const orgId = effectiveOrgId(resolvePrincipal(req, pctx)!, requestedOrg);
+    if (!orgId) return err(res, 403, 'credential is scoped to a different org');
     const visibility = ['org', 'groups', 'private'].includes(String(body.visibility)) ? (body.visibility as 'org' | 'groups' | 'private') : 'org';
     const entry = store.publish({
       bot,

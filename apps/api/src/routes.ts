@@ -3427,13 +3427,15 @@ export function createRouter(deps: RouteDeps): express.Router {
   router.use('/billing', billingRouter);
 
   // ---- Phase 4: tenancy + vault (mounted at /api) ----------------------
-  registerTenancyRoutes(router, { config, governance });
-  registerVaultRoutes(router, { config, governance });
+  // loopbackToken threads the owner credential into principal resolution
+  // (principal.ts, OPEN-1) for these tenancy-scoped surfaces.
+  registerTenancyRoutes(router, { config, governance, loopbackToken: deps.loopbackToken });
+  registerVaultRoutes(router, { config, governance, loopbackToken: deps.loopbackToken });
   // Composio connector: platform API key in the vault, per-bot app toggles.
-  registerComposioRoutes(router, { config, governance, bots });
+  registerComposioRoutes(router, { config, governance, bots, loopbackToken: deps.loopbackToken });
   // Composio connected accounts: OAuth connect links, account list/labels,
   // disconnect, and per-account tool browsers.
-  registerComposioAccountRoutes(router, { config, governance, bots });
+  registerComposioAccountRoutes(router, { config, governance, bots, loopbackToken: deps.loopbackToken });
   // Notion parity: databases/table view + Notion HTML/ZIP import.
   {
     const databasesRouter = express.Router();

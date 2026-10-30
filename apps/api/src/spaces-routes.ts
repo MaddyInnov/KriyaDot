@@ -18,6 +18,7 @@
 
 import express, { type Request, type Response, type Router } from 'express';
 import { SecureVault } from '@mvp/vault';
+import { resolvePrincipal } from './principal.js';
 import type { PrivacyTier } from '@mvp/governance';
 import {
   DEFAULT_SPACE_ID,
@@ -139,9 +140,15 @@ export interface SpaceRunContext {
   apiKeyRef?: string;
 }
 
-function callerOf(req: Request): string {
-  const header = req.header('x-user-id');
-  return typeof header === 'string' && header.length > 0 ? header : 'default-user';
+/**
+ * The vault namespace for a chat run: the verified principal's user id
+ * (principal.ts, OPEN-1 fix). Falls back to 'default-user' for flows whose
+ * credential is not a principal (paired-companion device tokens — the
+ * device is separately authenticated by the chat handler, and those runs
+ * always used the default namespace).
+ */
+function callerOf(req: Request, dataDir: string): string {
+  return resolvePrincipal(req, { dataDir })?.userId ?? 'default-user';
 }
 
 /**
@@ -183,7 +190,7 @@ export function resolveSpaceForRun(opts: {
   let apiKeyRef: string | undefined;
   if (space.apiKeyRef) {
     // The vault is per-user, namespaced like the /vault API routes.
-    const vault = new SecureVault(dataDir, callerOf(req), callerOf(req));
+    const vault = new SecureVault(dataDir, callerOf(req, dataDir), callerOf(req, dataDir));
     const secret = vault.get(space.apiKeyRef);
     if (!secret) {
       throw new SpaceHttpError(

@@ -17,6 +17,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { openDb } from '@mvp/agent-runtime';
+import { resolvePrincipal } from './principal.js';
 
 export interface PauseState {
   paused: boolean;
@@ -133,12 +134,24 @@ export interface SystemPauseRouteDeps {
   audit?: (action: string, fields: { actor?: string; toolName?: string; detail?: unknown }) => void;
 }
 
+/**
+ * The audit actor: the verified principal's user id (principal.ts,
+ * OPEN-1 fix) — never a client-asserted body field or header. Falls back
+ * to 'user' for credential-less local contexts (these routes sit behind
+ * the loopback owner gate in the assembled server).
+ */
 function actorOf(req: Request): string {
+  return resolvePrincipal(req, {})?.userId ?? 'user';
+}
+
+/**
+ * The client's self-label (web/cli/…) — kept as non-authoritative audit
+ * DETAIL only; it never becomes the actor.
+ */
+function clientLabelOf(req: Request): string | undefined {
   const body = (req.body ?? {}) as { actor?: unknown };
   if (typeof body.actor === 'string' && body.actor.trim()) return body.actor.trim().slice(0, 128);
-  const hdr = req.headers['x-user-id'];
-  if (typeof hdr === 'string' && hdr.trim()) return hdr.trim().slice(0, 128);
-  return 'user';
+  return undefined;
 }
 
 export function registerSystemPauseRoutes(router: express.Router, deps: SystemPauseRouteDeps): void {
@@ -150,6 +163,7 @@ export function registerSystemPauseRoutes(router: express.Router, deps: SystemPa
 
   r.post('/pause', (req: Request, res: Response) => {
     const actor = actorOf(req);
+    const client = clientLabelOf(req);
     const reasonRaw = (req.body as { reason?: unknown } | undefined)?.reason;
     const reason = typeof reasonRaw === 'string' && reasonRaw.trim() ? reasonRaw.trim() : undefined;
     const state = deps.registry.pause(actor, reason);
@@ -157,7 +171,7 @@ export function registerSystemPauseRoutes(router: express.Router, deps: SystemPa
       deps.audit?.('system.paused', {
         actor,
         toolName: 'system',
-        detail: { pausedAt: state.pausedAt, ...(reason ? { reason } : {}) },
+        detail: { pausedAt: state.pausedAt, ...(reason ? { reason } : {}), ...(client ? { client } : {}) },
       });
     } catch {
       // Audit must never break pause.
@@ -167,13 +181,14 @@ export function registerSystemPauseRoutes(router: express.Router, deps: SystemPa
 
   r.post('/resume', (req: Request, res: Response) => {
     const actor = actorOf(req);
+    const client = clientLabelOf(req);
     const was = deps.registry.state();
     const state = deps.registry.resume(actor);
     try {
       deps.audit?.('system.resumed', {
         actor,
         toolName: 'system',
-        detail: { pausedAt: was.pausedAt, pausedBy: was.pausedBy, resumedAt: state.resumedAt },
+        detail: { pausedAt: was.pausedAt, pausedBy: was.pausedBy, resumedAt: state.resumedAt, ...(client ? { client } : {}) },
       });
     } catch {
       // Audit must never break resume.

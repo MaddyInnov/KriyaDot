@@ -16,6 +16,8 @@ import { DEFAULT_POLICY, GovernanceGateway } from '@mvp/governance';
 import type { AppConfig } from '../src/config.js';
 import { registerVaultRoutes } from '../src/vault.js';
 
+const OWNER_TOKEN = 'test-owner-token'; // loopback owner credential (OPEN-1: tests authenticate as the owner; x-user-id then asserts the local profile)
+
 function freshDataDir(): string {
   return mkdtempSync(join(tmpdir(), 'vault-api-'));
 }
@@ -38,7 +40,7 @@ describe('vault router', () => {
     const app = express();
     app.use(express.json());
     const router = express.Router();
-    registerVaultRoutes(router, { config: { dataDir: dir } as AppConfig, governance });
+    registerVaultRoutes(router, { config: { dataDir: dir } as AppConfig, governance, loopbackToken: OWNER_TOKEN });
     app.use('/api', router);
     await new Promise<void>((resolve) => {
       server = app.listen(0, '127.0.0.1', () => resolve());
@@ -57,7 +59,7 @@ describe('vault router', () => {
   async function api(method: string, path: string, body?: unknown, userId = 'alice'): Promise<ApiResult> {
     const res = await fetch(`${baseUrl}${path}`, {
       method,
-      headers: { 'content-type': 'application/json', 'x-user-id': userId },
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${OWNER_TOKEN}`, 'x-user-id': userId },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     return { status: res.status, json: await res.json() };

@@ -22,10 +22,10 @@
 //   POST   /wallet/charge      → 400: the mock provider never charges
 //   GET    /accounts/summary   → OAuth statuses + vault/wallet counts
 //
-// The vault is per-user: the caller is `x-user-id` (fallback
-// 'default-user'), namespaced so users sharing a data dir never see each
-// other's secrets. Secret values never appear in logs, errors, or audit
-// detail — only names.
+// The vault is per-user: the namespace is the verified principal's user
+// id (principal.ts), so users sharing a data dir never see each other's
+// secrets. Secret values never appear in logs, errors, or audit detail —
+// only names.
 
 import express from 'express';
 import type { Request, Response } from 'express';
@@ -34,8 +34,9 @@ import { isPrivacyTier } from '@mvp/governance';
 import type { PrivacyTier } from '@mvp/governance';
 import { getOAuthStatus } from './oauth.js';
 import type { RouteDeps } from './routes.js';
+import { principalMiddleware, resolvePrincipal, type PrincipalContext } from './principal.js';
 
-type VaultDeps = Pick<RouteDeps, 'config' | 'governance'>;
+type VaultDeps = Pick<RouteDeps, 'config' | 'governance' | 'loopbackToken'> & { jwtSecret?: string };
 
 /**
  * Optional tier override from a request body; undefined = keep the
@@ -55,13 +56,19 @@ function errorBody(error: string, detail?: string): { error: string; detail?: st
   return detail ? { error, detail } : { error };
 }
 
-function callerOf(req: Request): string {
-  const header = req.header('x-user-id');
-  return typeof header === 'string' && header.length > 0 ? header : 'default-user';
-}
-
+// Identity (OPEN-1 fix): the vault namespace is the VERIFIED principal's
+// user id (principal.ts) — never the raw `x-user-id` header. Every router
+// below is behind principalMiddleware, so callerOf always has a principal.
 export function registerVaultRoutes(router: express.Router, deps: VaultDeps): void {
   const { config, governance } = deps;
+  const pctx: PrincipalContext = { dataDir: config.dataDir, loopbackToken: deps.loopbackToken, jwtSecret: deps.jwtSecret };
+  const guard = principalMiddleware(pctx);
+
+  function callerOf(req: Request): string {
+    const p = resolvePrincipal(req, pctx);
+    if (!p) throw new Error('unauthenticated');
+    return p.userId;
+  }
 
   const vaultOf = (req: Request): SecureVault =>
     new SecureVault(config.dataDir, callerOf(req), callerOf(req));
@@ -75,6 +82,7 @@ export function registerVaultRoutes(router: express.Router, deps: VaultDeps): vo
   // -- vault ----------------------------------------------------------
 
   const vaultRouter = express.Router();
+  vaultRouter.use(guard);
 
   vaultRouter.get('/', (req: Request, res: Response) => {
     try {
@@ -112,7 +120,7 @@ export function registerVaultRoutes(router: express.Router, deps: VaultDeps): vo
 
   vaultRouter.get('/:name', (req: Request, res: Response) => {
     // Local-first single-user: the only caller is the owner's UI/turn on this
-    // machine (vaults are per x-user-id namespace). Reads are audited
+    // machine (vaults are per verified-principal namespace). Reads are audited
     // name-only below. There is intentionally NO vault.get tool registered for
     // the model plane (see tool-registry.ts) — the agent can never pull
     // secrets into prompt context. Revisit with real authZ before any
@@ -204,6 +212,7 @@ export function registerVaultRoutes(router: express.Router, deps: VaultDeps): vo
   // vaultRouter's GET /:name would swallow /vault/logins.
 
   const loginsRouter = express.Router();
+  loginsRouter.use(guard);
 
   loginsRouter.get('/', (req: Request, res: Response) => {
     try {
@@ -239,6 +248,7 @@ export function registerVaultRoutes(router: express.Router, deps: VaultDeps): vo
   // -- wallet (mock only) ---------------------------------------------
 
   const walletRouter = express.Router();
+  walletRouter.use(guard);
 
   walletRouter.get('/', (req: Request, res: Response) => {
     const wallet = walletOf(req);
@@ -313,6 +323,7 @@ export function registerVaultRoutes(router: express.Router, deps: VaultDeps): vo
   // tokens, and vault/wallet are counts only — nothing sensitive leaves.
 
   const accountsRouter = express.Router();
+  accountsRouter.use(guard);
 
   accountsRouter.get('/summary', (req: Request, res: Response) => {
     try {

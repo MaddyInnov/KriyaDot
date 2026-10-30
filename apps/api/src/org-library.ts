@@ -26,6 +26,7 @@ import { randomUUID } from 'node:crypto';
 import express, { type Router } from 'express';
 import type { BotConfig } from '@mvp/agent-runtime';
 import { appendRosterImport } from './bot-roster-routes.js';
+import { principalMiddleware, resolvePrincipal, type PrincipalContext } from './principal.js';
 
 export type OrgLibraryKind = 'bot-template' | 'team' | 'skill';
 
@@ -115,12 +116,16 @@ export interface OrgLibraryDeps {
   installSkill?: (payload: unknown, orgId: string) => { skillId: string } | Promise<{ skillId: string }>;
   /** Group membership resolver for 'groups' visibility (default: none). */
   groupsForUser?: (orgId: string, userId: string) => string[];
+  loopbackToken?: string;
+  jwtSecret?: string;
   audit?: (action: string, fields: { actor?: string; detail?: unknown }) => void;
 }
 
-function callerOf(req: express.Request): string {
-  const h = req.header('x-user-id');
-  return typeof h === 'string' && h ? h : 'default-user';
+/** The verified principal's user id (principal.ts). Only call behind the router guard. */
+function callerOf(req: express.Request, ctx: PrincipalContext): string {
+  const p = resolvePrincipal(req, ctx);
+  if (!p) throw new Error('unauthenticated');
+  return p.userId;
 }
 
 function err(res: express.Response, status: number, message: string): void {
@@ -132,18 +137,25 @@ const KINDS: OrgLibraryKind[] = ['bot-template', 'team', 'skill'];
 export function createOrgLibraryRouter(deps: OrgLibraryDeps): Router {
   const router = express.Router();
   const store = new OrgLibraryStore(deps.dataDir);
+  const pctx: PrincipalContext = { dataDir: deps.dataDir, loopbackToken: deps.loopbackToken, jwtSecret: deps.jwtSecret };
+  router.use(principalMiddleware(pctx));
+  const caller = (req: express.Request): string => callerOf(req, pctx);
 
   function orgOf(req: express.Request): string {
+    // A credential-bound principal is pinned to its org; the header/query
+    // only selects an org for the loopback owner.
+    const p = resolvePrincipal(req, pctx);
+    if (p?.orgId) return p.orgId;
     return req.header('x-org-id') || (typeof req.query.orgId === 'string' ? req.query.orgId : '') || 'default-org';
   }
   function viewerOf(req: express.Request, orgId: string) {
-    const userId = callerOf(req);
+    const userId = caller(req);
     return { userId, groupIds: deps.groupsForUser?.(orgId, userId) ?? [] };
   }
 
   router.post('/', (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
-    const orgId = typeof body.orgId === 'string' && body.orgId ? body.orgId : orgOf(req);
+    const orgId = resolvePrincipal(req, pctx)?.orgId ?? (typeof body.orgId === 'string' && body.orgId ? body.orgId : orgOf(req));
     if (!KINDS.includes(body.kind as OrgLibraryKind)) return err(res, 400, 'kind must be bot-template|team|skill');
     if (typeof body.name !== 'string' || !body.name.trim()) return err(res, 400, 'name is required');
     if (body.payload === undefined) return err(res, 400, 'payload is required');
@@ -152,7 +164,7 @@ export function createOrgLibraryRouter(deps: OrgLibraryDeps): Router {
       kind: body.kind as OrgLibraryKind,
       name: body.name.trim().slice(0, 120),
       payload: body.payload,
-      author: callerOf(req),
+      author: caller(req),
       visibility: ['org', 'groups', 'private'].includes(String(body.visibility)) ? (body.visibility as OrgLibraryEntry['visibility']) : 'org',
       allowedGroupIds: Array.isArray(body.allowedGroupIds) ? (body.allowedGroupIds as string[]) : [],
     });
@@ -178,7 +190,7 @@ export function createOrgLibraryRouter(deps: OrgLibraryDeps): Router {
     const orgId = orgOf(req);
     const entry = store.get(orgId, req.params.id);
     if (!entry) return err(res, 404, 'unknown library entry');
-    if (entry.author !== callerOf(req)) return err(res, 403, 'only the author can edit this entry');
+    if (entry.author !== caller(req)) return err(res, 403, 'only the author can edit this entry');
     const body = (req.body ?? {}) as Record<string, unknown>;
     const updated = store.update(orgId, entry.id, {
       ...(typeof body.name === 'string' ? { name: body.name.trim().slice(0, 120) } : {}),
@@ -193,7 +205,7 @@ export function createOrgLibraryRouter(deps: OrgLibraryDeps): Router {
     const orgId = orgOf(req);
     const entry = store.get(orgId, req.params.id);
     if (!entry) return err(res, 404, 'unknown library entry');
-    if (entry.author !== callerOf(req)) return err(res, 403, 'only the author can delete this entry');
+    if (entry.author !== caller(req)) return err(res, 403, 'only the author can delete this entry');
     store.remove(orgId, entry.id);
     res.json({ ok: true });
   });
@@ -219,7 +231,7 @@ export function createOrgLibraryRouter(deps: OrgLibraryDeps): Router {
         const bot: BotConfig = { ...(JSON.parse(JSON.stringify(payload)) as BotConfig), id };
         bots.push(bot);
         appendRosterImport(bot, deps.dataDir);
-        deps.audit?.('org_library.installed', { actor: callerOf(req), detail: { orgId, entryId: entry.id, kind: entry.kind, botId: id } });
+        deps.audit?.('org_library.installed', { actor: caller(req), detail: { orgId, entryId: entry.id, kind: entry.kind, botId: id } });
         res.status(201).json({ ok: true, installed: { kind: entry.kind, bot } });
         return;
       }

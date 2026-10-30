@@ -24,9 +24,11 @@
 //   GET  /orgs/:id/quotas/:userId                                (member+; self or admin)
 //   POST /orgs/:id/usage/:userId { storageBytes?, monthlyTokens? } → enforces quota (402 on exceed)
 //
-// Identity: x-user-id header (same convention as tenancy.ts) OR a tenancy
+// Identity: the verified principal (principal.ts, OPEN-1 fix) — a tenancy
 // JWT (`Authorization: Bearer <HS256 jwt>`, secret from deps.jwtSecret /
-// env KRIYADOT_TENANCY_JWT_SECRET) whose sub/orgId claims scope the call.
+// env KRIYADOT_TENANCY_JWT_SECRET) whose sub/orgId claims scope the call,
+// an SSO session token, or the loopback owner (whose `x-user-id` header
+// may assert a local profile). The header alone never authenticates.
 
 import { join } from 'node:path';
 import express, { type Router } from 'express';
@@ -36,15 +38,16 @@ import {
   canAct,
   canUserAccessResource,
   isRole,
-  tenancyJwtFromHeader,
   type ResourceType,
   type Role,
 } from '@mvp/tenancy';
+import { resolvePrincipal, type PrincipalContext } from './principal.js';
 
 export interface TenancyDepthDeps {
   dataDir?: string;
   tenancyDbPath?: string;
   jwtSecret?: string;
+  loopbackToken?: string;
   audit?: (action: string, fields: { actor?: string; detail?: unknown }) => void;
 }
 
@@ -57,22 +60,22 @@ export function createTenancyDepthRouter(deps: TenancyDepthDeps): Router {
   const dbPath = deps.tenancyDbPath ?? join(deps.dataDir ?? '.', 'tenancy.db');
   const tenants = new TenantStore(dbPath);
   const extras = new TenancyExtrasStore(dbPath);
-  const jwtSecret = deps.jwtSecret ?? process.env.KRIYADOT_TENANCY_JWT_SECRET ?? '';
-
-  function caller(req: express.Request): { userId: string; jwtOrgId?: string } {
-    if (jwtSecret) {
-      const claims = tenancyJwtFromHeader(req.headers.authorization, jwtSecret);
-      if (claims) return { userId: claims.sub, jwtOrgId: claims.orgId };
-    }
-    const h = req.header('x-user-id');
-    return { userId: typeof h === 'string' && h ? h : 'default-user' };
-  }
+  const pctx: PrincipalContext = {
+    dataDir: deps.dataDir ?? (deps.tenancyDbPath ? join(deps.tenancyDbPath, '..') : undefined),
+    jwtSecret: deps.jwtSecret,
+    loopbackToken: deps.loopbackToken,
+  };
 
   function gate(req: express.Request, res: express.Response, required: Role): { orgId: string; userId: string; role: Role } | null {
     const orgId = req.params.id;
-    const { userId, jwtOrgId } = caller(req);
-    if (jwtOrgId && jwtOrgId !== orgId) {
-      err(res, 403, 'JWT is scoped to a different org');
+    const principal = resolvePrincipal(req, pctx);
+    if (!principal) {
+      err(res, 401, 'unauthenticated: a verified credential is required');
+      return null;
+    }
+    const { userId } = principal;
+    if (principal.orgId && principal.orgId !== orgId) {
+      err(res, 403, 'credential is scoped to a different org');
       return null;
     }
     const membership = tenants.getMembership(orgId, userId);

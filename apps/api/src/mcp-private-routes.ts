@@ -23,6 +23,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import type { InstalledMcpServerConfig, PerBotMcpManager } from '@mvp/agent-runtime';
 import type { GovernanceGateway } from '@mvp/governance';
+import { resolvePrincipal } from './principal.js';
 
 export interface McpPrivateRouteDeps {
   manager: PerBotMcpManager;
@@ -40,7 +41,8 @@ function errMessage(err: unknown): string {
 }
 
 function actor(req: Request): string {
-  return req.header('x-user-id') ?? 'api';
+  // Audit actor = the verified principal (principal.ts, OPEN-1 fix), never a raw header.
+  return resolvePrincipal(req, {})?.userId ?? 'api';
 }
 
 export function registerMcpPrivateRoutes(router: Router, deps: McpPrivateRouteDeps): void {

@@ -46,6 +46,7 @@ import {
 } from './cloud-lightning.js';
 import { deployKriyadot, type DeployResult } from './cloud-deploy.js';
 import { CloudSupervisor, type CloudTier } from './cloud-supervisor.js';
+import { principalMiddleware, resolvePrincipal, type PrincipalContext } from './principal.js';
 
 /** Lightning's own pages — the only Lightning URLs this layer links to. */
 export const LIGHTNING_PRICING_URL = 'https://lightning.ai/pricing';
@@ -76,11 +77,21 @@ export interface CloudRouteDeps {
   defaultRepoUrl?: string;
   /** Health probe / clock seams, forwarded to the supervisor. */
   healthProbe?: (url: string) => Promise<boolean>;
+  /** Principal-resolution context (OPEN-1): data dir (SSO sessions) + owner token. */
+  dataDir?: string;
+  loopbackToken?: string;
+  jwtSecret?: string;
 }
 
-function callerOf(req: Request): string {
-  const header = req.header('x-user-id');
-  return typeof header === 'string' && header.length > 0 ? header : 'default-user';
+/**
+ * The verified principal's user id (principal.ts, OPEN-1 fix) — Lightning
+ * credentials are stored per verified user, never per asserted header.
+ * Only call behind the router's principalMiddleware guard.
+ */
+function callerOf(req: Request, ctx: PrincipalContext): string {
+  const p = resolvePrincipal(req, ctx);
+  if (!p) throw new Error('unauthenticated');
+  return p.userId;
 }
 
 function errorBody(message: string): Record<string, unknown> {
@@ -139,6 +150,12 @@ export function lightningPlans(): LightningPlan[] {
 
 export function createCloudLightningRouter(deps: CloudRouteDeps): Router {
   const router = express.Router();
+  const pctx: PrincipalContext = { dataDir: deps.dataDir, loopbackToken: deps.loopbackToken, jwtSecret: deps.jwtSecret };
+  const caller = (req: Request): string => callerOf(req, pctx);
+  // Scoped to this router's own prefix: the router is mounted at '/api'
+  // alongside other feature routers, so an unscoped guard would reject
+  // requests (e.g. SSO logins, device-token calls) that belong to them.
+  router.use('/cloud', principalMiddleware(pctx));
   const studioName = deps.studioName ?? DEFAULT_STUDIO_NAME;
   const tier: CloudTier = deps.tier ?? 'free';
 
@@ -149,7 +166,7 @@ export function createCloudLightningRouter(deps: CloudRouteDeps): Router {
   };
 
   const connectedClient = (req: Request): { client: LightningClient; creds: LightningCredentials } | undefined => {
-    const creds = readLightningCredentials(deps.secretStore, callerOf(req));
+    const creds = readLightningCredentials(deps.secretStore, caller(req));
     if (!creds) return undefined;
     return { client: clientFor(creds), creds };
   };
@@ -179,8 +196,8 @@ export function createCloudLightningRouter(deps: CloudRouteDeps): Router {
         res.status(401).json(errorBody(`Lightning rejected those credentials${verdict.detail ? `: ${clientError(verdict.detail)}` : ''}`));
         return;
       }
-      deps.secretStore.set(callerOf(req), LIGHTNING_USER_ID_SECRET, userId);
-      deps.secretStore.set(callerOf(req), LIGHTNING_API_KEY_SECRET, apiKey);
+      deps.secretStore.set(caller(req), LIGHTNING_USER_ID_SECRET, userId);
+      deps.secretStore.set(caller(req), LIGHTNING_API_KEY_SECRET, apiKey);
       // The apiKey is never echoed back — only the (non-secret) user id.
       res.json({ ok: true, connected: true, verified: true, lightningUserId: userId });
     } catch (err) {
@@ -215,8 +232,8 @@ export function createCloudLightningRouter(deps: CloudRouteDeps): Router {
   });
 
   router.post('/cloud/lightning/disconnect', (req, res) => {
-    deps.secretStore.delete(callerOf(req), LIGHTNING_USER_ID_SECRET);
-    deps.secretStore.delete(callerOf(req), LIGHTNING_API_KEY_SECRET);
+    deps.secretStore.delete(caller(req), LIGHTNING_USER_ID_SECRET);
+    deps.secretStore.delete(caller(req), LIGHTNING_API_KEY_SECRET);
     res.json({ ok: true, connected: false });
   });
 
@@ -275,7 +292,7 @@ export function createCloudLightningRouter(deps: CloudRouteDeps): Router {
           : undefined;
     try {
       const providerEnv = deps.providerEnvForUser
-        ? await deps.providerEnvForUser(callerOf(req))
+        ? await deps.providerEnvForUser(caller(req))
         : {};
       const result: DeployResult = await deployKriyadot(found.client, {
         repoUrl,

@@ -2780,6 +2780,8 @@ async function boot(): Promise<void> {
         secretStore: new VaultCloudSecretStore(config.dataDir),
         studioName: 'kriyadot',
         tier: 'free',
+        dataDir: config.dataDir,
+        loopbackToken,
       }),
     );
 
@@ -3445,14 +3447,14 @@ async function boot(): Promise<void> {
   // Tenancy depth: role templates, groups+grants, audiences, quotas.
   {
     const { createTenancyDepthRouter } = await import('./tenancy-depth-routes.js');
-    app.use('/api', createTenancyDepthRouter({ dataDir: config.dataDir, audit: (action, fields) => governance.audit(action, fields) }));
+    app.use('/api', createTenancyDepthRouter({ dataDir: config.dataDir, loopbackToken, audit: (action, fields) => governance.audit(action, fields) }));
   }
   // Expert publishing + organization library + enterprise pack.
   {
     const { createPublishedBotsRouter } = await import('./published-bots-routes.js');
     app.use(
       '/api/published-bots',
-      createPublishedBotsRouter({ dataDir: config.dataDir, getBots: () => seed.bots, audit: (action, fields) => governance.audit(action, fields) }),
+      createPublishedBotsRouter({ dataDir: config.dataDir, getBots: () => seed.bots, loopbackToken, audit: (action, fields) => governance.audit(action, fields) }),
     );
     const { createOrgLibraryRouter, OrgLibraryStore } = await import('./org-library.js');
     const { TeamLibraryService } = await import('./team-library-service.js');
@@ -3462,6 +3464,7 @@ async function boot(): Promise<void> {
       '/api/org-library',
       createOrgLibraryRouter({
         dataDir: config.dataDir,
+        loopbackToken,
         getBots: () => seed.bots,
         // Team-kind installs: persist the manifest as a library entry,
         // then instantiate it (bots + team) through the team-library
@@ -3508,7 +3511,7 @@ async function boot(): Promise<void> {
       }),
     );
     const { createBrandRouter } = await import('./brand.js');
-    app.use('/api/brand', createBrandRouter({ dataDir: config.dataDir, audit: (action, fields) => governance.audit(action, fields) }));
+    app.use('/api/brand', createBrandRouter({ dataDir: config.dataDir, loopbackToken, audit: (action, fields) => governance.audit(action, fields) }));
     const { createInstallationsRouter, registerSelfInstallation } = await import('./installations.js');
     try {
       registerSelfInstallation(config.dataDir, process.env.KRIYADOT_VERSION ?? '0.1.0');
@@ -3517,7 +3520,7 @@ async function boot(): Promise<void> {
     }
     app.use(
       '/api/installations',
-      createInstallationsRouter({ dataDir: config.dataDir, audit: (action, fields) => governance.audit(action, fields) }),
+      createInstallationsRouter({ dataDir: config.dataDir, loopbackToken, audit: (action, fields) => governance.audit(action, fields) }),
     );
   }
   // Voice catalog (OMB §1.1): provider voice search for the bot picker.
@@ -3528,7 +3531,7 @@ async function boot(): Promise<void> {
   // Managed knowledge bases (Octop §2.13).
   app.use('/api/kb', await (async () => {
     const { createKbRouter } = await import('./kb-routes.js');
-    return createKbRouter({ dataDir: config.dataDir, store: kbStore });
+    return createKbRouter({ dataDir: config.dataDir, store: kbStore, loopbackToken });
   })());
   // Pluggable workspace backends (Octop §2.9): admin surface, only when a
   // backend registry is configured via WORKSPACE_BACKENDS_JSON/_FILE.

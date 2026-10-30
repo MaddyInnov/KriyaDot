@@ -560,7 +560,11 @@ export function registerRoutineRoutes(
       return err instanceof Error ? err.message : 'invalid event schedule';
     }
     if (schedule.kind !== 'event') return null;
-    const userId = schedule.userId ?? composioCallerOf(req);
+    // Identity (OPEN-1): the verified principal scopes the account-cache
+    // lookup; the 'default-user' fallback only preserves the pre-fix local
+    // namespace for contexts with no credential at all (this is a read-only
+    // validation lookup — it grants nothing).
+    const userId = schedule.userId ?? composioCallerOf(req, { dataDir: deps.dataDir }) ?? 'default-user';
     if (deps.eventAccountChecker) {
       return deps.eventAccountChecker({ accountId: schedule.accountId, app: schedule.app, userId, botId });
     }

@@ -20,6 +20,7 @@ import type { Request, Response } from 'express';
 import type { LazyMcpManager } from '@mvp/agent-runtime';
 import type { InstalledMcpServerConfig } from '@mvp/agent-runtime';
 import type { GovernanceGateway } from '@mvp/governance';
+import { resolvePrincipal } from './principal.js';
 
 export interface McpDirectoryRouteDeps {
   manager: LazyMcpManager;
@@ -37,7 +38,8 @@ function errMessage(err: unknown): string {
 }
 
 function actor(req: Request): string {
-  return req.header('x-user-id') ?? 'api';
+  // Audit actor = the verified principal (principal.ts, OPEN-1 fix), never a raw header.
+  return resolvePrincipal(req, {})?.userId ?? 'api';
 }
 
 export function registerMcpDirectoryRoutes(router: Router, deps: McpDirectoryRouteDeps): void {

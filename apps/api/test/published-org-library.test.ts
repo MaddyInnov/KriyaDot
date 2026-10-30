@@ -22,8 +22,10 @@ async function serve(app: express.Express): Promise<{ base: string; close: () =>
   return { base: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, close: () => server.close() };
 }
 
+const OWNER_TOKEN = 'test-owner-token'; // OPEN-1: requests authenticate as the loopback owner; x-user-id then asserts the local profile
 const H = (user: string, org?: string) => ({
   'content-type': 'application/json',
+  authorization: `Bearer ${OWNER_TOKEN}`,
   'x-user-id': user,
   ...(org ? { 'x-org-id': org } : {}),
 });
@@ -37,7 +39,7 @@ describe('published bots', () => {
     bots = [bot('expert-1')];
     const app = express();
     app.use(express.json());
-    app.use('/api/published-bots', createPublishedBotsRouter({ dataDir: dir, getBots: () => bots }));
+    app.use('/api/published-bots', createPublishedBotsRouter({ dataDir: dir, getBots: () => bots, loopbackToken: OWNER_TOKEN }));
     srv = await serve(app);
   });
   const url = () => `${srv.base}/api/published-bots`;
@@ -84,7 +86,7 @@ describe('org library', () => {
     bots = [];
     const app = express();
     app.use(express.json());
-    app.use('/api/org-library', createOrgLibraryRouter({ dataDir: dir, getBots: () => bots }));
+    app.use('/api/org-library', createOrgLibraryRouter({ dataDir: dir, getBots: () => bots, loopbackToken: OWNER_TOKEN }));
     srv = await serve(app);
   });
   const url = () => `${srv.base}/api/org-library`;

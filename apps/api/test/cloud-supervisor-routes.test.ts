@@ -9,6 +9,8 @@ import {
 } from '../src/cloud-lightning.js';
 import { CloudSupervisor, detectRestart } from '../src/cloud-supervisor.js';
 import { createCloudLightningRouter, lightningPlans } from '../src/cloud-routes.js';
+const OWNER_TOKEN = 'test-owner-token'; // OPEN-1: requests authenticate with the loopback owner credential
+
 
 const clock = { t: 1_000_000, now() { return this.t; } };
 
@@ -99,7 +101,7 @@ describe('cloud routes', () => {
   async function req(method: string, path: string, body?: unknown) {
     const res = await fetch(`${base}${path}`, {
       method,
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${OWNER_TOKEN}`, },
       body: body ? JSON.stringify(body) : undefined,
     });
     return { status: res.status, json: (await res.json()) as Record<string, any> };
@@ -119,6 +121,7 @@ describe('cloud routes', () => {
         client: fake,
         healthProbe: async () => true,
         providerEnvForUser: () => ({ OPENAI_API_KEY: 'sk-from-vault' }),
+        loopbackToken: OWNER_TOKEN,
       }),
     );
     const srv = app.listen(0);

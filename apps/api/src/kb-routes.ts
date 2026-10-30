@@ -5,10 +5,12 @@
 //   import { createKbRouter } from './kb-routes.js';
 //   app.use('/api/kb', createKbRouter({ dataDir: config.dataDir }));
 //
-// Actor identity: `x-user-id` header (default 'default-user', matching the
-// single-user loopback convention elsewhere) and optional `x-org-id`.
-// Sharing (owner-only share/unshare; read | contribute roles) is enforced
-// inside KbStore on every route — these handlers only translate HTTP.
+// Actor identity: the verified principal (principal.ts, OPEN-1 fix). The
+// `x-org-id` header only SELECTS an org for the loopback owner; a
+// credential-bound principal (tenancy JWT / SSO) is pinned to its own org
+// and the header is ignored. Sharing (owner-only share/unshare; read |
+// contribute roles) is enforced inside KbStore on every route — these
+// handlers only translate HTTP.
 //
 // Routes (mounted at /api/kb):
 //   POST   /                              create corpus
@@ -29,16 +31,21 @@
 
 import express, { type Request, type Response, type Router } from 'express';
 import { KbStore, type KbActor } from './kb.js';
+import { effectiveOrgId, principalMiddleware, resolvePrincipal, type PrincipalContext } from './principal.js';
 
 export interface KbRouterDeps {
   dataDir: string;
   store?: KbStore;
+  loopbackToken?: string;
+  jwtSecret?: string;
 }
 
-export function actorFromRequest(req: Request): KbActor {
-  const userId = (req.header('x-user-id') ?? '').trim() || 'default-user';
-  const orgId = (req.header('x-org-id') ?? '').trim() || undefined;
-  return { userId, orgId };
+/** The KB actor for a request — its verified principal. Only call behind principalMiddleware. */
+export function actorFromRequest(req: Request, ctx: PrincipalContext): KbActor {
+  const principal = resolvePrincipal(req, ctx);
+  if (!principal) throw new Error('unauthenticated');
+  const requestedOrg = (req.header('x-org-id') ?? '').trim() || undefined;
+  return { userId: principal.userId, orgId: effectiveOrgId(principal, requestedOrg) };
 }
 
 function fail(res: Response, err: unknown): void {
@@ -56,11 +63,14 @@ function fail(res: Response, err: unknown): void {
 export function createKbRouter(deps: KbRouterDeps): Router {
   const store = deps.store ?? new KbStore(deps.dataDir);
   const router = express.Router();
+  const pctx: PrincipalContext = { dataDir: deps.dataDir, loopbackToken: deps.loopbackToken, jwtSecret: deps.jwtSecret };
+  const actor = (req: Request): KbActor => actorFromRequest(req, pctx);
+  router.use(principalMiddleware(pctx));
 
   router.post('/', (req: Request, res: Response) => {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
-      const corpus = store.createCorpus(actorFromRequest(req), {
+      const corpus = store.createCorpus(actor(req), {
         name: String(body.name ?? ''),
         description: typeof body.description === 'string' ? body.description : undefined,
         maxDocs: typeof body.maxDocs === 'number' ? body.maxDocs : undefined,
@@ -75,7 +85,7 @@ export function createKbRouter(deps: KbRouterDeps): Router {
 
   router.get('/', (req: Request, res: Response) => {
     try {
-      res.json({ corpora: store.listCorpora(actorFromRequest(req)) });
+      res.json({ corpora: store.listCorpora(actor(req)) });
     } catch (err) {
       fail(res, err);
     }
@@ -86,7 +96,7 @@ export function createKbRouter(deps: KbRouterDeps): Router {
       const q = typeof req.query.q === 'string' ? req.query.q : '';
       const kbId = typeof req.query.kbId === 'string' ? req.query.kbId : undefined;
       const topK = typeof req.query.topK === 'string' ? Number(req.query.topK) : undefined;
-      res.json({ citations: store.search(actorFromRequest(req), q, { kbId, topK }) });
+      res.json({ citations: store.search(actor(req), q, { kbId, topK }) });
     } catch (err) {
       fail(res, err);
     }
@@ -94,7 +104,7 @@ export function createKbRouter(deps: KbRouterDeps): Router {
 
   router.get('/:id', (req: Request, res: Response) => {
     try {
-      res.json(store.getCorpus(actorFromRequest(req), req.params.id));
+      res.json(store.getCorpus(actor(req), req.params.id));
     } catch (err) {
       fail(res, err);
     }
@@ -104,7 +114,7 @@ export function createKbRouter(deps: KbRouterDeps): Router {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
       res.json(
-        store.updateCorpus(actorFromRequest(req), req.params.id, {
+        store.updateCorpus(actor(req), req.params.id, {
           name: typeof body.name === 'string' ? body.name : undefined,
           description: typeof body.description === 'string' ? body.description : undefined,
           maxDocs: typeof body.maxDocs === 'number' ? body.maxDocs : undefined,
@@ -122,7 +132,7 @@ export function createKbRouter(deps: KbRouterDeps): Router {
 
   router.delete('/:id', (req: Request, res: Response) => {
     try {
-      store.deleteCorpus(actorFromRequest(req), req.params.id);
+      store.deleteCorpus(actor(req), req.params.id);
       res.json({ ok: true });
     } catch (err) {
       fail(res, err);
@@ -133,7 +143,7 @@ export function createKbRouter(deps: KbRouterDeps): Router {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
       const folder = store.addFolder(
-        actorFromRequest(req),
+        actor(req),
         req.params.id,
         String(body.name ?? ''),
         typeof body.parentId === 'string' ? body.parentId : null,
@@ -147,7 +157,7 @@ export function createKbRouter(deps: KbRouterDeps): Router {
   router.post('/:id/share', (req: Request, res: Response) => {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
-      const corpus = store.share(actorFromRequest(req), req.params.id, {
+      const corpus = store.share(actor(req), req.params.id, {
         principalType: body.principalType === 'org' ? 'org' : 'user',
         principalId: String(body.principalId ?? ''),
         role: body.role === 'contribute' ? 'contribute' : 'read',
@@ -162,7 +172,7 @@ export function createKbRouter(deps: KbRouterDeps): Router {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
       const corpus = store.unshare(
-        actorFromRequest(req),
+        actor(req),
         req.params.id,
         body.principalType === 'org' ? 'org' : 'user',
         String(body.principalId ?? ''),
@@ -175,7 +185,7 @@ export function createKbRouter(deps: KbRouterDeps): Router {
 
   router.get('/:id/documents', (req: Request, res: Response) => {
     try {
-      res.json({ documents: store.listDocuments(actorFromRequest(req), req.params.id) });
+      res.json({ documents: store.listDocuments(actor(req), req.params.id) });
     } catch (err) {
       fail(res, err);
     }
@@ -184,7 +194,7 @@ export function createKbRouter(deps: KbRouterDeps): Router {
   router.post('/:id/documents', (req: Request, res: Response) => {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
-      const doc = store.addDocument(actorFromRequest(req), req.params.id, {
+      const doc = store.addDocument(actor(req), req.params.id, {
         title: String(body.title ?? ''),
         text: String(body.text ?? ''),
         fileName: typeof body.fileName === 'string' ? body.fileName : undefined,
@@ -198,7 +208,7 @@ export function createKbRouter(deps: KbRouterDeps): Router {
 
   router.get('/:id/documents/:docId', (req: Request, res: Response) => {
     try {
-      res.json(store.getDocument(actorFromRequest(req), req.params.id, req.params.docId));
+      res.json(store.getDocument(actor(req), req.params.id, req.params.docId));
     } catch (err) {
       fail(res, err);
     }
@@ -208,7 +218,7 @@ export function createKbRouter(deps: KbRouterDeps): Router {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
       res.json(
-        store.editDocument(actorFromRequest(req), req.params.id, req.params.docId, String(body.editedText ?? '')),
+        store.editDocument(actor(req), req.params.id, req.params.docId, String(body.editedText ?? '')),
       );
     } catch (err) {
       fail(res, err);
@@ -217,7 +227,7 @@ export function createKbRouter(deps: KbRouterDeps): Router {
 
   router.delete('/:id/documents/:docId', (req: Request, res: Response) => {
     try {
-      store.deleteDocument(actorFromRequest(req), req.params.id, req.params.docId);
+      store.deleteDocument(actor(req), req.params.id, req.params.docId);
       res.json({ ok: true });
     } catch (err) {
       fail(res, err);
@@ -229,7 +239,7 @@ export function createKbRouter(deps: KbRouterDeps): Router {
       const q = typeof req.query.q === 'string' ? req.query.q : '';
       const topK = typeof req.query.topK === 'string' ? Number(req.query.topK) : undefined;
       res.json({
-        citations: store.search(actorFromRequest(req), q, { kbId: req.params.id, topK }),
+        citations: store.search(actor(req), q, { kbId: req.params.id, topK }),
       });
     } catch (err) {
       fail(res, err);

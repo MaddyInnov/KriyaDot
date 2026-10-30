@@ -11,6 +11,7 @@ import { KbStore, chunkKbText, type KbActor } from '../src/kb.js';
 import { createKbRouter } from '../src/kb-routes.js';
 import { createKbTools } from '../src/kb-tools.js';
 
+const OWNER_TOKEN = 'test-owner-token'; // OPEN-1: route tests authenticate as the loopback owner; x-user-id then asserts the local profile
 const owner: KbActor = { userId: 'alice' };
 const reader: KbActor = { userId: 'bob' };
 const contributor: KbActor = { userId: 'carol' };
@@ -126,7 +127,7 @@ describe('kb routes + tools', () => {
     store = new KbStore(dir);
     const app = express();
     app.use(express.json());
-    app.use('/api/kb', createKbRouter({ dataDir: dir, store }));
+    app.use('/api/kb', createKbRouter({ dataDir: dir, store, loopbackToken: OWNER_TOKEN }));
     await new Promise<void>((resolve) => {
       server = app.listen(0, () => resolve());
     });
@@ -140,7 +141,7 @@ describe('kb routes + tools', () => {
   const call = async (method: string, path: string, user: string, body?: unknown) => {
     const r = await fetch(`${base}${path}`, {
       method,
-      headers: { 'content-type': 'application/json', 'x-user-id': user },
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${OWNER_TOKEN}`, 'x-user-id': user },
       body: body ? JSON.stringify(body) : undefined,
     });
     return { status: r.status, json: (await r.json()) as any };

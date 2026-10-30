@@ -20,8 +20,11 @@
 //   POST   /orgs/invites/accept         → { token } → Membership
 //   GET    /orgs/:id/scope              → tenantScope() filter descriptor
 //
-// Identity: the caller is `x-user-id` (fallback 'default-user'). Deny-by-
-// default: every org-scoped route 403s unless the caller is a member meeting
+// Identity: the caller is the verified principal (principal.ts, OPEN-1
+// fix) — tenancy JWT subject, SSO session user, or the loopback owner
+// (whose `x-user-id` header may assert a local profile). The header alone
+// never authenticates anyone. Deny-by-default: unauthenticated → 401;
+// every org-scoped route 403s unless the principal is a member meeting
 // the required role. Invite tokens are never logged.
 
 import express from 'express';
@@ -30,31 +33,41 @@ import type { Request, Response } from 'express';
 import { TenantStore, canAct, isRole, maskForViewer, tenantScope } from '@mvp/tenancy';
 import type { Role } from '@mvp/tenancy';
 import type { RouteDeps } from './routes.js';
+import { requirePrincipal, resolvePrincipal, type Principal, type PrincipalContext } from './principal.js';
 
-type TenancyDeps = Pick<RouteDeps, 'config' | 'governance'>;
+type TenancyDeps = Pick<RouteDeps, 'config' | 'governance' | 'loopbackToken'> & { jwtSecret?: string };
 
 function errorBody(error: string, detail?: string): { error: string; detail?: string } {
   return detail ? { error, detail } : { error };
 }
 
-function callerOf(req: Request): string {
-  const header = req.header('x-user-id');
-  return typeof header === 'string' && header.length > 0 ? header : 'default-user';
-}
-
 export function registerTenancyRoutes(router: express.Router, deps: TenancyDeps): void {
   const store = new TenantStore(join(deps.config.dataDir, 'tenancy.db'));
   const { governance } = deps;
+  const pctx: PrincipalContext = { dataDir: deps.config.dataDir, loopbackToken: deps.loopbackToken, jwtSecret: deps.jwtSecret };
   const sub = express.Router();
 
-  // Resolve the caller's role in the org from :id. Fails closed: unknown
-  // org or non-member → 403 (we don't distinguish, to avoid org enumeration).
+  // The verified caller, or null (handlers deny 401 via requireCaller).
+  function callerOf(req: Request): Principal | null {
+    return resolvePrincipal(req, pctx);
+  }
+
+  function requireCaller(req: Request, res: Response): Principal | null {
+    return requirePrincipal(req, res, pctx);
+  }
+
+  // Resolve the caller's role in the org from :id. Fails closed: no
+  // principal, unknown org or non-member → undefined (handlers 403, we
+  // don't distinguish, to avoid org enumeration). A credential bound to
+  // a different org never resolves a role here.
   function roleOf(req: Request): { orgId: string; userId: string; role: Role } | undefined {
+    const principal = callerOf(req);
+    if (!principal) return undefined;
     const orgId = req.params.id;
-    const userId = callerOf(req);
-    const membership = store.getMembership(orgId, userId);
+    if (principal.orgId && principal.orgId !== orgId) return undefined;
+    const membership = store.getMembership(orgId, principal.userId);
     if (!membership) return undefined;
-    return { orgId, userId, role: membership.role };
+    return { orgId, userId: principal.userId, role: membership.role };
   }
 
   function deny(res: Response, required: Role): void {
@@ -63,11 +76,13 @@ export function registerTenancyRoutes(router: express.Router, deps: TenancyDeps)
 
   // POST /orgs — create an org; the caller becomes its owner.
   sub.post('/', (req: Request, res: Response) => {
+    const caller = requireCaller(req, res);
+    if (!caller) return;
     try {
       const body = (req.body ?? {}) as { name?: unknown };
-      const org = store.createOrg(body.name as string, callerOf(req));
+      const org = store.createOrg(body.name as string, caller.userId);
       governance.audit('tenancy.org_created', {
-        actor: callerOf(req),
+        actor: caller.userId,
         toolName: 'tenancy',
         detail: { orgId: org.id, name: org.name },
       });
@@ -81,8 +96,10 @@ export function registerTenancyRoutes(router: express.Router, deps: TenancyDeps)
 
   // GET /orgs — orgs the caller belongs to.
   sub.get('/', (req: Request, res: Response) => {
+    const caller = requireCaller(req, res);
+    if (!caller) return;
     try {
-      res.json(store.listOrgsForUser(callerOf(req)));
+      res.json(store.listOrgsForUser(caller.userId));
     } catch (err) {
       res
         .status(500)
@@ -91,12 +108,16 @@ export function registerTenancyRoutes(router: express.Router, deps: TenancyDeps)
   });
 
   // POST /orgs/invites/accept — accept an invite by token (before :id routes).
+  // The membership is created for the VERIFIED principal: the invite token
+  // is the invitation credential, the caller's identity is never asserted.
   sub.post('/invites/accept', (req: Request, res: Response) => {
+    const caller = requireCaller(req, res);
+    if (!caller) return;
     try {
       const body = (req.body ?? {}) as { token?: unknown };
-      const membership = store.acceptInvite(String(body.token ?? ''), callerOf(req));
+      const membership = store.acceptInvite(String(body.token ?? ''), caller.userId);
       governance.audit('tenancy.invite_accepted', {
-        actor: callerOf(req),
+        actor: caller.userId,
         toolName: 'tenancy',
         detail: { orgId: membership.orgId, role: membership.role },
       });

@@ -8,6 +8,8 @@ import express from 'express';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { registerComposioRoutes } from '../src/composio.js';
 import { registerComposioAccountRoutes } from '../src/composio-accounts.js';
+const OWNER_TOKEN = 'test-owner-token'; // OPEN-1: requests authenticate with the loopback owner credential
+
 import type { ComposioClient, ComposioConnectedAccount } from '../src/composio.js';
 
 // Zero paid API usage: mutable mock so tests can simulate the OAuth
@@ -80,6 +82,7 @@ describe('composio account routes', () => {
       governance: { audit } as unknown as import('@mvp/governance').GovernanceGateway,
       bots,
       composioClient: mock.client,
+      loopbackToken: OWNER_TOKEN,
     };
     registerComposioRoutes(router, deps);
     registerComposioAccountRoutes(router, deps);
@@ -100,7 +103,7 @@ describe('composio account routes', () => {
   async function call(method: string, path: string, body?: unknown) {
     const res = await fetch(`${baseUrl}${path}`, {
       method,
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${OWNER_TOKEN}`, },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;

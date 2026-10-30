@@ -35,6 +35,7 @@ import { LdapClient, ldapConfigFromEnv, type LdapConfig } from './auth-ldap.js';
 import {
   OidcClient,
   SessionTokenStore,
+  getSharedSsoSessionStore,
   oidcConfigFromEnv,
   type FetchFn,
   type OidcConfig,
@@ -48,6 +49,8 @@ export interface AuthSsoDeps {
   fetchFn?: FetchFn;
   captchaStore?: CaptchaStore;
   captchaPolicy?: CaptchaPolicy;
+  /** Session store override (tests); defaults to the shared per-data-dir store the principal resolver reads. */
+  sessions?: SessionTokenStore;
   audit?: (action: string, fields: { actor?: string; detail?: unknown }) => void;
 }
 
@@ -60,7 +63,7 @@ export function createAuthSsoRouter(deps: AuthSsoDeps): Router {
   const dbPath = deps.tenancyDbPath ?? join(deps.dataDir, 'tenancy.db');
   const tenants = new TenantStore(dbPath);
   const extras = new TenancyExtrasStore(dbPath);
-  const sessions = new SessionTokenStore(deps.dataDir);
+  const sessions = deps.sessions ?? getSharedSsoSessionStore(deps.dataDir);
   const captchaStore = deps.captchaStore ?? new CaptchaStore();
   const failures = new LoginFailureTracker();
   const policy = deps.captchaPolicy ?? captchaPolicyFromEnv();

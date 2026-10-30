@@ -22,6 +22,7 @@ import type { Request, Response } from 'express';
 import { ProcessingRuleStore } from '@mvp/governance';
 import { join } from 'node:path';
 import type { GovernanceGateway } from '@mvp/governance';
+import { resolvePrincipal } from './principal.js';
 
 export interface ProcessingRuleDeps {
   dataDir: string;
@@ -43,7 +44,8 @@ function numQuery(v: unknown): number | undefined {
 }
 
 function actorOf(req: Request): string {
-  return req.header('x-user-id') ?? 'api';
+  // Audit actor = the verified principal (principal.ts, OPEN-1 fix), never a raw header.
+  return resolvePrincipal(req, {})?.userId ?? 'api';
 }
 
 export function registerProcessingRuleRoutes(router: Router, deps: ProcessingRuleDeps): void {

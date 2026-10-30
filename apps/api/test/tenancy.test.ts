@@ -14,6 +14,9 @@ import { DEFAULT_POLICY, GovernanceGateway } from '@mvp/governance';
 import type { AppConfig } from '../src/config.js';
 import { registerTenancyRoutes } from '../src/tenancy.js';
 
+const OWNER_TOKEN = 'test-owner-token'; // loopback owner credential (OPEN-1: tests authenticate as the owner; x-user-id then asserts the local profile)
+
+
 function freshDataDir(): string {
   return mkdtempSync(join(tmpdir(), 'tenancy-api-'));
 }
@@ -38,6 +41,7 @@ describe('tenancy router', () => {
     registerTenancyRoutes(router, {
       config: { dataDir: dir } as AppConfig,
       governance,
+      loopbackToken: OWNER_TOKEN,
     });
     app.use('/api', router);
     await new Promise<void>((resolve) => {
@@ -64,6 +68,7 @@ describe('tenancy router', () => {
       method,
       headers: {
         'content-type': 'application/json',
+        authorization: `Bearer ${OWNER_TOKEN}`,
         ...(userId ? { 'x-user-id': userId } : {}),
       },
       body: body === undefined ? undefined : JSON.stringify(body),

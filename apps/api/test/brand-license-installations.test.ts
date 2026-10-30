@@ -11,10 +11,16 @@ import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import express from 'express';
 import { afterEach, describe, expect, it } from 'vitest';
-import { TenantStore } from '@mvp/tenancy';
+import { TenantStore, signTenancyJwt } from '@mvp/tenancy';
 import { BrandStore, createBrandRouter } from '../src/brand.js';
 import { InstallationRegistry, createInstallationsRouter, hashHostname, registerSelfInstallation } from '../src/installations.js';
 import { licenseHasFeature, requireFeature, verifyLicense, type LicensePayload } from '../src/license.js';
+
+// OPEN-1: brand/installations admin checks resolve a VERIFIED principal.
+// Non-owner callers authenticate with a tenancy JWT (sub = their user id);
+// the role (org owner/admin) then comes from stored memberships, never a header.
+const JWT_SECRET = 'brand-inst-test-secret';
+const jwtFor = (sub: string, orgId: string): string => signTenancyJwt({ sub, orgId }, JWT_SECRET);
 
 const { publicKey, privateKey } = generateKeyPairSync('ed25519');
 const PUB_B64 = publicKey.export({ type: 'spki', format: 'der' }).toString('base64');
@@ -103,15 +109,18 @@ describe('brand store + routes', () => {
     void org;
     const app = express();
     app.use(express.json());
-    app.use('/api/brand', createBrandRouter({ dataDir: dir, tenancyDbPath: dbPath }));
+    app.use('/api/brand', createBrandRouter({ dataDir: dir, tenancyDbPath: dbPath, jwtSecret: JWT_SECRET }));
     await new Promise<void>((resolve) => {
       server = app.listen(0, '127.0.0.1', resolve);
     });
     const base = `http://127.0.0.1:${(server!.address() as AddressInfo).port}/api/brand`;
     expect((await (await fetch(base)).json() as { brand: { name: string } }).brand.name).toBe('KriyaDot');
-    const denied = await fetch(base, { method: 'PUT', headers: { 'content-type': 'application/json', 'x-user-id': 'nobody' }, body: JSON.stringify({ name: 'Hax' }) });
+    const denied = await fetch(base, { method: 'PUT', headers: { 'content-type': 'application/json', authorization: `Bearer ${jwtFor('nobody', org.id)}` }, body: JSON.stringify({ name: 'Hax' }) });
     expect(denied.status).toBe(403);
-    const allowed = await fetch(base, { method: 'PUT', headers: { 'content-type': 'application/json', 'x-user-id': 'boss-1' }, body: JSON.stringify({ name: 'Acme AI', primaryColor: '#445566' }) });
+    // A bare x-user-id header no longer grants anything at all (OPEN-1).
+    const spoofed = await fetch(base, { method: 'PUT', headers: { 'content-type': 'application/json', 'x-user-id': 'boss-1' }, body: JSON.stringify({ name: 'Hax' }) });
+    expect(spoofed.status).toBe(403);
+    const allowed = await fetch(base, { method: 'PUT', headers: { 'content-type': 'application/json', authorization: `Bearer ${jwtFor('boss-1', org.id)}` }, body: JSON.stringify({ name: 'Acme AI', primaryColor: '#445566' }) });
     expect(allowed.status).toBe(200);
     expect((await (await fetch(base)).json() as { brand: { name: string } }).brand.name).toBe('Acme AI');
   });
@@ -135,10 +144,10 @@ describe('installations registry', () => {
   it('register requires the shared token; list is admin-only', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'inst-'));
     const dbPath = join(dir, 'tenancy.db');
-    new TenantStore(dbPath).createOrg('Acme', 'boss-1');
+    const org = new TenantStore(dbPath).createOrg('Acme', 'boss-1');
     const app = express();
     app.use(express.json());
-    app.use('/api/installations', createInstallationsRouter({ dataDir: dir, tenancyDbPath: dbPath, registrationToken: 'reg-token-1' }));
+    app.use('/api/installations', createInstallationsRouter({ dataDir: dir, tenancyDbPath: dbPath, registrationToken: 'reg-token-1', jwtSecret: JWT_SECRET }));
     await new Promise<void>((resolve) => {
       server = app.listen(0, '127.0.0.1', resolve);
     });
@@ -150,9 +159,9 @@ describe('installations registry', () => {
     const created = await okRes.json() as { installation: { hostnameHash: string } };
     expect(created.installation.hostnameHash).toBe(hashHostname('fleet-host-7'));
     expect(JSON.stringify(created)).not.toContain('fleet-host-7');
-    const listDenied = await fetch(base, { headers: { 'x-user-id': 'nobody' } });
+    const listDenied = await fetch(base, { headers: { authorization: `Bearer ${jwtFor('nobody', org.id)}` } });
     expect(listDenied.status).toBe(403);
-    const listOk = await (await fetch(base, { headers: { 'x-user-id': 'boss-1' } })).json() as { installations: unknown[] };
+    const listOk = await (await fetch(base, { headers: { authorization: `Bearer ${jwtFor('boss-1', org.id)}` } })).json() as { installations: unknown[] };
     expect(listOk.installations).toHaveLength(1);
   });
 });

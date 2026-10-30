@@ -24,6 +24,7 @@ import os from 'node:os';
 import { join } from 'node:path';
 import express, { type Router } from 'express';
 import { TenantStore, canAct } from '@mvp/tenancy';
+import { resolvePrincipal, type PrincipalContext } from './principal.js';
 
 export interface InstallationRecord {
   id: string;
@@ -114,18 +115,16 @@ export interface InstallationsDeps {
   tenancyDbPath?: string;
   /** Defaults to env KRIYADOT_REGISTRATION_TOKEN. */
   registrationToken?: string;
+  loopbackToken?: string;
+  jwtSecret?: string;
   audit?: (action: string, fields: { actor?: string; detail?: unknown }) => void;
-}
-
-function callerOf(req: express.Request): string {
-  const h = req.header('x-user-id');
-  return typeof h === 'string' && h ? h : 'default-user';
 }
 
 export function createInstallationsRouter(deps: InstallationsDeps): Router {
   const router = express.Router();
   const registry = new InstallationRegistry(deps.dataDir);
   const tenants = new TenantStore(deps.tenancyDbPath ?? join(deps.dataDir, 'tenancy.db'));
+  const pctx: PrincipalContext = { dataDir: deps.dataDir, loopbackToken: deps.loopbackToken, jwtSecret: deps.jwtSecret };
   const expectedToken = deps.registrationToken ?? process.env.KRIYADOT_REGISTRATION_TOKEN ?? '';
 
   function tokenOk(provided: unknown): boolean {
@@ -136,8 +135,10 @@ export function createInstallationsRouter(deps: InstallationsDeps): Router {
   }
 
   function isAdmin(req: express.Request): boolean {
-    if ((req as express.Request & { loopbackAuthed?: boolean }).loopbackAuthed) return true;
-    return tenants.listOrgsForUser(callerOf(req)).some((o) => canAct(o.role, 'admin'));
+    const principal = resolvePrincipal(req, pctx);
+    if (!principal) return false;
+    if (principal.kind === 'owner') return true;
+    return tenants.listOrgsForUser(principal.userId).some((o) => canAct(o.role, 'admin'));
   }
 
   router.post('/register', (req, res) => {

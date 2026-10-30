@@ -16,6 +16,7 @@ import type { AppConfig } from '../src/config.js';
 import { registerVaultRoutes } from '../src/vault.js';
 
 const PASSWORD = 's3cr3t-p@ssw0rd-xyz';
+const OWNER_TOKEN = 'test-owner-token'; // loopback owner credential (OPEN-1: tests authenticate as the owner; x-user-id then asserts the local profile)
 
 interface ApiResult {
   status: number;
@@ -32,7 +33,7 @@ describe('vault login endpoints', () => {
     const app = express();
     app.use(express.json());
     const router = express.Router();
-    registerVaultRoutes(router, { config: { dataDir: dir } as AppConfig, governance });
+    registerVaultRoutes(router, { config: { dataDir: dir } as AppConfig, governance, loopbackToken: OWNER_TOKEN });
     app.use('/api', router);
     await new Promise<void>((resolve) => {
       server = app.listen(0, '127.0.0.1', () => resolve());
@@ -51,7 +52,7 @@ describe('vault login endpoints', () => {
   async function api(method: string, path: string, body?: unknown): Promise<ApiResult> {
     const res = await fetch(`${baseUrl}${path}`, {
       method,
-      headers: { 'content-type': 'application/json', 'x-user-id': 'alice' },
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${OWNER_TOKEN}`, 'x-user-id': 'alice' },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     return { status: res.status, json: await res.json().catch(() => null) };

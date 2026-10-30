@@ -4,8 +4,8 @@
 // Brand config is deployment-global, stored at <dataDir>/brand.json:
 //   { name, tagline, logoDataUrl | logoUrl, primaryColor }
 // GET /brand is public-ish (the web shell needs it before login); PUT /brand
-// is admin-gated: the caller (x-user-id) must be owner/admin in SOME org of
-// this deployment, or hold the loopback bearer (req.loopbackAuthed).
+// is admin-gated: the verified principal (principal.ts) must be the loopback
+// owner or owner/admin in SOME org of this deployment.
 //
 // HOST WIRING (index.ts):
 //   import { createBrandRouter } from './brand.js';
@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import { join } from 'node:path';
 import express, { type Router } from 'express';
 import { TenantStore, canAct } from '@mvp/tenancy';
+import { resolvePrincipal, type PrincipalContext } from './principal.js';
 
 export interface BrandConfig {
   name: string;
@@ -86,23 +87,27 @@ export class BrandStore {
 export interface BrandDeps {
   dataDir: string;
   tenancyDbPath?: string;
+  loopbackToken?: string;
+  jwtSecret?: string;
   audit?: (action: string, fields: { actor?: string; detail?: unknown }) => void;
-}
-
-function callerOf(req: express.Request): string {
-  const h = req.header('x-user-id');
-  return typeof h === 'string' && h ? h : 'default-user';
 }
 
 export function createBrandRouter(deps: BrandDeps): Router {
   const router = express.Router();
   const store = new BrandStore(deps.dataDir);
   const tenants = new TenantStore(deps.tenancyDbPath ?? join(deps.dataDir, 'tenancy.db'));
+  const pctx: PrincipalContext = { dataDir: deps.dataDir, loopbackToken: deps.loopbackToken, jwtSecret: deps.jwtSecret };
+
+  function callerOf(req: express.Request): string {
+    return resolvePrincipal(req, pctx)?.userId ?? '';
+  }
 
   function isAdmin(req: express.Request): boolean {
-    if ((req as express.Request & { loopbackAuthed?: boolean }).loopbackAuthed) return true;
+    const principal = resolvePrincipal(req, pctx);
+    if (!principal) return false;
+    if (principal.kind === 'owner') return true;
     // Admin-gated per tenancy role: owner/admin in any org of this deployment.
-    return tenants.listOrgsForUser(callerOf(req)).some((o) => canAct(o.role, 'admin'));
+    return tenants.listOrgsForUser(principal.userId).some((o) => canAct(o.role, 'admin'));
   }
 
   router.get('/', (_req, res) => {

@@ -41,7 +41,7 @@ export const API_SPEC_REGISTRY: ApiSpecEntry[] = [
   { method: 'get', path: '/api/audit', summary: 'Recent governance audit entries', tags: ['system'] },
 
   // --- Managed knowledge bases (detail) ---
-  { method: 'post', path: '/api/kb', summary: 'Create a knowledge base (corpus)', tags: ['kb'], detail: 'Body: { name, description?, maxDocs?, maxBytes?, embeddingProvider?: "local" | "neural" }. Owner = x-user-id header (default default-user).', requestBody: true },
+  { method: 'post', path: '/api/kb', summary: 'Create a knowledge base (corpus)', tags: ['kb'], detail: 'Body: { name, description?, maxDocs?, maxBytes?, embeddingProvider?: "local" | "neural" }. Owner = the verified principal (owner token / tenancy JWT / SSO session).', requestBody: true },
   { method: 'get', path: '/api/kb', summary: 'List knowledge bases visible to the actor', tags: ['kb'], detail: 'Includes corpora shared to the actor (user or org) with read/contribute roles.' },
   { method: 'get', path: '/api/kb/search', summary: 'Search across visible knowledge bases with citations', tags: ['kb'], detail: 'Returns { citations: [{ kbId, docId, docTitle, chunkIndex, excerpt, score }] }.', query: ['q', 'kbId', 'topK'] },
   { method: 'get', path: '/api/kb/{id}', summary: 'Get one knowledge base', tags: ['kb'] },

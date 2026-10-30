@@ -12,6 +12,7 @@ import { TenantStore, signTenancyJwt } from '@mvp/tenancy';
 import { createTenancyDepthRouter } from '../src/tenancy-depth-routes.js';
 
 const JWT_SECRET = 'route-test-secret';
+const OWNER_TOKEN = 'test-owner-token'; // loopback owner credential (OPEN-1: tests authenticate as the owner; x-user-id then asserts the local profile)
 
 describe('tenancy-depth routes', () => {
   let orgId: string;
@@ -26,7 +27,7 @@ describe('tenancy-depth routes', () => {
     tenants.addMember(orgId, 'mem-1', 'member');
     const app = express();
     app.use(express.json());
-    app.use('/api/tenancy', createTenancyDepthRouter({ tenancyDbPath: dbPath, jwtSecret: JWT_SECRET }));
+    app.use('/api/tenancy', createTenancyDepthRouter({ tenancyDbPath: dbPath, jwtSecret: JWT_SECRET, loopbackToken: OWNER_TOKEN }));
     const server = app.listen(0, '127.0.0.1');
     await new Promise<void>((r) => server.once('listening', r));
     srv = { base: `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/tenancy`, close: () => server.close() };
@@ -35,7 +36,7 @@ describe('tenancy-depth routes', () => {
   const call = (method: string, path: string, user: string, body?: unknown) =>
     fetch(`${srv.base}${path}`, {
       method,
-      headers: { 'content-type': 'application/json', 'x-user-id': user },
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${OWNER_TOKEN}`, 'x-user-id': user },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     });
 

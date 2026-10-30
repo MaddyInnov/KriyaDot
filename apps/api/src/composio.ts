@@ -43,6 +43,7 @@ import { join } from 'node:path';
 import { SecureVault } from '@mvp/vault';
 import type { BotConfig } from '@mvp/agent-runtime';
 import type { RouteDeps } from './routes.js';
+import { principalMiddleware, resolvePrincipal, type PrincipalContext } from './principal.js';
 
 // ---------------------------------------------------------------------------
 // Composio HTTP client (interface + production fetch implementation)
@@ -380,14 +381,16 @@ export const fetchComposioClient: ComposioClient = {
 /** Vault secret name holding the Composio API key (per-user namespace). */
 export const COMPOSIO_KEY_NAME = 'composio-api-key';
 
-function callerOf(req: Request): string {
-  const header = req.header('x-user-id');
-  return typeof header === 'string' && header.length > 0 ? header : 'default-user';
-}
-
-/** Public alias: the KriyaDot user id for a request (used by account routes). */
-export function composioCallerOf(req: Request): string {
-  return callerOf(req);
+/**
+ * The verified principal's user id for a request (principal.ts, OPEN-1
+ * fix) — the Composio key/enablement namespace. Returns null when no
+ * credential verifies; route handlers sit behind principalMiddleware so
+ * for them it is never null (see the asserting callerOf inside
+ * registerComposioRoutes). Cross-module callers (account routes,
+ * bot-routines) pass their own principal context.
+ */
+export function composioCallerOf(req: Request, ctx: PrincipalContext): string | null {
+  return resolvePrincipal(req, ctx)?.userId ?? null;
 }
 
 function sanitizeNamespace(ns: string): string {
@@ -506,9 +509,11 @@ export function syncComposioToolGrant(bot: BotConfig, dataDir: string, userId: s
   }
 }
 
-export type ComposioDeps = Pick<RouteDeps, 'config' | 'governance' | 'bots'> & {
+export type ComposioDeps = Pick<RouteDeps, 'config' | 'governance' | 'bots' | 'loopbackToken'> & {
   /** Injected in tests; defaults to the real fetch client in production. */
   composioClient?: ComposioClient;
+  /** Tenancy JWT secret override (defaults to the KRIYADOT_TENANCY_JWT_SECRET env). */
+  jwtSecret?: string;
 };
 
 function errorBody(error: string, detail?: string): { error: string; detail?: string } {
@@ -522,6 +527,13 @@ function errorBody(error: string, detail?: string): { error: string; detail?: st
 export function registerComposioRoutes(router: express.Router, deps: ComposioDeps): void {
   const { config, governance, bots } = deps;
   const client: ComposioClient = deps.composioClient ?? fetchComposioClient;
+  const pctx: PrincipalContext = { dataDir: config.dataDir, loopbackToken: deps.loopbackToken, jwtSecret: deps.jwtSecret };
+
+  function callerOf(req: Request): string {
+    const userId = composioCallerOf(req, pctx);
+    if (!userId) throw new Error('unauthenticated');
+    return userId;
+  }
 
   const vaultOf = (req: Request): SecureVault =>
     new SecureVault(config.dataDir, callerOf(req), callerOf(req));
@@ -552,6 +564,7 @@ export function registerComposioRoutes(router: express.Router, deps: ComposioDep
   };
 
   const r = express.Router();
+  r.use(principalMiddleware(pctx));
 
   // GET /composio/status — graceful when no key is configured.
   r.get('/status', (req: Request, res: Response) => {

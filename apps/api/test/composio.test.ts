@@ -7,6 +7,8 @@ import type { AddressInfo } from 'node:net';
 import express from 'express';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { registerComposioRoutes, COMPOSIO_KEY_NAME } from '../src/composio.js';
+const OWNER_TOKEN = 'test-owner-token'; // OPEN-1: requests authenticate with the loopback owner credential
+
 import type { ComposioClient } from '../src/composio.js';
 import { SecureVault } from '@mvp/vault';
 
@@ -102,6 +104,7 @@ describe('composio routes', () => {
       governance: { audit } as unknown as import('@mvp/governance').GovernanceGateway,
       bots,
       composioClient: mockClient,
+      loopbackToken: OWNER_TOKEN,
     });
     app.use('/api', router);
     await new Promise<void>((resolve) => {
@@ -120,7 +123,7 @@ describe('composio routes', () => {
   async function call(method: string, path: string, body?: unknown) {
     const res = await fetch(`${baseUrl}${path}`, {
       method,
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${OWNER_TOKEN}`, },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;

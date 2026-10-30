@@ -256,3 +256,22 @@ export class SessionTokenStore {
     return existed;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Shared per-data-dir session store (OPEN-1): the SSO router issues tokens
+// and the principal resolver (principal.ts) verifies them — both must see
+// the SAME in-process instance, because records are loaded from disk only
+// at construction. Keyed by resolved data dir.
+// ---------------------------------------------------------------------------
+
+const sharedSessionStores = new Map<string, SessionTokenStore>();
+
+export function getSharedSsoSessionStore(dataDir: string): SessionTokenStore {
+  const key = path.resolve(dataDir);
+  let store = sharedSessionStores.get(key);
+  if (!store) {
+    store = new SessionTokenStore(dataDir);
+    sharedSessionStores.set(key, store);
+  }
+  return store;
+}

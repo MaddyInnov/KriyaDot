@@ -39,6 +39,7 @@ import {
   getComposioApiKey,
   readComposioEnables,
 } from './composio.js';
+import { principalMiddleware, type PrincipalContext } from './principal.js';
 
 export interface AccountRecord {
   toolkitSlug: string;
@@ -171,10 +172,19 @@ export function registerComposioAccountRoutes(router: express.Router, deps: Comp
   // Injected in tests; the real fetch client in production (zero paid API
   // usage in tests — same contract as registerComposioRoutes).
   const client: ComposioClient = deps.composioClient ?? fetchComposioClient;
+  const pctx: PrincipalContext = { dataDir: config.dataDir, loopbackToken: deps.loopbackToken };
   const r = express.Router();
+  r.use(principalMiddleware(pctx));
+
+  // The verified principal's user id (OPEN-1); never null behind the guard.
+  const callerOf = (req: Request): string => {
+    const userId = composioCallerOf(req, pctx);
+    if (!userId) throw new Error('unauthenticated');
+    return userId;
+  };
 
   const apiKeyOf = (req: Request): string | undefined =>
-    getComposioApiKey(config.dataDir, composioCallerOf(req));
+    getComposioApiKey(config.dataDir, callerOf(req));
 
   // POST /composio/accounts/link — start a Connect Link flow for one toolkit.
   // Returns the hosted sign-in URL; the account appears in GET /accounts
@@ -195,7 +205,7 @@ export function registerComposioAccountRoutes(router: express.Router, deps: Comp
       return;
     }
     const label = typeof body.label === 'string' ? body.label.trim().slice(0, 64) : '';
-    const userId = composioCallerOf(req);
+    const userId = callerOf(req);
     let redirectUrl: string;
     try {
       ({ redirectUrl } = await client.createAuthLink(apiKey, {
@@ -250,7 +260,7 @@ export function registerComposioAccountRoutes(router: express.Router, deps: Comp
       res.json({ connected: false, accounts: [] as AccountView[], pending: [] as PendingLink[] });
       return;
     }
-    const userId = composioCallerOf(req);
+    const userId = callerOf(req);
     let live: ComposioConnectedAccount[];
     try {
       live = await client.listConnectedAccounts(apiKey, composioEntityId(userId));
@@ -344,7 +354,7 @@ export function registerComposioAccountRoutes(router: express.Router, deps: Comp
       res.status(400).json(errorBody('label is required (1-64 chars)'));
       return;
     }
-    const userId = composioCallerOf(req);
+    const userId = callerOf(req);
     const cache = readAccountCache(config.dataDir, userId);
     if (!cache[id]) {
       // Validate against live data before labeling a ghost.
@@ -393,7 +403,7 @@ export function registerComposioAccountRoutes(router: express.Router, deps: Comp
       res.status(400).json(errorBody('invalid account id'));
       return;
     }
-    const userId = composioCallerOf(req);
+    const userId = callerOf(req);
     try {
       await client.deleteConnectedAccount(apiKey, id);
     } catch (err) {
@@ -430,7 +440,7 @@ export function registerComposioAccountRoutes(router: express.Router, deps: Comp
       res.status(400).json(errorBody('invalid account id'));
       return;
     }
-    const userId = composioCallerOf(req);
+    const userId = callerOf(req);
     let account: ComposioConnectedAccount | null = null;
     const cached = readAccountCache(config.dataDir, userId)[id];
     if (cached) {

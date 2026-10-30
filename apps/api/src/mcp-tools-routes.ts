@@ -18,6 +18,7 @@ import type { Request, Response } from 'express';
 import { parseScopePatch, requiredScopeForTool } from '@mvp/agent-runtime';
 import type { McpScopeStore, PlatformToolDef } from '@mvp/agent-runtime';
 import type { GovernanceGateway } from '@mvp/governance';
+import { resolvePrincipal } from './principal.js';
 
 export interface McpToolScopeDeps {
   mcpServer: { listToolDefs(): Promise<PlatformToolDef[]> };
@@ -70,7 +71,7 @@ export function registerMcpToolScopeRoutes(router: Router, deps: McpToolScopeDep
       }
       mcpScopeStore.set(def.name, patch);
       governance.audit('mcp.tool_scopes_updated', {
-        actor: req.header('x-user-id') ?? 'api',
+        actor: resolvePrincipal(req, {})?.userId ?? 'api',
         toolName: def.name,
         detail: { scopes: mcpScopeStore.get(def.name) },
       });
