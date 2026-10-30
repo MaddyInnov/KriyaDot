@@ -83,8 +83,16 @@ export class MockMediaProvider implements MediaProvider {
 
 export { OpenAIImagesProvider, openAIImagesProviderFromEnv } from './openai-images.js';
 export type { MediaFetch, OpenAIImagesProviderOptions } from './openai-images.js';
+export * from './video-provider.js';
+export * from './image-edit.js';
+export * from './assembly.js';
 
 import { openAIImagesProviderFromEnv, type MediaFetch } from './openai-images.js';
+import {
+  CompositeMediaProvider,
+  VideoBackedMediaProvider,
+  httpVideoProviderFromEnv,
+} from './video-provider.js';
 
 /**
  * Resolve the configured media provider (closure C9). When the
@@ -94,10 +102,26 @@ import { openAIImagesProviderFromEnv, type MediaFetch } from './openai-images.js
  * out of the box. Never throws for missing keys. Live verification of
  * the real provider is credential-gated: no key exists in tests/CI, so
  * the real path is proven there only against an injected fake fetch.
+ *
+ * M-4: when MEDIA_VIDEO_API_KEY is also configured, the result is a
+ * CompositeMediaProvider whose 'video' kind is served by the real
+ * async-job video provider (submit + poll) while images keep the
+ * provider above and any unrouted kind keeps the honest fallback.
  */
 export function resolveMediaProvider(
   env: Record<string, string | undefined> = process.env,
   fetchFn?: MediaFetch,
 ): MediaProvider {
-  return openAIImagesProviderFromEnv(env, fetchFn) ?? new MockMediaProvider();
+  const base = openAIImagesProviderFromEnv(env, fetchFn) ?? new MockMediaProvider();
+  const video = httpVideoProviderFromEnv(env, fetchFn);
+  if (!video) return base;
+  const pollMs = Number.parseInt(env['MEDIA_VIDEO_POLL_MS'] ?? '', 10);
+  return new CompositeMediaProvider(
+    {
+      video: new VideoBackedMediaProvider(video, {
+        pollIntervalMs: Number.isFinite(pollMs) && pollMs >= 0 ? pollMs : 2000,
+      }),
+    },
+    base,
+  );
 }

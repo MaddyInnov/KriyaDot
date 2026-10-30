@@ -125,7 +125,7 @@ export class CheckpointStore {
     this.db
       .prepare(
         `DELETE FROM checkpoints WHERE session_id = ? AND id NOT IN (
-           SELECT id FROM checkpoints WHERE session_id = ? ORDER BY created_at DESC LIMIT ?
+           SELECT id FROM checkpoints WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?
          )`,
       )
       .run(cp.sessionId, cp.sessionId, MAX_CHECKPOINTS_PER_SESSION);
@@ -148,7 +148,7 @@ export class CheckpointStore {
       const res = this.db
         .prepare(
           `DELETE FROM checkpoints WHERE session_id = ? AND id NOT IN (
-             SELECT id FROM checkpoints WHERE session_id = ? ORDER BY created_at DESC LIMIT ?
+             SELECT id FROM checkpoints WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?
            )`,
         )
         .run(sessionId, sessionId, MAX_CHECKPOINTS_PER_SESSION);
@@ -167,7 +167,7 @@ export class CheckpointStore {
   /** Every checkpoint for a session, oldest first (diff aggregation input). */
   listChronological(sessionId: string, limit = 500): Checkpoint[] {
     const rows = this.db
-      .prepare('SELECT * FROM checkpoints WHERE session_id = ? ORDER BY created_at ASC LIMIT ?')
+      .prepare('SELECT * FROM checkpoints WHERE session_id = ? ORDER BY created_at ASC, rowid ASC LIMIT ?')
       .all(sessionId, limit) as unknown as CheckpointRow[];
     return rows.map(rowToCheckpoint);
   }
@@ -181,7 +181,7 @@ export class CheckpointStore {
 
   list(sessionId: string, limit = 20): Checkpoint[] {
     const rows = this.db
-      .prepare('SELECT * FROM checkpoints WHERE session_id = ? ORDER BY created_at DESC LIMIT ?')
+      .prepare('SELECT * FROM checkpoints WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?')
       .all(sessionId, limit) as unknown as CheckpointRow[];
     return rows.map(rowToCheckpoint);
   }

@@ -110,6 +110,8 @@ class MainActivity : AppCompatActivity() {
                     android.Manifest.permission.READ_CALENDAR,
                     android.Manifest.permission.READ_CONTACTS,
                     android.Manifest.permission.READ_SMS,
+                    // Wave-4 (CT-7): direct SMS send (phone_sms_send action).
+                    android.Manifest.permission.SEND_SMS,
                     android.Manifest.permission.ACCESS_FINE_LOCATION,
                     android.Manifest.permission.ACCESS_COARSE_LOCATION,
                 ),

@@ -283,6 +283,8 @@ import { listChannelIds } from './channel-config.js';
 // require-approval), purchase intent service with Stripe Link / browser
 // executors, and the billing-area purchases routes (mounted via routes.ts).
 import { createPurchaseWiring, purchasePolicyRules, registerPurchaseTools } from './purchases.js';
+import { outboundCallPolicyRules } from './outbound-calls.js';
+import { phoneSmsPolicyRules } from './phone-sms.js';
 import { createMcpManageTool } from './mcp-manage-tool.js';
 import { createScheduleTools, GenericMonitorService } from './schedule-tools.js';
 import { createWsElicitationBridge, registerCompanionElicitationSurface } from './elicitation-ws.js';
@@ -518,7 +520,7 @@ async function boot(): Promise<void> {
   // so deny-by-default is preserved and extended.
   const globalPolicy: Policy = {
     ...DEFAULT_POLICY,
-    rules: [...publishPagePolicyRules(), ...interconnectionPolicyRules(), ...computerUsePolicyRules(), ...museModuleToolPolicies(), ...composioToolPolicies(), ...signInCodePolicyRules(), ...purchasePolicyRules(), ...phoneActionPolicyRules(), ...capabilityToolsPolicyRules(), ...DEFAULT_POLICY.rules],
+    rules: [...publishPagePolicyRules(), ...interconnectionPolicyRules(), ...computerUsePolicyRules(), ...museModuleToolPolicies(), ...composioToolPolicies(), ...signInCodePolicyRules(), ...purchasePolicyRules(), ...phoneActionPolicyRules(), ...outboundCallPolicyRules(), ...phoneSmsPolicyRules(), ...capabilityToolsPolicyRules(), ...DEFAULT_POLICY.rules],
   };
   const governance = new GovernanceGateway({
     dbPath: `${config.dataDir}/governance.db`,
@@ -888,6 +890,90 @@ async function boot(): Promise<void> {
   // claims the purchase intent; execution runs solely after the human
   // approves the intent's card (see purchases.ts safety contract).
   registerPurchaseTools({ registry: toolRegistry, service: purchaseWiring.service });
+  // §4.10 calls, texts & proactive delivery (CT-1..CT-12): packaged
+  // outbound calling (brief → governance approval → provider call →
+  // report in chat), phone SMS commands, proactive editions + pacing.
+  // Tools are require-approval via the policy rules added above; dialing
+  // re-checks the linked approval inside the service (purchases pattern).
+  const { OutboundCallService, OutboundCallStore, registerOutboundCallTools } = await import('./outbound-calls.js');
+  const { createOutboundCallRouter } = await import('./outbound-call-routes.js');
+  const { selectTelephonyProvider } = await import('./telephony.js');
+  const telephonyProvider = selectTelephonyProvider(process.env.TELEPHONY_PROVIDER, process.env);
+  const outboundCalls = new OutboundCallService({
+    store: new OutboundCallStore(config.dataDir),
+    provider: telephonyProvider,
+    raiseApproval: (brief) =>
+      governance.requestApproval(
+        'request_outbound_call',
+        {
+          briefId: brief.id,
+          counterpartyName: brief.counterpartyName,
+          number: brief.number,
+          purpose: brief.purpose,
+          maxDurationSec: brief.maxDurationSec,
+        },
+        { sessionId: 'outbound-calls', botId: brief.botId, actor: brief.botId },
+      ),
+    approvalStatus: (id) => governance.getApproval(id)?.status,
+    deliverChat: ({ botId, text }) => {
+      const sessionId = agentRuntime.sessionStore.createSession(botId);
+      agentRuntime.sessionStore.appendMessage(sessionId, { role: 'assistant', content: text });
+    },
+    audit: (action, fields) => governance.audit(action, { actor: 'outbound-calls', detail: fields }),
+    isPaused,
+    botName: (botId) => seed.bots.find((b) => b.id === botId)?.name,
+  });
+  registerOutboundCallTools(toolRegistry, { service: outboundCalls });
+  // CT-2: scheduled calls tick — authorization is re-checked at fire time
+  // inside the service, so a still-pending approval blocks, never dials.
+  const scheduledCallTimer = setInterval(() => {
+    void outboundCalls.tickScheduled().catch(() => undefined);
+  }, 60_000);
+  scheduledCallTimer.unref();
+  const { PhoneSmsService, PhoneSmsStore, registerPhoneSmsTools } = await import('./phone-sms.js');
+  const { createPhoneSmsRouter } = await import('./phone-sms-routes.js');
+  const phoneSmsService = new PhoneSmsService({
+    store: new PhoneSmsStore(config.dataDir),
+    dispatcher: {
+      dispatchAction: (d, a, p, t) => phoneHub.dispatchAction(d, a, p, t),
+      dispatchDataQuery: (d, q, p, t) => phoneHub.dispatchDataQuery(d, q as never, p, t),
+      isOnline: (d) => phoneHub.isOnline(d),
+    },
+    resolveDeviceId: (requested) =>
+      requested ?? phoneStore.listDevices().find((d) => phoneHub.isOnline(d.id))?.id,
+    audit: (action, fields) => governance.audit(action, { actor: 'api', detail: fields }),
+    isPaused,
+  });
+  registerPhoneSmsTools(toolRegistry, { service: phoneSmsService });
+  const { ProactiveEditionService, ProactiveEditionStore } = await import('./proactive-editions.js');
+  const { createProactiveEditionRouter } = await import('./proactive-edition-routes.js');
+  const proactiveEditions = new ProactiveEditionService({
+    store: new ProactiveEditionStore(config.dataDir),
+    deliver: async ({ text }) => {
+      // Editions land as a needs-you inbox item + a push (the proactive
+      // fan-out); the full text rides the inbox summary.
+      try {
+        teamInboxStore.addItem({
+          personId: peopleStore.listPeople()[0]?.id ?? 'default',
+          kind: 'fyi',
+          state: 'needs-you',
+          title: 'Proactive edition',
+          summary: text.slice(0, 4000),
+        });
+      } catch {
+        // Inbox delivery must never break the edition pipeline.
+      }
+      await pushService.notify({
+        kind: 'needsInput',
+        botId: seed.bots[0]?.id ?? 'system',
+        botName: seed.bots[0]?.name ?? 'KriyaDot',
+        title: 'Proactive edition',
+        body: text.slice(0, 300),
+      });
+    },
+    audit: (action, fields) => governance.audit(action, { actor: 'proactive-editions', detail: fields }),
+    isPaused,
+  });
   // OpenCode parity: git worktree tools (per-session isolated checkouts).
   // Workspace resolves per-session: a session with an attached worktree
   // operates inside it, otherwise in the default workspace. The closure runs
@@ -2130,6 +2216,11 @@ async function boot(): Promise<void> {
 
   // 4. HTTP layer. API routes first, then the frontend.
   const app = express();
+  // §4.10 routers (services constructed with the tool registrations
+  // above): outbound calls, phone SMS, proactive editions.
+  app.use('/api/calls', createOutboundCallRouter({ service: outboundCalls, provider: telephonyProvider }));
+  app.use('/api/phone-sms', createPhoneSmsRouter({ service: phoneSmsService }));
+  app.use('/api/proactive', createProactiveEditionRouter({ service: proactiveEditions }));
   // Trust one reverse-proxy hop (nginx in hosted deployments): express then
   // honors X-Forwarded-Proto / X-Forwarded-Host / X-Forwarded-For for
   // req.protocol, req.hostname and req.ip, so the companion pairing and
@@ -3197,6 +3288,66 @@ async function boot(): Promise<void> {
       reactionAnswers: reactionAnswerService,
     }),
   );
+  // §4.6 channel parity (CH-1/2/3/5/6/7/8/9/10): durable WhatsApp side
+  // chats (own store, never the main chat), structured button approvals
+  // (free text has NO decision path), tappable action cards, unified
+  // secure connect flow, reaction bridging into the shared store above.
+  {
+    const { createChannelParityRouter } = await import('./channel-parity-routes.js');
+    const { createWhatsAppTransport } = await import('./whatsapp-cloud.js');
+    const { resolveWhatsAppToken, resolveWhatsAppPhoneNumberId } = await import('./messaging.js');
+    const { saveProviderKey, removeProviderKey } = await import('./providers.js');
+    const channelParity = createChannelParityRouter({
+      dataDir: config.dataDir,
+      governance,
+      audit: (action, fields) => governance.audit(action, fields),
+      saveKey: (ref, input) => saveProviderKey(config.dataDir, ref, input),
+      removeKey: (ref) => removeProviderKey(config.dataDir, ref),
+      reactionStore: messageReactionStore,
+      onMessage: async (info) => {
+        // Same guarded pattern as the legacy onMention wiring: the turn
+        // carries external/relayed provenance, so approvals it mints can
+        // never be approved. Reply goes back out over the Cloud transport.
+        const defaultBotId = process.env.MESSAGING_DEFAULT_BOT;
+        const bot =
+          (defaultBotId ? seed.bots.find((b) => b.id === defaultBotId) : undefined) ?? seed.bots[0];
+        if (!bot) return;
+        let reply = '';
+        try {
+          await agentRuntime.runTurn({
+            bot,
+            message: info.text,
+            sessionId: `mention-whatsapp-${info.chatId}`,
+            provenance: {
+              origin: 'external',
+              relayPath: ['whatsapp'],
+              relayNames: ['whatsapp'],
+              timestamp: new Date().toISOString(),
+              relayed: true,
+            },
+            onEvent: async (event) => {
+              if (event.type === 'token') reply += event.content;
+            },
+          });
+        } catch (err) {
+          console.error('[messaging] whatsapp parity turn failed:', err instanceof Error ? err.message : err);
+          return;
+        }
+        const trimmed = reply.trim();
+        if (!trimmed) return;
+        try {
+          const transport = createWhatsAppTransport({
+            token: resolveWhatsAppToken(config.dataDir),
+            phoneNumberId: resolveWhatsAppPhoneNumberId(),
+          });
+          await transport.sendText(info.chatId, trimmed.slice(0, 4000));
+        } catch (err) {
+          console.error('[messaging] whatsapp parity reply failed:', err instanceof Error ? err.message : err);
+        }
+      },
+    });
+    app.use('/api/messaging', channelParity.router);
+  }
   app.use(
     '/api/bots',
     createBotRosterRouter({
@@ -3866,6 +4017,12 @@ async function boot(): Promise<void> {
         agentRuntime.sessionStore.appendMessage(sessionId, { role: 'assistant', content: text });
       },
       push: async ({ botId, botName, title, body }) => {
+        // CT-12: care sends count toward the proactive daily pacing cap.
+        try {
+          proactiveEditions.recordExternalSend('proactive-care');
+        } catch {
+          // Pacing bookkeeping must never break a care send.
+        }
         await pushService.notify({ kind: 'needsInput', botId, botName, title, body });
       },
       isPaused,
@@ -4239,6 +4396,24 @@ async function boot(): Promise<void> {
     service: closureFileLinks,
   });
   registerPageRecordPublicRoutes(app, { dataDir: config.dataDir });
+  // §4.11 browser finishes (BR-7..BR-13): permission suite, takeover +
+  // handback, size-classified file grants, question cards into the
+  // originating chat (real WidgetCoordinator), protected artifacts on
+  // the FL-7 service above, one-checkout-per-window leases, and the
+  // BR-8 CAPTCHA policy surface (defensible shape only — pause +
+  // takeover; no solver exists to wire). The composed action gate is
+  // exposed on the suite handle for the browser runner seams.
+  const { createBrowserSuite } = await import('./browser-suite-routes.js');
+  const browserSuite = createBrowserSuite({
+    dataDir: config.dataDir,
+    widgets: widgetCoordinator,
+    fileLinks: closureFileLinks,
+    workspaceRoot: config.workspaceDir,
+    audit: (action, fields) => governance.audit(action, fields),
+    config: process.env,
+  });
+  void browserSuite;
+  app.use('/api/browser', browserSuite.router);
   // Workspace trash (FL-13): purge entries past the 30-day retention daily.
   {
     const purgeTrash = () => {

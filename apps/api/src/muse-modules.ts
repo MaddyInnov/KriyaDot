@@ -122,9 +122,15 @@ import {
   evaluateWatcher,
   scheduleWatcher,
   exportArtifact,
+  resolveImageEditor,
+  editImageFlow,
+  insertUserIntoPicture,
+  readVerifiedProfilePhoto,
+  resolveVisualMatcher,
+  matchProductsFromPhoto,
 } from '@mvp/muse-modules';
 import type { RouteDeps } from './routes.js';
-import { MockSTTProvider } from '@mvp/voice';
+import { selectSTTProvider, selectTTSProvider, generatePodcastEpisode, podcastEpisodeManifest } from '@mvp/voice';
 import { PageStore } from './pages.js';
 
 function sendError(res: Response, err: unknown, fallback: string): void {
@@ -756,6 +762,78 @@ export function registerMuseModuleRoutes(router: Router, deps: RouteDeps): void 
       sendError(res, err, 'failed to generate media');
     }
   });
+  // M-2: image edit flow — source bytes are verified inside the flow
+  // before any provider call; the editor is the real provider when
+  // MEDIA_IMAGES_API_KEY is set, the deterministic mock otherwise.
+  mediaRouter.post('/edit', async (req, res) => {
+    try {
+      const b = body(req);
+      const asset = await editImageFlow(resolveImageEditor(process.env), {
+        image: Buffer.from(String(b.imageBase64 ?? ''), 'base64'),
+        prompt: String(b.prompt ?? ''),
+        ...(typeof b.maskBase64 === 'string' && b.maskBase64
+          ? { mask: Buffer.from(b.maskBase64, 'base64') }
+          : {}),
+      });
+      res.status(201).json(asset);
+    } catch (err) {
+      sendError(res, err, 'failed to edit image');
+    }
+  });
+  // M-2: insert the user into a picture — the profile reference is
+  // ALWAYS byte-verified (request bytes or the host-configured profile
+  // photo path); unverified bytes never reach a provider.
+  mediaRouter.post('/insert-me', async (req, res) => {
+    try {
+      const b = body(req);
+      let profilePhoto: Uint8Array;
+      if (typeof b.profilePhotoBase64 === 'string' && b.profilePhotoBase64) {
+        profilePhoto = Buffer.from(b.profilePhotoBase64, 'base64');
+      } else if (process.env.KRIYADOT_PROFILE_PHOTO_PATH) {
+        profilePhoto = (await readVerifiedProfilePhoto(process.env.KRIYADOT_PROFILE_PHOTO_PATH)).bytes;
+      } else {
+        res.status(400).json({
+          error: 'profile photo required: send profilePhotoBase64 or configure KRIYADOT_PROFILE_PHOTO_PATH on the host',
+        });
+        return;
+      }
+      const asset = await insertUserIntoPicture(resolveImageEditor(process.env), {
+        profilePhoto,
+        ...(typeof b.scenePrompt === 'string' && b.scenePrompt ? { scenePrompt: b.scenePrompt } : {}),
+        ...(typeof b.sceneImageBase64 === 'string' && b.sceneImageBase64
+          ? { sceneImage: Buffer.from(b.sceneImageBase64, 'base64') }
+          : {}),
+        ...(typeof b.prompt === 'string' && b.prompt ? { prompt: b.prompt } : {}),
+      });
+      res.status(201).json(asset);
+    } catch (err) {
+      sendError(res, err, 'failed to insert person into picture');
+    }
+  });
+  // V-6: podcast-style multi-voice episode from a "Name: text" script.
+  // Combined audio is a single WAV when every segment is PCM WAV;
+  // otherwise the manifest honestly carries per-segment audio.
+  mediaRouter.post('/podcast', async (req, res) => {
+    try {
+      const b = body(req);
+      const episode = await generatePodcastEpisode({
+        script: String(b.script ?? ''),
+        ...(typeof b.title === 'string' && b.title ? { title: b.title } : {}),
+        ...(b.cast && typeof b.cast === 'object' ? { cast: b.cast as never } : {}),
+        provider: selectTTSProvider(process.env),
+      });
+      res.status(201).json({
+        manifest: podcastEpisodeManifest(episode),
+        combinedAudioBase64: episode.combinedAudio
+          ? Buffer.from(episode.combinedAudio).toString('base64')
+          : null,
+        combinedMimeType: episode.combinedMimeType ?? null,
+        combinedNote: episode.combinedNote ?? null,
+      });
+    } catch (err) {
+      sendError(res, err, 'failed to generate podcast episode');
+    }
+  });
   router.use('/media', mediaRouter);
 
   // ---- Calls --------------------------------------------------------------
@@ -1019,6 +1097,23 @@ export function registerMuseModuleRoutes(router: Router, deps: RouteDeps): void 
       sendError(res, err, 'failed to cancel order');
     }
   });
+  // M-3: photo → product visual matching. The photo is byte-verified,
+  // described by the vision matcher (real when MEDIA_VISION_API_KEY is
+  // set, honest mock otherwise), and matched products feed the normal
+  // cart/checkout unchanged.
+  shoppingRouter.post('/visual-match', async (req, res) => {
+    try {
+      const b = body(req);
+      const result = await matchProductsFromPhoto(
+        resolveVisualMatcher(process.env),
+        Buffer.from(String(b.imageBase64 ?? ''), 'base64'),
+        { ...(typeof b.limit === 'number' ? { limit: b.limit } : {}) },
+      );
+      res.json(result);
+    } catch (err) {
+      sendError(res, err, 'failed to match products from photo');
+    }
+  });
   router.use('/shopping', shoppingRouter);
 
   // ---- Places -------------------------------------------------------------
@@ -1108,8 +1203,11 @@ export function registerMuseModuleRoutes(router: Router, deps: RouteDeps): void 
       const audio = Buffer.from(audioBase64, 'base64');
       validateAudioFile(fileName, audio.length);
 
-      // 1. Transcribe (mock STT by default; real provider when wired).
-      const stt = new MockSTTProvider();
+      // 1. Transcribe via the real STT stack by default (M-6):
+      //    selectSTTProvider resolves VOICE_STT_PROVIDER, else the first
+      //    configured real provider (Groq → OpenAI), else the mock —
+      //    the mock is now only the unconfigured fallback / test seam.
+      const stt = selectSTTProvider(process.env);
       const { text: transcript, durationMs } = await transcribeMeetingAudio(stt, audio, fileName);
 
       // 2. Summarize via the agent runtime.

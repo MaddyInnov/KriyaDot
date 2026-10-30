@@ -19,6 +19,10 @@
     <uses-permission android:name="android.permission.READ_CALENDAR" />
     <uses-permission android:name="android.permission.READ_CONTACTS" />
     <uses-permission android:name="android.permission.READ_SMS" />
+    <!-- Wave-4 (CT-7): direct SMS send via SmsManager for the phone_sms_send
+         action (user-approved on the server before dispatch; requested at
+         runtime from MainActivity and checked again in InputService). -->
+    <uses-permission android:name="android.permission.SEND_SMS" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 

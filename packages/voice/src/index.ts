@@ -13,3 +13,5 @@ export * from './chatterbox.js';
 export * from './system-tts.js';
 export * from './catalog.js';
 export * from './speech-text.js';
+export * from './podcast.js';
+export * from './dictation.js';

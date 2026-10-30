@@ -31,6 +31,7 @@ export * from './browser/index.js';
 export * from './browser/real.js';
 export * from './ideas/index.js';
 export * from './shopping/index.js';
+export * from './shopping/visual-match.js';
 export * from './places/index.js';
 export * from './social/index.js';
 export * from './meetings/index.js';

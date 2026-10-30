@@ -11,6 +11,11 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
+# V-5 dictation (src/dictation.rs): global push-to-talk shortcut +
+# OS-level text insertion. Source-level only until CI runs cargo check
+# (no Rust toolchain on the build VM).
+tauri-plugin-global-shortcut = "2"
+enigo = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["time"] }

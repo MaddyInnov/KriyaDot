@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.telephony.SmsManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import org.json.JSONObject
@@ -164,6 +165,28 @@ class InputService : AccessibilityService() {
                 respond(id, true, null)
             }
             "send_message" -> sendMessage(id, params, respond)
+            // Wave-4 (CT-7): direct SMS through SmsManager — no app driving.
+            // The exact text was approved server-side before dispatch.
+            "sms_send" -> sendSmsDirect(id, params, respond)
+            // Wave-4 (CT-8): open the SMS composer prefilled. NEVER sends —
+            // the user reviews and taps Send themselves, or not at all.
+            "sms_compose" -> {
+                val number = params.optString("number", "")
+                val text = params.optString("text", "").take(1600)
+                if (number.isEmpty()) {
+                    respond(id, false, "missing_number")
+                    return
+                }
+                try {
+                    val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:" + Uri.encode(number)))
+                    intent.putExtra("sms_body", text)
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    startActivity(intent)
+                    respond(id, true, null)
+                } catch (e: Exception) {
+                    respond(id, false, "compose_failed")
+                }
+            }
             "call" -> {
                 val number = params.optString("number", "")
                 if (number.isEmpty()) {
@@ -250,6 +273,40 @@ class InputService : AccessibilityService() {
             "left" -> swipe(cx + dx, cy, cx - dx, cy, 300)
             "right" -> swipe(cx - dx, cy, cx + dx, cy, 300)
             else -> swipe(cx, cy - dy, cx, cy + dy, 300) // "down"
+        }
+    }
+
+    /**
+     * Wave-4 (CT-7): send an SMS directly via SmsManager. Requires the
+     * SEND_SMS runtime permission; without it the ack is
+     * `sms_permission_missing` and nothing is sent. Long texts are split
+     * with divideMessage and sent as a multipart SMS.
+     */
+    private fun sendSmsDirect(id: String, params: JSONObject, respond: (id: String, ok: Boolean, error: String?) -> Unit) {
+        val number = params.optString("number", "")
+        val text = params.optString("text", "").take(1600)
+        if (number.isEmpty() || text.isEmpty()) {
+            respond(id, false, "missing_sms_params")
+            return
+        }
+        if (checkSelfPermission(android.Manifest.permission.SEND_SMS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            respond(id, false, "sms_permission_missing")
+            return
+        }
+        try {
+            @Suppress("DEPRECATION")
+            val manager = SmsManager.getDefault()
+            val parts = manager.divideMessage(text)
+            if (parts.size <= 1) {
+                manager.sendTextMessage(number, null, text, null, null)
+            } else {
+                manager.sendMultipartTextMessage(number, null, parts, null, null)
+            }
+            respond(id, true, null)
+        } catch (e: SecurityException) {
+            respond(id, false, "sms_permission_missing")
+        } catch (e: Exception) {
+            respond(id, false, "sms_send_failed")
         }
     }
 

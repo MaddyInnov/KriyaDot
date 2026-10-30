@@ -21,18 +21,20 @@ export interface Product {
   priceCents: number;
   currency: string;
   imageUrl: string;
+  /** Visual attributes a photo matcher can observe (M-3): category, material, color family, form. */
+  visualTags?: string[];
 }
 
 /** Mock catalog fixture — deterministic, offline. */
 export const MOCK_CATALOG: Product[] = [
-  { id: 'prod-001', name: 'Aurora Desk Lamp', description: 'Dimmable LED desk lamp, warm-to-cool white.', priceCents: 4999, currency: 'USD', imageUrl: 'mock://products/prod-001.jpg' },
-  { id: 'prod-002', name: 'Nomad Backpack 25L', description: 'Water-resistant everyday carry backpack.', priceCents: 8999, currency: 'USD', imageUrl: 'mock://products/prod-002.jpg' },
-  { id: 'prod-003', name: 'Kiln Ceramic Mug', description: 'Hand-glazed 350ml stoneware mug.', priceCents: 2499, currency: 'USD', imageUrl: 'mock://products/prod-003.jpg' },
-  { id: 'prod-004', name: 'Tempo Wireless Earbuds', description: 'ANC earbuds, 30h case battery.', priceCents: 12999, currency: 'USD', imageUrl: 'mock://products/prod-004.jpg' },
-  { id: 'prod-005', name: 'Field Notes Trio', description: 'Three pocket notebooks, dot grid.', priceCents: 1499, currency: 'USD', imageUrl: 'mock://products/prod-005.jpg' },
-  { id: 'prod-006', name: 'Ember Pour-Over Set', description: 'Glass dripper, carafe, and filters.', priceCents: 6499, currency: 'USD', imageUrl: 'mock://products/prod-006.jpg' },
-  { id: 'prod-007', name: 'Drift Mechanical Keyboard', description: '75% hot-swap keyboard, tactile switches.', priceCents: 15999, currency: 'USD', imageUrl: 'mock://products/prod-007.jpg' },
-  { id: 'prod-008', name: 'Solstice Throw Blanket', description: 'Woven cotton throw, 130×180cm.', priceCents: 5499, currency: 'USD', imageUrl: 'mock://products/prod-008.jpg' },
+  { id: 'prod-001', name: 'Aurora Desk Lamp', description: 'Dimmable LED desk lamp, warm-to-cool white.', priceCents: 4999, currency: 'USD', imageUrl: 'mock://products/prod-001.jpg', visualTags: ['lamp', 'lighting', 'metal', 'white', 'desk', 'modern'] },
+  { id: 'prod-002', name: 'Nomad Backpack 25L', description: 'Water-resistant everyday carry backpack.', priceCents: 8999, currency: 'USD', imageUrl: 'mock://products/prod-002.jpg', visualTags: ['backpack', 'bag', 'fabric', 'black', 'travel', 'outdoor'] },
+  { id: 'prod-003', name: 'Kiln Ceramic Mug', description: 'Hand-glazed 350ml stoneware mug.', priceCents: 2499, currency: 'USD', imageUrl: 'mock://products/prod-003.jpg', visualTags: ['mug', 'ceramic', 'cup', 'kitchen', 'white', 'round'] },
+  { id: 'prod-004', name: 'Tempo Wireless Earbuds', description: 'ANC earbuds, 30h case battery.', priceCents: 12999, currency: 'USD', imageUrl: 'mock://products/prod-004.jpg', visualTags: ['earbuds', 'audio', 'plastic', 'white', 'small', 'tech'] },
+  { id: 'prod-005', name: 'Field Notes Trio', description: 'Three pocket notebooks, dot grid.', priceCents: 1499, currency: 'USD', imageUrl: 'mock://products/prod-005.jpg', visualTags: ['notebook', 'paper', 'brown', 'flat', 'stationery'] },
+  { id: 'prod-006', name: 'Ember Pour-Over Set', description: 'Glass dripper, carafe, and filters.', priceCents: 6499, currency: 'USD', imageUrl: 'mock://products/prod-006.jpg', visualTags: ['coffee', 'glass', 'carafe', 'kitchen', 'transparent', 'round'] },
+  { id: 'prod-007', name: 'Drift Mechanical Keyboard', description: '75% hot-swap keyboard, tactile switches.', priceCents: 15999, currency: 'USD', imageUrl: 'mock://products/prod-007.jpg', visualTags: ['keyboard', 'tech', 'plastic', 'black', 'rectangular', 'desk'] },
+  { id: 'prod-008', name: 'Solstice Throw Blanket', description: 'Woven cotton throw, 130×180cm.', priceCents: 5499, currency: 'USD', imageUrl: 'mock://products/prod-008.jpg', visualTags: ['blanket', 'fabric', 'textile', 'soft', 'home', 'folded'] },
 ];
 
 /** Case-insensitive substring search over name + description. */

@@ -141,6 +141,35 @@ Every dispatched action is audit-logged server-side in plain language
 the action and the contact NAME, never message or typed text. While the
 global pause (system-pause.ts) is active, phone tools refuse to dispatch.
 
+## 8. Wave-4 extensions: direct SMS, composer drafts, SMS archive search (CT-6..CT-9)
+
+Additive only — older phone-agents answer unknown actions/queries with
+`unknown_action` / `unknown_query` acks, and the server surfaces those
+cleanly. No v1 or W14 message shape changed.
+
+### Server → phone (via the existing correlated `action` channel)
+
+| action | params | notes |
+|--------|--------|-------|
+| `sms_send` | `number`, `text` | CT-7: send an SMS directly via the phone's `SmsManager` (SEND_SMS permission; ack error `sms_permission_missing` when not granted). Dispatched ONLY after governance approval of `phone_sms_send` with the exact number + text. |
+| `sms_compose` | `number`, `text` | CT-8: open the SMS composer prefilled (`ACTION_SENDTO`). Composes only — this action can never send. Used by draft-only mode and `phone_sms_draft`. |
+| `call` | `number`, `contact?` | Existing W14 action; CT-6 packages it as "call from my number" (`call_from_my_number` tool + tap-to-call card). |
+
+### Server → phone (via the existing correlated `data_query` channel)
+
+| query | params | notes |
+|-------|--------|-------|
+| `sms_search` | `query`, `limit` (1..200) | CT-9: archive search over SMS bodies + addresses (READ_SMS), newest first. |
+| `sms_thread` | `address`, `limit` (1..200) | CT-7 read: one conversation thread by address. |
+
+### Draft-only texting mode (CT-8)
+
+A per-device mode held server-side (`phone-sms.db`): when a device is in
+`draft-only` mode, `phone_sms_send` refuses to dispatch `sms_send` — it
+stores a server-side draft and best-effort opens the composer via
+`sms_compose`. A draft becomes a send only through a fresh, separately
+approved send after the mode is changed back to `send`.
+
 ## 7. ADB fallback endpoints
 
 - `GET /api/phone/adb/status` → `{ available, devices[] }`

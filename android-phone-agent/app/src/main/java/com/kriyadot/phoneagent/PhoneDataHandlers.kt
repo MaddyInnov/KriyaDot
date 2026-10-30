@@ -35,6 +35,9 @@ object PhoneDataHandlers {
             "calendar" -> calendar(context, params)
             "contacts" -> contacts(context, params)
             "messages_recent" -> messages(context, params)
+            // Wave-4 (CT-9 / CT-7 read): SMS archive search + thread reads.
+            "sms_search" -> smsSearch(context, params)
+            "sms_thread" -> smsThread(context, params)
             "location" -> location(context)
             else -> throw PhoneDataException("unknown_query")
         }
@@ -137,6 +140,75 @@ object PhoneDataHandlers {
             }
         }
         return JSONObject().put("messages", out)
+    }
+
+    /**
+     * Wave-4 (CT-9): search the SMS archive. Matches message bodies and
+     * addresses with a LIKE query over the Telephony provider; results are
+     * newest-first and body-capped exactly like the recent-messages read.
+     */
+    private fun smsSearch(context: Context, params: JSONObject): JSONObject {
+        requirePermission(context, Manifest.permission.READ_SMS, "messages_permission_missing")
+        val query = params.optString("query", "").trim()
+        if (query.isEmpty()) throw PhoneDataException("bad_query")
+        val limit = params.optInt("limit", 50).coerceIn(1, 200)
+        val projection = arrayOf(
+            Telephony.Sms.ADDRESS,
+            Telephony.Sms.BODY,
+            Telephony.Sms.DATE,
+            Telephony.Sms.TYPE,
+        )
+        val like = "%" + query + "%"
+        val out = JSONArray()
+        val cursor = context.contentResolver.query(
+            Telephony.Sms.CONTENT_URI, projection,
+            Telephony.Sms.BODY + " LIKE ? OR " + Telephony.Sms.ADDRESS + " LIKE ?",
+            arrayOf(like, like),
+            Telephony.Sms.DATE + " DESC",
+        )
+        cursor?.use { c ->
+            while (c.moveToNext() && out.length() < limit) {
+                val item = JSONObject()
+                item.put("address", c.getString(0) ?: "")
+                item.put("body", (c.getString(1) ?: "").take(1000))
+                item.put("date", c.getLong(2))
+                item.put("type", c.getInt(3))
+                out.put(item)
+            }
+        }
+        return JSONObject().put("messages", out).put("query", query)
+    }
+
+    /** Wave-4 (CT-7 read): one SMS conversation thread by address. */
+    private fun smsThread(context: Context, params: JSONObject): JSONObject {
+        requirePermission(context, Manifest.permission.READ_SMS, "messages_permission_missing")
+        val address = params.optString("address", "").trim()
+        if (address.isEmpty()) throw PhoneDataException("bad_address")
+        val limit = params.optInt("limit", 50).coerceIn(1, 200)
+        val projection = arrayOf(
+            Telephony.Sms.ADDRESS,
+            Telephony.Sms.BODY,
+            Telephony.Sms.DATE,
+            Telephony.Sms.TYPE,
+        )
+        val out = JSONArray()
+        val cursor = context.contentResolver.query(
+            Telephony.Sms.CONTENT_URI, projection,
+            Telephony.Sms.ADDRESS + " LIKE ?",
+            arrayOf("%" + address + "%"),
+            Telephony.Sms.DATE + " DESC",
+        )
+        cursor?.use { c ->
+            while (c.moveToNext() && out.length() < limit) {
+                val item = JSONObject()
+                item.put("address", c.getString(0) ?: "")
+                item.put("body", (c.getString(1) ?: "").take(1000))
+                item.put("date", c.getLong(2))
+                item.put("type", c.getInt(3))
+                out.put(item)
+            }
+        }
+        return JSONObject().put("messages", out).put("address", address)
     }
 
     private fun location(context: Context): JSONObject {

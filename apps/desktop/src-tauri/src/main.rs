@@ -26,6 +26,11 @@ use tauri::{
 };
 use tauri_plugin_shell::ShellExt;
 
+// V-5 dictation: global push-to-talk shortcut + OS-level text
+// insertion (src/dictation.rs). SOURCE-LEVEL ONLY — unverified until
+// CI compiles it (no cargo toolchain on the build VM).
+mod dictation;
+
 /// Fixed loopback port the desktop backend listens on.
 /// The bundled frontend detects Tauri (`window.__TAURI__`) and calls
 /// `http://127.0.0.1:DESKTOP_API_PORT` for all API traffic.
@@ -184,6 +189,15 @@ fn start_health_watch(app: AppHandle, state: SidecarState) {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        // V-5: global push-to-talk hotkey (see dictation.rs).
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    dictation::on_shortcut_event(app, shortcut, event);
+                })
+                .build(),
+        )
+        .invoke_handler(tauri::generate_handler![dictation::dictation_insert_text])
         .setup(|app| {
             // Data directory for SQLite DBs + providers.local.json (0600).
             let data_dir = app
@@ -211,6 +225,11 @@ fn main() {
 
             let state = SidecarState::new(data_dir);
             app.manage(state.clone());
+
+            // V-5: register the global push-to-talk shortcut
+            // (CommandOrControl+Shift+Space). Failure is non-fatal —
+            // dictation.rs logs it and in-app/web dictation still works.
+            dictation::register_push_to_talk(app.handle());
 
             // System tray: Show / status / Restart API / Quit.
             let show = MenuItem::with_id(app, "show", "Show KriyaDot", true, None::<&str>)?;
