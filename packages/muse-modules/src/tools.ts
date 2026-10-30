@@ -28,6 +28,7 @@ import { CommitmentStore } from './commitments/index.js';
 import { WatcherStore, evaluateWatcher } from './watchers/index.js';
 import { ArtifactStore } from './artifacts/index.js';
 import { exportArtifact, type ArtifactExportFormat } from './artifacts/exports.js';
+import { ideaTools } from './ideas/tools.js';
 
 /** Tag external content as untrusted, mirroring runtime.ts's convention. */
 export function tagUntrusted(toolName: string, text: string): string {
@@ -228,6 +229,7 @@ export function registerMuseModuleTools(
     trackCommitmentTool(opts.dataDir),
     manageWatchersTool(opts.dataDir),
     exportArtifactTool(opts.dataDir),
+    ...ideaTools(opts.dataDir),
   ]) {
     if (registry.has(tool.name)) {
       throw new Error(`tool name collision: "${tool.name}" is already registered`);

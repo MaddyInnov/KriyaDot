@@ -2,7 +2,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { ModuleDb } from '../db.js';
 import { ValidationError, NotFoundError } from '../errors.js';
-import { IdeaStore } from './index.js';
+import { IdeaStore, USER_DISMISSAL } from './index.js';
 
 describe('IdeaStore', () => {
   let db: ModuleDb;
@@ -32,7 +32,7 @@ describe('IdeaStore', () => {
 
   it('dismiss and re-run', () => {
     const idea = store.create({ title: 'x' });
-    expect(store.dismiss(idea.id).status).toBe('dismissed');
+    expect(store.dismiss(idea.id, USER_DISMISSAL).status).toBe('dismissed');
     expect(store.run(idea.id).status).toBe('active');
   });
 
@@ -42,6 +42,6 @@ describe('IdeaStore', () => {
     store.run(idea.id);
     expect(() => store.run(idea.id)).toThrow(ValidationError); // active → active illegal
     store.complete(idea.id);
-    expect(() => store.dismiss(idea.id)).toThrow(ValidationError); // done → dismissed illegal
+    expect(() => store.dismiss(idea.id, USER_DISMISSAL)).toThrow(ValidationError); // done → dismissed illegal
   });
 });

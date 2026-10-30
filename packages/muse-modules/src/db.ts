@@ -155,6 +155,21 @@ CREATE TABLE IF NOT EXISTS mm_ideas (
 );
 CREATE INDEX IF NOT EXISTS idx_mm_ideas_status ON mm_ideas (status, updated_at DESC);
 
+-- Idea run events (I-3): append-only progress log binding an idea card to
+-- the chat run executing it. One run = one run_id; events are progress /
+-- completed / failed in chronological order.
+CREATE TABLE IF NOT EXISTS mm_idea_run_events (
+  id TEXT PRIMARY KEY,
+  idea_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  pct INTEGER,
+  note TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mm_idea_run_events_run ON mm_idea_run_events (run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_mm_idea_run_events_idea ON mm_idea_run_events (idea_id, created_at);
+
 CREATE TABLE IF NOT EXISTS mm_carts (
   id TEXT PRIMARY KEY,
   items_json TEXT NOT NULL,
@@ -307,6 +322,15 @@ export class ModuleDb {
       `ALTER TABLE mm_feed_posts ADD COLUMN seen INTEGER NOT NULL DEFAULT 0`,
       `ALTER TABLE mm_feed_posts ADD COLUMN actionable INTEGER NOT NULL DEFAULT 0`,
       `ALTER TABLE mm_feed_posts ADD COLUMN deadline_at INTEGER`,
+      // Ideas closure (I-5/I-6/SI-5): provenance, curation scores,
+      // expiry and the bound run id live on the idea row itself.
+      `ALTER TABLE mm_ideas ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'`,
+      `ALTER TABLE mm_ideas ADD COLUMN scores_json TEXT`,
+      `ALTER TABLE mm_ideas ADD COLUMN rationale TEXT`,
+      `ALTER TABLE mm_ideas ADD COLUMN evidence_json TEXT`,
+      `ALTER TABLE mm_ideas ADD COLUMN expires_at INTEGER`,
+      `ALTER TABLE mm_ideas ADD COLUMN retire_reason TEXT`,
+      `ALTER TABLE mm_ideas ADD COLUMN run_id TEXT`,
     ]) {
       try {
         this.db.exec(sql);

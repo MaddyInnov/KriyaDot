@@ -16,6 +16,7 @@
 		B10000000000000000000007 /* RemoteScreenSocket.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000007 /* RemoteScreenSocket.swift */; };
 		B10000000000000000000008 /* SealedPush.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000008 /* SealedPush.swift */; };
 		B10000000000000000000009 /* PushManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000009 /* PushManager.swift */; };
+		B10000000000000000000010 /* PushProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000010 /* PushProvider.swift */; };
 		B10000000000000000000010 /* CompanionViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000010 /* CompanionViewModel.swift */; };
 		B10000000000000000000011 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000011 /* RootView.swift */; };
 		B10000000000000000000012 /* PairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000012 /* PairingView.swift */; };
@@ -43,6 +44,7 @@
 		F10000000000000000000007 /* RemoteScreenSocket.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteScreenSocket.swift; sourceTree = "<group>"; };
 		F10000000000000000000008 /* SealedPush.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SealedPush.swift; sourceTree = "<group>"; };
 		F10000000000000000000009 /* PushManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushManager.swift; sourceTree = "<group>"; };
+		F10000000000000000000010 /* PushProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushProvider.swift; sourceTree = "<group>"; };
 		F10000000000000000000010 /* CompanionViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionViewModel.swift; sourceTree = "<group>"; };
 		F10000000000000000000011 /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
 		F10000000000000000000012 /* PairingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingView.swift; sourceTree = "<group>"; };
@@ -118,6 +120,7 @@
 				F10000000000000000000007 /* RemoteScreenSocket.swift */,
 				F10000000000000000000008 /* SealedPush.swift */,
 				F10000000000000000000009 /* PushManager.swift */,
+				F10000000000000000000010 /* PushProvider.swift */,
 			);
 			path = Core;
 			name = Core;
@@ -232,6 +235,7 @@
 				B10000000000000000000007 /* RemoteScreenSocket.swift in Sources */,
 				B10000000000000000000008 /* SealedPush.swift in Sources */,
 				B10000000000000000000009 /* PushManager.swift in Sources */,
+				B10000000000000000000010 /* PushProvider.swift in Sources */,
 				B10000000000000000000010 /* CompanionViewModel.swift in Sources */,
 				B10000000000000000000011 /* RootView.swift in Sources */,
 				B10000000000000000000012 /* PairingView.swift in Sources */,

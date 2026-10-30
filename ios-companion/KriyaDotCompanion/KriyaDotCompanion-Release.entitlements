@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- Release entitlements (C-13 prep): production APNs environment.
+     The founder selects this file for the Release configuration in
+     Xcode (Signing & Capabilities) once the App ID has the Push
+     Notifications capability enabled. Debug keeps
+     KriyaDotCompanion.entitlements (aps-environment=development),
+     matching a sandbox APNS_ENV on the server. -->
+<plist version="1.0">
+<dict>
+	<key>aps-environment</key>
+	<string>production</string>
+</dict>
+</plist>

@@ -7,3 +7,5 @@ export * from './cost-breakdown.js';
 export * from './spend-caps.js';
 export * from './threshold-gate.js';
 export * from './purchase.js';
+export * from './link-limits.js';
+export * from './merchant-preference.js';

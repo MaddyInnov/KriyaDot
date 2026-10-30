@@ -18,9 +18,18 @@ export class ValidationError extends Error {
   }
 }
 
+/** Thrown when an actor attempts an operation reserved for another actor class (e.g. agent dismissing an idea — I-4). */
+export class PermissionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PermissionError';
+  }
+}
+
 /** Map a thrown module error to an HTTP status code. */
 export function statusForError(err: unknown): number {
   if (err instanceof NotFoundError) return 404;
+  if (err instanceof PermissionError) return 403;
   if (err instanceof ValidationError) return 400;
   return 500;
 }

@@ -13,6 +13,10 @@ import { randomUUID } from 'node:crypto';
 import { ValidationError, NotFoundError } from '../errors.js';
 import type { ModuleDb } from '../db.js';
 
+// CN-7: cross-merchant catalog providers + aggregator (Meta Catalog
+// adapter, env-gated; mock fixture as honest fallback) live in ./catalog.
+export * from './catalog.js';
+
 export interface Product {
   id: string;
   name: string;

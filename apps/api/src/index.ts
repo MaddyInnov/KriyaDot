@@ -270,7 +270,13 @@ import { registerPageRecordPublicRoutes } from './page-records.js';
 import { registerGatedPublicServing } from './publish-gate.js';
 import { runTrashPurge } from './workspace-trash.js';
 // Muse closure (Wave 2): capability awareness (ADD-2) + user guide (ADD-3).
-import { createCapabilityService } from './capabilities.js';
+import { createCapabilityService, PRODUCT_FEATURES } from './capabilities.js';
+import {
+  registerGoogleWorkspaceProvider,
+  registerGoogleWorkspaceTools,
+  googleWorkspaceToolPolicies,
+} from './google-workspace.js';
+import { composioAppCapabilityFeatures, googleWorkspaceCapabilityFeature } from './composio-apps.js';
 import {
   registerCapabilityTools,
   grantCapabilityToolsToBots,
@@ -520,7 +526,7 @@ async function boot(): Promise<void> {
   // so deny-by-default is preserved and extended.
   const globalPolicy: Policy = {
     ...DEFAULT_POLICY,
-    rules: [...publishPagePolicyRules(), ...interconnectionPolicyRules(), ...computerUsePolicyRules(), ...museModuleToolPolicies(), ...composioToolPolicies(), ...signInCodePolicyRules(), ...purchasePolicyRules(), ...phoneActionPolicyRules(), ...outboundCallPolicyRules(), ...phoneSmsPolicyRules(), ...capabilityToolsPolicyRules(), ...DEFAULT_POLICY.rules],
+    rules: [...publishPagePolicyRules(), ...interconnectionPolicyRules(), ...computerUsePolicyRules(), ...museModuleToolPolicies(), ...composioToolPolicies(), ...signInCodePolicyRules(), ...purchasePolicyRules(), ...phoneActionPolicyRules(), ...outboundCallPolicyRules(), ...phoneSmsPolicyRules(), ...googleWorkspaceToolPolicies(), ...capabilityToolsPolicyRules(), ...DEFAULT_POLICY.rules],
   };
   const governance = new GovernanceGateway({
     dbPath: `${config.dataDir}/governance.db`,
@@ -840,8 +846,15 @@ async function boot(): Promise<void> {
       }
     },
     channels: () => listChannelIds().map((id) => ({ id })),
+    // CN-4..CN-8 + CN-3: verified Composio app capabilities and the
+    // first-party Google Workspace entry join the curated feature table.
+    features: [...PRODUCT_FEATURES, ...composioAppCapabilityFeatures(), googleWorkspaceCapabilityFeature()],
   });
   registerCapabilityTools({ registry: toolRegistry, service: capabilityService });
+  // CN-3: first-party Google Workspace tools (Gmail/Calendar/Drive) on
+  // the existing OAuth framework — fail closed until the founder's
+  // Google OAuth credentials are configured.
+  registerGoogleWorkspaceTools(toolRegistry, { dataDir: config.dataDir });
   grantCapabilityToolsToBots(seed.bots);
   // Sign-in codes (W4b): enter_sign_in_code — approval-gated via
   // signInCodePolicyRules above (the approval card shows site + source;
@@ -2582,6 +2595,28 @@ async function boot(): Promise<void> {
   // the dreamsSource dep below.
   const { DreamStore, NightlyDreamer, dreamBriefingItems } = await import('./dreaming.js');
   const dreamStore = new DreamStore(config.dataDir);
+  // Wave-5 shared stores (memory/goals finishes + ideas loops below).
+  const wave5Mdb = new ModuleDb(path.join(config.dataDir, 'muse-modules.db'));
+  const { GoalFinishesStore } = await import('@mvp/muse-modules');
+  const goalFinishesStore = new GoalFinishesStore(wave5Mdb);
+  const { ReflectionStore, reflectionBriefingItems } = await import('./reflective-dreaming.js');
+  const reflectionStore = new ReflectionStore(config.dataDir);
+  // SI-2 / SI-1 / SI-3 named routines: the schedule + visibility surface.
+  // The deterministic loop executors run from host timers (dreamer block
+  // + the loop timers further below) — never both paths for one loop.
+  {
+    const { ensureReflectionRoutine } = await import('./reflective-dreaming.js');
+    const { ensureGoalStudyRoutine, ensureSkillAuditRoutine } = await import('./idea-loops.js');
+    for (const bot of seed.bots) {
+      try {
+        ensureReflectionRoutine(routineStore, bot.id);
+        ensureGoalStudyRoutine(routineStore, bot.id);
+        ensureSkillAuditRoutine(routineStore, bot.id);
+      } catch {
+        // Routine registration must never break boot.
+      }
+    }
+  }
   {
     const { createProvider } = await import('@mvp/agent-runtime');
     const dreamer = new NightlyDreamer({
@@ -2600,6 +2635,26 @@ async function boot(): Promise<void> {
         return res.content ?? '';
       },
     });
+    // SI-2 reflective dreaming: nightly synthesis (worked / ruptured /
+    // becoming + repair threads) chained after the idea dreamer.
+    const { ReflectiveDreamer } = await import('./reflective-dreaming.js');
+    const reflectiveDreamer = new ReflectiveDreamer({
+      store: reflectionStore,
+      episodesForBot: (botId) =>
+        tieredMemoryStore
+          .getAtoms(botId, 50)
+          .map((a) => (a as { fact?: string }).fact ?? '')
+          .filter((s) => s.trim().length > 0),
+      outcomesForBot: () => [],
+      model: async (prompt) => {
+        const bot = seed.bots[0];
+        const provider = createProvider(bot?.provider ?? 'groq');
+        const res = await provider.chat([{ role: 'user', content: prompt }], [], {
+          model: bot?.model ?? 'default',
+        });
+        return res.content ?? '';
+      },
+    });
     let lastDreamDay = '';
     const dreamTimer = setInterval(() => {
       try {
@@ -2607,15 +2662,282 @@ async function boot(): Promise<void> {
         const day = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}`;
         if (now.getHours() >= 3 && lastDreamDay !== day) {
           lastDreamDay = day;
-          void dreamer
-            .runForBots(seed.bots.map((b) => b.id))
-            .catch(() => undefined);
+          void (async () => {
+            await dreamer.runForBots(seed.bots.map((b) => b.id)).catch(() => undefined);
+            // SI-2 reflection, then I-6: fresh dreams are curated into
+            // the Ideas tab, stale ideas expire, due goal briefings run.
+            if (!pauseRegistry.isPaused()) {
+              await reflectiveDreamer.runForBots(seed.bots.map((b) => b.id)).catch(() => undefined);
+              try {
+                const { runDreamCuration } = await import('./ideas-ext-routes.js');
+                runDreamCuration({
+                  mdb: wave5Mdb,
+                  dreamCandidates: () => dreamStore.list(undefined, 20),
+                  isPaused: () => pauseRegistry.isPaused(),
+                });
+                const { IdeaStore } = await import('@mvp/muse-modules');
+                new IdeaStore(wave5Mdb).expireStale();
+                goalFinishesStore.generateDueBriefings();
+              } catch {
+                // Curation/expiry must never break the nightly chain.
+              }
+            }
+          })();
         }
       } catch {
         // Dreaming must never break the server.
       }
     }, 3_600_000);
     if (typeof dreamTimer.unref === 'function') dreamTimer.unref();
+  }
+
+  // SI-1 daily goal study (07:00) + SI-3 weekly skill audit (Mon ~04:00)
+  // — host timers invoking the deterministic loop executors (the named
+  // routines registered above are the schedule/visibility surface only).
+  {
+    const { DailyGoalStudyLoop, GoalStudyStore, SkillAuditLoop, QuietMomentSweep } = await import('./idea-loops.js');
+    const { CommitmentStore } = await import('@mvp/muse-modules');
+    const goalStudy = new DailyGoalStudyLoop({
+      mdb: wave5Mdb,
+      store: new GoalStudyStore(config.dataDir),
+      research: async (goal) => {
+        const bot = seed.bots[0];
+        const provider = createProvider(bot?.provider ?? 'groq');
+        const res = await provider.chat(
+          [
+            {
+              role: 'user',
+              content: `Write one short research-briefing paragraph for the goal "${goal.title}" (${goal.description ?? ''}). Recent progress: ${goal.progress}%. Focus on the next concrete step and one relevant fact.`,
+            },
+          ],
+          [],
+          { model: bot?.model ?? 'default' },
+        );
+        return res.content ?? '';
+      },
+      signals: () => {
+        const out: string[] = [];
+        try {
+          for (const c of new CommitmentStore(wave5Mdb).list()) {
+            const t = (c as { title?: string }).title;
+            if (t) out.push(t);
+          }
+        } catch {
+          // Signals are best-effort.
+        }
+        try {
+          for (const a of tieredMemoryStore.getAtoms(seed.bots[0]?.id ?? '', 20)) {
+            const f = (a as { fact?: string }).fact;
+            if (f) out.push(f);
+          }
+        } catch {
+          // Signals are best-effort.
+        }
+        return out;
+      },
+      isPaused: () => pauseRegistry.isPaused(),
+    });
+    const skillAudit = new SkillAuditLoop({ dataDir: config.dataDir, isPaused: () => pauseRegistry.isPaused() });
+    let lastStudyDay = '';
+    let lastAuditWeek = '';
+    const loopTimer = setInterval(() => {
+      try {
+        const now = new Date();
+        const day = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}`;
+        if (now.getHours() >= 7 && lastStudyDay !== day) {
+          lastStudyDay = day;
+          void goalStudy.run().catch(() => undefined);
+        }
+        const week = `${now.getFullYear()}-w${Math.floor(now.getDate() / 7)}-${now.getMonth()}`;
+        if (now.getDay() === 1 && now.getHours() >= 4 && lastAuditWeek !== week) {
+          lastAuditWeek = week;
+          skillAudit.run();
+        }
+      } catch {
+        // Loop timers must never break the server.
+      }
+    }, 3_600_000);
+    loopTimer.unref();
+    // SI-4 quiet-moment internalisation sweep: bounded memory capture
+    // after inactivity. Activity is approximated from live turns.
+    const { MemoryJournal, capturePass } = await import('@mvp/agent-runtime');
+    const quietJournal = new MemoryJournal(config.dataDir);
+    const quietSweep = new QuietMomentSweep({
+      idleMs: 20 * 60 * 1000,
+      maxPerSweep: 25,
+      internalise: async (limit) => {
+        let processed = 0;
+        const perBot = Math.max(1, Math.ceil(limit / Math.max(1, seed.bots.length)));
+        for (const bot of seed.bots) {
+          try {
+            processed += capturePass(tieredMemoryStore, quietJournal, bot.id, { maxEvents: perBot }).eventsScanned;
+          } catch {
+            // Per-bot capture failures are isolated.
+          }
+        }
+        return processed;
+      },
+      isPaused: () => pauseRegistry.isPaused(),
+    });
+    const quietTimer = setInterval(() => {
+      try {
+        if (turnTracker.listActive().length > 0) quietSweep.noteActivity();
+        quietSweep.tick();
+      } catch {
+        // The sweep must never break the server.
+      }
+    }, 60_000);
+    quietTimer.unref();
+  }
+
+  // CN-3: widen the google OAuth preset to the core-suite scopes BEFORE
+  // the OAuth routes inside the main router serve connect flows.
+  registerGoogleWorkspaceProvider();
+  // PUR-6: filled in when the browser suite mounts (after this router).
+  const browserTakeoverHolder: { manager?: import('./browser-takeover.js').BrowserTakeoverManager } = {};
+
+  // ---- Wave-5 surfaces (mounted BEFORE the main router so specific
+  // paths — /ideas/ranked, /why, /library — are never shadowed) ----
+  {
+    const { createMemoryGoalsRouter } = await import('./memory-goals-routes.js');
+    const { ChannelSideChatStore } = await import('./channel-side-chats.js');
+    const { listTrackedItems } = await import('@mvp/muse-modules');
+    const { TaskStore } = await import('./tasks.js');
+    app.use(
+      '/api/memory-goals',
+      createMemoryGoalsRouter({
+        dataDir: config.dataDir,
+        memory: tieredMemoryStore,
+        searchMessages: (q, opts) => agentRuntime.sessionStore.searchMessages(q, opts),
+        // Same SQLite file the WhatsApp parity wiring writes (read-side
+        // store instance; the parity handle keeps the write side).
+        sideChats: new ChannelSideChatStore(config.dataDir),
+        audit: (action, fields) => governance.audit(action, fields),
+        goalFinishes: goalFinishesStore,
+        listTrackedItems: (opts) =>
+          listTrackedItems(wave5Mdb, {
+            tasks: () => new TaskStore(config.dataDir).list(),
+            kind: opts.kind as never,
+            status: opts.status as never,
+            goalId: opts.goalId,
+          }),
+      }).router,
+    );
+  }
+  {
+    const { createIdeasExtRouter } = await import('./ideas-ext-routes.js');
+    const { createWhyRouter } = await import('./why-routes.js');
+    app.use(
+      '/api',
+      createIdeasExtRouter({
+        mdb: wave5Mdb,
+        dreamCandidates: () => dreamStore.list(undefined, 20),
+        memoryContext: () =>
+          tieredMemoryStore
+            .getAtoms(seed.bots[0]?.id ?? '', 50)
+            .map((a) => (a as { fact?: string }).fact ?? '')
+            .filter((s) => s.trim().length > 0),
+        isPaused: () => pauseRegistry.isPaused(),
+      }),
+    );
+    app.use(
+      '/api',
+      createWhyRouter({
+        dataDir: config.dataDir,
+        mdb: wave5Mdb,
+        auditSearch: (q) =>
+          governance
+            .listAudit(500)
+            .filter((e) => JSON.stringify(e).toLowerCase().includes(q.toLowerCase()))
+            .map((e) => ({
+              action: e.action,
+              actor: (e as { actor?: string }).actor,
+              detail: (e as { detail?: unknown }).detail,
+              ts: typeof (e as { ts?: unknown }).ts === 'number' ? (e as { ts: number }).ts : undefined,
+            })),
+      }),
+    );
+  }
+  {
+    // §4.5 chat surfaces: Library (C-15/FL-11/FL-14), share intake
+    // (C-11), provider conversations (C-5), per-message share/delete
+    // (C-12/C-9), bot avatars (C-16), iOS readiness (C-13 source prep).
+    const { createLibraryRouter } = await import('./library-routes.js');
+    const { ArtifactStore, SlideDeckStore, resolveMediaProvider } = await import('@mvp/muse-modules');
+    app.use(
+      '/api',
+      createLibraryRouter({
+        dataDir: config.dataDir,
+        workspaceDir: config.workspaceDir,
+        artifacts: new ArtifactStore(wave5Mdb),
+        decks: new SlideDeckStore(wave5Mdb),
+        media: () => [],
+        audit: (action, fields) => governance.audit(action, fields),
+      }),
+    );
+    const { ShareIntakeStore, createShareIntakeRouter } = await import('./share-intake.js');
+    app.use('/api', createShareIntakeRouter({ store: new ShareIntakeStore(config.dataDir) }));
+    const { createProviderConversationsRouter } = await import('./provider-conversations.js');
+    const { ChannelSideChatStore } = await import('./channel-side-chats.js');
+    app.use('/api', createProviderConversationsRouter({ store: new ChannelSideChatStore(config.dataDir) }));
+    const { createMessageShareRouter } = await import('./message-share.js');
+    const { MessageDeletionStore, createMessageDeleteRouter, filterDeletedMessages } = await import('./message-delete.js');
+    const messageDeletions = new MessageDeletionStore(config.dataDir);
+    app.use(
+      '/api',
+      createMessageShareRouter({
+        dataDir: config.dataDir,
+        listThreadMessages: (id) => filterDeletedMessages(messageDeletions, id, agentRuntime.listThreadMessages(id)),
+      }),
+    );
+    const { resolvePrincipal } = await import('./principal.js');
+    app.use(
+      '/api',
+      createMessageDeleteRouter({
+        store: messageDeletions,
+        listThreadMessages: (id) => agentRuntime.listThreadMessages(id),
+        sessionOwnerId: (id) => agentRuntime.sessionStore.getSession(id)?.ownerPersonId ?? null,
+        requesterId: (req) => resolvePrincipal(req as never, { dataDir: config.dataDir, loopbackToken })?.userId ?? 'you',
+        audit: (action, fields) => governance.audit(action, fields),
+      }),
+    );
+    const { BotAvatarStore, createBotAvatarRouter } = await import('./bot-avatar-media.js');
+    app.use(
+      '/api',
+      createBotAvatarRouter({
+        store: new BotAvatarStore(config.dataDir),
+        provider: resolveMediaProvider(),
+        getBot: (id) => botsById.get(id) ?? null,
+        audit: (action, fields) => governance.audit(action, fields),
+      }),
+    );
+    const { createIosReadinessRouter } = await import('./ios-readiness.js');
+    app.use(
+      '/api',
+      createIosReadinessRouter({
+        facts: () => ({
+          apsEnvironment: 'development',
+          hasDevelopmentTeam: Boolean(process.env.IOS_DEVELOPMENT_TEAM),
+          bundleId: 'com.kriyadot.companion',
+        }),
+      }),
+    );
+  }
+  {
+    // CN-3 status surface + CN-10 sync routes + CN-2 mailbox settings.
+    const { registerGoogleWorkspaceRoutes } = await import('./google-workspace.js');
+    registerGoogleWorkspaceRoutes(app, { dataDir: config.dataDir });
+    const { ConnectorSyncEngine, registerConnectorSyncRoutes } = await import('./connector-sync.js');
+    const connectorSyncEngine = new ConnectorSyncEngine({ dataDir: config.dataDir });
+    void connectorSyncEngine;
+    registerConnectorSyncRoutes(app, {
+      dataDir: config.dataDir,
+      engine: connectorSyncEngine,
+      bots: seed.bots.map((b) => ({ id: b.id })),
+      loopbackToken,
+    });
+    const { registerMailboxSettingsRoutes } = await import('./mailbox-settings.js');
+    registerMailboxSettingsRoutes(app, { dataDir: config.dataDir, loopbackToken });
   }
 
   app.use(
@@ -2645,6 +2967,8 @@ async function boot(): Promise<void> {
       phone: { store: phoneStore, hub: phoneHub, adb: phoneAdb },
       // Global pause (W14d): the chat route refuses new turns while paused.
       pauseRegistry,
+      // PUR-6: lazy BR-9 takeover manager for purchase takeover.
+      browserTakeoverHolder,
       briefingSignalsSource:
         resolveGithubSignalsSource({
           dataDir: config.dataDir,
@@ -2655,7 +2979,8 @@ async function boot(): Promise<void> {
       // name through this map (populated by connectMcp after listen).
       mcpClientsByServer,
       // Nightly dreaming: the briefing's dream section reads the store.
-      dreamsSource: () => dreamBriefingItems(dreamStore),
+      // SI-2: reflective-dreaming items ride the same briefing section.
+      dreamsSource: () => [...dreamBriefingItems(dreamStore), ...reflectionBriefingItems(reflectionStore)],
       // First-reply rescue: a failed first turn lands in the owner's
       // needs-you inbox (team inbox, FYI kind, needs-you state).
       addNeedsYou: (item) => {
@@ -4413,6 +4738,8 @@ async function boot(): Promise<void> {
     config: process.env,
   });
   void browserSuite;
+  // PUR-6: purchase takeover routes resolve the BR-9 manager lazily.
+  browserTakeoverHolder.manager = browserSuite.takeover;
   app.use('/api/browser', browserSuite.router);
   // Workspace trash (FL-13): purge entries past the 30-day retention daily.
   {

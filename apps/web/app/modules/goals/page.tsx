@@ -3,6 +3,7 @@
 
 import { useCallback, useState } from 'react';
 import { MODULES_BASE, api, fmtTs, PageHeader, ErrorBox, EmptyState, useModuleData } from '../lib';
+import GoalFinishesPanel from '../../../components/goals/goal-finishes-panel';
 
 interface Goal {
   id: string;
@@ -155,6 +156,8 @@ export default function GoalsPage() {
         ))}
       </div>
       {(goals ?? []).length === 0 && <EmptyState text="No goals yet. Create one above." />}
+
+      <GoalFinishesPanel />
 
       {selected && (
         <div className="card mt">

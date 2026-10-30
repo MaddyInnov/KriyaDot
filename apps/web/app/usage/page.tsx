@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { authedFetch, getBots } from '../../lib/api';
 import type { BotConfig } from '../../lib/api';
+import { PurchaseCheckoutPanel } from '../../components/panels/purchase-checkout-panel';
 
 interface FeatureSlice {
   feature: string;
@@ -508,7 +509,7 @@ function PurchasesSection() {
             </tr>
           </thead>
           <tbody>
-            {intents.map((p) => (
+            {intents.flatMap((p) => [
               <tr key={p.id}>
                 <td className="mono small">
                   {new Date(p.createdAt).toLocaleString()}
@@ -570,8 +571,19 @@ function PurchasesSection() {
                     </div>
                   )}
                 </td>
-              </tr>
-            ))}
+              </tr>,
+              // §4.13 checkout surface (Link limits, merchant preference,
+              // cancel, takeover) under actionable intents.
+              ...(p.status === 'pending-approval' || p.status === 'awaiting-user-confirm'
+                ? [
+                    <tr key={`checkout-${p.id}`}>
+                      <td colSpan={7}>
+                        <PurchaseCheckoutPanel intentId={p.id} />
+                      </td>
+                    </tr>,
+                  ]
+                : []),
+            ])}
           </tbody>
         </table>
       )}

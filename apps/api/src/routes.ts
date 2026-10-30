@@ -153,6 +153,7 @@ import { saveBotModel } from './bot-models.js';
 import { registerMarketplaceRoutes } from './marketplace.js';
 import { registerBillingRoutes } from './billing.js';
 import { registerPurchaseRoutes } from './purchases.js';
+import { registerPurchaseExtrasRoutes } from './purchase-extras.js';
 import type { PurchaseWiring } from './purchases.js';
 import { registerTenancyRoutes } from './tenancy.js';
 import { registerVaultRoutes } from './vault.js';
@@ -409,6 +410,13 @@ export interface RouteDeps {
    * Optional: omitted in tests that don't exercise purchases.
    */
   purchaseWiring?: PurchaseWiring;
+  /**
+   * PUR-6: the BR-9 browser takeover manager lives in index.ts and is
+   * created AFTER this router — the holder is filled in when the
+   * browser suite mounts, and the purchase-extras takeover route reads
+   * it lazily per request.
+   */
+  browserTakeoverHolder?: { manager?: import('./browser-takeover.js').BrowserTakeoverManager };
   /**
    * W8d: pending sign-in request cards (native CLI driver sign-in).
    * When set (with checkCliSignIn), a chat message that is exactly
@@ -3542,6 +3550,19 @@ export function createRouter(deps: RouteDeps): express.Router {
   // (/api/billing/purchases*) — purchases live in the billing area, not a
   // new top-level destination.
   if (deps.purchaseWiring) {
+    // §4.13 purchase extras (PUR-2/3/6/7) register BEFORE the core
+    // purchase routes so GET /purchases/link-limits is not shadowed by
+    // GET /purchases/:id. The takeover manager resolves lazily through
+    // the holder (the browser suite mounts after this router exists).
+    registerPurchaseExtrasRoutes(billingRouter, {
+      service: deps.purchaseWiring.service,
+      settings: deps.purchaseWiring.settings,
+      dataDir: config.dataDir,
+      spentLookup: (since, until, botId) => costTracker.spentCents({ since, until, botId }),
+      get takeoverManager() {
+        return deps.browserTakeoverHolder?.manager;
+      },
+    });
     registerPurchaseRoutes(billingRouter, {
       service: deps.purchaseWiring.service,
       settings: deps.purchaseWiring.settings,

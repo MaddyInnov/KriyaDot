@@ -21,6 +21,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { kriyadotFetch } from '../../lib/kriyadot-api';
+import { MemoryFinishesPanel } from './memory-finishes-panel';
 
 export interface MemoryAtom {
   id: string;
@@ -732,6 +733,9 @@ function MemoryUpkeepSection({ botId }: { botId: string }) {
           </ul>
         </>
       )}
+
+      {/* §4.4 finishes: merged search, explain view, people pages, import. */}
+      <MemoryFinishesPanel botId={botId} />
     </div>
   );
 }

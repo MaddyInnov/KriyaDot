@@ -23,6 +23,7 @@ import { randomUUID } from 'node:crypto';
 import type { GovernanceGateway } from '@mvp/governance';
 import type { AppConfig } from './config.js';
 import { syncProviderKeysToEnv } from './providers.js';
+import { resolveChannelSyncEnabled } from './connector-sync.js';
 import type { OnBehalfOfLedger } from '@mvp/agent-runtime';
 import {
   fetchUnseenMail,
@@ -790,7 +791,23 @@ export function registerMessagingRoutes(router: express.Router, deps: MessagingR
       emailPollerStarted = true;
       const ownAddress = (process.env[EMAIL_FROM_ENV] ?? imapConfig.user).toLowerCase();
       const pollMs = Math.max(15_000, Number(process.env.EMAIL_POLL_MS ?? '') || 60_000);
+      let syncGateLogged = false;
       const poll = async (): Promise<void> => {
+        // CN-10: the Permissions pane's per-connector background-sync
+        // toggle actually gates this poller. Checked every tick (cheap
+        // file read) so toggling takes effect without a restart.
+        // Semantics (connector-sync.ts resolveChannelSyncEnabled): no
+        // recorded setting → legacy behaviour (poll, as before CN-10);
+        // settings exist → poll only while at least one bot has email
+        // background sync ON; off for every bot stops the poller.
+        if (!resolveChannelSyncEnabled(config.dataDir, 'default-user', 'email', { legacyDefaultWhenUnset: true })) {
+          if (!syncGateLogged) {
+            syncGateLogged = true;
+            console.log('[messaging] email background sync is OFF in Permissions — IMAP poller paused (toggle it on to resume).');
+          }
+          return;
+        }
+        syncGateLogged = false;
         try {
           const mails = await fetchUnseenMail(imapConfig);
           for (const mail of mails) {

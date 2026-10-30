@@ -317,6 +317,9 @@ function intentSummary(intent: PurchaseIntent): Record<string, unknown> {
     case 'denied':
       base.message = 'The user denied this purchase. It will not be executed.';
       break;
+    case 'cancelled':
+      base.message = 'The user cancelled this purchase while it was still pending. It will not be executed.';
+      break;
     case 'completed':
       base.message = 'Purchase completed after user approval.';
       base.ledgerRef = intent.ledgerRef;

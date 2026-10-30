@@ -1,1 +1,41 @@
-{"background_color":"#f4f1ea","description":"All-in-one AI agent platform — chat, bots, workflows, and automations on your phone.","display":"standalone","icons":[{"purpose":"any","sizes":"192x192","src":"/icons/icon-192.png","type":"image/png"},{"purpose":"any","sizes":"512x512","src":"/icons/icon-512.png","type":"image/png"},{"purpose":"maskable","sizes":"512x512","src":"/icons/icon-512.png","type":"image/png"}],"name":"KriyaDot","orientation":"portrait","scope":"/","short_name":"KriyaDot","start_url":"/","theme_color":"#4f46e5"}
+{
+  "background_color": "#f4f1ea",
+  "description": "All-in-one AI agent platform \u2014 chat, bots, workflows, and automations on your phone.",
+  "display": "standalone",
+  "icons": [
+    {
+      "purpose": "any",
+      "sizes": "192x192",
+      "src": "/icons/icon-192.png",
+      "type": "image/png"
+    },
+    {
+      "purpose": "any",
+      "sizes": "512x512",
+      "src": "/icons/icon-512.png",
+      "type": "image/png"
+    },
+    {
+      "purpose": "maskable",
+      "sizes": "512x512",
+      "src": "/icons/icon-512.png",
+      "type": "image/png"
+    }
+  ],
+  "name": "KriyaDot",
+  "orientation": "portrait",
+  "scope": "/",
+  "short_name": "KriyaDot",
+  "start_url": "/",
+  "theme_color": "#4f46e5",
+  "share_target": {
+    "action": "/share-target",
+    "method": "GET",
+    "enctype": "application/x-www-form-urlencoded",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "url": "url"
+    }
+  }
+}

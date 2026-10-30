@@ -17,13 +17,15 @@ import UserNotifications
 /// 4. Token refreshes arrive through the same delegate callback and are
 ///    re-registered the same way (Android: onNewToken).
 ///
-/// SERVER STATUS (honest note): the server currently implements only
-/// the FCM branch of the registration endpoint and PushService sends
-/// via FCM only, so APNs delivery cannot work until the server adds an
-/// APNs provider (see README "Push notifications"). The sealed-payload
-/// decryption in SealedPush.swift is transport-agnostic and is ready
-/// for the APNs data fields (`kind`, `sealed`, `fallbackTitle`,
-/// `fallbackBody`, `botId`, `chatId`, `approvalId`) when it lands.
+/// SERVER STATUS (updated for C-13): the server now implements BOTH
+/// branches — PushService (apps/api/src/push.ts) sends via FCM and via
+/// APNs (ES256 .p8 provider tokens, HTTP/2, sealed payloads, 410 token
+/// pruning). What remains founder-gated is the SIGNED build itself:
+/// APNs registration only succeeds with the aps-environment entitlement
+/// signed under the founder's team (see SIGNING.md). The sealed-payload
+/// decryption in SealedPush.swift is transport-agnostic and consumes
+/// the APNs data fields (`kind`, `sealed`, `fallbackTitle`,
+/// `fallbackBody`, `botId`, `chatId`, `approvalId`).
 final class PushManager: NSObject {
     static let shared = PushManager()
 

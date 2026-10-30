@@ -28,6 +28,7 @@ export default function WorkspacePage() {
     <div>
       <h1 className="page-title">Workspace</h1>
       <p className="page-sub">Notes, tasks, files — control your phone from here, or control KriyaDot from your phone — in one personal working surface.</p>
+      <p className="page-sub"><a href="/workspace/library">Open the Library — artifacts, decks, media, files and system files in one surface →</a></p>
       <div className="tabs" role="tablist" aria-label="Workspace sections">
         {TABS.map((t) => (
           <button

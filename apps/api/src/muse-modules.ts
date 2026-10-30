@@ -128,6 +128,7 @@ import {
   readVerifiedProfilePhoto,
   resolveVisualMatcher,
   matchProductsFromPhoto,
+  createCrossMerchantCatalog,
 } from '@mvp/muse-modules';
 import type { RouteDeps } from './routes.js';
 import { selectSTTProvider, selectTTSProvider, generatePodcastEpisode, podcastEpisodeManifest } from '@mvp/voice';
@@ -1016,7 +1017,9 @@ export function registerMuseModuleRoutes(router: Router, deps: RouteDeps): void 
   });
   for (const [path, op] of [
     ['/run', (id: string) => ideas.run(id)],
-    ['/dismiss', (id: string) => ideas.dismiss(id)],
+    // I-4: this router serves the signed-in user, so dismissal carries the
+    // user actor explicitly; agent tools have no dismiss path at all.
+    ['/dismiss', (id: string) => ideas.dismiss(id, { kind: 'user' })],
     ['/complete', (id: string) => ideas.complete(id)],
   ] as const) {
     ideasRouter.post(`/:id${path}`, (req, res) => {
@@ -1031,9 +1034,28 @@ export function registerMuseModuleRoutes(router: Router, deps: RouteDeps): void 
 
   // ---- Shopping (approval-gated purchase) ---------------------------------
   const shoppingRouter = Router();
-  shoppingRouter.get('/products', (req, res) => {
+  // CN-7: product search runs over the cross-merchant catalog (real
+  // providers when configured — e.g. Meta catalog — with the fixture as
+  // the honest fallback). The array shape is unchanged for the web UI;
+  // /products/meta exposes provenance (sources / degraded) for labels.
+  const crossCatalog = createCrossMerchantCatalog(process.env);
+  shoppingRouter.get('/products', async (req, res) => {
     try {
-      res.json(searchProducts(String(req.query.q ?? '')));
+      const result = await crossCatalog.search(String(req.query.q ?? ''));
+      res.json(result.products);
+    } catch (err) {
+      sendError(res, err, 'failed to search products');
+    }
+  });
+  shoppingRouter.get('/products/meta', async (req, res) => {
+    try {
+      const result = await crossCatalog.search(String(req.query.q ?? ''));
+      res.json({
+        sources: result.sources,
+        usedFallback: result.usedFallback,
+        degraded: result.degraded ?? null,
+        count: result.products.length,
+      });
     } catch (err) {
       sendError(res, err, 'failed to search products');
     }

@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: Apache-2.0
+// Signing configuration scaffolding (Muse parity §4.5 C-13).
+//
+// Copy this file to `Signing.xcconfig` (same folder), fill in the
+// founder values, and — in Xcode — set it as the target's base
+// configuration, or paste the values under Signing & Capabilities.
+// `Signing.xcconfig` itself is founder-local state: never commit a
+// real team id alongside distribution credentials.
+//
+// DEVELOPMENT_TEAM =            // 10-character Apple Developer team id (founder supplies)
+// PRODUCT_BUNDLE_IDENTIFIER = com.kriyadot.companion
+// CODE_SIGN_STYLE = Automatic
+//
+// With the team set + automatic signing, Xcode mints the development
+// certificate and provisioning profile (with the Push Notifications
+// capability from the entitlements) on first device build.

@@ -19,7 +19,13 @@
 //     stays on the existing Composio routes; this pane records the
 //     per-action-group Allow/Ask/Deny choices + the background-sync flag
 //     (persisted + exposed; sync engines that exist — the email poller —
-//     are flagged `implemented`, the rest honestly report false).
+//     are flagged `implemented`, the rest honestly report false). The
+//     sync-engine side of CN-10 lives in connector-sync.ts: its gate
+//     functions READ this store (the email IMAP poller in messaging.ts
+//     consults resolveChannelSyncEnabled every tick), registered sync
+//     targets run only while their toggle is on, and reauth-needed
+//     states are surfaced both there and on the connector entries below
+//     (`reauthNeeded`, derived from the Composio account cache).
 //   - Allowances are the only new evaluation input, wired at ONE seam:
 //     GovernanceAdapter's optional `getAllowance` hook (see
 //     governance-adapter.ts). An allowance converts Ask → Allow ONLY
@@ -67,6 +73,7 @@ import {
   readComposioEnables,
   type ComposioClient,
 } from './composio.js';
+import { readAccountCache } from './composio-accounts.js';
 
 // ---------------------------------------------------------------------------
 // Shared vocabulary
@@ -655,6 +662,38 @@ export interface ConnectorPaneEntry {
   enabled: boolean;
   groups: Array<ConnectorActionGroup & { effect: PaneEffect }>;
   backgroundSync: { enabled: boolean; implemented: boolean };
+  /**
+   * CN-10 reauth surfacing: true when a connected account for this
+   * connector is cached in a non-ACTIVE state (EXPIRED / INACTIVE / …)
+   * or a background sync recorded an authentication failure. Derived
+   * from local state only — no live provider call.
+   */
+  reauthNeeded: boolean;
+  reauthReason?: string;
+}
+
+/**
+ * CN-10: per-toolkit reauth reasons from the local Composio account
+ * cache (composio-accounts.ts). Accounts not ACTIVE need reconnecting.
+ */
+export function composioReauthByToolkit(
+  dataDir: string,
+  userId: string,
+): Map<string, string> {
+  const out = new Map<string, string>();
+  try {
+    for (const record of Object.values(readAccountCache(dataDir, userId))) {
+      if (record.status && record.status !== 'ACTIVE' && !out.has(record.toolkitSlug)) {
+        out.set(
+          record.toolkitSlug,
+          `A connected account is ${record.status} — reconnect it in Accounts to restore access.`,
+        );
+      }
+    }
+  } catch {
+    // Cache unreadable → no reauth claims (never break the pane).
+  }
+  return out;
 }
 
 // --- Protocols (P-7) -----------------------------------------------------------
@@ -917,6 +956,7 @@ export function registerPermissionsPaneRoutes(router: Router, deps: PermissionsP
       return;
     }
     const settings = readConnectorSettings(deps.dataDir, userId)[botId] ?? {};
+    const reauthByToolkit = composioReauthByToolkit(deps.dataDir, userId);
     const entries: ConnectorPaneEntry[] = [];
     const withSettings = (
       id: string,
@@ -926,6 +966,7 @@ export function registerPermissionsPaneRoutes(router: Router, deps: PermissionsP
       groups: ConnectorActionGroup[],
     ): ConnectorPaneEntry => {
       const setting = settings[id];
+      const reauthReason = kind === 'composio' ? reauthByToolkit.get(id) : undefined;
       return {
         id,
         name,
@@ -936,6 +977,8 @@ export function registerPermissionsPaneRoutes(router: Router, deps: PermissionsP
           enabled: setting?.backgroundSync ?? false,
           implemented: kind === 'channel' && SYNC_IMPLEMENTED_CHANNELS.has(id),
         },
+        reauthNeeded: reauthReason !== undefined,
+        ...(reauthReason ? { reauthReason } : {}),
       };
     };
 

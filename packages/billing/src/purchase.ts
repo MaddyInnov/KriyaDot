@@ -53,6 +53,7 @@ export type PurchaseStatus =
   | 'pending-approval'
   | 'approved'
   | 'denied'
+  | 'cancelled'
   | 'executing'
   | 'completed'
   | 'failed'
@@ -107,6 +108,7 @@ export const PURCHASE_TOOL_NAME = 'request_purchase';
 
 const TERMINAL_STATUSES: ReadonlySet<PurchaseStatus> = new Set([
   'denied',
+  'cancelled',
   'completed',
   'failed',
   'blocked',
@@ -118,11 +120,15 @@ export function isTerminalPurchaseStatus(s: PurchaseStatus): boolean {
 
 /** Legal status transitions. Terminal statuses have no outgoing edges. */
 const TRANSITIONS: Readonly<Record<PurchaseStatus, readonly PurchaseStatus[]>> = {
-  'pending-approval': ['approved', 'denied', 'blocked'],
+  // PUR-7: a still-pending intent can be cancelled by the user. Cancel
+  // is ONLY reachable from 'pending-approval' — once a decision or an
+  // execution exists there is nothing left to cancel.
+  'pending-approval': ['approved', 'denied', 'blocked', 'cancelled'],
   approved: ['executing', 'blocked', 'denied'],
   executing: ['completed', 'failed', 'awaiting-user-confirm', 'blocked'],
   'awaiting-user-confirm': ['completed', 'failed'],
   denied: [],
+  cancelled: [],
   completed: [],
   failed: [],
   blocked: [],
@@ -1093,6 +1099,41 @@ export class PurchaseService {
     const approved = this.deps.store.transition(intentId, 'approved', { decidedAt: this.now() });
     this.audit('purchase.approved', approved);
     return this.executeIntent(intentId);
+  }
+
+  /**
+   * PUR-7 — User-facing cancel for a PENDING purchase intent.
+   *
+   * State-safe by construction:
+   *   - Only 'pending-approval' intents can be cancelled (the intent has
+   *     not been decided and nothing has executed). Any other live or
+   *     terminal status throws — a completed/approved purchase is never
+   *     quietly rewritten.
+   *   - Idempotent: cancelling an already-cancelled intent returns it
+   *     unchanged (no second transition, no second audit entry).
+   *   - Audited exactly once ('purchase.cancelled'); the optional reason
+   *     is sanitized (card-like data redacted) before it is persisted
+   *     in the intent note or the audit payload.
+   * A cancelled intent is terminal: executeIntent returns it unchanged
+   * even if its governance approval is later approved out of band, and
+   * reconcileIntent leaves it alone (it only syncs pending intents).
+   */
+  async cancelIntent(intentId: string, reason?: string): Promise<PurchaseIntent> {
+    const intent = this.deps.store.get(intentId);
+    if (!intent) throw new Error(`unknown purchase intent: ${intentId}`);
+    if (intent.status === 'cancelled') return intent; // idempotent no-op
+    if (intent.status !== 'pending-approval') {
+      throw new Error(
+        `purchase intent ${intentId} cannot be cancelled from status ${intent.status} — only pending-approval intents can be cancelled`,
+      );
+    }
+    const note = reason ? sanitizePurchaseText(reason, 500) : 'Cancelled by the user before a decision was made.';
+    const cancelled = this.deps.store.transition(intentId, 'cancelled', {
+      decidedAt: this.now(),
+      note,
+    });
+    this.audit('purchase.cancelled', cancelled, { reason: note });
+    return cancelled;
   }
 
   /** Decision entry point when only the governance approval id is known. */

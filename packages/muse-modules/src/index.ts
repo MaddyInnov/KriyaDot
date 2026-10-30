@@ -10,10 +10,12 @@
 // and registerMuseModuleTools() for the agent-invokable tools.
 
 export { ModuleDb } from './db.js';
-export { NotFoundError, ValidationError, statusForError, messageForError } from './errors.js';
+export { NotFoundError, ValidationError, PermissionError, statusForError, messageForError } from './errors.js';
 export * from './feed/index.js';
 export * from './reminders/index.js';
 export * from './goals/index.js';
+export * from './goals/finishes.js';
+export * from './tracked-items/index.js';
 export * from './commitments/index.js';
 export * from './watchers/index.js';
 export * from './artifacts/index.js';
@@ -30,6 +32,9 @@ export * from './research/index.js';
 export * from './browser/index.js';
 export * from './browser/real.js';
 export * from './ideas/index.js';
+export * from './ideas/curation.js';
+export * from './ideas/runs.js';
+export * from './ideas/tools.js';
 export * from './shopping/index.js';
 export * from './shopping/visual-match.js';
 export * from './places/index.js';
