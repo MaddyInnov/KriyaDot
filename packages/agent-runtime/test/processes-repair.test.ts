@@ -226,20 +226,36 @@ function findTsc(): string {
 }
 
 describe('ADD-6 build-and-repair loop', () => {
-  // The loop's default exec is the sandboxed command path, which fails
-  // closed when no kernel/container backend exists unless the operator
-  // opts into host execution. CI runners expose no Landlock backend
-  // (seccomp), so without this opt-out every cycle is refused and the
-  // loop escalates with no diagnostics — the tests below exercise the
-  // loop itself, so they take the documented opt-out (sandbox.ts).
+  // The loop's default exec is the sandboxed command path, whose
+  // backend resolution chain is container → kernel → host. Two legs
+  // must be controlled explicitly or the outcome depends on the host:
+  //  - Docker preempts everything else when a daemon answers (GitHub
+  //    runners ship one), but the container leg runs a stock image
+  //    with NO workspace mount and no toolchain — a workspace build
+  //    can never execute there (`npm: not found`, zero parseable
+  //    errors, loop escalates with an empty trail). That is exactly
+  //    the CI-only failure this block originally hit. Disable the leg
+  //    (SANDBOX_DISABLE_DOCKER, sandbox.ts) so the tests are hermetic
+  //    on Docker-bearing machines.
+  //  - What remains is the kernel leg (Landlock where available) and
+  //    then host execution, which requires the documented opt-out
+  //    (SANDBOX_ALLOW_HOST=1) — without it a kernel-less host fails
+  //    closed and every cycle is refused. The tests below exercise
+  //    the loop itself against the real fixture project, so they take
+  //    the opt-out; assertions are unchanged.
   let prevAllowHost: string | undefined;
+  let prevDisableDocker: string | undefined;
   beforeAll(() => {
     prevAllowHost = process.env.SANDBOX_ALLOW_HOST;
     process.env.SANDBOX_ALLOW_HOST = '1';
+    prevDisableDocker = process.env.SANDBOX_DISABLE_DOCKER;
+    process.env.SANDBOX_DISABLE_DOCKER = '1';
   });
   afterAll(() => {
     if (prevAllowHost === undefined) delete process.env.SANDBOX_ALLOW_HOST;
     else process.env.SANDBOX_ALLOW_HOST = prevAllowHost;
+    if (prevDisableDocker === undefined) delete process.env.SANDBOX_DISABLE_DOCKER;
+    else process.env.SANDBOX_DISABLE_DOCKER = prevDisableDocker;
   });
 
   it('detects project kinds and discovers commands', () => {
