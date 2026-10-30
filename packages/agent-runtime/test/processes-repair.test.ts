@@ -12,7 +12,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
   ProcessRegistry,
   createProcessTools,
@@ -226,6 +226,22 @@ function findTsc(): string {
 }
 
 describe('ADD-6 build-and-repair loop', () => {
+  // The loop's default exec is the sandboxed command path, which fails
+  // closed when no kernel/container backend exists unless the operator
+  // opts into host execution. CI runners expose no Landlock backend
+  // (seccomp), so without this opt-out every cycle is refused and the
+  // loop escalates with no diagnostics — the tests below exercise the
+  // loop itself, so they take the documented opt-out (sandbox.ts).
+  let prevAllowHost: string | undefined;
+  beforeAll(() => {
+    prevAllowHost = process.env.SANDBOX_ALLOW_HOST;
+    process.env.SANDBOX_ALLOW_HOST = '1';
+  });
+  afterAll(() => {
+    if (prevAllowHost === undefined) delete process.env.SANDBOX_ALLOW_HOST;
+    else process.env.SANDBOX_ALLOW_HOST = prevAllowHost;
+  });
+
   it('detects project kinds and discovers commands', () => {
     const ws = tmpDir('br-detect-');
     writeFileSync(join(ws, 'package.json'), JSON.stringify({ name: 'x', scripts: { build: 'tsc', test: 'vitest' } }));
