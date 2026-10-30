@@ -50,6 +50,11 @@ export interface BackgroundRunRecord {
   priorContext?: string;
   /** Epoch ms when a queued run (cap, #17) actually started dispatching. */
   dispatchedAt?: number;
+  /** CA-5: specialist profile / agent-definition id this run was spawned from. */
+  profileId?: string;
+  /** CA-5: auto-created isolation worktree attached to this run (branch kept on cleanup). */
+  worktreePath?: string;
+  worktreeBranch?: string | null;
 }
 
 /** Pluggable persistence for the registry (closure #44). */
@@ -115,6 +120,9 @@ export class BackgroundRunRegistry {
     originBotId: string;
     originSessionId: string;
     task: string;
+    profileId?: string;
+    worktreePath?: string;
+    worktreeBranch?: string | null;
   }): { record: BackgroundRunRecord; signal: AbortSignal } {
     const id = `bgr-${randomUUID().slice(0, 8)}`;
     const controller = new AbortController();
@@ -128,6 +136,9 @@ export class BackgroundRunRegistry {
       task: input.task,
       status: 'running',
       startedAt: Date.now(),
+      ...(input.profileId ? { profileId: input.profileId } : {}),
+      ...(input.worktreePath ? { worktreePath: input.worktreePath } : {}),
+      ...(input.worktreeBranch !== undefined ? { worktreeBranch: input.worktreeBranch } : {}),
     };
     this.runs.set(id, record);
     this.controllers.set(id, controller);
@@ -227,6 +238,9 @@ export class BackgroundRunRegistry {
       originBotId: prev.originBotId,
       originSessionId: prev.originSessionId,
       task: prev.task,
+      ...(prev.profileId ? { profileId: prev.profileId } : {}),
+      ...(prev.worktreePath ? { worktreePath: prev.worktreePath } : {}),
+      ...(prev.worktreeBranch !== undefined ? { worktreeBranch: prev.worktreeBranch } : {}),
     });
     record.resumedFromId = prev.id;
     record.priorContext = priorContext;

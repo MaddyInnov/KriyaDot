@@ -6,7 +6,9 @@ import type { SubagentAuditFn, SubagentSpawnFn } from '../subagents.js';
 import type { ProvenanceNote } from '../provenance.js';
 import { noteFromChain } from '../provenance.js';
 import { SubagentStore } from '../subagent-store.js';
-import { subagentProfiles } from '../subagent-profiles.js';
+import { resolveDelegateProfile, type AgentDefinition, type AgentEphemeral } from '../agent-definitions.js';
+import { createIsolatedWorktree, cleanupIsolatedWorktree, type IsolatedWorktree } from '../worktrees.js';
+import type { HookBus } from '../hooks.js';
 import { AcpClient, acpOptionsFromBot } from '../acp.js';
 import type { BotConfig } from '../types.js';
 import type { DelegationDecisionEvent } from '../routing-decisions.js';
@@ -46,6 +48,17 @@ export interface CreateDelegateToolsOptions {
    * Defaults to process.cwd() when unset.
    */
   workspaceDir?: string;
+  /**
+   * CA-5: file-defined agents (.kriyadot/agents/*.md, loaded by the
+   * host via loadAgentDefinitions). Profile resolution checks these
+   * FIRST — file-defined agents win over the built-in library on a
+   * name/id collision. A resolver function is re-read per call.
+   */
+  agentDefinitions?: AgentDefinition[] | (() => AgentDefinition[]);
+  /** CA-1: hook bus forwarded to the spawn bookkeeping (subagent.start/stop). */
+  hooks?: HookBus;
+  /** CA-5: root for auto-created isolation worktrees (default `<workspaceDir>/.worktrees`). */
+  worktreeRoot?: string;
 }
 
 /**
@@ -190,7 +203,41 @@ export function createDelegateTools(opts: CreateDelegateToolsOptions): ToolDefin
         }
       }
 
-      const profile = typeof args.profileId === 'string' && args.profileId ? (()=>{ const e=subagentProfiles.ephemeralFor(args.profileId as string); if(!e) throw new Error(`delegate: unknown profileId "${String(args.profileId)}"`); return { id: args.profileId as string, name: e.name, systemPrompt: e.systemPrompt, tools: e.tools }; })() : undefined;
+      // CA-5: profile resolution — file-defined agents (agentDefinitions
+      // option) win over the built-in 155-profile library on collision.
+      const definitions =
+        typeof opts.agentDefinitions === 'function' ? opts.agentDefinitions() : opts.agentDefinitions;
+      const profile: ({ id: string } & AgentEphemeral) | undefined =
+        typeof args.profileId === 'string' && args.profileId
+          ? (() => {
+              const e = resolveDelegateProfile(args.profileId as string, definitions);
+              if (!e) throw new Error(`delegate: unknown profileId "${String(args.profileId)}"`);
+              return e;
+            })()
+          : undefined;
+      // CA-5: worktree isolation — from the definition (isolation:
+      // worktree) or a per-spawn `isolation: 'worktree'` argument
+      // (accepted like profileId: a handler-level arg, deliberately not
+      // added to the advertised schema, matching the profileId precedent).
+      const wantIsolation =
+        args.isolation === 'worktree' || profile?.isolation === 'worktree' ? ('worktree' as const) : undefined;
+      let iso: IsolatedWorktree | undefined;
+      if (wantIsolation) {
+        const repo = opts.workspaceDir;
+        if (!repo) {
+          throw new Error('delegate: isolation "worktree" needs a workspace (the host did not provide workspaceDir)');
+        }
+        iso = await createIsolatedWorktree({
+          repoPath: repo,
+          worktreeRoot: opts.worktreeRoot,
+          hooks: opts.hooks,
+          sessionId: ctx.sessionId,
+          botId: ctx.botId,
+        });
+      }
+      const cleanupIso = async (): Promise<void> => {
+        if (iso) await cleanupIsolatedWorktree(iso, { hooks: opts.hooks, sessionId: ctx.sessionId, botId: ctx.botId });
+      };
       // Strip `delegate` from any explicit subset — the child must not be
       // able to recurse unboundedly through the same tool.
       const requested = Array.isArray(args.tools)
@@ -223,6 +270,24 @@ export function createDelegateTools(opts: CreateDelegateToolsOptions): ToolDefin
       if (!store) {
         // Minimal wiring: spawn without depth enforcement or records.
         // Hosts SHOULD pass a SubagentStore (see options docs).
+        // CA-1: subagent.start/stop still fire on this path when a bus
+        // is wired (no store bookkeeping, but hooks observe the spawn).
+        if (opts.hooks) {
+          const start = await opts.hooks
+            .emit('subagent.start', {
+              sessionId: ctx.sessionId,
+              botId: ctx.botId,
+              task: task.slice(0, 500),
+              via: 'delegate' as const,
+              ...(profile?.id ? { profileId: profile.id } : {}),
+              childBotId,
+            })
+            .catch(() => undefined);
+          if (start?.cancelled) {
+            await cleanupIso();
+            throw new Error(`Subagent spawn blocked by a hook: ${start.reason ?? 'subagent.start hook cancelled the spawn'}`);
+          }
+        }
         try {
           const result = await spawn({
             task,
@@ -231,12 +296,41 @@ export function createDelegateTools(opts: CreateDelegateToolsOptions): ToolDefin
             parentSessionId: ctx.sessionId,
             provenance: childProvenance,
             profile,
+            isolation: wantIsolation,
+            worktreePath: iso?.info.path,
           });
           recordDecision({ delegatingBotId: ctx.botId, targetBotId: childBotId, via: 'subagent', outcome: 'success', task });
-          return { result: result.result, usage: result.usage ?? null };
+          if (opts.hooks) {
+            await opts.hooks
+              .emit('subagent.stop', {
+                sessionId: ctx.sessionId,
+                botId: ctx.botId,
+                task: task.slice(0, 500),
+                status: 'done' as const,
+                via: 'delegate' as const,
+                ...(profile?.id ? { profileId: profile.id } : {}),
+              })
+              .catch(() => undefined);
+          }
+          return { result: result.result, usage: result.usage ?? null, ...(iso ? { worktreePath: iso.info.path, worktreeBranch: iso.info.branch } : {}) };
         } catch (err) {
           recordDecision({ delegatingBotId: ctx.botId, targetBotId: childBotId, via: 'subagent', outcome: 'failed', task, error: err instanceof Error ? err.message : String(err) });
+          if (opts.hooks) {
+            await opts.hooks
+              .emit('subagent.stop', {
+                sessionId: ctx.sessionId,
+                botId: ctx.botId,
+                task: task.slice(0, 500),
+                status: 'failed' as const,
+                via: 'delegate' as const,
+                error: err instanceof Error ? err.message : String(err),
+                ...(profile?.id ? { profileId: profile.id } : {}),
+              })
+              .catch(() => undefined);
+          }
           throw err;
+        } finally {
+          await cleanupIso();
         }
       }
 
@@ -253,16 +347,22 @@ export function createDelegateTools(opts: CreateDelegateToolsOptions): ToolDefin
           botId: botOverride ?? ctx.botId,
           provenance: childProvenance,
           profile,
+          hooks: opts.hooks,
+          isolation: wantIsolation,
+          worktreePath: iso?.info.path,
         });
         recordDecision({ delegatingBotId: ctx.botId, targetBotId: childBotId, via: 'subagent', outcome: 'success', task });
         return {
           result: spawned.result,
           usage: spawned.usage ?? null,
           subagentId: spawned.subagentId,
+          ...(iso ? { worktreePath: iso.info.path, worktreeBranch: iso.info.branch } : {}),
         };
       } catch (err) {
         recordDecision({ delegatingBotId: ctx.botId, targetBotId: childBotId, via: 'subagent', outcome: 'failed', task, error: err instanceof Error ? err.message : String(err) });
         throw err;
+      } finally {
+        await cleanupIso();
       }
     },
   };

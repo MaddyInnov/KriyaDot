@@ -21,7 +21,7 @@ import type {
   ToolCall,
   ToolContext,
 } from '@mvp/agent-runtime';
-import { isRelayedOrigin } from '@mvp/agent-runtime';
+import { evaluateSandboxAutoAllow, isRelayedOrigin, sandboxAutoAllowEnabled } from '@mvp/agent-runtime';
 import { DEFAULT_POLICY, GovernanceGateway as RealGovernanceGateway } from '@mvp/governance';
 import type { Policy, SimulationResult } from '@mvp/governance';
 import { checkHardFloor } from '@mvp/governance';
@@ -353,6 +353,40 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
         }
         // Privileged tools ignore learned allow — fall through to policy.
       }
+    }
+    // Sandbox-auto-allow (CA-3, OPT-IN, default OFF): when the bot (or
+    // this session's context) opted in AND the live sandbox backend
+    // fully confines the command, a would-be 'require-approval'
+    // converts to 'allow' — containment replaces the prompt. Hard
+    // floors already returned above; a policy DENY is never widened
+    // (the conversion only fires when a side-effect-free simulation
+    // of the full policy stack says 'require-approval'); unconfined
+    // (host) execution never qualifies. See agent-runtime
+    // tools/sandbox-auto-allow.ts.
+    try {
+      const botCfg = this.getBotConfig?.(ctx.botId);
+      const enabled = ctx.sandboxAutoAllow ?? sandboxAutoAllowEnabled(botCfg);
+      if (enabled === true && (call.name === 'run_command' || call.name === 'run_background')) {
+        const verdict = evaluateSandboxAutoAllow({
+          enabled: true,
+          toolName: call.name,
+          command: typeof call.args?.command === 'string' ? call.args.command : undefined,
+        });
+        if (verdict.allow) {
+          const sim = await this.simulatePolicy(
+            ctx.botId,
+            call.name,
+            call.args,
+            ctx.sessionToolHistory as unknown as string[] | undefined,
+          );
+          if (sim.effect === 'require-approval' && !sim.hardFloor && !sim.denylist && !sim.domainDenied) {
+            this.audit({ type: 'policy', botId: ctx.botId, sessionId: ctx.sessionId, call, detail: `Sandbox-auto-allow (CA-3, audited): ${verdict.reason}`, ts: new Date().toISOString() });
+            return { decision: 'allow', reason: verdict.reason };
+          }
+        }
+      }
+    } catch {
+      // Auto-allow must never break evaluation — fall through to policy.
     }
     // Permissions pane allowances (P-6/P-15/P-16): an exact-match user
     // allowance converts Ask → Allow and nothing else. Hard floors have

@@ -43,6 +43,14 @@ export interface BotPolicy {
    * the flag to flow from bot config — see the closure report.
    */
   policySnapshot?: boolean;
+  /**
+   * Opt-in sandbox-auto-allow (CA-3): field-compatible with
+   * agent-runtime's BotPolicy.sandboxAutoAllow. The API governance
+   * adapter reads it (via the bot config) and gates it on live
+   * sandbox confinement; mergeBotPolicy does not need to carry it
+   * because the adapter consults the bot config directly.
+   */
+  sandboxAutoAllow?: boolean;
 }
 
 /**

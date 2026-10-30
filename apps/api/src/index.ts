@@ -1001,8 +1001,20 @@ async function boot(): Promise<void> {
   // (platformEmbedder is selected once, before buildToolRegistry above,
   // via selectDefaultEmbedder — neural > onnx seam > trigram hash.)
 
+  // CA-5: file-defined agents (.kriyadot/agents/*.md in the workspace and
+  // the user's home) — delegate/background profile resolution checks these
+  // BEFORE the built-in profile library. Loaded once at boot.
+  const { loadAgentDefinitions } = await import('@mvp/agent-runtime');
+  const agentDefinitions = loadAgentDefinitions({
+    workspaceDir: config.workspaceDir,
+    userDir: os.homedir(),
+  }).definitions;
+  if (agentDefinitions.length > 0) {
+    console.log(`[agents] loaded ${agentDefinitions.length} file-defined agent(s)`);
+  }
   const agentRuntime: AgentRuntime = new AgentRuntime({
     dbPath: `${config.dataDir}/agent.db`,
+    agentDefinitions,
     spanStore,
     skillsDir: path.join(seedDir, 'skills'),
     additionalSkillsDirs: [path.join(config.dataDir, 'skills')],
@@ -1160,6 +1172,16 @@ async function boot(): Promise<void> {
   // About-me context: the user's own profile rides into every bot turn.
   agentRuntime.addContextProvider(({ bot }) => aboutMeContext(config.dataDir, bot.id));
 
+  // CA-17: output styles — one shared file-backed store: the /style
+  // session command writes selections through it (sessionCommandDeps
+  // below) and this provider appends the selected style's prompt to
+  // every turn's system context.
+  const { OutputStyleStore, buildStylePrompt } = await import('./session-craft.js');
+  const outputStyleStore = OutputStyleStore.forDataDir(config.dataDir);
+  agentRuntime.addContextProvider(({ sessionId }) =>
+    sessionId ? buildStylePrompt(outputStyleStore.getSessionStyle(sessionId)) : '',
+  );
+
   // Script hooks (Octomind parity #67/#101): bots whose config carries
   // shell `hooks` entries get them registered on the shared HookBus as
   // real script handlers (the production call site for
@@ -1169,6 +1191,32 @@ async function boot(): Promise<void> {
     const scriptHooks = registerScriptHooksFromConfigs(hookBus, seed.bots);
     if (scriptHooks.registered > 0) {
       console.log(`[hooks] registered ${scriptHooks.registered} script hook(s) from bot configs`);
+    }
+  }
+
+  // CA-1: HTTP + prompt config hooks from bot configs (script entries are
+  // registered by the block above, so only the new kinds are installed
+  // here — no double-firing). Prompt hooks evaluate through the bot's own
+  // provider via the cheapest evaluate profile; every handler fails open
+  // except explicit gate blocks, and no hook can approve anything.
+  {
+    const { hooksFromConfig, registerHookConfig, providerPromptEvaluator } = await import('@mvp/agent-runtime');
+    let installed = 0;
+    for (const bot of seed.bots) {
+      try {
+        const { entries } = hooksFromConfig(bot as { hooks?: unknown });
+        const nonScript = entries.filter((e) => e.kind === 'http' || e.kind === 'prompt');
+        if (nonScript.length === 0) continue;
+        const { registered } = registerHookConfig(hookBus, nonScript, {
+          evaluator: providerPromptEvaluator(createProvider(bot.provider), { profiles: modelProfiles }),
+        });
+        installed += registered;
+      } catch (err) {
+        console.warn(`[hooks] config hooks for bot "${bot.id}" failed to install:`, (err as Error).message);
+      }
+    }
+    if (installed > 0) {
+      console.log(`[hooks] registered ${installed} http/prompt hook(s) from bot configs`);
     }
   }
 
@@ -1202,6 +1250,10 @@ async function boot(): Promise<void> {
     audit: (action, fields) => governance.audit(action, fields),
     // Delegate children resolve purpose profiles + get a summarizer too.
     modelProfiles,
+    // CA-5/CA-1: file-defined agents win profile resolution; the shared
+    // bus lets subagent.start/stop + worktree hooks observe spawns.
+    agentDefinitions,
+    hooks: hookBus,
   });
 
   // Bot-to-bot collaboration tools (Codync team parity): list_bots, ask_bot,
@@ -2171,6 +2223,8 @@ async function boot(): Promise<void> {
   // Hindsight (Octomind parity): runtime retrospective lessons land as
   // memory atoms (deduped by the store; category inferred).
   memorySinkHolder.storeLesson = (botId, lesson, sessionId) => {
+    // CA-37: incognito sessions never write to long-term memory.
+    if (sessionId && !agentRuntime.sessionAllowsMemoryWrite(sessionId)) return;
     try {
       tieredMemoryStore.storeAtom(botId, { fact: lesson, entities: [], confidence: 0.6 }, sessionId);
     } catch {
@@ -2677,8 +2731,30 @@ async function boot(): Promise<void> {
       // verbatim quotes, session citation, reflection kickoff when a
       // chat fn is available — here the pipeline runs without one, so
       // reflection is skipped and the result says so).
-      runDistillPipeline: (botId: string, sessionId: string) =>
-        tieredMemoryStore.runDistillPipeline(botId, sessionId),
+      runDistillPipeline: (botId: string, sessionId: string) => {
+        // CA-37: incognito sessions are never distilled (memory-only).
+        if (!agentRuntime.sessionAllowsMemoryWrite(sessionId)) {
+          return Promise.resolve({
+            botId,
+            sessionId,
+            turns: 0,
+            stored: 0,
+            rejected: 0,
+            atomIds: [],
+            reflection: null,
+          });
+        }
+        return tieredMemoryStore.runDistillPipeline(botId, sessionId);
+      },
+      // CA-17: /style — backed by the shared OutputStyleStore (the same
+      // instance the turn context provider reads selections from).
+      sessionStyle: {
+        list: (userId: string) => outputStyleStore.list(userId),
+        get: (userId: string, name: string) => outputStyleStore.get(userId, name),
+        getSession: (sessionId: string) => outputStyleStore.getSessionStyle(sessionId),
+        setSession: (sessionId: string, userId: string, styleName: string | null) =>
+          outputStyleStore.setSessionStyle(sessionId, userId, styleName),
+      },
       // /share (closure #114): publish the session transcript as a
       // public page — same store + renderer as the REST share routes.
       shareSession: (sessionId: string) => {
@@ -3034,11 +3110,21 @@ async function boot(): Promise<void> {
       listThreadMessages: (id) => agentRuntime.listThreadMessages(id),
       duplicateThread: (id) => agentRuntime.sessionStore.duplicateSession(id),
       deleteThread: (id) => agentRuntime.sessionStore.deleteSession(id),
+      // CA-37: incognito threads — content stays memory-only and the
+      // session is dropped entirely on close.
+      createIncognitoThread: (botId) => agentRuntime.sessionStore.createSession(botId, { incognito: true }),
+      closeIncognitoThread: (id) => agentRuntime.sessionStore.closeIncognitoSession(id),
       audit: (action, fields) => governance.audit(action, fields),
       titles: threadTitles,
       // W2: deleting a thread clears its circuit-breaker state so a
       // deleted session can't leak breaker/denial state into a recycled id.
-      onThreadDeleted: (id) => agentRuntime.clearSessionCircuitState(id),
+      // CA-13: it also kills the session's background processes.
+      onThreadDeleted: (id) => {
+        agentRuntime.clearSessionCircuitState(id);
+        void import('@mvp/agent-runtime')
+          .then((m) => m.defaultProcessRegistry.disposeSession(id))
+          .catch(() => undefined);
+      },
       // W7: when a person context is presented, list only that person's
       // private chats; no context → unchanged (all threads).
       resolvePersonId: (req) => resolveExplicitPersonContext(req as never),
@@ -4165,6 +4251,36 @@ async function boot(): Promise<void> {
     setTimeout(purgeTrash, 60_000).unref();
     setInterval(purgeTrash, 24 * 60 * 60 * 1000).unref();
   }
+  // Checkpoints (CA-4/CA-30): summarize-restore, per-file restore, the
+  // session-changes diff endpoint, and the retention sweep (daily).
+  {
+    const { createCheckpointsRouter } = await import('./checkpoints-routes.js');
+    const { createSummarizer } = await import('./summarizer.js');
+    const summarize = createSummarizer(undefined, modelProfiles);
+    app.use(
+      '/api',
+      createCheckpointsRouter({
+        checkpointStore,
+        rewindSession: (sid, keep) => agentRuntime.rewindSession(sid, keep),
+        listMessages: (sid) =>
+          agentRuntime.listThreadMessages(sid).map((m) => ({ role: m.role, content: m.content })),
+        appendMessage: (sid, msg) =>
+          agentRuntime.sessionStore.appendMessage(sid, { role: 'user', content: msg.content }),
+        summarize: (messages) => summarize(messages as never),
+        audit: (action, fields) => governance.audit(action, fields as never),
+      }),
+    );
+    const { runCheckpointRetention } = await import('./checkpoints.js');
+    const sweepCheckpoints = () => {
+      try {
+        runCheckpointRetention(checkpointStore);
+      } catch {
+        // Retention must never break boot or the server loop.
+      }
+    };
+    setTimeout(sweepCheckpoints, 90_000).unref();
+    setInterval(sweepCheckpoints, 24 * 60 * 60 * 1000).unref();
+  }
   app.get('/_kriyadot/', (_req, res) => {
     try {
       res.type('html').send(
@@ -4316,6 +4432,13 @@ async function boot(): Promise<void> {
     }
     try {
       agentRuntime.close();
+    } catch {
+      // ignore
+    }
+    try {
+      // CA-13: no background shell process outlives the server.
+      const { defaultProcessRegistry } = await import('@mvp/agent-runtime');
+      defaultProcessRegistry.disposeAll();
     } catch {
       // ignore
     }

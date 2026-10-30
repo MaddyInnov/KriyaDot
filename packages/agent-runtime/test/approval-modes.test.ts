@@ -10,10 +10,12 @@ import {
 } from '../src/approval-modes.js';
 
 describe('parseApprovalMode', () => {
-  it('accepts the three modes', () => {
+  it('accepts the five modes', () => {
     expect(parseApprovalMode('plan')).toBe('plan');
     expect(parseApprovalMode('auto')).toBe('auto');
     expect(parseApprovalMode('bypass')).toBe('bypass');
+    expect(parseApprovalMode('acceptEdits')).toBe('acceptEdits');
+    expect(parseApprovalMode('dontAsk')).toBe('dontAsk');
   });
   it('rejects anything else', () => {
     expect(parseApprovalMode('yolo')).toBeUndefined();
@@ -21,8 +23,8 @@ describe('parseApprovalMode', () => {
     expect(parseApprovalMode(undefined)).toBeUndefined();
     expect(parseApprovalMode(42)).toBeUndefined();
   });
-  it('APPROVAL_MODES lists all three', () => {
-    expect([...APPROVAL_MODES].sort()).toEqual(['auto', 'bypass', 'plan']);
+  it('APPROVAL_MODES lists all five', () => {
+    expect([...APPROVAL_MODES].sort()).toEqual(['acceptEdits', 'auto', 'bypass', 'dontAsk', 'plan']);
   });
 });
 

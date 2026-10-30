@@ -3,7 +3,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { exportBotRoster, getAgentModels, getBots, getPersonas, getProviders, getRedteamReports, importBotRoster, runRedteamSuite, setBotModel, setBotPersona, setBotWorkspace, simulatePolicy, updateBotPolicy } from '../../lib/api';
-import type { AgentModel, BotConfig, BotPolicyEffect, BotPolicyRule, ModelOptions, PersonaInfo, PolicySimulationResult, ProviderInfo, RedteamReport, RosterImportReport, VoiceSettings } from '../../lib/api';
+import type { AgentModel, ApprovalMode, BotConfig, BotPolicyEffect, BotPolicyRule, ModelOptions, PersonaInfo, PolicySimulationResult, ProviderInfo, RedteamReport, RosterImportReport, VoiceSettings } from '../../lib/api';
 import { useUxMode } from '../../lib/ux-mode';
 import { I18nProvider, LanguageSwitcher, useI18n } from '../../lib/i18n';
 import ComputerPanel from '../../components/panels/computer-panel';
@@ -877,7 +877,7 @@ function BotsPageInner() {
     setBots((prev) => prev.map((b) => (b.id === botId ? { ...b, workspace: workspace ?? undefined } : b)));
   };
 
-  const onApprovalModeSaved = (botId: string, approvalMode: 'plan' | 'auto' | 'bypass') => {
+  const onApprovalModeSaved = (botId: string, approvalMode: ApprovalMode) => {
     setBots((prev) => prev.map((b) => (b.id === botId ? { ...b, approvalMode } : b)));
   };
 

@@ -11,6 +11,8 @@ import { isThemeName, THEME_NAMES } from '../themes.js';
 import { MarkdownText } from './MarkdownText.js';
 import { Spinner } from './Spinner.js';
 import type { JobManager } from '../jobs.js';
+import { emitTerminalSignal, resolveNotifyMode, type NotifyMode } from '../terminal-signals.js';
+import { actionForEvent, DEFAULT_KEYBINDINGS, type KeyBindings } from '../keybindings.js';
 
 export interface ChatMessage {
   id: number;
@@ -54,6 +56,10 @@ interface Props {
   onTheme: (name: ThemeName) => void;
   /** Shared background-job registry (#187): each chat turn registers here so the Jobs panel can list/cancel it. */
   jobs?: JobManager;
+  /** CA-28: terminal completion-signal mode. */
+  notifyMode?: NotifyMode;
+  /** CA-19: keybinding overrides (defaults when omitted). */
+  keybindings?: KeyBindings;
 }
 
 let nextId = 1;
@@ -69,7 +75,9 @@ function summarizeArgs(args: unknown): string {
   }
 }
 
-export function ChatView({ api, bot, palette, sessionId, messages, setMessages, onCommand, onTheme, jobs }: Props): React.ReactElement {
+export function ChatView({ api, bot, palette, sessionId, messages, setMessages, onCommand, onTheme, jobs, notifyMode, keybindings }: Props): React.ReactElement {
+  const notify = resolveNotifyMode(notifyMode);
+  const bindings = keybindings ?? DEFAULT_KEYBINDINGS;
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
@@ -133,6 +141,7 @@ export function ChatView({ api, bot, palette, sessionId, messages, setMessages, 
           append('tool', ev.denied ? `✕ ${ev.call.name} denied` : `✓ ${ev.call.name} done`, ev.denied);
           break;
         case 'approval_required': {
+          emitTerminalSignal(notify, 'approval-needed');
           flushAssistantBuffer();
           setPendingApproval({
             approvalId: ev.approvalId,
@@ -148,6 +157,7 @@ export function ChatView({ api, bot, palette, sessionId, messages, setMessages, 
           append('system', '⏳ Queued — will run when the current turn finishes.');
           break;
         case 'done': {
+          emitTerminalSignal(notify, 'turn-complete');
           flushAssistantBuffer();
           const u = ev.usage;
           if (u && (u.inputTokens || u.outputTokens)) {
@@ -261,9 +271,62 @@ export function ChatView({ api, bot, palette, sessionId, messages, setMessages, 
           if (isThemeName(args)) onTheme(args);
           else append('system', `Unknown theme "${args}". Choose one of: ${THEME_NAMES.join(', ')}`);
           break;
+        case 'rewind': {
+          // CA-4: list checkpoints, or restore #n [code|conversation|both].
+          void (async () => {
+            try {
+              const checkpoints = await api.listCheckpoints(sessionId);
+              if (!args) {
+                if (checkpoints.length === 0) append('system', 'No checkpoints for this session yet.');
+                else {
+                  append(
+                    'system',
+                    checkpoints
+                      .map((cp, i) => `${i + 1}. ${new Date(cp.createdAt).toLocaleTimeString()} · ${cp.label} · ${Object.keys(cp.files).length} file(s)`)
+                      .join('\n'),
+                  );
+                }
+                return;
+              }
+              const [target, modeArg] = args.split(/\s+/);
+              const cp = /^\d+$/.test(target ?? '') ? checkpoints[Number(target) - 1] : checkpoints.find((c) => c.id.startsWith(target ?? ''));
+              if (!cp) {
+                append('system', `No checkpoint matches "${target}".`);
+                return;
+              }
+              const mode = modeArg === 'code' || modeArg === 'conversation' ? modeArg : 'both';
+              const r = await api.restoreCheckpoint(cp.id, mode);
+              append('system', `↩ Restored ${cp.label} (${mode}): ${r.restoredFiles.length} file(s), ${r.messagesRemoved} message(s) removed.`);
+            } catch (err) {
+              append('system', `⚠ /rewind failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          })();
+          break;
+        }
+        case 'diff': {
+          // CA-30: session-changes review from the server aggregate.
+          void (async () => {
+            try {
+              const r = await api.sessionDiff(sessionId);
+              if (r.files.length === 0) append('system', 'No file changes recorded for this session.');
+              else {
+                append(
+                  'system',
+                  [
+                    `Session changes — ${r.files.length} file(s), +${r.totals.added} -${r.totals.removed}`,
+                    ...r.files.map((f) => `  ${f.path}  +${f.added} -${f.removed}  (${f.status})`),
+                  ].join('\n'),
+                );
+              }
+            } catch (err) {
+              append('system', `⚠ /diff failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          })();
+          break;
+        }
       }
     },
-    [append, onCommand, onTheme],
+    [append, onCommand, onTheme, api, sessionId],
   );
 
   const onSubmit = useCallback(
@@ -278,15 +341,16 @@ export function ChatView({ api, bot, palette, sessionId, messages, setMessages, 
     [runCommand, sendMessage],
   );
 
-  // Keyboard: y/n decide approvals; Ctrl+T cancels the running turn.
+  // Keyboard (CA-19 bindings): approve/deny decide approvals; the cancel
+  // chord (default Ctrl+T) cancels the running turn.
   useInput((inputKey, key) => {
+    const action = actionForEvent(bindings, inputKey, key);
     if (pendingApproval) {
-      const k = inputKey.toLowerCase();
-      if (k === 'y') decideApproval('approved');
-      else if (k === 'n') decideApproval('denied');
+      if (action === 'approve') decideApproval('approved');
+      else if (action === 'deny') decideApproval('denied');
       return;
     }
-    if (key.ctrl && inputKey === 't' && turnRef.current) {
+    if (action === 'cancel' && turnRef.current) {
       turnRef.current.abort();
       append('system', '⏹ Turn cancelled.');
     }
@@ -347,7 +411,7 @@ export function ChatView({ api, bot, palette, sessionId, messages, setMessages, 
           <Text color={palette.amber} bold>⚠ Approval needed: {pendingApproval.toolName}</Text>
           {pendingApproval.argSummary ? <Text color={palette.dim}>{pendingApproval.argSummary}</Text> : null}
           <Text color={palette.text}>
-            Press <Text color={palette.green} bold>y</Text> to approve · <Text color={palette.red} bold>n</Text> to deny
+            Press <Text color={palette.green} bold>{bindings.approve}</Text> to approve · <Text color={palette.red} bold>{bindings.deny}</Text> to deny
           </Text>
         </Box>
       )}
@@ -364,7 +428,7 @@ export function ChatView({ api, bot, palette, sessionId, messages, setMessages, 
       </Box>
       <Box paddingX={1}>
         <Text color={palette.dim}>
-          {streaming ? 'streaming — Ctrl+T cancels turn' : pendingApproval ? '' : '/bots switch · /quit exit'}
+          {streaming ? `streaming — ${bindings.cancel} cancels turn` : pendingApproval ? '' : '/bots switch · /quit exit'}
         </Text>
       </Box>
     </Box>

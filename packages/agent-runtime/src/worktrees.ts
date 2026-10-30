@@ -29,6 +29,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
 import type { ToolContext, ToolDefinition } from './types.js';
 import { resolveWorkspaceDir, type WorkspaceSource } from './workspaces.js';
+import type { HookBus } from './hooks.js';
 
 export interface CreateWorktreeOptions {
   /**
@@ -211,6 +212,8 @@ export interface CreateWorktreeToolsOptions {
    * workspace; defaults to `<workspace>/.worktrees`.
    */
   worktreeRoot?: WorkspaceSource;
+  /** CA-1: hook bus for worktree.create / worktree.remove events. */
+  hooks?: HookBus;
 }
 
 export function createWorktreeTools(opts: CreateWorktreeToolsOptions): ToolDefinition[] {
@@ -246,10 +249,33 @@ export function createWorktreeTools(opts: CreateWorktreeToolsOptions): ToolDefin
       const ws = resolveWorkspaceDir(opts.workspaceDir, ctx);
       const mgr = managerFor(ctx);
       const repo = args.repo === undefined ? ws : confine(ws, String(args.repo));
+      // CA-1: worktree.create gate — a blocking hook verdict prevents creation.
+      if (opts.hooks) {
+        const gate = await opts.hooks
+          .emit('worktree.create', {
+            sessionId: ctx.sessionId,
+            botId: ctx.botId,
+            repoPath: repo,
+            branch: args.branch === undefined ? undefined : String(args.branch),
+          })
+          .catch(() => undefined);
+        if (gate?.cancelled) throw new Error(`worktree creation blocked by a hook: ${gate.reason ?? 'cancelled'}`);
+      }
       const info = mgr.create(repo, {
         branch: args.branch === undefined ? undefined : String(args.branch),
         base: args.base === undefined ? undefined : String(args.base),
       });
+      if (opts.hooks) {
+        await opts.hooks
+          .emit('worktree.create', {
+            sessionId: ctx.sessionId,
+            botId: ctx.botId,
+            repoPath: repo,
+            worktreePath: info.path,
+            branch: info.branch,
+          })
+          .catch(() => undefined);
+      }
       return { ok: true, path: info.path, branch: info.branch, head: info.head };
     },
   };
@@ -297,9 +323,103 @@ export function createWorktreeTools(opts: CreateWorktreeToolsOptions): ToolDefin
       const raw = String(args.path ?? '');
       const target = raw.startsWith('/') ? raw : resolve(ws, raw);
       mgr.remove(repo, target, { force: args.force === true });
+      if (opts.hooks) {
+        await opts.hooks
+          .emit('worktree.remove', { sessionId: ctx.sessionId, botId: ctx.botId, repoPath: repo, worktreePath: target })
+          .catch(() => undefined);
+      }
       return { ok: true, removed: target };
     },
   };
 
   return [createTool, listTool, removeTool];
+}
+
+// ---------------------------------------------------------------------------
+// CA-5: auto-isolation for delegate / background spawns
+// ---------------------------------------------------------------------------
+
+export interface IsolatedWorktree {
+  manager: WorktreeManager;
+  info: WorktreeInfo;
+  repoPath: string;
+}
+
+export interface CreateIsolatedWorktreeOptions {
+  /** The git repo (workspace root) to branch a worktree from. */
+  repoPath: string;
+  /** Root new worktrees live under. Defaults to `<repoPath>/.worktrees`. */
+  worktreeRoot?: string;
+  branch?: string;
+  base?: string;
+  /** CA-1 hook bus: worktree.create is emitted (gate honored) before creation. */
+  hooks?: HookBus;
+  sessionId?: string;
+  botId?: string;
+}
+
+/**
+ * Create a worktree for an isolated spawn. Emits the worktree.create
+ * gate first when a bus is supplied — a blocking verdict aborts the
+ * isolation (the caller decides whether that fails the spawn; the
+ * delegate/background paths fail the spawn with the hook's reason).
+ */
+export async function createIsolatedWorktree(opts: CreateIsolatedWorktreeOptions): Promise<IsolatedWorktree> {
+  const repoPath = resolve(opts.repoPath);
+  if (opts.hooks) {
+    const gate = await opts.hooks.emit('worktree.create', {
+      sessionId: opts.sessionId,
+      botId: opts.botId,
+      repoPath,
+      branch: opts.branch,
+    });
+    if (gate.cancelled) {
+      throw new Error(`worktree isolation blocked by a hook: ${gate.reason ?? 'worktree.create hook cancelled'}`);
+    }
+  }
+  const manager = new WorktreeManager(opts.worktreeRoot ? resolve(opts.worktreeRoot) : join(repoPath, '.worktrees'));
+  const info = manager.create(repoPath, { branch: opts.branch, base: opts.base });
+  if (opts.hooks) {
+    await opts.hooks
+      .emit('worktree.create', {
+        sessionId: opts.sessionId,
+        botId: opts.botId,
+        repoPath,
+        worktreePath: info.path,
+        branch: info.branch,
+      })
+      .catch(() => undefined);
+  }
+  return { manager, info, repoPath };
+}
+
+/**
+ * Clean up an isolated spawn's worktree following the manager's
+ * existing rules: a clean worktree is removed (its BRANCH IS KEPT —
+ * `git worktree remove` never deletes branches); a dirty worktree is
+ * KEPT (removal refuses without force, and isolation cleanup never
+ * forces — the work may be exactly what the user wants to inspect).
+ * Emits worktree.remove when a bus is supplied and removal happened.
+ * Returns true when the directory was removed.
+ */
+export async function cleanupIsolatedWorktree(
+  iso: IsolatedWorktree,
+  opts: { hooks?: HookBus; sessionId?: string; botId?: string } = {},
+): Promise<boolean> {
+  try {
+    iso.manager.remove(iso.repoPath, iso.info.path);
+  } catch {
+    return false; // dirty (or already gone): keep per existing policy
+  }
+  if (opts.hooks) {
+    await opts.hooks
+      .emit('worktree.remove', {
+        sessionId: opts.sessionId,
+        botId: opts.botId,
+        repoPath: iso.repoPath,
+        worktreePath: iso.info.path,
+      })
+      .catch(() => undefined);
+  }
+  return true;
 }

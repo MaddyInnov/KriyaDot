@@ -7,6 +7,7 @@ import matter from 'gray-matter';
 import type { SchemaDriftApprovalBroker } from './mcp.js';
 import type { ToolDefinition, TurnValidatorSpec } from './types.js';
 import { parseValidatorSpecs } from './validators.js';
+import { expandShellInjections, type ShellInjectionGate, type ShellInjectionRunner } from './dynamic-context.js';
 
 // vitest (Vite 5.4.21) cannot statically resolve the `node:sqlite` specifier,
 // so load it at runtime via the builtin-module API instead of a top-level import.
@@ -33,6 +34,31 @@ export interface SkillSummary {
   description: string;
 }
 
+/**
+ * Invocation control (CA-16): who may activate a skill.
+ *  - 'user'  — only when the user explicitly invokes it (frontmatter
+ *              `invocation: user`, or `disable-model-invocation: true`).
+ *              Model auto-activation paths (declarative rules, semantic
+ *              matching) must skip it.
+ *  - 'model' — model-only; hidden from user invocation lists.
+ *  - 'both'  — default: either side may activate it.
+ */
+export type SkillInvocation = 'user' | 'model' | 'both';
+
+/** Execution context (CA-16): inline in the current turn, or forked. */
+export type SkillContext = 'inline' | 'fork';
+
+export function parseSkillInvocation(data: Record<string, unknown>): SkillInvocation {
+  const raw = data['invocation'];
+  if (raw === 'user' || raw === 'model' || raw === 'both') return raw;
+  if (data['disable-model-invocation'] === true || data['disableModelInvocation'] === true) return 'user';
+  return 'both';
+}
+
+export function parseSkillContext(data: Record<string, unknown>): SkillContext {
+  return data['context'] === 'fork' ? 'fork' : 'inline';
+}
+
 export interface LoadedSkill {
   name: string;
   description: string;
@@ -45,6 +71,10 @@ export interface LoadedSkill {
   requiredEnv?: string[];
   /** Declarative activation rules from frontmatter `activation:` (#163). */
   activation?: SkillActivationRules;
+  /** Invocation control (CA-16). Default 'both'. */
+  invocation?: SkillInvocation;
+  /** Execution context (CA-16): 'fork' runs via delegate, isolated. */
+  context?: SkillContext;
 }
 
 /** A skill skipped at load/activation because required env is missing (#123). */
@@ -107,6 +137,14 @@ export interface SkillLoaderOptions {
    * against a specific environment.
    */
   env?: Record<string, string | undefined>;
+  /**
+   * Dynamic context injection (CA-16): when set, `` !`cmd` `` markers in
+   * a skill body are expanded at loadFull time through this governed
+   * shell path (see dynamic-context.ts). The gate MUST allow a command
+   * before the runner sees it. Unset → markers degrade to explicit
+   * not-run notes, never to execution.
+   */
+  dynamicContext?: { gate: ShellInjectionGate; runner: ShellInjectionRunner };
 }
 
 /** SQLite TOFU pin store for skill content hashes (one row per skill name). */
@@ -160,6 +198,10 @@ interface RawSkill {
   requiredEnv: string[];
   /** Declarative activation rules from frontmatter `activation:` (#163). */
   activation: SkillActivationRules;
+  /** Invocation control (CA-16). */
+  invocation: SkillInvocation;
+  /** Execution context (CA-16). */
+  context: SkillContext;
 }
 
 /**
@@ -392,6 +434,8 @@ export class SkillLoader {
             validators: [],
             requiredEnv: cached.requiredEnv,
             activation: { keywords: [], patterns: [], exclude: [] },
+            invocation: 'both',
+            context: 'inline',
           });
           return cached.summary;
         }
@@ -442,7 +486,14 @@ export class SkillLoader {
     this.assertEnvSatisfied(raw);
     const sha256 = createHash('sha256').update(raw.content, 'utf8').digest('hex');
     await this.checkPin(raw.name, sha256);
-    return { ...raw, sha256 };
+    // CA-16: dynamic context injection — expand !`cmd` markers through
+    // the governed shell path when the host wired one; otherwise the
+    // markers degrade to explicit not-run notes (never execution).
+    let content = raw.content;
+    if (content.includes('!`')) {
+      content = await expandShellInjections(content, this.options.dynamicContext ?? {});
+    }
+    return { ...raw, content, sha256 };
   }
 
   /**
@@ -480,7 +531,34 @@ export class SkillLoader {
       validators: parseValidatorSpecs(data.validators),
       requiredEnv: parseRequiredEnv(data.requiredEnv),
       activation: parseActivationRules(data.activation),
+      invocation: parseSkillInvocation(data),
+      context: parseSkillContext(data),
     };
+  }
+
+  /** Invocation + context metadata for a skill (CA-16), gate-free read. */
+  getSkillMeta(name: string): { invocation: SkillInvocation; context: SkillContext } {
+    try {
+      const raw = this.readSkill(name);
+      return { invocation: raw.invocation, context: raw.context };
+    } catch {
+      return { invocation: 'both', context: 'inline' };
+    }
+  }
+
+  /** True when the MODEL may auto-activate / invoke this skill (CA-16). */
+  canModelInvoke(name: string): boolean {
+    return this.getSkillMeta(name).invocation !== 'user';
+  }
+
+  /** True when the USER may explicitly invoke this skill (CA-16). */
+  canUserInvoke(name: string): boolean {
+    return this.getSkillMeta(name).invocation !== 'model';
+  }
+
+  /** Filter a candidate list down to model-invocable skills (CA-16). */
+  filterModelInvocable(names: string[]): string[] {
+    return names.filter((n) => this.canModelInvoke(n));
   }
 
   /**
@@ -527,6 +605,8 @@ export class SkillLoader {
     const names = candidates ?? this.list();
     const matched: string[] = [];
     for (const name of names) {
+      // CA-16: user-only skills never auto-activate from a message match.
+      if (!this.canModelInvoke(name)) continue;
       if (evaluateActivationRules(this.getActivationRules(name), message)) matched.push(name);
     }
     return matched.sort();
@@ -636,6 +716,42 @@ export class SkillLoader {
     }
     this.pinStore.upsertPin(name, sha256);
   }
+}
+
+/**
+ * A prepared skill execution (CA-16). For `context: fork` skills the
+ * execution is isolated: the host runs it through the delegate path
+ * (createDelegateTools / a background subagent) with `prompt` as the
+ * delegate task, so the skill's work happens in a fresh context and
+ * only its result returns to the session. For inline skills the host
+ * simply injects `prompt` into the current turn.
+ *
+ * WIRING: the delegate seam is this descriptor — runtime/host code that
+ * activates a skill calls prepareSkillExecution() and, when mode is
+ * 'fork', dispatches `delegateTask` through its existing delegate tool
+ * instead of inlining the skill body.
+ */
+export interface PreparedSkillExecution {
+  mode: SkillContext;
+  skill: string;
+  /** Inline mode: text to inject into the current turn. */
+  prompt: string;
+  /** Fork mode: the isolated task handed to the delegate path. */
+  delegateTask?: string;
+}
+
+export function prepareSkillExecution(skill: LoadedSkill, userRequest: string): PreparedSkillExecution {
+  const body = `Skill: ${skill.name}\n${skill.description ? `${skill.description}\n` : ''}\n${skill.content}`;
+  if (skill.context === 'fork') {
+    return {
+      mode: 'fork',
+      skill: skill.name,
+      prompt: body,
+      delegateTask:
+        `Execute the following skill in isolation and report only the result back.\n\n${body}\n\n---\nUser request: ${userRequest}`,
+    };
+  }
+  return { mode: 'inline', skill: skill.name, prompt: body };
 }
 
 /**

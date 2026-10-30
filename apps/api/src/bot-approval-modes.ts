@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-// Per-bot approval mode persistence (Atomic parity: plan/auto/bypass).
+// Per-bot approval mode persistence (Atomic parity: plan/auto/bypass,
+// plus the CA-2 named modes acceptEdits/dontAsk — the selector data is
+// data-driven through parseApprovalMode/APPROVAL_MODES in the runtime,
+// so the new modes persist and validate with no shape change here).
 //
 // Same overlay pattern as bot-voice.ts: bot configs ship in seed/bots.json
 // (immutable at runtime); approval modes from the UI are overlaid in
-// <dataDir>/bot-approval-modes.json: { "<botId>": "plan"|"auto"|"bypass" }.
+// <dataDir>/bot-approval-modes.json: { "<botId>": "<ApprovalMode>" }.
 // Applied onto the in-memory bots at boot (HOST WIRING: call
 // applyBotApprovalModes(seed.bots, config.dataDir) in index.ts) and updated
 // by PUT /api/bots/:id/approval-mode.
@@ -83,7 +86,7 @@ export function saveBotApprovalModeForBot(
   const bot = bots.find((b) => b.id === botId);
   if (!bot) throw new Error(`Unknown bot: ${botId}`);
   const sanitized = sanitizeApprovalMode(mode);
-  if (!sanitized) throw new Error('approvalMode must be one of plan|auto|bypass');
+  if (!sanitized) throw new Error('approvalMode must be one of plan|auto|bypass|acceptEdits|dontAsk');
   const file = readFile(dataDir);
   file[botId] = sanitized;
   writeFile(dataDir, file);

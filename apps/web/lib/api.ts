@@ -187,8 +187,8 @@ export interface BotConfig {
   avatarUrl?: string;
   /** Per-bot voice-call settings (STT/TTS providers, TTS voice, VAD). */
   voice?: VoiceSettings;
-  /** Approval mode (Atomic parity): 'plan' | 'auto' | 'bypass'. Default 'auto'. */
-  approvalMode?: 'plan' | 'auto' | 'bypass';
+  /** Approval mode: 'plan' | 'auto' | 'bypass' | 'acceptEdits' | 'dontAsk' (CA-2). Default 'auto'. */
+  approvalMode?: ApprovalMode;
   /** Chief of Staff: prompt injection + chief-only tools enabled. */
   chiefOfStaff?: boolean;
   /** Sections the chief is the primary contact for. */
@@ -1026,7 +1026,7 @@ export const setBotVoice = (
     body: JSON.stringify({ voice }),
   });
 
-export type ApprovalMode = 'plan' | 'auto' | 'bypass';
+export type ApprovalMode = 'plan' | 'auto' | 'bypass' | 'acceptEdits' | 'dontAsk';
 
 export const setBotApprovalMode = (
   botId: string,

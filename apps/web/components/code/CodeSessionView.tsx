@@ -13,6 +13,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { langFromPath, lineDiff, tokenize, type DiffLine, type Token } from './highlight';
 import type { CodeFileSession } from './useCodeSession';
+import type { CheckpointClient } from './checkpoints';
+import { RewindPanel } from './RewindPanel';
 
 const TOKEN_CLASS: Record<Token['t'], string> = {
   keyword: 'tk-kw',
@@ -164,10 +166,30 @@ export interface CodeSessionViewProps {
   onToggleLayout: () => void;
   onClose: () => void;
   onFileDone: (file: string) => void;
+  /** CA-4: when set (with checkpointClient), a Rewind toggle opens the checkpoint drawer. */
+  sessionId?: string;
+  checkpointClient?: CheckpointClient;
 }
 
-export function CodeSessionView({ files, layout, onToggleLayout, onClose, onFileDone }: CodeSessionViewProps) {
+/** CA-30: per-file +/- counts for the review mode, from before/after. */
+export function reviewRows(files: CodeFileSession[]): Array<{ file: string; added: number; removed: number; kind: string }> {
+  return files
+    .filter((f) => f.kind === 'write')
+    .map((f) => {
+      const diff = lineDiff(f.before ?? '', f.after);
+      return {
+        file: f.file,
+        added: diff.filter((l) => l.kind === 'add').length,
+        removed: diff.filter((l) => l.kind === 'del').length,
+        kind: f.before === null ? 'created' : 'modified',
+      };
+    })
+    .sort((a, b) => a.file.localeCompare(b.file));
+}
+
+export function CodeSessionView({ files, layout, onToggleLayout, onClose, onFileDone, sessionId, checkpointClient }: CodeSessionViewProps) {
   const [activeFile, setActiveFile] = useState<string | null>(null);
+  const [mode, setMode] = useState<'live' | 'review' | 'rewind'>('live');
   const current = files.find((f) => f.file === activeFile) ?? files[files.length - 1] ?? null;
   // Follow the newest file while its edit is still streaming.
   const prevCount = useRef(files.length);
@@ -190,6 +212,26 @@ export function CodeSessionView({ files, layout, onToggleLayout, onClose, onFile
           {files.length} file{files.length === 1 ? '' : 's'}
         </span>
         <span className="spacer" style={{ flex: 1 }} />
+        <button
+          type="button"
+          className="btn btn-sm"
+          onClick={() => setMode((m) => (m === 'review' ? 'live' : 'review'))}
+          aria-pressed={mode === 'review'}
+          title="Review everything changed this session, per file"
+        >
+          Review changes
+        </button>
+        {sessionId && checkpointClient && (
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={() => setMode((m) => (m === 'rewind' ? 'live' : 'rewind'))}
+            aria-pressed={mode === 'rewind'}
+            title="Open the checkpoint rewind drawer"
+          >
+            ⏪ Rewind
+          </button>
+        )}
         <button type="button" className="btn btn-sm" onClick={onToggleLayout} title={layout === 'inline' ? 'Pop out to side panel' : 'Dock inline'}>
           {layout === 'inline' ? '⤢ Side panel' : '⤡ Dock inline'}
         </button>
@@ -214,7 +256,33 @@ export function CodeSessionView({ files, layout, onToggleLayout, onClose, onFile
           </button>
         ))}
       </div>
-      {current &&
+      {mode === 'review' && (
+        <div className="cs-review" role="region" aria-label="Session changes review">
+          {reviewRows(files).length === 0 ? (
+            <p className="muted small" style={{ padding: '8px 12px' }}>No file writes yet this session.</p>
+          ) : (
+            <ul className="cs-review-list">
+              {reviewRows(files).map((r) => (
+                <li key={r.file} className="cs-review-row">
+                  <span className="mono">{r.file}</span>
+                  <span className="cs-review-counts">
+                    +{r.added} −{r.removed}
+                  </span>
+                  <span className="muted small">{r.kind}</span>
+                  <button type="button" className="btn btn-sm" onClick={() => { setActiveFile(r.file); setMode('live'); }}>
+                    View diff
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+      {mode === 'rewind' && sessionId && checkpointClient && (
+        <RewindPanel sessionId={sessionId} client={checkpointClient} onClose={() => setMode('live')} />
+      )}
+      {mode === 'live' &&
+        current &&
         (current.kind === 'read' ? (
           <ReadPane file={current} />
         ) : (

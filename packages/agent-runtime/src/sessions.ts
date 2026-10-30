@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { ChatMessage, RichMessage, ToolCall } from './types.js';
+import type { HookBus } from './hooks.js';
 import { createHash } from 'node:crypto';
 import {
   scoreAttention,
@@ -32,6 +33,22 @@ export interface SessionRecord {
    * attacker. (Tenancy orgs/roles govern hosted multi-tenant use.)
    */
   ownerPersonId?: string;
+  /**
+   * Incognito / ephemeral chat (CA-37): when true, the session's
+   * messages are held ONLY in this process's memory — never written to
+   * SQLite — and no memory writes may be derived from its turns (see
+   * {@link sessionAllowsMemoryWrite}). The session ROW (id, bot,
+   * timestamps, this flag) is persisted so the thread list can badge
+   * it; the conversation CONTENT is gone when the process exits or the
+   * session is closed/deleted. Search, compaction archives, and branch
+   * copies never see incognito content in the database.
+   */
+  incognito?: boolean;
+}
+
+/** Memory-write gate (CA-37): incognito sessions never write memory. */
+export function sessionAllowsMemoryWrite(record: SessionRecord | undefined | null): boolean {
+  return record?.incognito !== true;
 }
 
 /** Person id that owns pre-W7 / unowned private chats: the default user. */
@@ -204,6 +221,14 @@ export interface SessionStoreOptions {
    * is no summary to serve yet). Default off.
    */
   backgroundCompaction?: boolean;
+  /**
+   * CA-1 hook bus: when set, the store emits session.start on
+   * createSession, session.end on deleteSession, and
+   * compact.before/compact.after around compactNow folds (compact.before
+   * is a gate — a blocking verdict skips the fold). All emissions are
+   * failure-isolated; hooks never break session storage.
+   */
+  hooks?: HookBus;
 }
 
 /** One archived (lossless) compacted range, dereferenceable via recall. */
@@ -422,10 +447,17 @@ export class SessionStore {
   private readonly retentionBudgets: Record<MessageCategory, number>;
   private readonly attentionPinThreshold: number;
   private readonly maxRetainedBlocks: number;
+  private readonly hooks?: HookBus;
   /** sessionId → { summary, upToId }: already-compacted watermark cache. */
   private readonly compactionCache = new Map<string, { summary: string; upToId: number }>();
   /** Sessions with a background fold currently in flight. */
   private readonly foldsInFlight = new Set<string>();
+  /**
+   * Incognito message logs (CA-37): sessionId → messages, in memory
+   * only. Never persisted; dropped on delete/close and on process exit.
+   */
+  private readonly ephemeralMessages = new Map<string, IdentifiedMessage[]>();
+  private readonly ephemeralNextId = new Map<string, number>();
 
   constructor(dbPath: string, opts: SessionStoreOptions = {}) {
     this.db = openDb(dbPath);
@@ -444,6 +476,7 @@ export class SessionStore {
         ? Math.min(1, Math.max(0, opts.attentionPinThreshold))
         : DEFAULT_ATTENTION_PIN_THRESHOLD;
     this.maxRetainedBlocks = parsePositiveInt(opts.maxRetainedBlocks) ?? 20;
+    this.hooks = opts.hooks;
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY,
@@ -453,6 +486,12 @@ export class SessionStore {
     // W7 migration: private-chat owner person (nullable; null = default user).
     try {
       this.db.exec('ALTER TABLE sessions ADD COLUMN owner_person_id TEXT');
+    } catch {
+      // Column already exists.
+    }
+    // CA-37 migration: incognito flag (0 = normal persisted session).
+    try {
+      this.db.exec('ALTER TABLE sessions ADD COLUMN incognito INTEGER NOT NULL DEFAULT 0');
     } catch {
       // Column already exists.
     }
@@ -552,21 +591,27 @@ export class SessionStore {
     this.db.prepare('DELETE FROM messages_fts WHERE rowid NOT IN (SELECT id FROM messages)').run();
   }
 
-  createSession(botId: string, opts: { ownerPersonId?: string } = {}): string {
+  createSession(botId: string, opts: { ownerPersonId?: string; incognito?: boolean } = {}): string {
     const id = newId();
     this.db
-      .prepare('INSERT INTO sessions (id, bot_id, created_at, owner_person_id) VALUES (?, ?, ?, ?)')
-      .run(id, botId, new Date().toISOString(), opts.ownerPersonId ?? null);
+      .prepare('INSERT INTO sessions (id, bot_id, created_at, owner_person_id, incognito) VALUES (?, ?, ?, ?, ?)')
+      .run(id, botId, new Date().toISOString(), opts.ownerPersonId ?? null, opts.incognito ? 1 : 0);
+    if (opts.incognito) {
+      this.ephemeralMessages.set(id, []);
+      this.ephemeralNextId.set(id, 1);
+    }
+    // CA-1: session.start (fire-and-forget — createSession is sync).
+    if (this.hooks) void this.hooks.emit('session.start', { sessionId: id, botId }).catch(() => undefined);
     return id;
   }
 
   getSession(id: string): SessionRecord | undefined {
     const row = this.db
       .prepare(
-        'SELECT id, bot_id AS botId, created_at AS createdAt, owner_person_id AS ownerPersonId FROM sessions WHERE id = ?',
+        'SELECT id, bot_id AS botId, created_at AS createdAt, owner_person_id AS ownerPersonId, incognito FROM sessions WHERE id = ?',
       )
       .get(id) as
-      | { id: string; botId: string; createdAt: string; ownerPersonId: string | null }
+      | { id: string; botId: string; createdAt: string; ownerPersonId: string | null; incognito: number | null }
       | undefined;
     if (!row) return undefined;
     return {
@@ -574,6 +619,7 @@ export class SessionStore {
       botId: row.botId,
       createdAt: row.createdAt,
       ...(row.ownerPersonId ? { ownerPersonId: row.ownerPersonId } : {}),
+      ...(row.incognito ? { incognito: true } : {}),
     };
   }
 
@@ -583,6 +629,24 @@ export class SessionStore {
    * already exists (client-generated session ids). Returns false when the
    * session is unknown.
    */
+  /** CA-37: true when this session is incognito (flagged row or live ephemeral log). */
+  isIncognitoSession(sessionId: string): boolean {
+    if (this.ephemeralMessages.has(sessionId)) return true;
+    return this.getSession(sessionId)?.incognito === true;
+  }
+
+  /**
+   * CA-37: close an incognito session — drops the in-memory log AND the
+   * session row, so nothing of the conversation remains. Returns false
+   * when the session is unknown or not incognito.
+   */
+  closeIncognitoSession(sessionId: string): boolean {
+    if (!this.isIncognitoSession(sessionId)) return false;
+    this.ephemeralMessages.delete(sessionId);
+    this.ephemeralNextId.delete(sessionId);
+    return this.deleteSession(sessionId);
+  }
+
   setSessionOwner(sessionId: string, ownerPersonId: string | null): boolean {
     const res = this.db
       .prepare('UPDATE sessions SET owner_person_id = ? WHERE id = ?')
@@ -626,7 +690,7 @@ export class SessionStore {
     const rows = this.db
       .prepare(
         `SELECT s.id AS id, s.bot_id AS botId, s.created_at AS createdAt,
-                s.owner_person_id AS ownerPersonId,
+                s.owner_person_id AS ownerPersonId, s.incognito AS incognito,
                 COUNT(m.id) AS messageCount,
                 MAX(m.ts) AS lastMessageTs
          FROM sessions s
@@ -641,17 +705,23 @@ export class SessionStore {
       botId: string;
       createdAt: string;
       ownerPersonId: string | null;
+      incognito: number | null;
       messageCount: number;
       lastMessageTs: string | null;
     }>;
-    return rows.map((r) => ({
-      id: r.id,
-      botId: r.botId,
-      createdAt: r.createdAt,
-      ...(r.ownerPersonId ? { ownerPersonId: r.ownerPersonId } : {}),
-      messageCount: r.messageCount,
-      lastMessageTs: r.lastMessageTs,
-    }));
+    return rows.map((r) => {
+      // CA-37: incognito counts/timestamps come from the in-memory log.
+      const eph = r.incognito ? this.ephemeralMessages.get(r.id) : undefined;
+      return {
+        id: r.id,
+        botId: r.botId,
+        createdAt: r.createdAt,
+        ...(r.ownerPersonId ? { ownerPersonId: r.ownerPersonId } : {}),
+        ...(r.incognito ? { incognito: true } : {}),
+        messageCount: eph ? eph.length : r.messageCount,
+        lastMessageTs: eph && eph.length > 0 ? eph[eph.length - 1]!.ts : r.lastMessageTs,
+      };
+    });
   }
 
   /**
@@ -673,6 +743,30 @@ export class SessionStore {
   }
 
   appendMessage(sessionId: string, msg: ChatMessage): void {
+    // CA-37: incognito sessions keep messages in memory only — the DB
+    // write below is skipped entirely for them.
+    if (this.isIncognitoSession(sessionId)) {
+      let log = this.ephemeralMessages.get(sessionId);
+      if (!log) {
+        log = [];
+        this.ephemeralMessages.set(sessionId, log);
+        this.ephemeralNextId.set(sessionId, 1);
+      }
+      const rich0 = msg as RichMessage;
+      const id = this.ephemeralNextId.get(sessionId) ?? 1;
+      this.ephemeralNextId.set(sessionId, id + 1);
+      log.push({
+        id,
+        role: msg.role,
+        content: msg.content,
+        ts: new Date().toISOString(),
+        ...(msg.toolName ? { toolName: msg.toolName } : {}),
+        ...(msg.toolCallId ? { toolCallId: msg.toolCallId } : {}),
+        ...(rich0.toolCalls ? { toolCalls: rich0.toolCalls } : {}),
+        ...(rich0.nativeItems ? { nativeItems: rich0.nativeItems } : {}),
+      });
+      return;
+    }
     const rich = msg as RichMessage;
     const toolCalls: ToolCall[] | undefined = rich.toolCalls;
     // Provider-native output items (#34): persisted verbatim (JSON) so a
@@ -1079,9 +1173,23 @@ export class SessionStore {
     // Forced (#128): an explicit compact bypasses the amortization gate.
     const plan = this.planCompaction(rows, keepN, { force: true });
     if (!plan) return false;
+    // CA-1: compact.before is a GATE — a blocking hook verdict skips
+    // the fold (compaction is deferred, never forced past a hook).
+    if (this.hooks) {
+      const gate = await this.hooks
+        .emit('compact.before', { sessionId, messageCount: plan.compactRange.length })
+        .catch(() => undefined);
+      if (gate?.cancelled) return false;
+    }
     const before = (this.compactionCache.get(sessionId) ?? this.readCompaction(sessionId))?.upToId ?? -1;
     const after = await this.foldRange(sessionId, plan.compactRange);
-    return after.upToId > before;
+    const compacted = after.upToId > before;
+    if (this.hooks) {
+      await this.hooks
+        .emit('compact.after', { sessionId, messageCount: plan.compactRange.length, compacted })
+        .catch(() => undefined);
+    }
+    return compacted;
   }
 
   private startBackgroundFold(sessionId: string, rows: MessageRow[], keepN: number): void {
@@ -1097,6 +1205,17 @@ export class SessionStore {
   }
 
   async getMessages(sessionId: string): Promise<ChatMessage[]> {
+    // CA-37: incognito history comes from memory; no compaction, no DB.
+    if (this.isIncognitoSession(sessionId)) {
+      return (this.ephemeralMessages.get(sessionId) ?? []).map((m) => ({
+        role: m.role,
+        content: m.content,
+        ...(m.toolName ? { toolName: m.toolName } : {}),
+        ...(m.toolCallId ? { toolCallId: m.toolCallId } : {}),
+        ...(m.toolCalls ? { toolCalls: m.toolCalls } : {}),
+        ...(m.nativeItems ? { nativeItems: m.nativeItems } : {}),
+      }) as ChatMessage);
+    }
     const rows = this.allRows(sessionId);
 
     const keepN = Math.max(this.historyLimit, COMPACTION_KEEP_FLOOR);
@@ -1166,6 +1285,10 @@ export class SessionStore {
    * verbatim log used by chat-thread branching.
    */
   listThreadMessages(sessionId: string): IdentifiedMessage[] {
+    // CA-37: incognito logs live in memory only.
+    if (this.isIncognitoSession(sessionId)) {
+      return [...(this.ephemeralMessages.get(sessionId) ?? [])];
+    }
     const rows = this.db
       .prepare(
         'SELECT id, role, content, tool_name, tool_call_id, tool_calls, native_items, media_items, ts FROM messages WHERE session_id = ? ORDER BY id ASC',
@@ -1199,6 +1322,22 @@ export class SessionStore {
    * Returns `{ ok: false, reason }` instead of throwing for 404 mapping.
    */
   branchSession(sessionId: string, fromMessageId: number, botId?: string): BranchSessionResult {
+    // CA-37: branching an incognito thread keeps the branch incognito
+    // and in memory — its content must never land in the database.
+    if (this.isIncognitoSession(sessionId)) {
+      const src = this.getSession(sessionId);
+      if (!src) return { ok: false, reason: 'thread-not-found' };
+      const log = this.ephemeralMessages.get(sessionId) ?? [];
+      const idx = log.findIndex((m) => m.id === fromMessageId);
+      if (idx < 0) return { ok: false, reason: 'message-not-found' };
+      const newId = this.createSession(src.botId, { ownerPersonId: src.ownerPersonId, incognito: true });
+      const slice = log.slice(0, idx + 1);
+      this.ephemeralMessages.set(newId, slice.map((m, i) => ({ ...m, id: i + 1 })));
+      this.ephemeralNextId.set(newId, slice.length + 1);
+      const newSession = this.getSession(newId);
+      if (!newSession) return { ok: false, reason: 'thread-not-found' };
+      return { ok: true, session: newSession, copiedMessages: slice.length };
+    }
     let session = this.getSession(sessionId);
     if (!session) {
       const hasMessages =
@@ -1240,6 +1379,14 @@ export class SessionStore {
   duplicateSession(sessionId: string): string | undefined {
     const session = this.getSession(sessionId);
     if (!session) return undefined;
+    // CA-37: an incognito duplicate stays incognito and in memory.
+    if (session.incognito) {
+      const newId = this.createSession(session.botId, { ownerPersonId: session.ownerPersonId, incognito: true });
+      const log = this.ephemeralMessages.get(sessionId) ?? [];
+      this.ephemeralMessages.set(newId, log.map((m, i) => ({ ...m, id: i + 1 })));
+      this.ephemeralNextId.set(newId, log.length + 1);
+      return newId;
+    }
     const newId = this.createSession(session.botId, { ownerPersonId: session.ownerPersonId });
     this.db
       .prepare(
@@ -1273,12 +1420,20 @@ export class SessionStore {
   deleteSession(sessionId: string): boolean {
     const session = this.getSession(sessionId);
     if (!session) return false;
+    // CA-37: drop any in-memory incognito log with the session.
+    this.ephemeralMessages.delete(sessionId);
+    this.ephemeralNextId.delete(sessionId);
     this.db.prepare('DELETE FROM messages WHERE session_id = ?').run(sessionId);
     this.db.prepare('DELETE FROM compactions WHERE session_id = ?').run(sessionId);
     this.db.prepare('DELETE FROM session_plan_state WHERE session_id = ?').run(sessionId);
     this.db.prepare('DELETE FROM session_worktrees WHERE session_id = ?').run(sessionId);
     const res = this.db.prepare('DELETE FROM sessions WHERE id = ?').run(sessionId);
-    return res.changes > 0;
+    const deleted = res.changes > 0;
+    // CA-1: session.end (fire-and-forget — deleteSession is sync).
+    if (deleted && this.hooks) {
+      void this.hooks.emit('session.end', { sessionId, botId: session.botId }).catch(() => undefined);
+    }
+    return deleted;
   }
 
   /**

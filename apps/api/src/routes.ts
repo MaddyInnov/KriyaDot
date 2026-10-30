@@ -9,7 +9,7 @@
 //   id → real approval id translation.
 
 import express from 'express';
-import { BotMemoryStore, SpaceStore, getProviderPreset, isFreeModel, listProviderPresets, readModelsDevCache, resolveApiKey, resolveBotWorkspaceDir, routeMessage, RouterDecisionLog, loadRouterWeights, routeMessageLogged } from '@mvp/agent-runtime';
+import { BotMemoryStore, SpaceStore, defaultProcessRegistry, drainProcessNotesIntoSteer, getProviderPreset, isFreeModel, listProviderPresets, readModelsDevCache, resolveApiKey, resolveBotWorkspaceDir, routeMessage, RouterDecisionLog, loadRouterWeights, routeMessageLogged } from '@mvp/agent-runtime';
 import type { AgentRuntime, BotConfig, SpanStore, StreamEvent, TokenUsage, WidgetCoordinator } from '@mvp/agent-runtime';
 import type { PerBotComputerManager } from '@mvp/agent-runtime';
 import type { VpsConnectionPool } from '@mvp/agent-runtime';
@@ -52,8 +52,11 @@ import { registerVpsRoutes } from './vps-routes.js';
 import {
   deleteSlashCommand,
   envForcedSkills,
+  executeInitCommand,
   executeRunCommand,
   expandSlashCommand,
+  expandSlashCommandV2,
+  isInitCommand,
   loadSlashCommands,
   loadSlashCommandsCached,
   mergeForcedSkills,
@@ -1303,6 +1306,8 @@ export function createRouter(deps: RouteDeps): express.Router {
       dataDir: config.dataDir,
       tieredMemoryStore,
       getBots: () => bots.map((b) => ({ id: b.id })),
+      // CA-37: incognito sessions never distill into long-term memory.
+      allowsMemoryWrite: (sessionId) => agentRuntime.sessionAllowsMemoryWrite(sessionId),
     }),
   );
 
@@ -1682,6 +1687,30 @@ export function createRouter(deps: RouteDeps): express.Router {
       return;
     }
 
+    // CA-6: `/init [--force]` scans the bot's workspace and writes a
+    // starter instruction file (AGENTS.md). Intercepted before slash
+    // expansion like /goal — it is a host command, not a prompt template.
+    if (isInitCommand(body.message)) {
+      try {
+        const result = executeInitCommand(body.message, { workspaceDir: botWorkspaceRoot(bot.id) });
+        if (result.ok) {
+          governance.audit('chat.init', {
+            actor: 'api',
+            detail: { botId: bot.id, sessionId: sessionKey, file: result.file },
+          });
+          sseReply(
+            `📄 Wrote ${result.file} — a starter instruction file generated from this workspace (stack, scripts and layout detected automatically). Edit it any time; bots read it at the start of every session.`,
+            { type: 'init_done', file: result.file },
+          );
+        } else {
+          sseReply(`⚠️ ${result.error ?? '/init could not run in this workspace.'}`);
+        }
+      } catch (err) {
+        sseReply(`⚠️ /init failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
+
     // W8d: a message that is exactly "done" settles a pending sign-in
     // request card for this bot+session (native CLI driver sign-in).
     // The sign-in status is re-checked through the cli-auth status
@@ -1810,7 +1839,13 @@ export function createRouter(deps: RouteDeps): express.Router {
     // Unknown `/command` → 400 with the list of known commands.
     let chatMessage = body.message;
     if (chatMessage.trim().startsWith('/')) {
-      const expanded = expandSlashCommand(chatMessage, loadSlashCommandsCached(config.dataDir));
+      // CA-15 v2 expansion: $ARGUMENTS/$1…$n positionals, @file inlining
+      // (workspace-confined) and governance-gated !`cmd` injection. No
+      // shell gate/runner is wired on this route yet, so injections
+      // degrade to explicit not-run notes rather than executing.
+      const expanded = await expandSlashCommandV2(chatMessage, loadSlashCommandsCached(config.dataDir), {
+        workspaceDir: botWorkspaceRoot(bot.id),
+      });
       if (expanded === null) {
         const known = Object.keys(loadSlashCommandsCached(config.dataDir));
         res.status(400).json(
@@ -1821,6 +1856,11 @@ export function createRouter(deps: RouteDeps): express.Router {
         return;
       }
       chatMessage = expanded.expanded;
+      // A command may pin a model (frontmatter `model:`); it applies only
+      // when the caller did not choose one explicitly.
+      if ('model' in expanded && expanded.model && !(typeof body.model === 'string' && body.model.trim())) {
+        body.model = expanded.model;
+      }
     }
 
     // Queue-at-boundary: a turn is already running on this session, so
@@ -2308,6 +2348,16 @@ export function createRouter(deps: RouteDeps): express.Router {
           });
           return turnAssistantText.trim().length > 0 || (turnUsage?.completionTokens ?? 0) > 0;
         };
+        // CA-13: background-process exit notes queued since the last
+        // turn ride into this turn through the runtime steer queue (the
+        // model can also pull them itself via poll_process_notes).
+        if (trackSessionId) {
+          try {
+            drainProcessNotesIntoSteer(defaultProcessRegistry, agentRuntime.steerQueue, trackSessionId);
+          } catch {
+            // Process notes are advisory — never break a turn over them.
+          }
+        }
         // First-reply rescue (OMB §1.1): a brand-new thread whose first
         // turn produces no reply (empty completion or silent error) gets
         // exactly one retry with a nudge; a failed rescue surfaces a

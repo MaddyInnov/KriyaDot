@@ -38,6 +38,21 @@ export const DEFAULT_POLICY: Policy = {
       reason: 'Read-only tools are safe to auto-allow',
     },
     {
+      id: 'allow-process-and-task-reads',
+      toolPattern: '^(read_process_output|list_processes|poll_process_notes|task_list)$',
+      actionClass: 'read',
+      effect: 'allow',
+      reason:
+        'Background-process output polling and agent todo reads are read-only session state (CA-12/CA-13)',
+    },
+    {
+      id: 'allow-agent-todos',
+      toolPattern: '^(task_create|task_update)$',
+      effect: 'allow',
+      reason:
+        'Agent-owned todo items (CA-12) mutate only the session\'s own task list — no files, no system state',
+    },
+    {
       id: 'allow-ask-user-question',
       toolPattern: '^ask_user_question$',
       effect: 'allow',
@@ -81,7 +96,7 @@ export const DEFAULT_POLICY: Policy = {
     },
     {
       id: 'approval-execution',
-      toolPattern: '^(run_command|exec|shell)$',
+      toolPattern: '^(run_command|run_background|build_and_repair|kill_process|exec|shell)$',
       actionClass: 'execute',
       effect: 'require-approval',
       reason: 'Command execution can change the system',

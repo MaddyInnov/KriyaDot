@@ -56,6 +56,12 @@ export interface MemoryUpkeepRouterDeps {
   mergeVerifier?: (keep: import('@mvp/agent-runtime').AtomCard, duplicate: import('@mvp/agent-runtime').AtomCard, similarity: number) => boolean;
   /** Per-privacy-tier hot-atom budgets (#80 watermarks). */
   watermarkBudgets?: Partial<Record<string, number>>;
+  /**
+   * CA-37: memory-write gate — return false for sessions that must never
+   * be distilled into long-term memory (incognito). Wired by the host to
+   * AgentRuntime.sessionAllowsMemoryWrite. Absent → all writes allowed.
+   */
+  allowsMemoryWrite?: (sessionId: string) => boolean;
 }
 
 /**
@@ -193,6 +199,11 @@ export function createMemoryUpkeepRouter(deps: MemoryUpkeepRouterDeps): Router {
     const sessionId = (req.body as { sessionId?: unknown })?.sessionId;
     if (typeof sessionId !== 'string' || !sessionId.trim()) {
       res.status(400).json(errorBody('"sessionId" is required'));
+      return;
+    }
+    // CA-37: incognito sessions are never distilled into long-term memory.
+    if (deps.allowsMemoryWrite && !deps.allowsMemoryWrite(sessionId.trim())) {
+      res.json({ ok: true, skipped: 'incognito', stored: 0, rejected: 0, turns: 0 });
       return;
     }
     const store = deps.tieredMemoryStore as unknown as {

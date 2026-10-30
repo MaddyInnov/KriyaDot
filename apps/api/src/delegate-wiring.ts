@@ -62,6 +62,13 @@ export interface DelegateWiringOpts {
    * sessions get adaptive compaction like parent sessions.
    */
   modelProfiles?: ModelProfiles;
+  /**
+   * CA-5: file-defined agents (`.kriyadot/agents/*.md`) — delegate profile
+   * resolution checks these BEFORE the built-in profile library.
+   */
+  agentDefinitions?: import('@mvp/agent-runtime').AgentDefinition[] | (() => import('@mvp/agent-runtime').AgentDefinition[]);
+  /** CA-1: shared hook bus so subagent.start/stop + worktree hooks fire. */
+  hooks?: import('@mvp/agent-runtime').HookBus;
 }
 
 /** Ensure the minted child session id has a row in the sessions table. */
@@ -193,6 +200,8 @@ export function registerDelegateTools(opts: DelegateWiringOpts): void {
     audit,
     getBotConfig: opts.getBotConfig,
     workspaceDir: opts.workspaceDir,
+    ...(opts.agentDefinitions ? { agentDefinitions: opts.agentDefinitions } : {}),
+    ...(opts.hooks ? { hooks: opts.hooks } : {}),
   })) {
     if (!opts.registry.has(tool.name)) {
       opts.registry.set(tool.name, tool);

@@ -296,4 +296,225 @@ export function validateFragmentReply(
   return parsed;
 }
 
+// ---------------------------------------------------------------------------
+// CA-17 — output styles: named writing styles decoupled from bot persona
+// ---------------------------------------------------------------------------
+//
+// A style is a small named object { name, description, prompt } that
+// shapes HOW replies are written (length, tone, structure) without
+// touching WHO the bot is (persona stays on the bot/session role).
+// Styles are stored per user, builtins ship with the product, and a
+// session can switch style mid-conversation via `/style <name>`; the
+// selection persists per session in the same store file.
+//
+// Sample-derived authoring: POST a few writing samples and the store
+// derives a style. When the host supplies an LLM seam it writes the
+// description; otherwise a deterministic fallback builds a structured
+// style card from the samples' surface statistics — labelled as such,
+// never dressed up as model insight.
+
+import fs from 'node:fs';
+import path from 'node:path';
+
+export interface OutputStyle {
+  name: string;
+  description: string;
+  /** Instruction text appended to the turn's system context. */
+  prompt: string;
+  builtin?: boolean;
+  /** How this style was authored: 'builtin' | 'manual' | 'samples-llm' | 'samples-stats'. */
+  source?: string;
+}
+
+export const BUILTIN_OUTPUT_STYLES: OutputStyle[] = [
+  {
+    name: 'concise',
+    description: 'Short, direct answers. No preamble, no filler.',
+    prompt: 'Write concisely: lead with the answer, use short sentences, skip preamble and repetition. Prefer a brief list over a paragraph when listing.',
+    builtin: true,
+    source: 'builtin',
+  },
+  {
+    name: 'detailed',
+    description: 'Thorough answers with context, reasoning, and caveats.',
+    prompt: 'Write in detail: explain reasoning, give context and examples, and flag caveats or edge cases. Use headings or lists when the answer has several parts.',
+    builtin: true,
+    source: 'builtin',
+  },
+  {
+    name: 'plain',
+    description: 'Plain everyday language, no jargon.',
+    prompt: 'Write in plain, everyday language. Avoid jargon; when a technical term is unavoidable, explain it in a few words. Keep sentences simple.',
+    builtin: true,
+    source: 'builtin',
+  },
+];
+
+export interface StyleSurfaceStats {
+  samples: number;
+  avgWordsPerSentence: number;
+  avgCharsPerWord: number;
+  contractionRate: number;
+  exclamationRate: number;
+  questionRate: number;
+  listLineRate: number;
+}
+
+/** Deterministic surface statistics over writing samples. */
+export function styleSurfaceStats(samples: string[]): StyleSurfaceStats {
+  const text = samples.join('\n');
+  const sentences = text.split(/[.!?]+/).map((s) => s.trim()).filter(Boolean);
+  const words = text.split(/\s+/).filter(Boolean);
+  const lines = text.split('\n').filter((l) => l.trim());
+  const perSentence = sentences.length ? words.length / sentences.length : words.length;
+  const perWord = words.length ? words.reduce((s, w) => s + w.length, 0) / words.length : 0;
+  const contractions = (text.match(/\b\w+['’](t|s|re|ve|ll|d|m)\b/gi) ?? []).length;
+  return {
+    samples: samples.length,
+    avgWordsPerSentence: Math.round(perSentence * 10) / 10,
+    avgCharsPerWord: Math.round(perWord * 10) / 10,
+    contractionRate: words.length ? Math.round((contractions / words.length) * 1000) / 1000 : 0,
+    exclamationRate: sentences.length ? Math.round(((text.match(/!/g) ?? []).length / sentences.length) * 100) / 100 : 0,
+    questionRate: sentences.length ? Math.round(((text.match(/\?/g) ?? []).length / sentences.length) * 100) / 100 : 0,
+    listLineRate: lines.length ? Math.round((lines.filter((l) => /^\s*([-*•]|\d+[.)])/.test(l)).length / lines.length) * 100) / 100 : 0,
+  };
+}
+
+/** Deterministic fallback style card from surface stats (honest, labelled). */
+export function deriveStyleFromSamples(name: string, samples: string[]): OutputStyle {
+  const s = styleSurfaceStats(samples);
+  const length = s.avgWordsPerSentence <= 12 ? 'short sentences (about 12 words or fewer)' : s.avgWordsPerSentence <= 22 ? 'medium-length sentences' : 'long, developed sentences';
+  const tone = s.contractionRate >= 0.01 ? 'a relaxed, conversational tone (contractions are natural)' : 'a formal tone (few or no contractions)';
+  const structure = s.listLineRate >= 0.15 ? 'frequent lists for structure' : 'flowing paragraphs rather than lists';
+  const energy = s.exclamationRate >= 0.2 ? 'occasional exclamation for emphasis' : 'measured punctuation, no exclamation marks';
+  const description = `Derived from ${s.samples} sample(s) by surface statistics: ${length}, ${tone}, ${structure}, ${energy}.`;
+  const prompt = `Match this writing style: use ${length}; keep ${tone}; prefer ${structure}; use ${energy}. Average word length in the samples is about ${s.avgCharsPerWord} characters — keep vocabulary at a similar level.`;
+  return { name, description, prompt, source: 'samples-stats' };
+}
+
+/**
+ * Author a style from samples. When `llmDescribe` is supplied (the
+ * host's runTurn-style seam) it produces the description+prompt and the
+ * style is marked 'samples-llm'; any seam failure falls back to the
+ * deterministic stats card ('samples-stats').
+ */
+export async function authorOutputStyle(
+  name: string,
+  samples: string[],
+  llmDescribe?: (samples: string[]) => Promise<{ description: string; prompt: string }>,
+): Promise<OutputStyle> {
+  const clean = samples.map((s) => s.trim()).filter(Boolean).slice(0, 10);
+  if (clean.length === 0) throw new Error('At least one non-empty writing sample is required.');
+  if (llmDescribe) {
+    try {
+      const out = await llmDescribe(clean);
+      if (out?.description && out?.prompt) return { name, description: out.description.slice(0, 500), prompt: out.prompt.slice(0, 2000), source: 'samples-llm' };
+    } catch {
+      // Fall through to the deterministic card.
+    }
+  }
+  return deriveStyleFromSamples(name, clean);
+}
+
+interface StylesFile {
+  users: Record<string, Record<string, OutputStyle>>;
+  sessions: Record<string, { userId: string; style: string }>;
+}
+
+/** Per-user output styles + per-session selections, file-backed. */
+export class OutputStyleStore {
+  private file: StylesFile = { users: {}, sessions: {} };
+
+  constructor(private readonly filePath: string) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as Partial<StylesFile>;
+      if (parsed && typeof parsed === 'object') {
+        this.file.users = parsed.users ?? {};
+        this.file.sessions = parsed.sessions ?? {};
+      }
+    } catch {
+      // Missing/corrupt file → builtins only.
+    }
+  }
+
+  static forDataDir(dataDir: string): OutputStyleStore {
+    return new OutputStyleStore(path.join(dataDir, 'output-styles.json'));
+  }
+
+  private persist(): void {
+    try {
+      fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+      fs.writeFileSync(this.filePath, JSON.stringify(this.file, null, 2), 'utf8');
+    } catch {
+      // Best-effort persistence; in-memory state still applies.
+    }
+  }
+
+  list(userId: string): OutputStyle[] {
+    const custom = Object.values(this.file.users[userId] ?? {});
+    const customNames = new Set(custom.map((s) => s.name));
+    return [...BUILTIN_OUTPUT_STYLES.filter((s) => !customNames.has(s.name)), ...custom];
+  }
+
+  get(userId: string, name: string): OutputStyle | undefined {
+    return this.list(userId).find((s) => s.name === name);
+  }
+
+  save(userId: string, style: OutputStyle): OutputStyle {
+    const clean: OutputStyle = {
+      name: style.name.trim().toLowerCase().replace(/\s+/g, '-').slice(0, 40),
+      description: (style.description ?? '').slice(0, 500),
+      prompt: (style.prompt ?? '').slice(0, 2000),
+      ...(style.source ? { source: style.source } : { source: 'manual' }),
+    };
+    if (!clean.name || !clean.prompt) throw new Error('A style needs a name and a prompt.');
+    (this.file.users[userId] ??= {})[clean.name] = clean;
+    this.persist();
+    return clean;
+  }
+
+  remove(userId: string, name: string): boolean {
+    const bucket = this.file.users[userId];
+    if (!bucket || !(name in bucket)) return false;
+    delete bucket[name];
+    this.persist();
+    return true;
+  }
+
+  /** Switch a session's style (null clears back to the bot default). */
+  setSessionStyle(sessionId: string, userId: string, styleName: string | null): void {
+    if (styleName === null) delete this.file.sessions[sessionId];
+    else this.file.sessions[sessionId] = { userId, style: styleName };
+    this.persist();
+  }
+
+  getSessionStyle(sessionId: string): OutputStyle | undefined {
+    const sel = this.file.sessions[sessionId];
+    if (!sel) return undefined;
+    return this.get(sel.userId, sel.style);
+  }
+}
+
+export interface StyleCommand {
+  action: 'list' | 'set' | 'clear' | 'show';
+  name?: string;
+}
+
+/** Parse `/style`, `/style <name>`, `/style clear`. Null when not a /style command. */
+export function parseStyleCommand(message: string): StyleCommand | null {
+  const m = /^\/style(?:\s+(\S+))?\s*$/.exec(message.trim());
+  if (!m) return null;
+  const arg = m[1]?.toLowerCase();
+  if (!arg) return { action: 'show' };
+  if (arg === 'list') return { action: 'list' };
+  if (arg === 'clear' || arg === 'off') return { action: 'clear' };
+  return { action: 'set', name: arg };
+}
+
+/** System-prompt fragment for a style (empty when no style selected). */
+export function buildStylePrompt(style: OutputStyle | undefined): string {
+  if (!style) return '';
+  return `# Output style: ${style.name}\n${style.prompt}`;
+}
+
 export { express };

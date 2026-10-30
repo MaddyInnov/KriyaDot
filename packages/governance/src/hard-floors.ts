@@ -141,7 +141,9 @@ export const HARD_FLOOR_PATTERNS: HardFloorPattern[] = [
   {
     id: 'catastrophic-shell',
     tier: 'catastrophic',
-    toolPattern: '^(run_command|shell|exec)$',
+    // run_background (CA-13) carries the same args.command shape and
+    // the same catastrophic floor — backgrounding never bypasses it.
+    toolPattern: '^(run_command|run_background|shell|exec)$',
     argCheck: (args) => {
       const text = argsText(args);
       // rm flag-variant bypass fix (M1): expand short-flag clusters so
@@ -180,7 +182,7 @@ export const HARD_FLOOR_PATTERNS: HardFloorPattern[] = [
   {
     id: 'destructive-shell',
     tier: 'destructive',
-    toolPattern: '^(run_command|shell|exec)$',
+    toolPattern: '^(run_command|run_background|shell|exec)$',
     argCheck: (args) => {
       const text = argsText(args);
       const patterns: Array<[RegExp, string]> = [

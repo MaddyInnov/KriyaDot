@@ -55,7 +55,7 @@ import {
   isUserOrigin,
   wrapPeerContent,
 } from './provenance.js';
-import { PLAN_APPROVAL_TOOL, buildPlanPrompt, parsePlanSteps, type ExtendedLayerStage } from './approval-modes.js';
+import { PLAN_APPROVAL_TOOL, applyApprovalMode, buildPlanPrompt, parsePlanSteps, type ExtendedLayerStage } from './approval-modes.js';
 import {
   ProgressGuard,
   ToolErrorTracker,
@@ -106,6 +106,8 @@ import {
 import { resolveTemplateVariables } from './template-vars.js';
 import { SessionStandingRules, renderStandingRules } from './session-rules.js';
 import { createBackgroundTools } from './tools/background.js';
+import { resolveDelegateProfile, type AgentDefinition } from './agent-definitions.js';
+import { createIsolatedWorktree, cleanupIsolatedWorktree, type IsolatedWorktree } from './worktrees.js';
 import {
   Supervisor,
   SupervisorPlanStore,
@@ -135,7 +137,6 @@ import { fitToolsToLimit, selectToolsByIntentSync } from './tool-fitting.js';
 import { ToolSpillStore, createSpillTools } from './tool-spill.js';
 import { makeToolHistoryEntry } from './history-entry.js';
 import { providerHealth } from './failover.js';
-import { subagentProfiles } from './subagent-profiles.js';
 import { join, dirname } from 'node:path';
 
 export interface AgentRuntimeOptions {
@@ -287,6 +288,13 @@ export interface AgentRuntimeOptions {
   toolsForMcpServer?: (serverId: string) => ToolDefinition[];
   /** Closure #15: roster for the discover_specialists tool (bots/roles). */
   discoverableItems?: () => DiscoverableItem[];
+  /**
+   * CA-5: file-defined agents (.kriyadot/agents/*.md) loaded by the
+   * host via loadAgentDefinitions. Background-run profile resolution
+   * checks these FIRST — file-defined agents win over the built-in
+   * profile library. A resolver function is re-read per spawn.
+   */
+  agentDefinitions?: AgentDefinition[] | (() => AgentDefinition[]);
 }
 
 /**
@@ -605,6 +613,36 @@ function toolEffect(name: string): string {
   return 'execute';
 }
 
+/**
+ * CA-4: target paths of a unified diff (the `+++` side, falling back to
+ * `---`), workspace-relative, `/dev/null` excluded, `a/`/`b/` prefixes
+ * stripped. Pure + exported for tests; tolerant of malformed input.
+ */
+export function extractPatchTargets(diff: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  let pendingOld: string | null = null;
+  const clean = (raw: string): string | null => {
+    let s = raw.trim();
+    if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1);
+    if (s === '/dev/null') return null;
+    if (s.startsWith('a/') || s.startsWith('b/')) s = s.slice(2);
+    return s || null;
+  };
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('--- ')) pendingOld = clean(line.slice(4));
+    else if (line.startsWith('+++ ')) {
+      const target = clean(line.slice(4)) ?? pendingOld;
+      if (target && !seen.has(target)) {
+        seen.add(target);
+        out.push(target);
+      }
+      pendingOld = null;
+    }
+  }
+  return out;
+}
+
 function newApprovalId(): string {
   return `appr_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
@@ -697,6 +735,8 @@ export class AgentRuntime {
    * AgentRuntimeOptions.peerApprovalGate; consulted before governance.
    */
   private readonly peerApprovalGate?: PeerApprovalGate;
+  /** CA-5: file-defined agents for background profile resolution. */
+  private readonly agentDefinitions?: AgentRuntimeOptions['agentDefinitions'];
   private readonly extraToolsForBot?: AgentRuntimeOptions['extraToolsForBot'];
   /** Octomind parity: workspace resolver (project instructions, validators). */
   private readonly workspaceDirForBot?: AgentRuntimeOptions['workspaceDirForBot'];
@@ -823,7 +863,14 @@ export class AgentRuntime {
   }
 
   constructor(opts: AgentRuntimeOptions) {
-    this.store = new SessionStore(opts.dbPath, opts.sessionStoreOptions);
+    // CA-1: the session store shares the runtime's hook bus (unless the
+    // host wired a store-specific one) so session.start/session.end and
+    // compact.before/after fire from their real call sites in sessions.ts.
+    this.store = new SessionStore(opts.dbPath, {
+      ...opts.sessionStoreOptions,
+      hooks: opts.sessionStoreOptions?.hooks ?? opts.hooks,
+    });
+    this.agentDefinitions = opts.agentDefinitions;
     this.skills = new SkillLoader(opts.skillsDir, {
       additionalDirs: opts.additionalSkillsDirs,
       usabilityGate: opts.skillUsabilityGate,
@@ -968,6 +1015,20 @@ export class AgentRuntime {
     return this.store.getSession(sessionId)?.botId;
   }
 
+  /** CA-37: true when the session is incognito (ephemeral, memory-only). */
+  isIncognitoSession(sessionId: string): boolean {
+    return this.store.isIncognitoSession(sessionId);
+  }
+
+  /**
+   * CA-37 memory-write gate: hosts MUST consult this before any
+   * distill/upkeep/hindsight write derived from a session's turns.
+   * Incognito turns never write memory.
+   */
+  sessionAllowsMemoryWrite(sessionId: string): boolean {
+    return !this.store.isIncognitoSession(sessionId);
+  }
+
   /**
    * Recall tool(s) over this runtime's session store (Octomind parity —
    * lossless compaction archives). Hosts register these into the tool
@@ -996,8 +1057,29 @@ export class AgentRuntime {
     ephemeral?: { name: string; systemPrompt: string; model?: string; providerId?: string };
     tools?: string[];
     profileId?: string;
+    /** CA-5: run in an auto-created git worktree (or inherit it from the agent definition). */
+    isolation?: 'worktree' | 'none';
   }): { runId: string; botName: string } | { error: string } {
-    if (input.profileId && !input.specialistBotId && !input.ephemeral) { const prof = subagentProfiles.ephemeralFor(input.profileId); if (!prof) return { error: `Unknown subagent profile "${input.profileId}"` }; input = { ...input, ephemeral: { name: prof.name, systemPrompt: prof.systemPrompt }, tools: input.tools ?? prof.tools }; }
+    // CA-5: profile resolution — file-defined agents (agentDefinitions
+    // option) win over the built-in library; the definition's rich
+    // fields (model, approvalMode, isolation, …) shape the exec bot.
+    let profileDef: ReturnType<typeof resolveDelegateProfile>;
+    if (input.profileId && !input.specialistBotId && !input.ephemeral) {
+      const definitions =
+        typeof this.agentDefinitions === 'function' ? this.agentDefinitions() : this.agentDefinitions;
+      profileDef = resolveDelegateProfile(input.profileId, definitions);
+      if (!profileDef) return { error: `Unknown subagent profile "${input.profileId}"` };
+      input = {
+        ...input,
+        ephemeral: {
+          name: profileDef.name,
+          systemPrompt: profileDef.systemPrompt,
+          ...(profileDef.model ? { model: profileDef.model } : {}),
+          ...(profileDef.providerId ? { providerId: profileDef.providerId } : {}),
+        },
+        tools: input.tools ?? profileDef.tools,
+      };
+    }
     let execBot: BotConfig;
     let ephemeral = false;
     if (input.specialistBotId) {
@@ -1020,10 +1102,13 @@ export class AgentRuntime {
         skills: [],
         tools: input.tools ?? [],
         mcpServers: [],
+        ...(profileDef?.approvalMode ? { approvalMode: profileDef.approvalMode } : {}),
+        ...(profileDef?.memoryScope ? { memoryScope: profileDef.memoryScope } : {}),
       };
     } else {
       return { error: 'delegate_background needs either specialistBotId or an ephemeral definition' };
     }
+    const wantIsolation = input.isolation ?? profileDef?.isolation;
     const { record, signal } = this.backgroundRuns.start({
       botId: execBot.id,
       botName: execBot.name,
@@ -1031,27 +1116,107 @@ export class AgentRuntime {
       originBotId: input.originBot.id,
       originSessionId: input.originSessionId,
       task: input.task,
+      ...(input.profileId ? { profileId: input.profileId } : {}),
     });
     const runId = record.id;
     void (async () => {
       // #17: concurrency cap — queue beyond the cap until a slot frees.
       const release = await this.spawnGate.acquire();
       let content = '';
+      let iso: IsolatedWorktree | undefined;
+      let status: 'done' | 'failed' | 'stopped' = 'done';
+      let stopEmitted = false;
       try {
+        // CA-1: subagent.start gate for background spawns.
+        if (this.hooks) {
+          const start = await this.hooks
+            .emit('subagent.start', {
+              sessionId: input.originSessionId,
+              botId: input.originBot.id,
+              task: input.task.slice(0, 500),
+              via: 'background' as const,
+              ...(input.profileId ? { profileId: input.profileId } : {}),
+              childBotId: execBot.id,
+            })
+            .catch(() => undefined);
+          if (start?.cancelled) throw new Error(`Background spawn blocked by a hook: ${start.reason ?? 'subagent.start hook cancelled the spawn'}`);
+        }
+        // CA-5: worktree isolation — auto-create, attach to the run
+        // record AND the run's session (session-attach machinery), and
+        // run the turn with the worktree as its workspace override.
+        let workspaceOverride: string | undefined;
+        if (wantIsolation === 'worktree') {
+          const repo = this.workspaceDirForBot?.(input.originBot);
+          if (!repo) throw new Error('delegate_background: isolation "worktree" needs a workspace for the origin bot (host workspaceDirForBot)');
+          iso = await createIsolatedWorktree({
+            repoPath: repo,
+            hooks: this.hooks,
+            sessionId: input.originSessionId,
+            botId: input.originBot.id,
+          });
+          record.worktreePath = iso.info.path;
+          record.worktreeBranch = iso.info.branch;
+          workspaceOverride = iso.info.path;
+          try {
+            this.store.attachWorktree(`bg-${runId}`, iso.info.path);
+          } catch { /* attach is best-effort; the record carries the path regardless */ }
+        }
         await this.runTurn({
           bot: execBot,
           message: input.task,
           sessionId: `bg-${runId}`,
           signal,
+          ...(workspaceOverride ? { workspaceOverride } : {}),
           onEvent: (e) => {
             if (e.type === 'token') content += e.content;
           },
         });
-        if (signal.aborted) this.backgroundRuns.fail(runId, 'stopped');
-        else this.backgroundRuns.complete(runId, content);
+        if (signal.aborted) {
+          this.backgroundRuns.fail(runId, 'stopped');
+          status = 'stopped';
+        } else {
+          this.backgroundRuns.complete(runId, content);
+        }
       } catch (err) {
         this.backgroundRuns.fail(runId, err instanceof Error ? err.message : String(err));
+        status = signal.aborted ? 'stopped' : 'failed';
+        if (this.hooks) {
+          stopEmitted = true;
+          await this.hooks
+            .emit('subagent.stop', {
+              sessionId: input.originSessionId,
+              botId: input.originBot.id,
+              task: input.task.slice(0, 500),
+              status,
+              via: 'background' as const,
+              runId,
+              error: err instanceof Error ? err.message : String(err),
+              ...(input.profileId ? { profileId: input.profileId } : {}),
+            })
+            .catch(() => undefined);
+        }
       } finally {
+        if (!stopEmitted && this.hooks) {
+          await this.hooks
+            .emit('subagent.stop', {
+              sessionId: input.originSessionId,
+              botId: input.originBot.id,
+              task: input.task.slice(0, 500),
+              status,
+              via: 'background' as const,
+              runId,
+              ...(input.profileId ? { profileId: input.profileId } : {}),
+            })
+            .catch(() => undefined);
+        }
+        // CA-5 cleanup per the worktree manager's existing rules:
+        // clean worktrees are removed (branch kept); dirty ones stay.
+        if (iso) {
+          await cleanupIsolatedWorktree(iso, { hooks: this.hooks, sessionId: input.originSessionId, botId: input.originBot.id });
+          try {
+            this.store.detachWorktree(`bg-${runId}`);
+          } catch { /* best-effort */ }
+        }
         release();
       }
     })();
@@ -1501,6 +1666,16 @@ ${record.priorContext ?? ''}`;
     if (opts.sessionId === undefined && this.hooks) {
       // session.created hook — never blocks a turn.
       await this.hooks.emit('session.created', { sessionId, botId: opts.bot.id }).catch(() => undefined);
+      // CA-1 note: session.start fires from SessionStore.createSession
+      // (the store shares this bus — see the constructor), so it is NOT
+      // re-emitted here; that keeps exactly one session.start per
+      // created session.
+    }
+    if (this.hooks) {
+      // CA-1: turn.start — every turn, new or resumed session.
+      await this.hooks
+        .emit('turn.start', { sessionId, botId: opts.bot.id, isNewSession: opts.sessionId === undefined })
+        .catch(() => undefined);
     }
     // Live step line (W8a): register this turn in the turn-state
     // registry and mirror every step change as a `step` stream event.
@@ -2936,6 +3111,36 @@ ${revised}` });
             }
           }
 
+          // CA-1: permission.request — emitted at the governance
+          // evaluation point when a call needs approval. Hooks are
+          // ADVISORY here: the bus only honors a block from handlers
+          // explicitly granted block power (additionalDeny config), and
+          // a block can only ADD a deny — it can never approve what
+          // governance required approval for or denied.
+          if (decision === 'require-approval' && this.hooks) {
+            const perm = await this.hooks
+              .emit('permission.request', {
+                sessionId,
+                botId: ctx.botId,
+                toolName: call.name,
+                args: (call.args ?? {}) as Record<string, unknown>,
+                decision: 'require-approval' as const,
+                reason,
+              })
+              .catch(() => undefined);
+            if (perm?.cancelled) {
+              decision = 'deny';
+              reason = `denied by a permission.request hook (additional deny): ${perm.reason ?? 'hook block'}`;
+              this.audit({
+                type: 'tool.permission_hook_denied',
+                sessionId,
+                botId: ctx.botId,
+                call,
+                detail: { reason },
+              });
+            }
+          }
+
           // Plan mode: block all mutating tools (write/execute/network).
           // The model can read, search, and explore freely, but any attempt
           // to change state is denied with an explanation.
@@ -2992,6 +3197,30 @@ ${revised}` });
               }
             } catch {
               // Authorizer failure is fail-safe: governance flow continues.
+            }
+          }
+
+          // CA-2 named modes: acceptEdits upgrades a prompt to an allow
+          // only for file edits / safe fs commands; dontAsk turns any
+          // prompt into a deny. Governance denies are never upgraded
+          // (applyApprovalMode is total over that rule). Bypass keeps
+          // its dedicated audited path below, so it is not applied here.
+          if (approvalMode === 'acceptEdits' || approvalMode === 'dontAsk') {
+            const applied = applyApprovalMode(approvalMode, decision, {
+              name: call.name,
+              mutating: def.mutating,
+              args: call.args as Record<string, unknown>,
+            });
+            if (applied.changed) {
+              this.audit({
+                type: 'tool.approval_mode_applied',
+                sessionId,
+                botId: ctx.botId,
+                call,
+                detail: { mode: approvalMode, from: decision, to: applied.decision, reason: applied.reason },
+              });
+              decision = applied.decision;
+              if (applied.reason) reason = applied.reason;
             }
           }
 
@@ -3914,6 +4143,41 @@ ${revised}` });
     call: ToolCall,
     ctx: ToolContext,
   ): Promise<{ result: unknown; contentBefore: string | null; hookInjections: string[] }> {
+    // CA-4: the `patch` tool mutates files named inside its unified-diff
+    // argument (no `path` arg), so the generic path-based checkpoint below
+    // never saw it. Snapshot every diff target up front instead.
+    if (this.onBeforeFileMutate && def.name === 'patch' && def.mutating === true) {
+      const diffText = typeof call.args?.diff === 'string' ? call.args.diff : '';
+      const dryRun = call.args?.dryRun === true;
+      if (diffText && !dryRun) {
+        try {
+          const { readFileSync, existsSync } = await import('node:fs');
+          const { join, resolve } = await import('node:path');
+          const bot = this.getBot(ctx.botId);
+          const wsDir = (bot ? this.workspaceDirForBot?.(bot) : undefined) ?? ctx.spaceWorkspaceOverride ?? process.cwd();
+          const historyLength = (await this.store.getMessages(ctx.sessionId)).length;
+          for (const rel of extractPatchTargets(diffText)) {
+            const abs = resolve(join(wsDir, rel));
+            let before: string | null = null;
+            try {
+              before = existsSync(abs) ? readFileSync(abs, 'utf-8') : null;
+            } catch {
+              before = null;
+            }
+            await this.onBeforeFileMutate({
+              sessionId: ctx.sessionId,
+              botId: ctx.botId,
+              toolName: def.name,
+              path: abs,
+              contentBefore: before,
+              historyLength,
+            });
+          }
+        } catch {
+          // Checkpoint failure must never block tool execution.
+        }
+      }
+    }
     // Pre-write snapshot (also feeds the live code_write stream event).
     // Same relative-path read the checkpoint hook has always used.
     let contentBefore: string | null = null;
@@ -4000,6 +4264,13 @@ ${revised}` });
       };
       const after = await this.hooks.emit('tool.after', afterPayload).catch(() => undefined);
       if (after) hookInjections = after.injections;
+      // CA-1: file.changed — a file-mutating tool that took a path and
+      // completed without an error changed a file (coding/file tools).
+      if (afterPayload.ok && filePath && def.mutating === true) {
+        await this.hooks
+          .emit('file.changed', { sessionId: ctx.sessionId, botId: ctx.botId, toolName: def.name, path: filePath })
+          .catch(() => undefined);
+      }
     }
     this.audit({ type: 'tool.executed', sessionId: ctx.sessionId, botId: ctx.botId, call });
     return { result, contentBefore, hookInjections };

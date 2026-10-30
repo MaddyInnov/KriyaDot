@@ -60,6 +60,25 @@ export interface McpServerInfo {
   [key: string]: unknown;
 }
 
+/** CA-4 checkpoint wire shape (mirrors apps/api Checkpoint). */
+export interface CheckpointInfo {
+  id: string;
+  sessionId: string;
+  createdAt: number;
+  files: Record<string, string | null>;
+  historyLength: number;
+  label: string;
+}
+
+/** CA-30 session-diff wire shape (checkpoints-routes GET /sessions/:id/diff). */
+export interface SessionDiffResult {
+  ok: boolean;
+  sessionId: string;
+  checkpointCount: number;
+  files: Array<{ path: string; status: string; added: number; removed: number; touches: number }>;
+  totals: { added: number; removed: number };
+}
+
 export interface PauseState {
   ok?: boolean;
   paused: boolean;
@@ -341,6 +360,40 @@ export class KriyaDotApi {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ decision }),
     });
+  }
+
+  // -- Checkpoints (CA-4) + session diff (CA-30) --------------------------
+  async listCheckpoints(sessionId: string): Promise<CheckpointInfo[]> {
+    const r = await this.request<{ ok: boolean; checkpoints: CheckpointInfo[] }>(
+      `/sessions/${encodeURIComponent(sessionId)}/checkpoints`,
+    );
+    return r.checkpoints;
+  }
+
+  async restoreCheckpoint(
+    id: string,
+    mode: 'code' | 'conversation' | 'both',
+  ): Promise<{ ok: boolean; restoredFiles: string[]; messagesRemoved: number; errors: string[] }> {
+    return this.request(`/checkpoints/${encodeURIComponent(id)}/restore`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    });
+  }
+
+  async restoreCheckpointSummarized(
+    id: string,
+    mode: 'conversation' | 'both',
+  ): Promise<{ ok: boolean; summary: string; messagesRemoved: number; errors: string[] }> {
+    return this.request(`/checkpoints/${encodeURIComponent(id)}/restore-summarized`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    });
+  }
+
+  async sessionDiff(sessionId: string): Promise<SessionDiffResult> {
+    return this.request<SessionDiffResult>(`/sessions/${encodeURIComponent(sessionId)}/diff`);
   }
 
   /**

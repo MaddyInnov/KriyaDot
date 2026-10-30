@@ -276,10 +276,13 @@ export interface NativeCliSpec {
 function claudePermissionArgs(mode: ApprovalMode): string[] {
   // KriyaDot's plan gate already approved the plan before spawn, so plan and
   // auto both run the CLI in default mode; bypass maps to bypassPermissions.
-  // (default keeps the CLI's own per-tool prompting policy for anything the
-  // user's settings require; in non-TTY operation unanswerable prompts fail
-  // closed rather than auto-approving.)
+  // CA-2: acceptEdits and dontAsk are native Claude Code permission modes
+  // and map verbatim. (default keeps the CLI's own per-tool prompting
+  // policy for anything the user's settings require; in non-TTY operation
+  // unanswerable prompts fail closed rather than auto-approving.)
   if (mode === 'bypass') return ['--permission-mode', 'bypassPermissions'];
+  if (mode === 'acceptEdits') return ['--permission-mode', 'acceptEdits'];
+  if (mode === 'dontAsk') return ['--permission-mode', 'dontAsk'];
   return ['--permission-mode', 'default'];
 }
 
@@ -289,6 +292,9 @@ function codexPermissionArgs(mode: ApprovalMode): string[] {
   }
   // plan: KriyaDot's plan gate approved the plan pre-spawn; the CLI then
   // executes inside the workspace sandbox. auto: Codex's own default.
+  // CA-2: Codex has no acceptEdits/dontAsk equivalents — workspace-write
+  // approximates acceptEdits (writes inside the sandbox), and unanswerable
+  // prompts fail closed there, which is dontAsk's behaviour in spirit.
   return ['--sandbox', 'workspace-write'];
 }
 

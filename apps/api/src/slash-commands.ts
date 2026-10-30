@@ -15,12 +15,25 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  confineRealpath,
+  expandShellInjections,
+  generateInitInstructions,
+  type ShellInjectionGate,
+  type ShellInjectionRunner,
+} from '@mvp/agent-runtime';
 
 const COMMANDS_FILE = 'slash-commands.json';
 
 export interface SlashCommand {
   description: string;
   prompt: string;
+  /** CA-15 frontmatter v2: bot/agent this command pins, when set. */
+  agent?: string;
+  /** CA-15 frontmatter v2: model this command pins, when set. */
+  model?: string;
+  /** CA-15 frontmatter v2: run as an isolated subtask (delegate) when true. */
+  subtask?: boolean;
 }
 
 export type SlashCommandMap = Record<string, SlashCommand>;
@@ -61,6 +74,9 @@ export function loadSlashCommands(dataDir: string): SlashCommandMap {  // Try th
             out[k] = {
               description: typeof c.description === 'string' ? c.description.slice(0, 200) : '',
               prompt: c.prompt,
+              ...(typeof c.agent === 'string' && c.agent ? { agent: c.agent.slice(0, 100) } : {}),
+              ...(typeof c.model === 'string' && c.model ? { model: c.model.slice(0, 100) } : {}),
+              ...(c.subtask === true ? { subtask: true } : {}),
             };
           }
         }
@@ -84,6 +100,9 @@ export function saveSlashCommand(dataDir: string, name: string, cmd: SlashComman
   all[name] = {
     description: (cmd.description ?? '').slice(0, 200),
     prompt: cmd.prompt,
+    ...(cmd.agent ? { agent: cmd.agent.slice(0, 100) } : {}),
+    ...(cmd.model ? { model: cmd.model.slice(0, 100) } : {}),
+    ...(cmd.subtask === true ? { subtask: true } : {}),
   };
   fs.mkdirSync(dataDir, { recursive: true });
   fs.writeFileSync(commandsPath(dataDir), JSON.stringify(all, null, 2) + '\n', { mode: 0o600 });
@@ -119,6 +138,27 @@ export function parseSlashCommand(message: string): ParsedCommand | null {
  * message unchanged. Unknown `/command` → returns null so the caller can
  * surface a helpful error.
  */
+/** Split a command's argument string into positional tokens (quote-aware). */
+export function splitCommandArgs(args: string): string[] {
+  const out: string[] = [];
+  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(args)) !== null) out.push(m[1] ?? m[2] ?? m[3] ?? '');
+  return out;
+}
+
+/**
+ * Positional expansion (CA-15): `$ARGUMENTS` = the whole args string,
+ * `$1`…`$n` = positional tokens (missing positions expand to empty).
+ * Legacy `{args}` / `{message}` placeholders are handled by callers.
+ */
+export function expandPositional(template: string, args: string): string {
+  const parts = splitCommandArgs(args);
+  return template
+    .replaceAll('$ARGUMENTS', args)
+    .replace(/\$(\d+)/g, (_whole, n: string) => parts[Number(n) - 1] ?? '');
+}
+
 export function expandSlashCommand(
   message: string,
   commands: SlashCommandMap,
@@ -127,10 +167,137 @@ export function expandSlashCommand(
   if (!parsed) return { expanded: message, commandName: null };
   const cmd = commands[parsed.name];
   if (!cmd) return null; // unknown command
-  const expanded = cmd.prompt
-    .replaceAll('{args}', parsed.args)
-    .replaceAll('{message}', message.trim());
+  const expanded = expandPositional(
+    cmd.prompt.replaceAll('{args}', parsed.args).replaceAll('{message}', message.trim()),
+    parsed.args,
+  );
   return { expanded, commandName: parsed.name };
+}
+
+// ---------------------------------------------------------------------------
+// CA-15 — frontmatter v2 expansion: @file refs + !`cmd` injection
+// ---------------------------------------------------------------------------
+
+export interface SlashExpandContext {
+  /** Workspace root for @file confinement. Without it, @file refs are refused. */
+  workspaceDir?: string;
+  /** Governance gate for !`cmd` injection (must allow before anything runs). */
+  shellGate?: ShellInjectionGate;
+  /** Governed shell runner for !`cmd` injection. */
+  shellRunner?: ShellInjectionRunner;
+  /** Per-file cap for @file inlining (chars). Default 8000. */
+  maxFileChars?: number;
+}
+
+export interface ExpandedCommandV2 {
+  expanded: string;
+  commandName: string;
+  agent?: string;
+  model?: string;
+  subtask: boolean;
+}
+
+/** Inline `@path` file references, workspace-confined and size-capped. */
+export function expandFileRefs(text: string, ctx: SlashExpandContext): string {
+  return text.replace(/@((?:\.\.?\/)?[\w./-]+\.[a-zA-Z]{1,6})\b/g, (whole, ref: string) => {
+    if (!ctx.workspaceDir) return `[file reference refused — no workspace: @${ref}]`;
+    let abs: string;
+    try {
+      abs = confineRealpath(ctx.workspaceDir, ref);
+    } catch {
+      return `[file reference refused — outside the workspace: @${ref}]`;
+    }
+    let content: string;
+    try {
+      content = fs.readFileSync(abs, 'utf8');
+    } catch {
+      return `[file not found: @${ref}]`;
+    }
+    const cap = ctx.maxFileChars ?? 8000;
+    const body = content.length > cap ? `${content.slice(0, cap)}\n…[file truncated]` : content;
+    return `\n\n[File: ${ref}]\n${body}\n[/File: ${ref}]\n\n`;
+  });
+}
+
+/**
+ * Full v2 expansion (CA-15): legacy {args}/{message} + $ARGUMENTS/$1…$n
+ * positional expansion, then @file inlining, then governance-gated
+ * !`cmd` shell injection. Returns the command's pinning fields
+ * (agent/model/subtask) alongside the expanded prompt so the chat route
+ * can honour them. Unknown command → null, like expandSlashCommand.
+ */
+export async function expandSlashCommandV2(
+  message: string,
+  commands: SlashCommandMap,
+  ctx: SlashExpandContext = {},
+): Promise<ExpandedCommandV2 | { expanded: string; commandName: null } | null> {
+  const parsed = parseSlashCommand(message);
+  if (!parsed) return { expanded: message, commandName: null };
+  const cmd = commands[parsed.name];
+  if (!cmd) return null;
+  let expanded = expandPositional(
+    cmd.prompt.replaceAll('{args}', parsed.args).replaceAll('{message}', message.trim()),
+    parsed.args,
+  );
+  expanded = expandFileRefs(expanded, ctx);
+  if (expanded.includes('!`')) {
+    expanded = await expandShellInjections(expanded, {
+      ...(ctx.shellGate ? { gate: ctx.shellGate } : {}),
+      ...(ctx.shellRunner ? { runner: ctx.shellRunner } : {}),
+    });
+  }
+  return {
+    expanded,
+    commandName: parsed.name,
+    ...(cmd.agent ? { agent: cmd.agent } : {}),
+    ...(cmd.model ? { model: cmd.model } : {}),
+    subtask: cmd.subtask === true,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// CA-6 — /init: repo scan → starter instruction file
+// ---------------------------------------------------------------------------
+
+export interface InitCommandResult {
+  ok: boolean;
+  /** Workspace-relative file written (when ok). */
+  file?: string;
+  content?: string;
+  error?: string;
+  analysis?: ReturnType<typeof generateInitInstructions>['analysis'];
+}
+
+/** True when a chat message is the /init command. */
+export function isInitCommand(message: string): boolean {
+  return /^\/init(?:\s|$)/.test(message.trim());
+}
+
+/**
+ * Execute `/init [--force]` for a workspace: analyse the repo and write
+ * the generated starter AGENTS.md through the workspace-confined path.
+ * Refuses to overwrite an existing instruction file (AGENTS.md,
+ * KRIYADOT.md, or .kriyadot/instructions.md) unless --force is passed.
+ */
+export function executeInitCommand(message: string, opts: { workspaceDir: string }): InitCommandResult {
+  const force = /(?:^|\s)--force(?:\s|$)/.test(message);
+  const generated = generateInitInstructions(opts.workspaceDir);
+  const existing = generated.analysis.existingInstructionFiles;
+  if (existing.length > 0 && !force) {
+    return {
+      ok: false,
+      error: `Instruction file already exists (${existing.join(', ')}). Re-run with /init --force to overwrite AGENTS.md.`,
+      analysis: generated.analysis,
+    };
+  }
+  let target: string;
+  try {
+    target = confineRealpath(opts.workspaceDir, generated.fileName);
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err), analysis: generated.analysis };
+  }
+  fs.writeFileSync(target, generated.content, 'utf8');
+  return { ok: true, file: generated.fileName, content: generated.content, analysis: generated.analysis };
 }
 
 /**

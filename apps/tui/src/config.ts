@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { ThemeName } from './themes.js';
 import { THEME_NAMES } from './themes.js';
+import { isNotifyMode, type NotifyMode } from './terminal-signals.js';
 
 export interface TuiConfig {
   /** API base URL, e.g. http://localhost:4000 */
@@ -12,6 +13,10 @@ export interface TuiConfig {
   /** Bot id to select on startup (empty = show bot picker). */
   defaultBot: string;
   theme: ThemeName;
+  /** CA-18: status-line template ({bot} {model} {cost} {contextPct} {gitBranch} {session}). */
+  statusLine?: string;
+  /** CA-28: terminal completion signal mode. */
+  notify?: NotifyMode;
 }
 
 export const DEFAULT_CONFIG: TuiConfig = {
@@ -42,6 +47,10 @@ export function loadConfig(): TuiConfig {
     apiUrl: typeof file.apiUrl === 'string' && file.apiUrl ? file.apiUrl : DEFAULT_CONFIG.apiUrl,
     defaultBot: typeof file.defaultBot === 'string' ? file.defaultBot : DEFAULT_CONFIG.defaultBot,
     theme: THEME_NAMES.includes(file.theme as ThemeName) ? (file.theme as ThemeName) : DEFAULT_CONFIG.theme,
+    // Optional fields stay absent when unset so older config files and
+    // DEFAULT_CONFIG comparisons keep their exact shape.
+    ...(typeof file.statusLine === 'string' && file.statusLine ? { statusLine: file.statusLine } : {}),
+    ...(isNotifyMode(file.notify) ? { notify: file.notify } : {}),
   };
   // Environment overrides (highest precedence short of CLI flags).
   if (process.env.KRIYADOT_API_URL) cfg.apiUrl = process.env.KRIYADOT_API_URL;

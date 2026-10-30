@@ -13,6 +13,13 @@ import { looksLikeMarkdown, renderMarkdown } from './markdown.js';
 import { createTerminalElicitationHandler } from './elicitation.js';
 import type { ElicitationRequestLike, ElicitationResultLike } from './elicitation.js';
 import type { StructuredOutputSpec } from './json-schema.js';
+import { emitTerminalSignal, resolveNotifyMode, type NotifyMode } from './terminal-signals.js';
+import {
+  aggregateCheckpointDiff,
+  formatCheckpointList,
+  formatSessionDiff,
+  type CheckpointLike,
+} from './checkpoints.js';
 
 export interface ParsedSlashCommand {
   name: string;
@@ -338,6 +345,15 @@ export interface ReplDeps extends TurnIO {
   botName: string;
   lines: ReplLineSource;
   clearScreen: () => void;
+  /** CA-28: terminal signal mode (default: env KRIYADOT_NOTIFY or 'bell'). */
+  notifyMode?: NotifyMode;
+  /** CA-28: signal sink. Default: deps.err (the terminal stream). */
+  signalWrite?: (s: string) => void;
+  /** CA-4/CA-30: checkpoint access. Defaults: the API client's methods via request(). Injectable for tests. */
+  listCheckpoints?: (sessionId: string) => Promise<CheckpointLike[]>;
+  restoreCheckpoint?: (id: string, mode: 'code' | 'conversation' | 'both') => Promise<{ ok: boolean; restoredFiles: string[]; messagesRemoved: number; errors?: string[] }>;
+  restoreCheckpointSummarized?: (id: string, mode: 'conversation' | 'both') => Promise<{ ok: boolean; summary: string; messagesRemoved: number; errors?: string[] }>;
+  sessionDiff?: (sessionId: string) => Promise<{ files: Array<{ path: string; status: string; added: number; removed: number; touches: number }> }>;
   /** Forward an in-session slash command (#114). Default: POST via deps.api.request. Injectable for tests. */
   sessionCommand?: (sessionId: string, botId: string, text: string) => Promise<SessionCommandResultLike>;
   /** Clipboard sink for /copy (#114). Default: tryCopyToClipboard. Injectable for tests. */
@@ -371,6 +387,21 @@ export async function runRepl(deps: ReplDeps, opts: ReplOpts): Promise<number> {
         body: JSON.stringify({ command: text, botId }),
       });
     });
+  // CA-28 terminal signals + CA-4/CA-30 checkpoint access (injectable).
+  const notifyMode = resolveNotifyMode(deps.notifyMode);
+  const signal = (kind: 'turn-complete' | 'approval-needed') =>
+    emitTerminalSignal(deps.signalWrite ?? deps.err, notifyMode, kind);
+  const apiAny = deps.api as unknown as {
+    listCheckpoints?: ReplDeps['listCheckpoints'];
+    restoreCheckpoint?: ReplDeps['restoreCheckpoint'];
+    restoreCheckpointSummarized?: ReplDeps['restoreCheckpointSummarized'];
+    sessionDiff?: ReplDeps['sessionDiff'];
+  };
+  const listCheckpoints = deps.listCheckpoints ?? apiAny.listCheckpoints?.bind(deps.api);
+  const restoreCheckpoint = deps.restoreCheckpoint ?? apiAny.restoreCheckpoint?.bind(deps.api);
+  const restoreSummarized = deps.restoreCheckpointSummarized ?? apiAny.restoreCheckpointSummarized?.bind(deps.api);
+  const fetchSessionDiff = deps.sessionDiff ?? apiAny.sessionDiff?.bind(deps.api);
+
   const elicitationHandler = createTerminalElicitationHandler({
     ask: (q) => deps.lines.question(q),
     // The REPL only runs on a TTY line source in production; tests inject
@@ -398,6 +429,7 @@ export async function runRepl(deps: ReplDeps, opts: ReplOpts): Promise<number> {
   const runTurn = async (messageText: string): Promise<void> => {
     history.push({ id: history.length + 1, role: 'user', content: messageText });
     const askApproval = async (toolName: string): Promise<boolean> => {
+      signal('approval-needed');
       if (autoApprove) return true;
       const ans = await deps.lines.question(`[approval] allow "${toolName}"? [y/N/always] `);
       const v = (ans ?? '').trim().toLowerCase();
@@ -433,6 +465,7 @@ export async function runRepl(deps: ReplDeps, opts: ReplOpts): Promise<number> {
     if (result.failed) {
       deps.err(`[error] ${result.error ?? 'turn failed'} ${formatUsage(result.usage)}\n`);
     } else {
+      signal('turn-complete');
       const u = formatUsage(result.usage);
       if (u) deps.err(`  ${u}\n`);
     }
@@ -533,6 +566,80 @@ export async function runRepl(deps: ReplDeps, opts: ReplOpts): Promise<number> {
             deps.err('usage: /approve always\n');
           }
           break;
+        case 'rewind': {
+          // CA-4: /rewind lists; /rewind <n|id> [code|conversation|both|summarize]
+          if (!listCheckpoints) {
+            deps.err('[error] /rewind: this API client has no checkpoint support\n');
+            break;
+          }
+          try {
+            const checkpoints = await listCheckpoints(sessionId);
+            if (!cmd.args) {
+              deps.err(`${formatCheckpointList(checkpoints)}\n`);
+              break;
+            }
+            const [target, modeArg] = cmd.args.split(/\s+/);
+            const byIndex = /^\d+$/.test(target ?? '') ? checkpoints[Number(target) - 1] : undefined;
+            const cp = byIndex ?? checkpoints.find((c) => c.id === target || c.id.startsWith(target ?? ''));
+            if (!cp) {
+              deps.err(`[error] /rewind: no checkpoint matches "${target}"\n`);
+              break;
+            }
+            const mode = (modeArg ?? 'both').toLowerCase();
+            if (mode === 'summarize' || mode === 'summary') {
+              if (!restoreSummarized) {
+                deps.err('[error] /rewind summarize: endpoint not available on this API\n');
+                break;
+              }
+              const r = await restoreSummarized(cp.id, 'conversation');
+              deps.err(`[rewind] summarized ${r.messagesRemoved} message(s) after the checkpoint:\n${r.summary}\n`);
+            } else if (mode === 'code' || mode === 'conversation' || mode === 'both') {
+              if (!restoreCheckpoint) {
+                deps.err('[error] /rewind: restore not available on this API client\n');
+                break;
+              }
+              const r = await restoreCheckpoint(cp.id, mode);
+              deps.err(
+                `[rewind] restored ${cp.label} (${mode}): ${r.restoredFiles.length} file(s), ${r.messagesRemoved} message(s) removed${r.errors?.length ? `; errors: ${r.errors.join('; ')}` : ''}\n`,
+              );
+            } else {
+              deps.err('usage: /rewind <n> [code|conversation|both|summarize]\n');
+            }
+          } catch (e) {
+            deps.err(`[error] /rewind: ${e instanceof Error ? e.message : String(e)}\n`);
+          }
+          break;
+        }
+        case 'diff': {
+          // CA-30: prefer the server aggregate (it can read current files);
+          // fall back to checkpoint-only aggregation.
+          try {
+            if (fetchSessionDiff) {
+              const r = await fetchSessionDiff(sessionId);
+              deps.err(
+                `${formatSessionDiff(r.files.map((f) => ({ ...f, status: f.status as 'created' | 'modified' | 'deleted' | 'changed' })))}\n`,
+              );
+            } else if (listCheckpoints) {
+              const checkpoints = await listCheckpoints(sessionId);
+              deps.err(`${formatSessionDiff(aggregateCheckpointDiff(checkpoints))}\n`);
+            } else {
+              deps.err('[error] /diff: no diff source available on this API client\n');
+            }
+          } catch (e) {
+            // Server diff endpoint missing (older API) → checkpoint fallback.
+            try {
+              if (listCheckpoints) {
+                const checkpoints = await listCheckpoints(sessionId);
+                deps.err(`${formatSessionDiff(aggregateCheckpointDiff(checkpoints))}\n`);
+              } else {
+                throw e;
+              }
+            } catch (e2) {
+              deps.err(`[error] /diff: ${e2 instanceof Error ? e2.message : String(e2)}\n`);
+            }
+          }
+          break;
+        }
         default:
           deps.err(`unknown command /${cmd.name} — /help lists commands\n`);
           break;

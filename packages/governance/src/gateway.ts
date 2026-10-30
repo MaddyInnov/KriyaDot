@@ -191,6 +191,10 @@ export class GovernanceGateway {
     'web_search',
     'web_fetch',
     'list_dir',
+    'read_process_output',
+    'list_processes',
+    'poll_process_notes',
+    'task_list',
   ]);
   private static readonly WRITE_TOOLS = new Set([
     'write_file',
@@ -201,6 +205,9 @@ export class GovernanceGateway {
   ]);
   private static readonly EXECUTE_TOOLS = new Set([
     'run_command',
+    'run_background',
+    'build_and_repair',
+    'kill_process',
     'exec',
     'shell',
   ]);

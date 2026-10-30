@@ -1,13 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Coding tools for the agent runtime: patch (unified diff), edit (surgical
-// string replace), glob, grep, and minimal LSP hooks (definition/hover).
+// string replace), glob, grep, semantic search, notebook tools, and the
+// LSP tool family (diagnostics / definition / hover / references) backed
+// by the managed language-server fleet in src/lsp/ (CA-9).
 //
-// Every tool is confined to the workspace directory (same confine() pattern
-// as tools/builtin.ts): any path that resolves outside the workspace throws.
+// Wave-3 coding-core closure (ADD-7):
+//   CA-9  — LSP tools run against LspManager (persistent servers, lazy
+//           per-root spawn, reuse, idle shutdown); after edit/patch the
+//           edited file's diagnostics are appended to the tool result.
+//   CA-10 — after edit/patch, the project formatter runs on the file
+//           (tools/formatters.ts); failures are notes, never failures.
+//   CA-11 — glob/grep/semantic-search honour .gitignore +
+//           .kriyadotignore (tools/ignore.ts); includeIgnored overrides.
+//   CA-14 — notebook_read / notebook_edit for .ipynb (tools/notebook.ts).
+//   CA-26 — multi-root sessions: the primary workspace plus additional
+//           roots (factory-seeded, per-turn via ToolContext, or added
+//           mid-session with add_workspace_dir), each confined to itself.
+//
+// Every tool is confined to a workspace root (same confine() pattern as
+// tools/builtin.ts): any path that resolves outside ALL roots throws.
 // These tools return plain ToolDefinitions and flow through the normal
 // governance path (the tool registry evaluates policy before dispatch).
 
-import { spawn, spawnSync } from 'node:child_process';
 import {
   Dirent,
   closeSync,
@@ -20,12 +34,16 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { readdirSync, statSync } from 'node:fs';
-import { dirname, join, relative, resolve, sep } from 'node:path';
-import type { ToolDefinition } from '../types.js';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import type { ToolContext, ToolDefinition } from '../types.js';
 import { resolveWorkspaceDir, type WorkspaceSource } from '../workspaces.js';
 import { confineRealpath } from '../confine.js';
 import { lineHash } from './line-hash.js';
 import { cosineSimilarity, type SyncEmbedder } from '../hybrid-search.js';
+import { LspManager, summarizeDiagnostics, type LspManagerOptions } from '../lsp/manager.js';
+import { formatFile, type FormatterRunner, type FormatterSpec } from './formatters.js';
+import { IgnoreMatcher } from './ignore.js';
+import { notebookEditTool, notebookReadTool } from './notebook.js';
 
 /**
  * Embedder injection for `search_code_semantic` (#60): the platform
@@ -38,6 +56,24 @@ import { cosineSimilarity, type SyncEmbedder } from '../hybrid-search.js';
 export interface CodingToolsOptions {
   workspaceDir: WorkspaceSource;
   embedder?: SyncEmbedder;
+  /**
+   * CA-9: a shared LspManager (host-owned lifecycle — the host disposes
+   * it). When omitted, the factory creates one per tool set.
+   */
+  lspManager?: LspManager;
+  /** CA-9: options for the factory-created LspManager (ignored when lspManager is given). */
+  lsp?: LspManagerOptions;
+  /** CA-10: formatter overrides (extension → spec|null), winning over `.kriyadot/formatters.json`. */
+  formatters?: Record<string, FormatterSpec | null>;
+  /** CA-10: injectable formatter process runner (tests fake it; no real formatters run). */
+  formatterRunner?: FormatterRunner;
+  /** CA-26: extra workspace roots seeded for every session using these tools. */
+  additionalRoots?: string[];
+  /**
+   * Post-edit pipeline (CA-9 diagnostics + CA-10 formatting) run by the
+   * edit/patch tools. Default true; set false to disable both halves.
+   */
+  postEdit?: boolean;
 }
 
 /**
@@ -51,6 +87,193 @@ function confine(workspaceDir: string, p: string): string {
 
 function wsRelative(workspaceDir: string, abs: string): string {
   return relative(resolve(workspaceDir), abs);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-root confinement (CA-26)
+// ---------------------------------------------------------------------------
+
+/**
+ * Session-scoped state for one tool set: roots added mid-session via
+ * add_workspace_dir. Factory-seeded roots and per-turn roots
+ * (ToolContext.additionalWorkspaceRoots) are merged in per call.
+ */
+export interface MultiRootState {
+  addedRoots: string[];
+}
+
+export function createMultiRootState(): MultiRootState {
+  return { addedRoots: [] };
+}
+
+interface ResolvedPath {
+  abs: string;
+  /** The root the path was confined to. */
+  root: string;
+  /** Path relative to that root ('/'-separated). */
+  rel: string;
+  /** True when the root is not the primary workspace. */
+  extra: boolean;
+}
+
+/** All effective roots for a call: primary first, then seeded/turn/session extras. */
+function effectiveRoots(
+  primary: string,
+  opts: CodingToolsOptions,
+  state: MultiRootState,
+  ctx: ToolContext | undefined,
+): string[] {
+  const roots: string[] = [resolve(primary)];
+  const push = (r: string) => {
+    const abs = resolve(r);
+    if (!roots.includes(abs)) roots.push(abs);
+  };
+  for (const r of opts.additionalRoots ?? []) push(r);
+  for (const r of ctx?.additionalWorkspaceRoots ?? []) push(r);
+  for (const r of state.addedRoots) push(r);
+  return roots;
+}
+
+/**
+ * Confine `p` against the root list. Absolute paths must land inside one
+ * root; relative paths resolve against the first root where the target
+ * already exists, else the primary root. A path escaping EVERY root
+ * throws — each root confines independently (CA-26).
+ */
+function confineAny(roots: string[], p: string): ResolvedPath {
+  if (isAbsolute(p)) {
+    for (let i = 0; i < roots.length; i++) {
+      try {
+        const abs = confineRealpath(roots[i]!, p);
+        return { abs, root: roots[i]!, rel: relative(roots[i]!, abs).split(sep).join('/'), extra: i > 0 };
+      } catch {
+        // Not inside this root — try the next.
+      }
+    }
+    throw new Error(`Path escapes workspace: "${p}"`);
+  }
+  // Relative: prefer the root where the path already exists.
+  for (let i = 0; i < roots.length; i++) {
+    const candidate = resolve(roots[i]!, p);
+    if (existsSync(candidate)) {
+      const abs = confineRealpath(roots[i]!, p);
+      return { abs, root: roots[i]!, rel: relative(roots[i]!, abs).split(sep).join('/'), extra: i > 0 };
+    }
+  }
+  const abs = confineRealpath(roots[0]!, p);
+  return { abs, root: roots[0]!, rel: relative(roots[0]!, abs).split(sep).join('/'), extra: false };
+}
+
+/** Display path for results: primary-root files stay plain; extra-root files are prefixed with the root's directory name. */
+function displayPath(rp: ResolvedPath): string {
+  return rp.extra ? `${basename(rp.root)}/${rp.rel}` : rp.rel;
+}
+
+// ---------------------------------------------------------------------------
+// Shared per-tool-set environment + the post-edit pipeline (CA-9 + CA-10)
+// ---------------------------------------------------------------------------
+
+interface CodingEnv {
+  opts: CodingToolsOptions;
+  state: MultiRootState;
+  lsp: LspManager;
+}
+
+function rootsFor(env: CodingEnv, ctx: ToolContext): string[] {
+  const primary = resolveWorkspaceDir(env.opts.workspaceDir, ctx);
+  return effectiveRoots(primary, env.opts, env.state, ctx);
+}
+
+function confineFor(env: CodingEnv, ctx: ToolContext, p: string): ResolvedPath {
+  return confineAny(rootsFor(env, ctx), p);
+}
+
+const MAX_POST_EDIT_FILES = 5;
+
+/**
+ * Post-edit pipeline, called by the mutating coding tools (edit, patch)
+ * after a successful write — the seam the task prefers over runtime.ts
+ * surgery: the coding-tool layer enriches its own results. Hosts whose
+ * write path lives elsewhere (builtin write_file) can call the exported
+ * runPostEditPipeline with the same manager/formatters the factory uses.
+ *
+ * Formatting runs first (it may change the file), then diagnostics are
+ * read for the final content. Everything is best-effort: formatter
+ * failures and unavailable language servers become `notes`, never errors.
+ */
+async function postEditEnrich(
+  env: CodingEnv,
+  files: ResolvedPath[],
+): Promise<Record<string, unknown>> {
+  if (env.opts.postEdit === false || files.length === 0) return {};
+  const formatting: unknown[] = [];
+  const notes: string[] = [];
+  const targets = files.slice(0, MAX_POST_EDIT_FILES);
+  for (const f of targets) {
+    const outcome = formatFile(f.root, f.abs, displayPath(f), {
+      runner: env.opts.formatterRunner,
+      overrides: env.opts.formatters,
+    });
+    if (outcome.formatted) {
+      formatting.push(outcome);
+    } else if (outcome.error) {
+      formatting.push(outcome);
+      notes.push(`formatter failed for ${displayPath(f)}: ${outcome.error}`);
+    } else if (outcome.skipped && !outcome.skipped.startsWith('no formatter')) {
+      notes.push(`formatting skipped for ${displayPath(f)}: ${outcome.skipped}`);
+    }
+  }
+  const diagnostics: unknown[] = [];
+  for (const f of targets) {
+    if (!env.lsp.supportsFile(f.root, f.abs)) continue;
+    const res = await env.lsp.getDiagnostics(f.root, f.abs);
+    if (!res.ok) {
+      notes.push(`diagnostics unavailable for ${displayPath(f)}: ${res.unavailable}`);
+      continue;
+    }
+    const summary = summarizeDiagnostics(displayPath(f), res.value);
+    if (summary.total > 0) diagnostics.push(summary);
+  }
+  return {
+    ...(formatting.length > 0 ? { formatting } : {}),
+    ...(diagnostics.length > 0 ? { diagnostics } : {}),
+    ...(notes.length > 0 ? { notes } : {}),
+  };
+}
+
+/**
+ * Exported post-edit pipeline for hosts/tools outside the coding factory
+ * (e.g. builtin write_file): formats `absPath` and computes its LSP
+ * diagnostics summary. Never throws.
+ */
+export async function runPostEditPipeline(args: {
+  root: string;
+  absPath: string;
+  relPath: string;
+  lsp: LspManager;
+  formatters?: Record<string, FormatterSpec | null>;
+  formatterRunner?: FormatterRunner;
+}): Promise<Record<string, unknown>> {
+  const env: CodingEnv = {
+    opts: {
+      workspaceDir: args.root,
+      formatters: args.formatters,
+      formatterRunner: args.formatterRunner,
+    },
+    state: createMultiRootState(),
+    lsp: args.lsp,
+  };
+  const rp: ResolvedPath = {
+    abs: args.absPath,
+    root: args.root,
+    rel: args.relPath.split(sep).join('/'),
+    extra: false,
+  };
+  try {
+    return await postEditEnrich(env, [rp]);
+  } catch {
+    return {};
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +415,7 @@ interface PatchFileResult {
   action?: 'modified' | 'created' | 'deleted';
 }
 
-function patchTool(workspaceDir: WorkspaceSource): ToolDefinition {
+function patchTool(env: CodingEnv): ToolDefinition {
   return {
     name: 'patch',
     mutating: true,
@@ -210,22 +433,23 @@ function patchTool(workspaceDir: WorkspaceSource): ToolDefinition {
       additionalProperties: false,
     },
     handler: async (args, ctx) => {
-      const ws = resolveWorkspaceDir(workspaceDir, ctx);
       const diff = String(args.diff ?? '');
       const dryRun = args.dryRun === true;
       if (!diff.trim()) throw new Error('patch: "diff" must not be empty');
       const fileDiffs = parseUnifiedDiff(diff);
       const results: PatchFileResult[] = [];
-      const pending: { abs: string; rel: string; lines: string[]; action: 'modified' | 'created' | 'deleted' }[] = [];
+      const pending: { abs: string; rel: string; resolved: ResolvedPath; lines: string[]; action: 'modified' | 'created' | 'deleted' }[] = [];
 
       for (const fd of fileDiffs) {
         const target = fd.newPath ?? fd.oldPath;
         if (!target) throw new Error('patch: diff has neither old nor new path');
         let rel: string;
         let abs: string;
+        let resolvedPath: ResolvedPath;
         try {
           rel = target;
-          abs = confine(ws, rel);
+          resolvedPath = confineFor(env, ctx, rel);
+          abs = resolvedPath.abs;
         } catch (err) {
           results.push({ path: target, ok: false, error: err instanceof Error ? err.message : String(err) });
           continue;
@@ -245,7 +469,7 @@ function patchTool(workspaceDir: WorkspaceSource): ToolDefinition {
         try {
           const next = applyHunks(original, fd, rel);
           const action = isDelete ? 'deleted' : isNew ? 'created' : 'modified';
-          pending.push({ abs, rel, lines: next, action });
+          pending.push({ abs, rel, resolved: resolvedPath, lines: next, action });
           results.push({ path: rel, ok: true, action });
         } catch (err) {
           results.push({ path: rel, ok: false, error: err instanceof Error ? err.message : String(err) });
@@ -263,7 +487,11 @@ function patchTool(workspaceDir: WorkspaceSource): ToolDefinition {
         }
       }
       const applied = results.filter((r) => r.ok).map((r) => r.path);
-      return { applied, dryRun, files: results };
+      // CA-9/CA-10: format + diagnose the files we just wrote.
+      const enrich = dryRun
+        ? {}
+        : await postEditEnrich(env, pending.filter((p) => p.action !== 'deleted').map((p) => p.resolved));
+      return { applied, dryRun, files: results, ...enrich };
     },
   };
 }
@@ -272,7 +500,7 @@ function patchTool(workspaceDir: WorkspaceSource): ToolDefinition {
 // edit — surgical string replace
 // ---------------------------------------------------------------------------
 
-function editTool(workspaceDir: WorkspaceSource): ToolDefinition {
+function editTool(env: CodingEnv): ToolDefinition {
   return {
     name: 'edit',
     mutating: true,
@@ -308,8 +536,8 @@ function editTool(workspaceDir: WorkspaceSource): ToolDefinition {
       additionalProperties: false,
     },
     handler: async (args, ctx) => {
-      const ws = resolveWorkspaceDir(workspaceDir, ctx);
-      const file = confine(ws, String(args.path));
+      const resolvedPath = confineFor(env, ctx, String(args.path));
+      const file = resolvedPath.abs;
       if (!existsSync(file)) throw new Error(`edit: file does not exist: "${args.path}"`);
       const content = readFileSync(file, 'utf8');
 
@@ -353,11 +581,13 @@ function editTool(workspaceDir: WorkspaceSource): ToolDefinition {
           ...lines.slice(endLine),
         ];
         writeFileSync(file, nextLines.join('\n'), 'utf8');
+        const enrich = await postEditEnrich(env, [resolvedPath]);
         return {
           path: String(args.path),
           mode: 'range',
           replacements: 1,
           linesReplaced: endLine - startLine + 1,
+          ...enrich,
         };
       }
 
@@ -378,7 +608,8 @@ function editTool(workspaceDir: WorkspaceSource): ToolDefinition {
       }
       const next = content.split(oldText).join(newText);
       writeFileSync(file, next, 'utf8');
-      return { path: String(args.path), replacements: count };
+      const enrich = await postEditEnrich(env, [resolvedPath]);
+      return { path: String(args.path), replacements: count, ...enrich };
     },
   };
 }
@@ -424,50 +655,80 @@ function globToRegExp(pattern: string): RegExp {
   return new RegExp('^' + re + '$');
 }
 
-function walkFiles(root: string, out: string[]): void {
-  let entries: Dirent[];
-  try {
-    entries = readdirSync(root, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  for (const e of entries) {
-    const abs = join(root, e.name);
-    if (e.isDirectory()) {
-      if (e.name === 'node_modules' || e.name === '.git') continue;
-      walkFiles(abs, out);
-    } else if (e.isFile()) {
-      out.push(abs);
+/**
+ * Collect files under one root, honouring .gitignore/.kriyadotignore
+ * (CA-11) unless includeIgnored is set. `.git` internals are always
+ * skipped; `node_modules` keeps its historical default skip unless
+ * includeIgnored is set or an ignore-file negation re-includes it.
+ * Nested ignore files are picked up as the walk descends.
+ */
+function collectFiles(root: string, includeIgnored: boolean, out: string[]): void {
+  const matcher = includeIgnored ? null : new IgnoreMatcher(root);
+  const walk = (dir: string, relBase: string): void => {
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
     }
-  }
+    if (matcher && relBase !== '') matcher.addDirectoryRules(dir, relBase);
+    for (const e of entries) {
+      const abs = join(dir, e.name);
+      const rel = relBase ? `${relBase}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        if (e.name === '.git') continue;
+        if (!includeIgnored && e.name === 'node_modules') continue;
+        if (matcher && matcher.isIgnored(rel, true)) continue;
+        walk(abs, rel);
+      } else if (e.isFile()) {
+        if (matcher && matcher.isIgnored(rel, false)) continue;
+        out.push(abs);
+      }
+    }
+  };
+  walk(root, '');
 }
 
-function globTool(workspaceDir: WorkspaceSource): ToolDefinition {
+/** Back-compat walk used where ignore handling is not parameterised. */
+function walkFiles(root: string, out: string[]): void {
+  collectFiles(root, false, out);
+}
+
+function globTool(env: CodingEnv): ToolDefinition {
   return {
     name: 'glob',
     description:
       'Find files in the workspace matching a glob pattern (*, ?, ** supported). ' +
-      'Returns workspace-relative paths, capped at 200.',
+      'Honours .gitignore and .kriyadotignore by default (set includeIgnored=true to ' +
+      'search ignored files too). Searches all session roots (CA-26); files in extra ' +
+      'roots are prefixed with that root\'s directory name. Returns paths capped at 200.',
     parameters: {
       type: 'object',
-      properties: { pattern: { type: 'string', description: 'Glob pattern, e.g. "src/**/*.ts"' } },
+      properties: {
+        pattern: { type: 'string', description: 'Glob pattern, e.g. "src/**/*.ts"' },
+        includeIgnored: { type: 'boolean', description: 'Include files matched by ignore rules (default false)' },
+      },
       required: ['pattern'],
       additionalProperties: false,
     },
     handler: async (args, ctx) => {
-      const ws = resolveWorkspaceDir(workspaceDir, ctx);
       const pattern = String(args.pattern ?? '');
       if (!pattern) throw new Error('glob: "pattern" must not be empty');
       const rx = globToRegExp(pattern);
-      const root = resolve(ws);
-      const all: string[] = [];
-      walkFiles(root, all);
-      const matched = all
-        .map((abs) => wsRelative(ws, abs).split(sep).join('/'))
-        .filter((rel) => rx.test(rel))
-        .sort()
-        .slice(0, MAX_GLOB_RESULTS);
-      return { pattern, matches: matched, truncated: matched.length === MAX_GLOB_RESULTS };
+      const includeIgnored = args.includeIgnored === true;
+      const roots = rootsFor(env, ctx);
+      const matched: string[] = [];
+      for (const root of roots) {
+        const all: string[] = [];
+        collectFiles(root, includeIgnored, all);
+        for (const abs of all) {
+          const rel = wsRelative(root, abs).split(sep).join('/');
+          const display = root === roots[0] ? rel : `${basename(root)}/${rel}`;
+          if (rx.test(rel) || rx.test(display)) matched.push(display);
+        }
+      }
+      const unique = [...new Set(matched)].sort().slice(0, MAX_GLOB_RESULTS);
+      return { pattern, matches: unique, truncated: unique.length === MAX_GLOB_RESULTS };
     },
   };
 }
@@ -500,24 +761,26 @@ function isBinaryFile(abs: string): boolean {
   }
 }
 
-function grepTool(workspaceDir: WorkspaceSource): ToolDefinition {
+function grepTool(env: CodingEnv): ToolDefinition {
   return {
     name: 'grep',
     description:
       'Regex content search across workspace files. Returns up to 50 matches with ' +
-      'line numbers. Binary files are skipped.',
+      'line numbers. Binary files are skipped. Honours .gitignore/.kriyadotignore ' +
+      'by default (includeIgnored=true searches ignored files too). Without a path, ' +
+      'searches all session roots (CA-26).',
     parameters: {
       type: 'object',
       properties: {
         pattern: { type: 'string', description: 'JavaScript regex pattern' },
-        path: { type: 'string', description: 'Workspace-relative file or directory (default: workspace root)' },
+        path: { type: 'string', description: 'Workspace-relative file or directory (default: all roots)' },
         filePattern: { type: 'string', description: 'Glob filter for file paths, e.g. "*.ts"' },
+        includeIgnored: { type: 'boolean', description: 'Include files matched by ignore rules (default false)' },
       },
       required: ['pattern'],
       additionalProperties: false,
     },
     handler: async (args, ctx) => {
-      const ws = resolveWorkspaceDir(workspaceDir, ctx);
       const pattern = String(args.pattern ?? '');
       if (!pattern) throw new Error('grep: "pattern" must not be empty');
       let rx: RegExp;
@@ -526,34 +789,55 @@ function grepTool(workspaceDir: WorkspaceSource): ToolDefinition {
       } catch (err) {
         throw new Error(`grep: invalid regex: ${err instanceof Error ? err.message : String(err)}`);
       }
-      const baseAbs = args.path === undefined ? resolve(ws) : confine(ws, String(args.path));
+      const includeIgnored = args.includeIgnored === true;
       const fileRx = args.filePattern === undefined ? null : globToRegExp(String(args.filePattern));
+      const roots = rootsFor(env, ctx);
 
-      const candidates: string[] = [];
-      let st;
-      try {
-        st = statSync(baseAbs);
-      } catch {
-        throw new Error(`grep: path does not exist: "${args.path}"`);
+      // Candidate files, each tagged with its display path.
+      const candidates: { abs: string; display: string }[] = [];
+      if (args.path !== undefined) {
+        const rp = confineFor(env, ctx, String(args.path));
+        let st;
+        try {
+          st = statSync(rp.abs);
+        } catch {
+          throw new Error(`grep: path does not exist: "${args.path}"`);
+        }
+        if (st.isDirectory()) {
+          const found: string[] = [];
+          collectFiles(rp.abs, includeIgnored, found);
+          for (const abs of found) {
+            const rel = wsRelative(rp.root, abs).split(sep).join('/');
+            candidates.push({ abs, display: rp.extra ? `${basename(rp.root)}/${rel}` : rel });
+          }
+        } else {
+          candidates.push({ abs: rp.abs, display: displayPath(rp) });
+        }
+      } else {
+        for (const root of roots) {
+          const found: string[] = [];
+          collectFiles(root, includeIgnored, found);
+          for (const abs of found) {
+            const rel = wsRelative(root, abs).split(sep).join('/');
+            candidates.push({ abs, display: root === roots[0] ? rel : `${basename(root)}/${rel}` });
+          }
+        }
       }
-      if (st.isDirectory()) walkFiles(baseAbs, candidates);
-      else candidates.push(baseAbs);
 
       const matches: { path: string; line: number; text: string }[] = [];
-      outer: for (const abs of candidates) {
-        const rel = wsRelative(ws, abs).split(sep).join('/');
-        if (fileRx && !fileRx.test(rel)) continue;
-        if (isBinaryFile(abs)) continue;
+      outer: for (const cand of candidates) {
+        if (fileRx && !fileRx.test(cand.display)) continue;
+        if (isBinaryFile(cand.abs)) continue;
         let content: string;
         try {
-          content = readFileSync(abs, 'utf8');
+          content = readFileSync(cand.abs, 'utf8');
         } catch {
           continue;
         }
         const lines = content.split('\n');
         for (let i = 0; i < lines.length; i++) {
           if (rx.test(lines[i])) {
-            matches.push({ path: rel, line: i + 1, text: lines[i].slice(0, 500) });
+            matches.push({ path: cand.display, line: i + 1, text: lines[i].slice(0, 500) });
             if (matches.length >= MAX_GREP_MATCHES) break outer;
           }
         }
@@ -628,7 +912,7 @@ function snippetFor(text: string, queryTokens: Map<string, number>): string {
 }
 
 function semanticSearchTool(
-  workspaceDir: WorkspaceSource,
+  env: CodingEnv,
   embedder: SyncEmbedder | undefined,
 ): ToolDefinition {
   return {
@@ -648,7 +932,7 @@ function semanticSearchTool(
       additionalProperties: false,
     },
     handler: async (args, ctx) => {
-      const ws = resolveWorkspaceDir(workspaceDir, ctx);
+      const ws = resolveWorkspaceDir(env.opts.workspaceDir, ctx);
       const root = resolve(ws);
       const query = String(args.query ?? '').trim();
       if (!query) throw new Error('search_code_semantic: "query" must not be empty');
@@ -767,155 +1051,39 @@ function semanticSearchTool(
 }
 
 // ---------------------------------------------------------------------------
-// LSP hooks — minimal hand-rolled JSON-RPC client over stdio.
+// LSP tools (CA-9) — backed by the managed fleet in src/lsp/.
+//
+// The previous implementation spawned `typescript-language-server` fresh
+// for every request and supported definition/hover only. These tools go
+// through LspManager: persistent per-root servers for TS/JS, Python, Go
+// and Rust (+ config-extensible registry), lazy spawn, reuse, idle
+// shutdown, and graceful degradation — an unavailable server yields
+// { degraded: true, error } and NEVER throws the turn.
 // ---------------------------------------------------------------------------
 
-const LSP_TIMEOUT_MS = 15_000;
-let lspProbeCache: boolean | null = null;
-
-/** True when `typescript-language-server --stdio` can be spawned. Cached. */
-function lspAvailable(): boolean {
-  if (lspProbeCache !== null) return lspProbeCache;
-  try {
-    const r = spawnSync('typescript-language-server', ['--version'], { timeout: 5000 });
-    lspProbeCache = r.status === 0;
-  } catch {
-    lspProbeCache = false;
-  }
-  return lspProbeCache;
+function lspPositionParams(args: Record<string, unknown>): { line: number; character: number } {
+  return { line: Number(args.line), character: Number(args.character) };
 }
 
-function languageIdFor(abs: string): string {
-  if (abs.endsWith('.tsx')) return 'typescriptreact';
-  if (abs.endsWith('.ts')) return 'typescript';
-  if (abs.endsWith('.jsx')) return 'javascriptreact';
-  if (abs.endsWith('.js') || abs.endsWith('.mjs') || abs.endsWith('.cjs')) return 'javascript';
-  return 'plaintext';
+function normalizeLocations(result: unknown): { uri?: string; line?: number; character?: number }[] {
+  const raw = result as
+    | { uri?: string; targetUri?: string; range?: { start?: { line?: number; character?: number } }; targetSelectionRange?: { start?: { line?: number; character?: number } } }
+    | null;
+  const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
+  return list.map((l) => ({
+    uri: l.uri ?? l.targetUri,
+    line: l.range?.start?.line ?? l.targetSelectionRange?.start?.line,
+    character: l.range?.start?.character ?? l.targetSelectionRange?.start?.character,
+  }));
 }
 
-interface JsonRpcResponse {
-  id: number;
-  result?: unknown;
-  error?: { code: number; message: string };
-}
-
-/**
- * Run a single LSP request against a freshly spawned typescript-language-server.
- * Never throws for server absence — the tools translate that to degraded mode.
- */
-async function lspRequest(
-  workspaceDir: string,
-  absPath: string,
-  method: 'textDocument/definition' | 'textDocument/hover',
-  position: { line: number; character: number },
-): Promise<unknown> {
-  const root = resolve(workspaceDir);
-  const content = readFileSync(absPath, 'utf8');
-  const uri = 'file://' + absPath;
-  const languageId = languageIdFor(absPath);
-
-  const child = spawn('typescript-language-server', ['--stdio'], { stdio: ['pipe', 'pipe', 'ignore'] });
-  let settled = false;
-  let seq = 0;
-  const pending = new Map<number, (v: JsonRpcResponse) => void>();
-  let buffer = Buffer.alloc(0);
-
-  const send = (msg: Record<string, unknown>) => {
-    const body = Buffer.from(JSON.stringify(msg), 'utf8');
-    const header = Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, 'utf8');
-    child.stdin.write(Buffer.concat([header, body]));
-  };
-  const request = (m: string, params: unknown): Promise<JsonRpcResponse> =>
-    new Promise((resolveRpc) => {
-      const id = ++seq;
-      pending.set(id, resolveRpc);
-      send({ jsonrpc: '2.0', id, method: m, params });
-    });
-
-  const cleanup = () => {
-    if (!settled) {
-      settled = true;
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        /* already gone */
-      }
-    }
-  };
-
-  child.stdout.on('data', (chunk: Buffer) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    for (;;) {
-      const headerEnd = buffer.indexOf('\r\n\r\n');
-      if (headerEnd === -1) break;
-      const header = buffer.subarray(0, headerEnd).toString('utf8');
-      const mLen = /Content-Length:\s*(\d+)/i.exec(header);
-      if (!mLen) break;
-      const len = Number(mLen[1]);
-      const total = headerEnd + 4 + len;
-      if (buffer.length < total) break;
-      const body = buffer.subarray(headerEnd + 4, total).toString('utf8');
-      buffer = buffer.subarray(total);
-      try {
-        const msg = JSON.parse(body) as JsonRpcResponse & { method?: string };
-        if (typeof msg.id === 'number' && pending.has(msg.id)) {
-          pending.get(msg.id)!(msg);
-          pending.delete(msg.id);
-        }
-        // server->client requests/notifications (e.g. window/logMessage) are ignored
-      } catch {
-        /* ignore malformed frame */
-      }
-    }
-  });
-  child.on('error', () => {
-    for (const [, resolveRpc] of pending) {
-      resolveRpc({ id: -1, error: { code: -32000, message: 'language server process error' } });
-    }
-    pending.clear();
-  });
-
-  const timeout = new Promise<never>((_, reject) =>
-    setTimeout(() => reject(new Error('language server request timed out')), LSP_TIMEOUT_MS),
-  );
-
-  try {
-    const result = await Promise.race([
-      (async () => {
-        await request('initialize', {
-          processId: process.pid,
-          rootUri: 'file://' + root,
-          capabilities: {},
-        });
-        send({ jsonrpc: '2.0', method: 'initialized', params: {} });
-        send({
-          jsonrpc: '2.0',
-          method: 'textDocument/didOpen',
-          params: { textDocument: { uri, languageId, version: 1, text: content } },
-        });
-        const resp = await request(method, {
-          textDocument: { uri },
-          position: { line: position.line, character: position.character },
-        });
-        send({ jsonrpc: '2.0', id: ++seq, method: 'shutdown', params: {} });
-        send({ jsonrpc: '2.0', method: 'exit', params: {} });
-        if (resp.error) throw new Error(`language server error: ${resp.error.message}`);
-        return resp.result ?? null;
-      })(),
-      timeout,
-    ]);
-    return result;
-  } finally {
-    cleanup();
-  }
-}
-
-function lspDefinitionTool(workspaceDir: WorkspaceSource): ToolDefinition {
+function lspDefinitionTool(env: CodingEnv): ToolDefinition {
   return {
     name: 'lsp_definition',
     description:
-      'Go-to-definition via the TypeScript language server (if installed). ' +
-      'Returns { degraded: true } when no language server is available — never throws.',
+      'Go-to-definition via the workspace language server (TypeScript/JavaScript, Python, ' +
+      'Go, Rust — managed fleet). Returns { degraded: true } when no language server is ' +
+      'available — never throws.',
     parameters: {
       type: 'object',
       properties: {
@@ -927,37 +1095,19 @@ function lspDefinitionTool(workspaceDir: WorkspaceSource): ToolDefinition {
       additionalProperties: false,
     },
     handler: async (args, ctx) => {
-      const ws = resolveWorkspaceDir(workspaceDir, ctx);
-      if (!lspAvailable()) {
-        return { degraded: true, error: 'language server not available' };
-      }
-      const abs = confine(ws, String(args.path));
-      if (!existsSync(abs)) throw new Error(`lsp_definition: file does not exist: "${args.path}"`);
-      try {
-        const result = await lspRequest(ws, abs, 'textDocument/definition', {
-          line: Number(args.line),
-          character: Number(args.character),
-        });
-        const locations = Array.isArray(result) ? result : result ? [result] : [];
-        return {
-          locations: locations.map((l: { uri?: string; range?: { start?: { line?: number; character?: number } } }) => ({
-            uri: l.uri,
-            line: l.range?.start?.line,
-            character: l.range?.start?.character,
-          })),
-        };
-      } catch (err) {
-        return { degraded: true, error: err instanceof Error ? err.message : String(err) };
-      }
+      const rp = confineFor(env, ctx, String(args.path));
+      const res = await env.lsp.definition(rp.root, rp.abs, lspPositionParams(args));
+      if (!res.ok) return { degraded: true, error: res.unavailable };
+      return { locations: normalizeLocations(res.value) };
     },
   };
 }
 
-function lspHoverTool(workspaceDir: WorkspaceSource): ToolDefinition {
+function lspHoverTool(env: CodingEnv): ToolDefinition {
   return {
     name: 'lsp_hover',
     description:
-      'Hover type information via the TypeScript language server (if installed). ' +
+      'Hover type information via the workspace language server (managed fleet). ' +
       'Returns { degraded: true } when no language server is available — never throws.',
     parameters: {
       type: 'object',
@@ -970,21 +1120,134 @@ function lspHoverTool(workspaceDir: WorkspaceSource): ToolDefinition {
       additionalProperties: false,
     },
     handler: async (args, ctx) => {
-      const ws = resolveWorkspaceDir(workspaceDir, ctx);
-      if (!lspAvailable()) {
-        return { degraded: true, error: 'language server not available' };
+      const rp = confineFor(env, ctx, String(args.path));
+      const res = await env.lsp.hover(rp.root, rp.abs, lspPositionParams(args));
+      if (!res.ok) return { degraded: true, error: res.unavailable };
+      const hover = res.value as { contents?: unknown } | null;
+      return { contents: hover?.contents ?? null };
+    },
+  };
+}
+
+function lspReferencesTool(env: CodingEnv): ToolDefinition {
+  return {
+    name: 'lsp_references',
+    description:
+      'Find all references to the symbol at a position via the workspace language ' +
+      'server (managed fleet). Returns { degraded: true } when no language server ' +
+      'is available — never throws.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Workspace-relative file path' },
+        line: { type: 'number', description: '0-based line number' },
+        character: { type: 'number', description: '0-based character offset' },
+      },
+      required: ['path', 'line', 'character'],
+      additionalProperties: false,
+    },
+    handler: async (args, ctx) => {
+      const rp = confineFor(env, ctx, String(args.path));
+      const res = await env.lsp.references(rp.root, rp.abs, lspPositionParams(args));
+      if (!res.ok) return { degraded: true, error: res.unavailable };
+      return { locations: normalizeLocations(res.value) };
+    },
+  };
+}
+
+const MAX_WORKSPACE_DIAGNOSTIC_FILES = 25;
+
+function lspDiagnosticsTool(env: CodingEnv): ToolDefinition {
+  return {
+    name: 'lsp_diagnostics',
+    description:
+      'Diagnostics (errors/warnings) from the workspace language servers. With a ' +
+      'path: diagnostics for that file. Without: scans workspace files served by a ' +
+      'language server (capped) and reports the files that have diagnostics. ' +
+      'Returns { degraded: true } when no language server is available — never throws.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Workspace-relative file path (optional)' },
+      },
+      additionalProperties: false,
+    },
+    handler: async (args, ctx) => {
+      if (typeof args.path === 'string' && args.path) {
+        const rp = confineFor(env, ctx, args.path);
+        const res = await env.lsp.getDiagnostics(rp.root, rp.abs);
+        if (!res.ok) return { degraded: true, error: res.unavailable };
+        return { diagnostics: [summarizeDiagnostics(displayPath(rp), res.value)] };
       }
-      const abs = confine(ws, String(args.path));
-      if (!existsSync(abs)) throw new Error(`lsp_hover: file does not exist: "${args.path}"`);
+      // Workspace mode: every root, files a server can serve, capped.
+      const summaries: ReturnType<typeof summarizeDiagnostics>[] = [];
+      let filesChecked = 0;
+      let unavailable: string | null = null;
+      outer: for (const root of rootsFor(env, ctx)) {
+        const all: string[] = [];
+        collectFiles(root, false, all);
+        for (const abs of all) {
+          if (filesChecked >= MAX_WORKSPACE_DIAGNOSTIC_FILES) break outer;
+          if (!env.lsp.supportsFile(root, abs)) continue;
+          filesChecked += 1;
+          const res = await env.lsp.getDiagnostics(root, abs);
+          if (!res.ok) {
+            unavailable = res.unavailable;
+            continue;
+          }
+          const rel = wsRelative(root, abs).split(sep).join('/');
+          const display = root === rootsFor(env, ctx)[0] ? rel : `${basename(root)}/${rel}`;
+          const summary = summarizeDiagnostics(display, res.value);
+          if (summary.total > 0) summaries.push(summary);
+        }
+      }
+      if (filesChecked === 0) {
+        return { degraded: true, error: 'no files in this workspace are served by a configured language server' };
+      }
+      if (summaries.length === 0 && unavailable) {
+        return { degraded: true, error: unavailable };
+      }
+      return { diagnostics: summaries, filesChecked };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// add_workspace_dir (CA-26)
+// ---------------------------------------------------------------------------
+
+function addWorkspaceDirTool(env: CodingEnv): ToolDefinition {
+  return {
+    name: 'add_workspace_dir',
+    mutating: true,
+    description:
+      'Add an extra workspace root to THIS session (multi-root, CA-26). Coding tools ' +
+      'then resolve paths against the primary workspace plus every added root; each ' +
+      'root confines paths to itself — a path escaping all roots is still refused. ' +
+      'Use for monorepo-plus-sibling-repo work in one session.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Directory to add (absolute, or relative to the primary workspace)' },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+    handler: async (args, ctx) => {
+      const primary = resolveWorkspaceDir(env.opts.workspaceDir, ctx);
+      const raw = String(args.path ?? '');
+      if (!raw) throw new Error('add_workspace_dir: "path" must not be empty');
+      const abs = isAbsolute(raw) ? resolve(raw) : resolve(primary, raw);
+      let st;
       try {
-        const result = (await lspRequest(ws, abs, 'textDocument/hover', {
-          line: Number(args.line),
-          character: Number(args.character),
-        })) as { contents?: unknown } | null;
-        return { contents: result?.contents ?? null };
-      } catch (err) {
-        return { degraded: true, error: err instanceof Error ? err.message : String(err) };
+        st = statSync(abs);
+      } catch {
+        throw new Error(`add_workspace_dir: directory does not exist: "${raw}"`);
       }
+      if (!st.isDirectory()) throw new Error(`add_workspace_dir: not a directory: "${raw}"`);
+      const roots = rootsFor(env, ctx);
+      if (!roots.includes(abs)) env.state.addedRoots.push(abs);
+      return { added: abs, roots: rootsFor(env, ctx) };
     },
   };
 }
@@ -994,24 +1257,39 @@ function lspHoverTool(workspaceDir: WorkspaceSource): ToolDefinition {
 // ---------------------------------------------------------------------------
 
 /**
- * Build the coding tool set, confined to `workspaceDir`.
- * Returned tools are plain ToolDefinitions; the tool registry applies
- * governance (deny-by-default / approvals) exactly as for built-in tools.
- * `opts.embedder` (optional) powers `search_code_semantic`'s semantic
- * leg; without it that tool runs lexical-only (#60).
+ * Build the coding tool set, confined to `workspaceDir` (plus any extra
+ * roots — CA-26). Returned tools are plain ToolDefinitions; the tool
+ * registry applies governance (deny-by-default / approvals) exactly as
+ * for built-in tools. `opts.embedder` (optional) powers
+ * `search_code_semantic`'s semantic leg; without it that tool runs
+ * lexical-only (#60).
+ *
+ * The tool set owns an LspManager (CA-9) unless the host passes its own
+ * via `opts.lspManager` — hosts that do should dispose it at shutdown;
+ * factory-created managers idle-shutdown their servers automatically.
  */
 export function createCodingTools(opts: CodingToolsOptions): ToolDefinition[] {
-  const { workspaceDir } = opts;
+  const env: CodingEnv = {
+    opts,
+    state: createMultiRootState(),
+    lsp: opts.lspManager ?? new LspManager(opts.lsp),
+  };
+  const confineFn = (ws: string, p: string) => confineAny(effectiveRoots(ws, opts, env.state, undefined), p).abs;
   return [
-    patchTool(workspaceDir),
-    editTool(workspaceDir),
-    globTool(workspaceDir),
-    grepTool(workspaceDir),
-    semanticSearchTool(workspaceDir, opts.embedder),
-    lspDefinitionTool(workspaceDir),
-    lspHoverTool(workspaceDir),
+    patchTool(env),
+    editTool(env),
+    globTool(env),
+    grepTool(env),
+    semanticSearchTool(env, opts.embedder),
+    lspDefinitionTool(env),
+    lspHoverTool(env),
+    lspReferencesTool(env),
+    lspDiagnosticsTool(env),
+    notebookReadTool(opts.workspaceDir, confineFn),
+    notebookEditTool(opts.workspaceDir, confineFn),
+    addWorkspaceDirTool(env),
   ];
 }
 
 // Re-exported for unit tests (pure functions).
-export const __test__ = { parseUnifiedDiff, applyHunks, globToRegExp, confine };
+export const __test__ = { parseUnifiedDiff, applyHunks, globToRegExp, confine, confineAny, effectiveRoots };

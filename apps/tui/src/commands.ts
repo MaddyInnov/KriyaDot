@@ -18,6 +18,8 @@ const KNOWN = new Set([
   'help',
   'quit',
   'jobs',
+  'rewind',
+  'diff',
 ]);
 
 /**
@@ -52,6 +54,8 @@ export const HELP_ENTRIES: HelpEntry[] = [
   { command: '/memory', usage: '/memory', description: 'Show this bot’s memory summary' },
   { command: '/activity', usage: '/activity', description: 'Show recent activity (audit log)' },
   { command: '/jobs', usage: '/jobs', description: 'Background job manager (list running jobs, cancel)' },
+  { command: '/rewind', usage: '/rewind [n] [mode]', description: 'List checkpoints, or restore #n (mode: code|conversation|both)' },
+  { command: '/diff', usage: '/diff', description: 'Review everything changed this session, per file (+/-)' },
   { command: '/theme', usage: '/theme <name>', description: 'Switch TUI theme (light/dark/midnight/porcelain/ocean)' },
   { command: '/clear', usage: '/clear', description: 'Clear the chat transcript' },
   { command: '/help', usage: '/help', description: 'Show this help' },

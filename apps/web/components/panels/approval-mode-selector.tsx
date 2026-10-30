@@ -21,6 +21,16 @@ const MODES: Array<{ id: ApprovalMode; label: string; blurb: string; danger?: bo
     blurb: 'Low-risk actions proceed under policy; risky actions still ask for approval.',
   },
   {
+    id: 'acceptEdits',
+    label: 'Accept edits',
+    blurb: 'File edits and safe filesystem commands proceed automatically; anything else still asks for approval.',
+  },
+  {
+    id: 'dontAsk',
+    label: "Don't ask",
+    blurb: 'Anything that would need approval is denied instead. Only explicitly allowed actions proceed.',
+  },
+  {
     id: 'bypass',
     label: 'Bypass (dangerous)',
     blurb: 'All approvals are auto-granted. Use only for fully trusted automation.',

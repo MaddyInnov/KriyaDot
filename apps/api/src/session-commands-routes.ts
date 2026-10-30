@@ -44,7 +44,7 @@
 
 import express, { type Router } from 'express';
 import type { IdentifiedMessage } from '@mvp/agent-runtime';
-import { buildContextReport, parseScheduleCommand, selectCopySegment, type CopySegment } from './session-craft.js';
+import { buildContextReport, parseScheduleCommand, parseStyleCommand, selectCopySegment, type CopySegment, type OutputStyle } from './session-craft.js';
 
 export interface SessionUsageView {
   promptTokens?: number;
@@ -101,6 +101,18 @@ export interface SessionCommandDeps {
     /** All skill names the host can activate (for validation). */
     known: () => string[];
   };
+  /**
+   * Output styles (CA-17): per-user named styles, switchable per
+   * session via /style. Backed by OutputStyleStore in production.
+   */
+  sessionStyle?: {
+    list: (userId: string) => OutputStyle[];
+    get: (userId: string, name: string) => OutputStyle | undefined;
+    getSession: (sessionId: string) => OutputStyle | undefined;
+    setSession: (sessionId: string, userId: string, styleName: string | null) => void;
+    /** Resolve the user id for a session (styles are per-user). */
+    userIdForSession?: (sessionId: string) => string;
+  };
 }
 
 export interface SessionCommandResult {
@@ -110,7 +122,7 @@ export interface SessionCommandResult {
   data?: unknown;
 }
 
-const KNOWN = ['share', 'analyze', 'copy', 'done', 'info', 'report', 'usage', 'status', 'learning', 'compact', 'new', 'schedule', 'context', 'role', 'skill'];
+const KNOWN = ['share', 'analyze', 'copy', 'done', 'info', 'report', 'usage', 'status', 'learning', 'compact', 'new', 'schedule', 'context', 'role', 'skill', 'style'];
 
 export class SessionCommandService {
   constructor(private readonly deps: SessionCommandDeps) {}
@@ -242,6 +254,31 @@ export class SessionCommandService {
         }
         d.sessionSkills.pin(sessionId, sub);
         return done(name, `Skill pinned to this session: ${sub}`, { skills: d.sessionSkills.list(sessionId) });
+      }
+      case 'style': {
+        if (!d.sessionStyle) return done(name, '/style is not wired on this host.');
+        const cmd = parseStyleCommand(trimmed);
+        if (!cmd) return done(name, 'Usage: /style [list|<name>|clear]');
+        const userId = d.sessionStyle.userIdForSession?.(sessionId) ?? 'default';
+        if (cmd.action === 'list') {
+          const styles = d.sessionStyle.list(userId);
+          return done(name, `Output styles: ${styles.map((s) => s.name).join(', ')}`, { styles });
+        }
+        if (cmd.action === 'show') {
+          const current = d.sessionStyle.getSession(sessionId);
+          return done(name, current ? `Output style: ${current.name} — ${current.description}` : 'No output style set for this session. Usage: /style <name> | /style list', { style: current ?? null });
+        }
+        if (cmd.action === 'clear') {
+          d.sessionStyle.setSession(sessionId, userId, null);
+          return done(name, 'Output style cleared for this session.', { style: null });
+        }
+        const style = d.sessionStyle.get(userId, cmd.name!);
+        if (!style) {
+          const known = d.sessionStyle.list(userId).map((s) => s.name);
+          return done(name, `Unknown style "${cmd.name}". Available: ${known.join(', ')}`, { styles: known });
+        }
+        d.sessionStyle.setSession(sessionId, userId, style.name);
+        return done(name, `Output style set: ${style.name} — ${style.description}`, { style });
       }
       case 'schedule': {
         const cmd = parseScheduleCommand(trimmed);

@@ -96,6 +96,25 @@ export type ChatEvent =
   | { type: 'queued_turn_start'; queueId: string; message: string }
   | { type: 'unknown'; raw: unknown };
 
+/** CA-4 checkpoint wire shape (mirrors apps/api Checkpoint). */
+export interface CheckpointInfo {
+  id: string;
+  sessionId: string;
+  createdAt: number;
+  files: Record<string, string | null>;
+  historyLength: number;
+  label: string;
+}
+
+/** CA-30 session-diff wire shape (checkpoints-routes GET /sessions/:id/diff). */
+export interface SessionDiffResult {
+  ok: boolean;
+  sessionId: string;
+  checkpointCount: number;
+  files: Array<{ path: string; status: string; added: number; removed: number; touches: number }>;
+  totals: { added: number; removed: number };
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -252,6 +271,26 @@ export class KriyaDotApi {
   async getBotMemory(botId: string): Promise<string> {
     const r = await this.request<{ content?: string }>(`/bots/${encodeURIComponent(botId)}/memory`);
     return r.content ?? '';
+  }
+
+  // -- Checkpoints (CA-4) + session diff (CA-30) --------------------------
+  async listCheckpoints(sessionId: string): Promise<CheckpointInfo[]> {
+    const r = await this.request<{ ok: boolean; checkpoints: CheckpointInfo[] }>(
+      `/sessions/${encodeURIComponent(sessionId)}/checkpoints`,
+    );
+    return r.checkpoints;
+  }
+
+  async restoreCheckpoint(id: string, mode: 'code' | 'conversation' | 'both'): Promise<{ ok: boolean; restoredFiles: string[]; messagesRemoved: number }> {
+    return this.request(`/checkpoints/${encodeURIComponent(id)}/restore`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    });
+  }
+
+  async sessionDiff(sessionId: string): Promise<SessionDiffResult> {
+    return this.request<SessionDiffResult>(`/sessions/${encodeURIComponent(sessionId)}/diff`);
   }
 
   async decideApproval(approvalId: string, decision: 'approved' | 'denied'): Promise<void> {

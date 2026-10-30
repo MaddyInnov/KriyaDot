@@ -18,6 +18,8 @@ export interface BackgroundRunHost {
     ephemeral?: { name: string; systemPrompt: string; model?: string; providerId?: string };
     tools?: string[];
     profileId?: string;
+    /** CA-5: run the specialist in an auto-created git worktree. */
+    isolation?: 'worktree' | 'none';
   }): { runId: string; botName: string } | { error: string };
   listBackgroundRuns(originSessionId: string): BackgroundRunRecord[];
   stopBackgroundRun(runId: string): boolean;
@@ -43,6 +45,7 @@ export function createBackgroundTools(host: BackgroundRunHost & { getBot?: (botI
           ephemeralPrompt: { type: 'string', description: 'System prompt for the ephemeral specialist.' },
           ephemeralModel: { type: 'string', description: 'Model override for the ephemeral specialist.' },
           profileId: { type: 'string', description: 'Sub-agent profile id (see the specialist profile library) — spawns an ephemeral specialist with that profile prompt and suggested tools.' },
+          isolation: { type: 'string', enum: ['worktree', 'none'], description: 'CA-5: "worktree" runs the specialist in an auto-created git worktree of the origin workspace (also settable on the agent definition itself).' },
           tools: {
             type: 'array',
             items: { type: 'string' },
@@ -72,6 +75,7 @@ export function createBackgroundTools(host: BackgroundRunHost & { getBot?: (botI
           specialistBotId: typeof args.specialistBotId === 'string' ? args.specialistBotId : undefined,
           ephemeral,
           profileId: typeof args.profileId === 'string' ? args.profileId : undefined,
+          isolation: args.isolation === 'worktree' ? 'worktree' : undefined,
           tools: Array.isArray(args.tools) ? (args.tools as string[]) : undefined,
         });
         if ('error' in result) return { error: result.error };

@@ -12,6 +12,8 @@ import type { CredentialProposer } from './credential-proposals.js';
 export type { CredentialProposer };
 import type { ExecutionPolicyConfig } from './execution-policy.js';
 export type { ExecutionPolicyConfig };
+import type { HookConfigEntry } from './hooks.js';
+export type { HookConfigEntry };
 
 /**
  * A native media attachment on a user message (Octomind parity #38):
@@ -247,6 +249,14 @@ export interface ToolContext {
    */
   spaceWorkspaceOverride?: string;
   /**
+   * Additional workspace roots for this turn (CA-26 multi-root sessions):
+   * absolute directories the coding tools may also resolve paths against,
+   * each confined to itself, alongside the primary workspace. Hosts seed
+   * this from session state (e.g. directories added via --add-dir or the
+   * add_workspace_dir tool in an earlier turn).
+   */
+  additionalWorkspaceRoots?: string[];
+  /**
    * Provenance of the turn's triggering message (OpenMausBot parity P1
    * #13). Set by the runtime from RunTurnOptions.provenance. Lets tools —
    * e.g. the peer-approval gate — see the origin chain of the content that
@@ -286,6 +296,13 @@ export interface ToolContext {
    * ask_user_question's awaitAnswer) reject when it aborts.
    */
   signal?: AbortSignal;
+  /**
+   * Per-session sandbox-auto-allow opt-in (CA-3): when true for this
+   * turn/session, confined run_command / run_background calls may
+   * skip the approval prompt (see tools/sandbox-auto-allow.ts).
+   * Absent → the bot config decides; default OFF everywhere.
+   */
+  sandboxAutoAllow?: boolean;
   /**
    * Credential/profile proposal host (OpenMausBot parity: profile/
    * credential proposal cards). When set, the `request_credential` tool
@@ -346,6 +363,15 @@ export interface BotPolicyRule {
  */
 export interface BotPolicy {
   rules: BotPolicyRule[];
+  /**
+   * Opt-in sandbox-auto-allow (CA-3, tools/sandbox-auto-allow.ts):
+   * when true, run_command / run_background calls FULLY confined by
+   * the kernel/Docker/cloud sandbox skip the approval prompt. Hard
+   * denials and deny rules still apply; unconfined (host) execution
+   * never qualifies. Default/absent = OFF (prompts as today). The
+   * same flag exists at BotConfig level; either one enables it.
+   */
+  sandboxAutoAllow?: boolean;
   /**
    * Opt-in policy snapshot mode (#70): when true, the session's
    * effective policy is captured immutably at its first tool call and
@@ -538,6 +564,15 @@ export interface BotConfig {
   tools: string[];
   mcpServers: string[];
   policy?: BotPolicy;
+  /**
+   * Opt-in sandbox-auto-allow (CA-3): when true, this bot's
+   * run_command / run_background calls that are fully confined by
+   * the kernel/Docker/cloud sandbox skip the approval prompt (hard
+   * denials + deny rules still apply; host/unconfined runs never
+   * qualify). Default OFF — approvals behave exactly as before.
+   * Also settable as `policy.sandboxAutoAllow`.
+   */
+  sandboxAutoAllow?: boolean;
   /** Sandbox mode for this bot (default: 'workspace-write'). */
   sandboxMode?: SandboxMode;
   /** MBTI persona template (e.g. 'INTJ'); null/undefined = no persona. */
@@ -723,6 +758,14 @@ export interface BotConfig {
    * Absent → no attribution line.
    */
   commitAttribution?: string;
+  /**
+   * Hook definitions (CA-1): script / HTTP / prompt handlers registered
+   * on the shared HookBus by the host at setup (hooks.ts
+   * parseHookConfig / installConfigHooks). Same shape as the Octomind
+   * script-hook config, extended with http/prompt kinds and an async
+   * flag. Absent → no config hooks for this bot.
+   */
+  hooks?: HookConfigEntry[];
 }
 
 export interface LLMProvider {

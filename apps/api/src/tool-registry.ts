@@ -9,13 +9,17 @@
 import path from 'node:path';
 import {
   BotMemoryStore,
+  LspManager,
   MCPClient,
   McpOAuthClient,
   McpOAuthRequiredError,
   SkillLoader,
   UserSkillStore,
   createBuiltInTools,
+  createBuildRepairTools,
   createCodingTools,
+  createProcessTools,
+  createTaskTools,
   createGitTools,
   createMemoryTools,
   createSkillAuthoringTools,
@@ -96,13 +100,30 @@ export async function buildToolRegistry(opts: {
         dataDir: opts.dataDir,
       })
     : opts.workspaceDir;
-  for (const tool of createBuiltInTools({ workspaceDir: resolveWorkspace })) {
+  // CA-9: ONE LspManager shared by the coding tools and write_file so
+  // post-edit formatting + diagnostics come from the same server fleet.
+  const sharedLspManager = new LspManager();
+  for (const tool of createBuiltInTools({ workspaceDir: resolveWorkspace, lspManager: sharedLspManager })) {
     registry.set(tool.name, tool);
   }
   // Phase 2: coding tools (patch/edit/glob/grep/LSP), per-bot memory tools,
   // and read_skill (progressive skill disclosure). All are ordinary registry
   // tools, so deny-by-default governance applies to each of them.
-  for (const tool of createCodingTools({ workspaceDir: resolveWorkspace, embedder: opts.embedder })) {
+  for (const tool of createCodingTools({ workspaceDir: resolveWorkspace, embedder: opts.embedder, lspManager: sharedLspManager })) {
+    registry.set(tool.name, tool);
+  }
+  // Wave-3 closure (CA-13 / ADD-6 / CA-12): background shell processes with
+  // a streaming monitor, the native build-and-repair loop, and model-owned
+  // per-session task lists. Same workspace resolver and deny-by-default
+  // governance as the coding tools; the process registry is the shared
+  // default (the host disposes it on shutdown — see index.ts).
+  for (const tool of createProcessTools({ workspaceDir: resolveWorkspace })) {
+    registry.set(tool.name, tool);
+  }
+  for (const tool of createBuildRepairTools({ workspaceDir: resolveWorkspace })) {
+    registry.set(tool.name, tool);
+  }
+  for (const tool of createTaskTools()) {
     registry.set(tool.name, tool);
   }
   // PR integration: git tools (status/diff auto-allowed; commit/branch/push

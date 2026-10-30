@@ -2,7 +2,7 @@
 
 import { lookup as dnsLookup, type LookupAddress } from 'node:dns';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, resolve, sep } from 'node:path';
+import { dirname, relative, resolve, sep } from 'node:path';
 import type { ToolContext, ToolDefinition } from '../types.js';
 import type { ButtonsWidgetPayload, WidgetAnswer, WidgetHost } from '../widgets.js';
 import { validateWidgetPayload } from '../widgets.js';
@@ -10,6 +10,8 @@ import { executeInPersistentSandbox, executeSandboxedCommand, sandboxBackend } f
 import { formatHashedLines } from './line-hash.js';
 import { semanticMisuseHint } from '../tool-hints.js';
 import { resolveWorkspaceDir, type WorkspaceSource } from '../workspaces.js';
+import type { LspManager } from '../lsp/manager.js';
+import { runPostEditPipeline } from './coding.js';
 // Shared catastrophic-shell detection (M1): the governance hard floor's
 // rm flag-cluster expansion, reused here so the tool-level denylist and the
 // CLI kill-switch catch `rm -rfv /etc`, `rm -rf --one-file-system /`, etc.
@@ -93,7 +95,7 @@ function readFileTool(workspaceDir: WorkspaceSource): ToolDefinition {
   };
 }
 
-function writeFileTool(workspaceDir: WorkspaceSource): ToolDefinition {
+function writeFileTool(workspaceDir: WorkspaceSource, lspManager?: LspManager): ToolDefinition {
   return {
     name: 'write_file',
     mutating: true,
@@ -108,10 +110,26 @@ function writeFileTool(workspaceDir: WorkspaceSource): ToolDefinition {
       additionalProperties: false,
     },
     handler: async (args, ctx) => {
-      const file = confine(resolveWorkspaceDir(workspaceDir, ctx), String(args.path));
+      const root = resolveWorkspaceDir(workspaceDir, ctx);
+      const file = confine(root, String(args.path));
       mkdirSync(dirname(file), { recursive: true });
       writeFileSync(file, String(args.content), 'utf8');
-      return { written: file, bytes: Buffer.byteLength(String(args.content), 'utf8') };
+      const result: Record<string, unknown> = {
+        written: file,
+        bytes: Buffer.byteLength(String(args.content), 'utf8'),
+      };
+      // CA-9: same post-edit pipeline as the coding tools (format +
+      // diagnostics) when the host shares an LspManager with this factory.
+      if (lspManager) {
+        const enrich = await runPostEditPipeline({
+          root,
+          absPath: file,
+          relPath: relative(root, file),
+          lsp: lspManager,
+        });
+        Object.assign(result, enrich);
+      }
+      return result;
     },
   };
 }
@@ -510,12 +528,12 @@ function webFetchTool(): ToolDefinition {
 
 /** Built-in tools available to every bot: file I/O, shell, web, and interactive questions. */
 export function createBuiltInTools(
-  opts: { workspaceDir: WorkspaceSource } & WebSearchOptions,
+  opts: { workspaceDir: WorkspaceSource; lspManager?: LspManager } & WebSearchOptions,
 ): ToolDefinition[] {
   const { workspaceDir } = opts;
   return [
     readFileTool(workspaceDir),
-    writeFileTool(workspaceDir),
+    writeFileTool(workspaceDir, opts.lspManager),
     runCommandTool(workspaceDir),
     webSearchTool(opts),
     webFetchTool(),

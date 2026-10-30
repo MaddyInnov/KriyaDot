@@ -4,6 +4,8 @@ import type { AuditEntry } from './governance.js';
 import type { TokenUsage } from './types.js';
 import type { ProvenanceNote } from './provenance.js';
 import { SubagentStore } from './subagent-store.js';
+import type { HookBus } from './hooks.js';
+import type { AgentEphemeral } from './agent-definitions.js';
 
 /**
  * Host-injected implementation of an actual subagent run. The host (top-level
@@ -38,7 +40,11 @@ export interface SubagentSpawnInput {
    */
   provenance?: ProvenanceNote;
   /** Specialist profile (item 16): host spawns an ephemeral specialist with this prompt/tools. */
-  profile?: { id: string; name: string; systemPrompt: string; tools: string[] };
+  profile?: { id: string; name: string; systemPrompt: string; tools: string[] } & Partial<AgentEphemeral>;
+  /** CA-5: isolation requested for this spawn ('worktree' = auto-created git worktree). */
+  isolation?: 'worktree' | 'none';
+  /** CA-5: the auto-created worktree path, when isolation was applied by the caller. */
+  worktreePath?: string;
 }
 
 export interface SubagentSpawnResult {
@@ -79,7 +85,13 @@ export interface SpawnSubagentOptions {
   botId?: string;
   /** Provenance forwarded to the child's spawn input (P1 #13). */
   provenance?: ProvenanceNote;
-  profile?: { id: string; name: string; systemPrompt: string; tools: string[] };
+  profile?: { id: string; name: string; systemPrompt: string; tools: string[] } & Partial<AgentEphemeral>;
+  /** CA-1: hook bus for subagent.start / subagent.stop lifecycle events. */
+  hooks?: HookBus;
+  /** CA-5: isolation requested for this spawn. */
+  isolation?: 'worktree' | 'none';
+  /** CA-5: auto-created worktree path attached to this spawn. */
+  worktreePath?: string;
 }
 
 /**
@@ -105,6 +117,24 @@ export async function spawnSubagent(
         'a subagent this deep cannot delegate further. ' +
         'Complete the work in this agent instead of spawning another.',
     );
+  }
+
+  // CA-1: subagent.start is a GATE event — a blocking hook verdict
+  // prevents the spawn entirely (hooks can only tighten, never loosen).
+  if (opts.hooks) {
+    const start = await opts.hooks
+      .emit('subagent.start', {
+        sessionId: parentSessionId,
+        botId: parentBotId,
+        task: task.slice(0, 500),
+        via: 'delegate' as const,
+        ...(opts.profile?.id ? { profileId: opts.profile.id } : {}),
+        ...(opts.botId ? { childBotId: opts.botId } : {}),
+      })
+      .catch(() => undefined);
+    if (start?.cancelled) {
+      throw new Error(`Subagent spawn blocked by a hook: ${start.reason ?? 'subagent.start hook cancelled the spawn'}`);
+    }
   }
 
   const record = store.spawnChild({
@@ -141,6 +171,8 @@ export async function spawnSubagent(
       sessionId: record.sessionId,
       provenance: opts.provenance,
       profile: opts.profile,
+      isolation: opts.isolation,
+      worktreePath: opts.worktreePath,
     });
     // If the host minted its own child session, prefer it for the record so
     // depth walks follow the real session chain.
@@ -155,6 +187,18 @@ export async function spawnSubagent(
       botId: parentBotId,
       detail: { subagentId: record.id, status: 'done', usage: result.usage ?? null },
     });
+    if (opts.hooks) {
+      await opts.hooks
+        .emit('subagent.stop', {
+          sessionId: parentSessionId,
+          botId: parentBotId,
+          task: task.slice(0, 500),
+          status: 'done' as const,
+          via: 'delegate' as const,
+          ...(opts.profile?.id ? { profileId: opts.profile.id } : {}),
+        })
+        .catch(() => undefined);
+    }
     return { ...result, subagentId: record.id };
   } catch (err) {
     store.finish(record.id, 'failed');
@@ -168,6 +212,19 @@ export async function spawnSubagent(
         error: err instanceof Error ? err.message : String(err),
       },
     });
+    if (opts.hooks) {
+      await opts.hooks
+        .emit('subagent.stop', {
+          sessionId: parentSessionId,
+          botId: parentBotId,
+          task: task.slice(0, 500),
+          status: 'failed' as const,
+          via: 'delegate' as const,
+          error: err instanceof Error ? err.message : String(err),
+          ...(opts.profile?.id ? { profileId: opts.profile.id } : {}),
+        })
+        .catch(() => undefined);
+    }
     throw err;
   }
 }

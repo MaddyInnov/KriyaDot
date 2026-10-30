@@ -9,7 +9,9 @@ import { helpText } from '../commands.js';
 import type { ThemeName, TuiPalette } from '../themes.js';
 import { getPalette } from '../themes.js';
 import type { TuiConfig } from '../config.js';
-import { saveConfig } from '../config.js';
+import { configDir, saveConfig } from '../config.js';
+import { renderStatusLine, detectGitBranch } from '../status-line.js';
+import { loadKeybindings, actionForEvent } from '../keybindings.js';
 import { ChatView, nextMessageId, type ChatCommand, type ChatMessage } from './ChatView.js';
 import { BotsView } from './BotsView.js';
 import { WorkflowsView } from './WorkflowsView.js';
@@ -49,6 +51,9 @@ export function App({ api, config }: Props): React.ReactElement {
   const [transcripts, setTranscripts] = useState<Record<string, ChatMessage[]>>({});
   /** Shared background-job registry (#187): ChatView registers turns, JobsView manages them. */
   const [jobManager] = useState(() => new JobManager());
+  /** CA-19 keybindings + CA-18 git branch, resolved once at startup. */
+  const [keybindingState] = useState(() => loadKeybindings(configDir()));
+  const [gitBranch] = useState(() => detectGitBranch(process.cwd()));
 
   useEffect(() => {
     let alive = true;
@@ -172,10 +177,11 @@ export function App({ api, config }: Props): React.ReactElement {
     [bot, exit, postSystem, switchModel],
   );
 
-  // Global keys: Ctrl+C quits everywhere; Esc returns to chat from sub-views.
+  // Global keys: Ctrl+C quits everywhere; the switchView chord (CA-19,
+  // default Esc) returns to chat from sub-views.
   useInput((input, key) => {
     if (key.ctrl && (input === 'c' || input === 'C')) exit();
-    else if (key.escape && view !== 'chat' && bot) setView('chat');
+    else if (actionForEvent(keybindingState.bindings, input, key) === 'switchView' && view !== 'chat' && bot) setView('chat');
   });
 
   if (connectionError) {
@@ -193,9 +199,22 @@ export function App({ api, config }: Props): React.ReactElement {
       <Box borderStyle="single" borderColor={palette.border} paddingX={1}>
         <Text color={palette.accent} bold>◆ KriyaDot</Text>
         <Text color={palette.dim}>  {VIEW_TITLES[view]}</Text>
-        {bot ? <Text color={palette.dim}>  · {bot.name}</Text> : null}
         <Box flexGrow={1} />
         <Text color={palette.dim}>{themeName} · Ctrl+C quit</Text>
+      </Box>
+      {/* CA-18: configurable status line (tui.json `statusLine`). */}
+      <Box paddingX={1}>
+        <Text color={palette.dim}>
+          {renderStatusLine(config.statusLine, {
+            bot: bot?.name,
+            model: bot?.model,
+            gitBranch,
+            session: sessionId,
+          })}
+        </Text>
+        {keybindingState.warnings.length > 0 ? (
+          <Text color={palette.amber}>  ⚠ {keybindingState.warnings[0]}</Text>
+        ) : null}
       </Box>
 
       {view === 'bots' && <BotsView bots={bots} palette={palette} onSelect={selectBot} onBack={() => bot && setView('chat')} />}
@@ -211,6 +230,8 @@ export function App({ api, config }: Props): React.ReactElement {
           onCommand={handleChatCommand}
           onTheme={applyTheme}
           jobs={jobManager}
+          notifyMode={config.notify}
+          keybindings={keybindingState.bindings}
         />
       )}
       {view === 'jobs' && <JobsView jobs={jobManager} palette={palette} />}

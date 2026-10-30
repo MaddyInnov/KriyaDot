@@ -51,6 +51,8 @@ export interface ChatThreadsDeps {
     messageCount: number;
     lastMessageTs: string | null;
     ownerPersonId?: string;
+    /** CA-37: incognito sessions are badged in the thread list. */
+    incognito?: boolean;
   }> | Promise<
     Array<{
       id: string;
@@ -59,6 +61,7 @@ export interface ChatThreadsDeps {
       messageCount: number;
       lastMessageTs: string | null;
       ownerPersonId?: string;
+      incognito?: boolean;
     }>
   >;
   /**
@@ -86,6 +89,17 @@ export interface ChatThreadsDeps {
    * production.
    */
   deleteThread: (sessionId: string) => boolean | Promise<boolean>;
+  /**
+   * CA-37 (optional): create an incognito session for a bot
+   * (SessionStore.createSession(botId, { incognito: true }) in
+   * production). Powers POST /incognito.
+   */
+  createIncognitoThread?: (botId: string) => string | Promise<string>;
+  /**
+   * CA-37 (optional): close an incognito session, dropping its
+   * in-memory log and its row (SessionStore.closeIncognitoSession).
+   */
+  closeIncognitoThread?: (sessionId: string) => boolean | Promise<boolean>;
   audit: (action: string, fields: { actor?: string; sessionId?: string; detail?: unknown }) => void;
   /**
    * Called after a thread is deleted (session + titles + flags removed).
@@ -324,6 +338,8 @@ export function createChatThreadsRouter(deps: ChatThreadsDeps): Router {
           createdAt: s.createdAt,
           messageCount: s.messageCount,
           lastMessageTs: s.lastMessageTs,
+          // CA-37: badge incognito threads (UI shows an "Incognito" chip).
+          incognito: s.incognito === true,
           ...(s.ownerPersonId ? { ownerPersonId: s.ownerPersonId } : {}),
         }))
         .filter((t) => includeHidden || !t.flags.hidden)
@@ -332,6 +348,42 @@ export function createChatThreadsRouter(deps: ChatThreadsDeps): Router {
     } catch (err) {
       res.status(500).json(errorBody('Failed to list threads', err instanceof Error ? err.message : String(err)));
     }
+  });
+
+  /**
+   * CA-37: start an incognito thread. POST /incognito { botId } →
+   * 201 { thread: { id, botId, incognito: true } }. The session's
+   * messages are never persisted and never write memory.
+   */
+  router.post('/incognito', async (req, res) => {
+    if (!deps.createIncognitoThread) {
+      res.status(501).json(errorBody('Incognito threads are not wired on this host'));
+      return;
+    }
+    const botId = typeof (req.body as { botId?: unknown })?.botId === 'string' ? ((req.body as { botId: string }).botId.trim()) : '';
+    if (!botId) {
+      res.status(400).json(errorBody('botId is required'));
+      return;
+    }
+    const id = await deps.createIncognitoThread(botId);
+    deps.audit('chat.thread_incognito_create', { actor: 'api', sessionId: id, detail: { botId } });
+    res.status(201).json({ ok: true, thread: { id, botId, incognito: true } });
+  });
+
+  /** CA-37: close an incognito thread (drops its in-memory log + row). */
+  router.post('/:threadId/close-incognito', async (req, res) => {
+    if (!deps.closeIncognitoThread) {
+      res.status(501).json(errorBody('Incognito threads are not wired on this host'));
+      return;
+    }
+    const closed = await deps.closeIncognitoThread(req.params.threadId);
+    if (!closed) {
+      res.status(404).json(errorBody(`Unknown or non-incognito thread "${req.params.threadId}"`));
+      return;
+    }
+    titles.deleteThread(req.params.threadId);
+    deps.audit('chat.thread_incognito_close', { actor: 'api', sessionId: req.params.threadId });
+    res.json({ ok: true, closed: req.params.threadId });
   });
 
   /**
