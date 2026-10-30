@@ -31,6 +31,76 @@ export async function warmCache(provider: LLMProvider, input: { model: string; s
   await provider.chat([{ role:'system', content: input.systemPrompt }, { role:'user', content:'ping' }], [], { model: input.model, maxTokens: 1 });
   return { warmed: true, request };
 }
+/**
+ * Structural per-bot shape for the factory below (Octomind parity #137).
+ * Deliberately NOT the BotConfig type from types.ts: the factory only
+ * needs these fields, and any object with this shape (a BotConfig
+ * included) is accepted. The per-bot opt-in field is:
+ *
+ *   cacheWarm?: boolean | { intervalMs?: number }
+ *
+ * - absent / false → no warmer for this bot.
+ * - true           → warmer with the default interval (5 minutes).
+ * - { intervalMs } → warmer with that interval (clamped to >= 60s).
+ */
+export interface CacheWarmBotConfigLike {
+  provider: string;
+  model: string;
+  systemPrompt: string;
+  cacheWarm?: boolean | { intervalMs?: number };
+}
+
+export const DEFAULT_CACHE_WARM_INTERVAL_MS = 5 * 60_000;
+
+/** Normalize a bot's `cacheWarm` field into settings, or null when off. */
+export function cacheWarmSettingsForBot(
+  botConfig: CacheWarmBotConfigLike,
+): CacheWarmSettings | null {
+  const cfg = botConfig.cacheWarm;
+  if (cfg === undefined || cfg === false) return null;
+  if (!isCacheCapable(botConfig.provider)) return null;
+  const intervalMs =
+    cfg === true || typeof cfg.intervalMs !== 'number' || !Number.isFinite(cfg.intervalMs)
+      ? DEFAULT_CACHE_WARM_INTERVAL_MS
+      : Math.max(60_000, cfg.intervalMs);
+  return { enabled: true, intervalMinutes: intervalMs / 60_000, providerId: botConfig.provider };
+}
+
+/**
+ * Factory (Octomind parity #137): build a ready-to-start CacheWarmer for
+ * one bot from its config, or return null when the bot has not opted in
+ * (`cacheWarm` absent/false) or its provider is not cache-capable.
+ *
+ * PARENT / API-HOST WIRING (this module does not instantiate anything on
+ * its own): in apps/api startup (or wherever bots are loaded), for each
+ * bot call
+ *   const warmer = createCacheWarmerForBot(bot, { provider: () => resolveProvider(bot) });
+ *   warmer?.start();
+ * and keep the returned instances to `stop()` on shutdown / bot reload.
+ * `deps.provider` may be a provider instance or a factory function; the
+ * factory form is preferred so a re-resolved provider is picked up.
+ */
+export function createCacheWarmerForBot(
+  botConfig: CacheWarmBotConfigLike,
+  deps: {
+    provider: LLMProvider | (() => LLMProvider);
+    onWarm?: (r: unknown) => void;
+  },
+): CacheWarmer | null {
+  const settings = cacheWarmSettingsForBot(botConfig);
+  if (!settings) return null;
+  const resolve = typeof deps.provider === 'function'
+    ? (deps.provider as () => LLMProvider)
+    : () => deps.provider as LLMProvider;
+  return new CacheWarmer({
+    provider: resolve,
+    settings: () => settings,
+    model: botConfig.model,
+    systemPrompt: botConfig.systemPrompt,
+    ...(deps.onWarm ? { onWarm: deps.onWarm } : {}),
+  });
+}
+
 export class CacheWarmer {
   private timer: ReturnType<typeof setInterval> | null = null; lastWarmedAt: number | null = null;
   constructor(private readonly deps: { provider: () => LLMProvider; settings: () => CacheWarmSettings; model: string; systemPrompt: string; onWarm?: (r: unknown) => void }) {}

@@ -1,0 +1,16 @@
+--- a/cart.js
++++ b/cart.js
+@@ -11,12 +11,7 @@
+   for (const item of items) {
+     const line = item.price * item.qty;
+     if (item.discountPct) {
+-      // BUG: the discount is computed on a single unit and then the
+-      // discounted unit price is multiplied — wait, that part is fine.
+-      // The real bug: for qty > 1 the discount is applied only ONCE
+-      // (to one unit) instead of to the whole line.
+-      const discountedUnit = item.price - (item.price * item.discountPct) / 100;
+-      total += discountedUnit + item.price * (item.qty - 1);
++      total += line - (line * item.discountPct) / 100;
+     } else {
+       total += line;
+     }

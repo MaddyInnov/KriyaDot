@@ -8,6 +8,7 @@ import { FilesPanel } from '../../components/panels/files-panel';
 import PhonePanel from '../../components/panels/phone-panel';
 import DevicesPanel from '../../components/panels/devices-panel';
 import BackupPanel from '../../components/panels/backup-panel';
+import { CloudPanel } from '../../components/panels/cloud-panel';
 
 const TABS = [
   { id: 'notes', label: 'Notes' },
@@ -16,6 +17,7 @@ const TABS = [
   { id: 'phone', label: 'Phone', title: 'Control your phone' },
   { id: 'devices', label: 'Devices', title: 'Control KriyaDot from your phone' },
   { id: 'backup', label: 'Backup', title: 'Back up and restore your workspace' },
+  { id: 'cloud', label: 'Cloud', title: 'Run KriyaDot on a Lightning AI Studio' },
 ] as const;
 
 type TabId = (typeof TABS)[number]['id'];
@@ -51,6 +53,8 @@ export default function WorkspacePage() {
           <DevicesPanel />
         ) : tab === 'backup' ? (
           <BackupPanel />
+        ) : tab === 'cloud' ? (
+          <CloudPanel />
         ) : (
           <FilesPanel />
         )}

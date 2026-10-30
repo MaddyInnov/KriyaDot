@@ -122,6 +122,24 @@ import { executeSandboxedCommand, sandboxBackend } from '../src/tools/sandbox.js
 const REAL_KEY = process.env.E2B_API_KEY;
 const HANG = new Promise<{ exitCode: number; stdout: string; stderr: string }>(() => {});
 
+// #117: the kernel sandbox is in the DEFAULT resolution chain now, so
+// tests that assert container-only selection / legacy fail-closed must
+// pin the sandbox env knobs explicitly (documented opt-outs) instead
+// of relying on the kernel being absent.
+const SANDBOX_ENV_KEYS = [
+  'SANDBOX_BACKEND',
+  'SANDBOX_KERNEL_FALLBACK',
+  'SANDBOX_DISABLE_KERNEL',
+  'SANDBOX_ALLOW_HOST',
+  'SANDBOX_HOST_FALLBACK',
+  'SANDBOX_STRICT',
+] as const;
+const REAL_SANDBOX_ENV = Object.fromEntries(SANDBOX_ENV_KEYS.map((k) => [k, process.env[k]]));
+
+function clearSandboxEnv(): void {
+  for (const k of SANDBOX_ENV_KEYS) delete process.env[k];
+}
+
 function setEnv(key: string | undefined): void {
   if (key === undefined) delete process.env.E2B_API_KEY;
   else process.env.E2B_API_KEY = key;
@@ -129,6 +147,7 @@ function setEnv(key: string | undefined): void {
 
 beforeEach(() => {
   setEnv(undefined);
+  clearSandboxEnv();
   e2bState.createCalls = [];
   e2bState.createError = null;
   e2bState.runCalls = [];
@@ -144,6 +163,11 @@ beforeEach(() => {
 afterEach(() => {
   if (REAL_KEY === undefined) delete process.env.E2B_API_KEY;
   else process.env.E2B_API_KEY = REAL_KEY;
+  clearSandboxEnv();
+  for (const k of SANDBOX_ENV_KEYS) {
+    const v = REAL_SANDBOX_ENV[k];
+    if (v !== undefined) process.env[k] = v;
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -168,10 +192,32 @@ describe('sandboxBackend()', () => {
   });
 
   it('fails closed to none when there is no key and docker is missing', () => {
+    // #117 adjustment: the kernel is in the default chain now, so this
+    // legacy assertion pins the documented kernel opt-out
+    // (SANDBOX_DISABLE_KERNEL=1) to isolate the container-only path.
+    process.env.SANDBOX_DISABLE_KERNEL = '1';
     dockerState.spawnSyncImpl = () => {
       throw Object.assign(new Error('spawnSync docker ENOENT'), { code: 'ENOENT' });
     };
     expect(sandboxBackend()).toBe('none');
+  });
+
+  it('selects the kernel backend by default when no container is available (#117)', () => {
+    // Docker probe fails; on this Linux VM the Landlock helper binary
+    // exists once compiled (sandbox-kernel tests compile it), so the
+    // default chain resolves container → kernel. Where the helper has
+    // never been compiled the sync probe reports 'none' and the async
+    // first-use path in executeSandboxedCommand compiles it instead.
+    dockerState.spawnSyncImpl = () => ({ status: 1 });
+    const backend = sandboxBackend();
+    expect(['landlock', 'none']).toContain(backend);
+  });
+
+  it('selects host only on the explicit opt-out (#117)', () => {
+    process.env.SANDBOX_DISABLE_KERNEL = '1';
+    process.env.SANDBOX_ALLOW_HOST = '1';
+    dockerState.spawnSyncImpl = () => ({ status: 1 });
+    expect(sandboxBackend()).toBe('host');
   });
 });
 
@@ -399,8 +445,38 @@ describe('docker backend', () => {
 // Fail closed with neither backend
 // ---------------------------------------------------------------------------
 describe('fail-closed', () => {
-  it('throws a descriptive error when neither E2B nor docker is available', async () => {
+  it('throws a descriptive error in strict mode when no backend is available', async () => {
+    // #117 adjustment: the DEFAULT no-backend behaviour is now a host
+    // fallback with a loud warning (existing deployments must not
+    // break); failing closed is the STRICT mode contract, so this
+    // test opts into it explicitly (kernel pinned off via the
+    // documented opt-out so no backend can be found).
+    process.env.SANDBOX_STRICT = '1';
+    process.env.SANDBOX_DISABLE_KERNEL = '1';
     dockerState.spawnSyncImpl = () => ({ status: 1 }); // docker probe fails
     await expect(executeSandboxedCommand('echo hi')).rejects.toThrow(/No sandbox backend available/);
+  });
+
+  it('falls back to host WITH warning metadata when the kernel is unavailable (non-strict)', async () => {
+    // Kernel pinned off + docker missing + no E2B: the availability
+    // fallback runs on the host and stamps sandboxed:false + warning.
+    // The mocked spawn never emits close for a plain sh child, so use
+    // a child that finishes immediately.
+    process.env.SANDBOX_DISABLE_KERNEL = '1';
+    dockerState.spawnSyncImpl = () => ({ status: 1 });
+    dockerState.spawnImpl = () => {
+      const child = new FakeChild();
+      queueMicrotask(() => {
+        child.stdout.emit('data', Buffer.from('host-ok\n'));
+        child.emit('close', 0, null);
+      });
+      return child;
+    };
+    const res = await executeSandboxedCommand('echo host-ok');
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toBe('host-ok\n');
+    expect(res.sandboxed).toBe(false);
+    expect(res.backend).toBe('host');
+    expect(res.warning).toMatch(/UNSANDBOXED/);
   });
 });

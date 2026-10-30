@@ -24,7 +24,14 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { openDb } from './sqlite.js';
-import type { AtomCard, TieredMemoryStore } from './memory.js';
+import type { AtomCard, MemoryScope, OrientationEntry, TieredMemoryStore } from './memory.js';
+import { estimateAtomTokens, isUserRuleFact } from './memory.js';
+import {
+  proposeCandidate,
+  verifyCandidate,
+  type CandidateVerifier,
+  type EvolutionCandidate,
+} from './routing-learn.js';
 
 // ---------------------------------------------------------------------------
 // Fact extraction (zero-cost heuristic — same honesty contract as the
@@ -124,7 +131,16 @@ export function writeAboutMe(dataDir: string, text: string): AboutMeProfile {
 // Undoable journal
 // ---------------------------------------------------------------------------
 
-export type JournalAction = 'add' | 'deactivate' | 'reactivate' | 'pin' | 'unpin';
+export type JournalAction =
+  | 'add'
+  | 'deactivate'
+  | 'reactivate'
+  | 'pin'
+  | 'unpin'
+  /** Atom moved to the cold archive (#80/#81); undo promotes it back. */
+  | 'archive'
+  /** Cold atom promoted back to hot (#81); undo re-archives it. */
+  | 'promote';
 
 /** One journaled memory mutation. `before` is null for adds. */
 export interface JournalEntry {
@@ -243,6 +259,14 @@ export class MemoryJournal {
       deactivateAtomDirect(store, botId, entry.atomId);
     } else if (entry.action === 'deactivate') {
       reactivateAtomDirect(store, botId, entry.atomId);
+    } else if (entry.action === 'archive') {
+      // Inverse of archive: promote the atom back out of the cold tier.
+      if (typeof store.promoteFromCold === 'function') store.promoteFromCold(botId, entry.atomId);
+      else reactivateAtomDirect(store, botId, entry.atomId);
+    } else if (entry.action === 'promote') {
+      // Inverse of promote: send the atom back to the cold archive.
+      if (typeof store.archiveAtom === 'function') store.archiveAtom(botId, entry.atomId);
+      else deactivateAtomDirect(store, botId, entry.atomId);
     } else if (before && typeof before.fact === 'string') {
       // For pin/unpin the before-snapshot restore is a no-op detail; the
       // meaningful undoable actions are add/deactivate.
@@ -270,6 +294,21 @@ function reactivateAtomDirect(store: TieredMemoryStore, botId: string, atomId: s
   store.setAtomActive(botId, atomId, true);
 }
 
+/**
+ * Archive-after-replace (#80): when the store supports the cold tier,
+ * a replaced atom is ARCHIVED (retrievable via searchCold, promotable on
+ * material use) instead of merely deactivated in place. Structural
+ * stores without archiveAtom fall back to plain deactivation.
+ * Returns the journal action that describes what happened.
+ */
+function archiveAtomDirect(store: TieredMemoryStore, botId: string, atomId: string): JournalAction {
+  if (typeof store.archiveAtom === 'function' && store.archiveAtom(botId, atomId)) {
+    return 'archive';
+  }
+  deactivateAtomDirect(store, botId, atomId);
+  return 'deactivate';
+}
+
 // ---------------------------------------------------------------------------
 // Nightly tidy: dedupe + contradiction check (deterministic, zero-LLM)
 // ---------------------------------------------------------------------------
@@ -283,6 +322,12 @@ export interface TidyResult {
   nearDuplicatesFound: number;
   /** Near-duplicate merges the verifier rejected (atoms kept). */
   mergesVetoed: number;
+  /**
+   * Replaced atoms moved to the cold archive (#80 archive-after-replace)
+   * rather than deactivated in place. Subset of duplicatesDeactivated;
+   * 0 for structural stores without cold-tier support.
+   */
+  archived: number;
   at: number;
 }
 
@@ -333,6 +378,7 @@ export function tidyMemory(
   let duplicatesDeactivated = 0;
   let nearDuplicatesFound = 0;
   let mergesVetoed = 0;
+  let archived = 0;
   // Dedupe: group by normalized fact text; keep the earliest, deactivate rest.
   const normOf = (s: string): string =>
     s.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -349,14 +395,16 @@ export function tidyMemory(
     const sorted = [...g].sort((x, y) => x.createdAt - y.createdAt);
     const [, ...dupes] = sorted;
     for (const d of dupes) {
+      // Archive-after-replace (#80): replaced atoms go to the cold tier.
+      const action = archiveAtomDirect(store, botId, d.id);
+      if (action === 'archive') archived += 1;
       journal.record({
         botId,
-        action: 'deactivate',
+        action,
         atomId: d.id,
         before: d,
         note: `tidy: duplicate of "${sorted[0].fact.slice(0, 60)}"`,
       });
-      deactivateAtomDirect(store, botId, d.id);
       duplicatesDeactivated += 1;
     }
   }
@@ -386,14 +434,16 @@ export function tidyMemory(
         mergesVetoed += 1;
         continue;
       }
+      // Archive-after-replace (#80): the merged-away atom goes cold.
+      const action = archiveAtomDirect(store, botId, duplicate.id);
+      if (action === 'archive') archived += 1;
       journal.record({
         botId,
-        action: 'deactivate',
+        action,
         atomId: duplicate.id,
         before: duplicate,
         note: `tidy: verified near-duplicate of "${keep.fact.slice(0, 60)}" (similarity ${similarity.toFixed(2)})`,
       });
-      deactivateAtomDirect(store, botId, duplicate.id);
       deactivatedThisRun.add(duplicate.id);
       duplicatesDeactivated += 1;
     }
@@ -427,6 +477,7 @@ export function tidyMemory(
     contradictionsOpened,
     nearDuplicatesFound,
     mergesVetoed,
+    archived,
     at: Date.now(),
   };
 }
@@ -441,7 +492,7 @@ export function capturePass(
   store: TieredMemoryStore,
   journal: MemoryJournal,
   botId: string,
-  opts: { sinceTs?: number; maxEvents?: number } = {},
+  opts: { sinceTs?: number; maxEvents?: number; scope?: MemoryScope } = {},
 ): { botId: string; eventsScanned: number; atomsStored: number } {
   const events = store.listRecentEvents(botId, opts.maxEvents ?? 200);
   let atomsStored = 0;
@@ -449,6 +500,36 @@ export function capturePass(
     if (opts.sinceTs && ev.ts < opts.sinceTs) continue;
     if (ev.role !== 'user') continue;
     const facts = extractFactsFromText(ev.text);
+    if (facts.length === 0) continue;
+    // Grounded storage (#75): capture goes through the same fail-closed
+    // path as live distillation — rules/preferences need a verbatim
+    // quote in the user's event text, procedures need the session
+    // citation this event provides. Scope (#74) is stamped when given.
+    if (typeof store.storeDistilledFacts === 'function') {
+      const res = store.storeDistilledFacts(
+        botId,
+        facts.map((f) => ({
+          fact: f.fact,
+          entities: f.entities,
+          confidence: f.confidence,
+          category: f.category,
+        })),
+        { sessionId: ev.sessionId, userText: ev.text, userEventId: ev.id, scope: opts.scope },
+      );
+      for (const id of res.atomIds) {
+        const atom = store.getAtom(botId, id);
+        journal.record({
+          botId,
+          action: 'add',
+          atomId: id,
+          after: atom ?? undefined,
+          note: `capture: background pass from turn ${ev.id.slice(0, 8)}`,
+        });
+        atomsStored += 1;
+      }
+      continue;
+    }
+    // Structural stores without the grounded path keep the legacy write.
     for (const f of facts) {
       try {
         const id = store.storeAtom(
@@ -473,4 +554,649 @@ export function capturePass(
     }
   }
   return { botId, eventsScanned: events.length, atomsStored };
+}
+
+// ---------------------------------------------------------------------------
+// Watermark budgets (#80): per-tier atom/token budgets with enforcement.
+//
+// Each tier (hot = active atoms, cold = archived catalog) has a HIGH
+// watermark (maxAtoms / maxTokens). When a tier exceeds its high
+// watermark it is drained down to its LOW watermark (default 80% of
+// high): hot drains by archiving the least valuable atoms (unpinned,
+// lowest material-use credit, oldest first) into the cold tier; cold
+// drains by permanently forgetting its oldest atoms. Before archiving,
+// near-duplicate pairs are offered to the mergeVerifier (when provided)
+// so paraphrase merges — verifier-gated, never automatic — shrink the
+// hot tier first. Every move is journaled.
+// ---------------------------------------------------------------------------
+
+export interface TierBudget {
+  /** High watermark: atom count. */
+  maxAtoms?: number;
+  /** High watermark: estimated tokens (see estimateAtomTokens). */
+  maxTokens?: number;
+  /** Low watermark targets; default 80% of the corresponding high mark. */
+  lowAtoms?: number;
+  lowTokens?: number;
+}
+
+export interface WatermarkBudgets {
+  hot?: TierBudget;
+  cold?: TierBudget;
+}
+
+export interface WatermarkResult {
+  botId: string;
+  hotBefore: number;
+  hotAfter: number;
+  coldBefore: number;
+  coldAfter: number;
+  /** Hot atoms archived into the cold tier. */
+  archived: number;
+  /** Near-duplicate merges performed under the verifier en route. */
+  merged: number;
+  /** Cold atoms permanently forgotten on cold overflow. */
+  coldForgotten: number;
+  at: number;
+}
+
+export const DEFAULT_WATERMARK_BUDGETS: WatermarkBudgets = {
+  hot: { maxAtoms: 1000, maxTokens: 200_000 },
+  cold: { maxAtoms: 5000 },
+};
+
+type MergeVerifier = (keep: AtomCard, duplicate: AtomCard, similarity: number) => boolean;
+
+export function enforceWatermarkBudgets(
+  store: TieredMemoryStore,
+  journal: MemoryJournal,
+  botId: string,
+  opts: {
+    budgets?: WatermarkBudgets;
+    /** Verifier gate for near-duplicate merges before archiving (#80). */
+    mergeVerifier?: MergeVerifier;
+    nearDuplicateThreshold?: number;
+  } = {},
+): WatermarkResult {
+  const budgets: WatermarkBudgets = {
+    hot: { ...DEFAULT_WATERMARK_BUDGETS.hot, ...opts.budgets?.hot },
+    cold: { ...DEFAULT_WATERMARK_BUDGETS.cold, ...opts.budgets?.cold },
+  };
+  let merged = 0;
+  let archived = 0;
+  let coldForgotten = 0;
+
+  const hotBefore = store.getAtoms(botId, 100_000).length;
+  const coldBefore = typeof store.listColdAtoms === 'function' ? store.listColdAtoms(botId, 100_000).length : 0;
+
+  // ---- hot tier -------------------------------------------------------
+  const hot = budgets.hot!;
+  let atoms = store.getAtoms(botId, 100_000);
+  let tokens = atoms.reduce((sum, a) => sum + estimateAtomTokens(a), 0);
+  const hotOver =
+    (hot.maxAtoms !== undefined && atoms.length > hot.maxAtoms) ||
+    (hot.maxTokens !== undefined && tokens > hot.maxTokens);
+  if (hotOver) {
+    // 1. Verifier-gated near-duplicate merges shrink hot first.
+    if (opts.mergeVerifier && typeof store.findNearDuplicatePairs === 'function') {
+      const pairs = store.findNearDuplicatePairs(botId, opts.nearDuplicateThreshold ?? 0.92);
+      const gone = new Set<string>();
+      for (const { keep, duplicate, similarity } of pairs) {
+        if (gone.has(keep.id) || gone.has(duplicate.id)) continue;
+        let approved = false;
+        try {
+          approved = opts.mergeVerifier(keep, duplicate, similarity);
+        } catch {
+          approved = false; // fail-closed
+        }
+        if (!approved) continue;
+        archiveAtomDirect(store, botId, duplicate.id);
+        journal.record({
+          botId,
+          action: 'archive',
+          atomId: duplicate.id,
+          before: duplicate,
+          note: `watermark: verified merge into "${keep.fact.slice(0, 60)}"`,
+        });
+        gone.add(duplicate.id);
+        merged += 1;
+      }
+      atoms = store.getAtoms(botId, 100_000);
+      tokens = atoms.reduce((sum, a) => sum + estimateAtomTokens(a), 0);
+    }
+    // 2. Archive least-valuable atoms down to the low watermarks.
+    const lowAtoms = hot.lowAtoms ?? (hot.maxAtoms !== undefined ? Math.floor(hot.maxAtoms * 0.8) : 0);
+    const lowTokens = hot.lowTokens ?? (hot.maxTokens !== undefined ? Math.floor(hot.maxTokens * 0.8) : 0);
+    const candidates = atoms
+      .filter((a) => !a.pinned)
+      .sort(
+        (a, b) =>
+          (a.useCredit ?? 0) - (b.useCredit ?? 0) ||
+          a.confidence - b.confidence ||
+          a.createdAt - b.createdAt,
+      );
+    let count = atoms.length;
+    for (const cand of candidates) {
+      const atomsOk = hot.maxAtoms === undefined || count <= lowAtoms;
+      const tokensOk = hot.maxTokens === undefined || tokens <= lowTokens;
+      if (atomsOk && tokensOk) break;
+      const action = archiveAtomDirect(store, botId, cand.id);
+      journal.record({
+        botId,
+        action,
+        atomId: cand.id,
+        before: cand,
+        note: 'watermark: hot tier over high watermark, archived to cold',
+      });
+      if (action === 'archive') archived += 1;
+      count -= 1;
+      tokens -= estimateAtomTokens(cand);
+    }
+  }
+
+  // ---- cold tier --------------------------------------------------------
+  const cold = budgets.cold!;
+  if (typeof store.listColdAtoms === 'function' && cold.maxAtoms !== undefined) {
+    const coldAtoms = store.listColdAtoms(botId, 100_000);
+    if (coldAtoms.length > cold.maxAtoms) {
+      const lowCold = cold.lowAtoms ?? Math.floor(cold.maxAtoms * 0.8);
+      // Oldest, least-credited cold atoms are forgotten first.
+      const victims = [...coldAtoms]
+        .sort((a, b) => (a.useCredit ?? 0) - (b.useCredit ?? 0) || a.createdAt - b.createdAt)
+        .slice(0, coldAtoms.length - lowCold);
+      for (const v of victims) {
+        journal.record({
+          botId,
+          action: 'deactivate',
+          atomId: v.id,
+          before: v,
+          note: 'watermark: cold tier over high watermark, permanently forgotten',
+        });
+        if (store.deleteAtom(botId, v.id)) coldForgotten += 1;
+      }
+    }
+  }
+
+  return {
+    botId,
+    hotBefore,
+    hotAfter: store.getAtoms(botId, 100_000).length,
+    coldBefore,
+    coldAfter: typeof store.listColdAtoms === 'function' ? store.listColdAtoms(botId, 100_000).length : 0,
+    archived,
+    merged,
+    coldForgotten,
+    at: Date.now(),
+  };
+}
+
+/**
+ * One full upkeep pass (#80): tidy (with the mergeVerifier forwarded —
+ * this is the entry point host call sites should use so the verifier
+ * gate is live, not inert) followed by watermark enforcement (verifier
+ * forwarded again for its merge step).
+ */
+export function runUpkeepPass(
+  store: TieredMemoryStore,
+  journal: MemoryJournal,
+  botId: string,
+  opts: {
+    mergeVerifier?: MergeVerifier;
+    nearDuplicateThreshold?: number;
+    budgets?: WatermarkBudgets;
+    maxPairs?: number;
+  } = {},
+): { tidy: TidyResult; watermarks: WatermarkResult } {
+  const tidy = tidyMemory(store, journal, botId, {
+    mergeVerifier: opts.mergeVerifier,
+    nearDuplicateThreshold: opts.nearDuplicateThreshold,
+    maxPairs: opts.maxPairs,
+  });
+  const watermarks = enforceWatermarkBudgets(store, journal, botId, {
+    budgets: opts.budgets,
+    mergeVerifier: opts.mergeVerifier,
+    nearDuplicateThreshold: opts.nearDuplicateThreshold,
+  });
+  return { tidy, watermarks };
+}
+
+// ---------------------------------------------------------------------------
+// About-me ↔ orientation store adapter (#76)
+//
+// The existing about-me profile is orientation memory (who the user is).
+// These shims express it through the orientation store WITHOUT breaking
+// the file-backed about-me API: sync copies file → orientation store;
+// readOrientationAboutMe reads it back in the AboutMeProfile shape.
+// ---------------------------------------------------------------------------
+
+/** Copy the file-backed about-me profile into the orientation store. */
+export function syncAboutMeToOrientation(
+  store: TieredMemoryStore,
+  botId: string,
+  dataDir: string,
+): OrientationEntry | null {
+  const { text } = readAboutMe(dataDir);
+  if (!text.trim()) return null;
+  return store.setOrientation(botId, 'about-me', text, 'about-me');
+}
+
+/** Read the about-me profile back from the orientation store. */
+export function orientationAboutMe(store: TieredMemoryStore, botId: string): AboutMeProfile {
+  const entry = store.getOrientation(botId, 'about-me');
+  return entry ? { text: entry.value, updatedAt: entry.updatedAt } : { text: '', updatedAt: 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Multi-pass learning synthesis (#84)
+//
+// Pass 1 clusters related atoms deterministically (shared entity, or
+// content-token overlap ≥ threshold — lexical, embedding-free).
+// Pass 2 composes each cluster into ONE synthesis proposal citing its
+// source atoms. Proposals are NOT applied: they enter the #82 evolution
+// pipeline as candidates (synthesisProposalToCandidate) and only a
+// promoted candidate should ever be stored (applySynthesisProposal is
+// that final, explicit step). The composer is injectable — an LLM fn
+// may replace the default extractive composition; no paid API is used
+// by default.
+// ---------------------------------------------------------------------------
+
+export interface SynthesisProposal {
+  id: string;
+  botId: string;
+  /** The composed higher-order statement. */
+  fact: string;
+  /** Atoms this synthesis is composed from (its citations). */
+  sourceAtomIds: string[];
+  entities: string[];
+  confidence: number;
+  category: 'reflection';
+}
+
+export type SynthesisComposer = (cluster: AtomCard[]) => string | Promise<string>;
+
+const SYNTH_STOPWORDS = new Set(
+  'the,user,users,that,this,with,from,have,has,will,would,should,their,them,they,about,into,over,under,after,before,when,what'.split(','),
+);
+
+function synthTokens(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter((t) => t.length > 2 && !SYNTH_STOPWORDS.has(t)),
+  );
+}
+
+/** Pass 1 (#84): deterministic lexical clustering of atoms (union-find). */
+export function clusterAtoms(atoms: AtomCard[], opts: { minOverlap?: number } = {}): AtomCard[][] {
+  const minOverlap = opts.minOverlap ?? 0.3;
+  const parent = atoms.map((_, i) => i);
+  const find = (x: number): number => (parent[x] === x ? x : (parent[x] = find(parent[x]!)));
+  const tokenSets = atoms.map((a) => synthTokens(`${a.fact} ${a.entities.join(' ')}`));
+  const entitySets = atoms.map((a) => new Set(a.entities.map((e) => e.toLowerCase())));
+  for (let i = 0; i < atoms.length; i++) {
+    for (let j = i + 1; j < atoms.length; j++) {
+      const sharedEntity = [...entitySets[i]!].some((e) => entitySets[j]!.has(e));
+      let related = sharedEntity;
+      if (!related) {
+        const a = tokenSets[i]!;
+        const b = tokenSets[j]!;
+        let overlap = 0;
+        for (const t of a) if (b.has(t)) overlap++;
+        const denom = Math.min(a.size, b.size);
+        related = denom > 0 && overlap / denom >= minOverlap && overlap >= 2;
+      }
+      if (related) parent[find(i)] = find(j);
+    }
+  }
+  const groups = new Map<number, AtomCard[]>();
+  atoms.forEach((a, i) => {
+    const root = find(i);
+    const g = groups.get(root) ?? [];
+    g.push(a);
+    groups.set(root, g);
+  });
+  // Deterministic order: bigger clusters first, then earliest atom.
+  return [...groups.values()].sort(
+    (a, b) => b.length - a.length || (a[0]?.createdAt ?? 0) - (b[0]?.createdAt ?? 0),
+  );
+}
+
+/** Default extractive composer (#84): joins the cluster's facts, citing order preserved. */
+export function extractiveCompose(cluster: AtomCard[]): string {
+  const facts = [...cluster].sort((a, b) => a.createdAt - b.createdAt).map((a) => a.fact);
+  return `Synthesis of ${cluster.length} related memories: ${facts.join(' ')}`.slice(0, 1000);
+}
+
+/**
+ * Run the synthesis pass (#84): cluster → compose → proposals.
+ * Nothing is stored; proposals are returned for the evolution pipeline.
+ */
+export async function runSynthesisPass(
+  store: TieredMemoryStore,
+  botId: string,
+  opts: { composer?: SynthesisComposer; minClusterSize?: number; maxProposals?: number } = {},
+): Promise<SynthesisProposal[]> {
+  const minClusterSize = opts.minClusterSize ?? 2;
+  const maxProposals = opts.maxProposals ?? 5;
+  const atoms = store.getAtoms(botId, 500);
+  const clusters = clusterAtoms(atoms).filter((c) => c.length >= minClusterSize);
+  const proposals: SynthesisProposal[] = [];
+  for (const cluster of clusters.slice(0, maxProposals)) {
+    const fact = opts.composer
+      ? await opts.composer(cluster)
+      : extractiveCompose(cluster);
+    if (!fact.trim()) continue;
+    proposals.push({
+      id: randomUUID(),
+      botId,
+      fact: fact.trim(),
+      sourceAtomIds: cluster.map((a) => a.id),
+      entities: [...new Set(cluster.flatMap((a) => a.entities))].slice(0, 10),
+      confidence: cluster.reduce((s, a) => s + a.confidence, 0) / cluster.length,
+      category: 'reflection',
+    });
+  }
+  return proposals;
+}
+
+/** Wrap a synthesis proposal as an evolution-pipeline candidate (#84 → #82). */
+export function synthesisProposalToCandidate(
+  proposal: SynthesisProposal,
+): EvolutionCandidate<SynthesisProposal> {
+  return proposeCandidate<SynthesisProposal>({
+    kind: 'memory-synthesis',
+    description: `synthesis from ${proposal.sourceAtomIds.length} atoms: ${proposal.fact.slice(0, 80)}`,
+    payload: proposal,
+  });
+}
+
+/**
+ * The explicit final step for a PROMOTED synthesis candidate (#84):
+ * store the synthesis atom, citing its sources via a session-style
+ * evidence trail (source atom ids in sourceTurn + relates links).
+ * Callers must only invoke this for candidates the #82 pipeline (or a
+ * human) promoted — synthesis is never applied directly.
+ */
+export function applySynthesisProposal(store: TieredMemoryStore, proposal: SynthesisProposal): string {
+  const id = store.storeAtom(
+    proposal.botId,
+    {
+      fact: proposal.fact,
+      entities: proposal.entities,
+      confidence: proposal.confidence,
+      category: 'reflection',
+    },
+    `synthesis:${proposal.id}`,
+    undefined,
+    { category: 'reflection' },
+  );
+  for (const src of proposal.sourceAtomIds) {
+    if (src === id) continue;
+    try {
+      store.createLink(proposal.botId, id, src, 'relates', 'synthesis');
+    } catch {
+      // source may have been forgotten since the proposal was made
+    }
+  }
+  return id;
+}
+
+// ---------------------------------------------------------------------------
+// Standing global rules + scoped memory rules (#85)
+//
+// When the same user rule recurs across multiple project scopes, the
+// learner proposes it as a STANDING GLOBAL RULE (scope: global,
+// pinned-candidate) — as a candidate through the #82 evolution pipeline,
+// never applied directly. Scoped pairing mirrors routing-learn: rules
+// are also grouped by (project, category-pattern) so a rule that only
+// recurs inside one project is proposed as a scoped memory rule for
+// that scope instead.
+// ---------------------------------------------------------------------------
+
+export interface StandingRulePayload {
+  fact: string;
+  /** Always 'global' for standing rules. */
+  scope: 'global';
+  /** Standing rules are pinned candidates: promotion pins the atom. */
+  pinnedCandidate: true;
+  projectIds: string[];
+  atomIds: string[];
+}
+
+export interface ScopedRulePayload {
+  fact: string;
+  projectId: string;
+  /** Pattern leg of the scope pairing (mirrors routing-learn's taskType). */
+  pattern: string;
+  atomIds: string[];
+}
+
+function normRuleFact(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function isRuleAtom(a: AtomCard): boolean {
+  return isUserRuleFact(
+    { fact: a.fact, entities: a.entities, confidence: a.confidence, category: a.category },
+    a.category,
+  );
+}
+
+/**
+ * Detect rules recurring across ≥ minScopes distinct projects (#85) and
+ * return them as evolution candidates for standing global rules.
+ */
+export function proposeStandingGlobalRules(
+  store: TieredMemoryStore,
+  botId: string,
+  opts: { minScopes?: number } = {},
+): Array<EvolutionCandidate<StandingRulePayload>> {
+  const minScopes = opts.minScopes ?? 2;
+  const atoms = store.getAtoms(botId, 5000).filter(isRuleAtom);
+  const byFact = new Map<string, AtomCard[]>();
+  for (const a of atoms) {
+    const key = normRuleFact(a.fact);
+    if (!key) continue;
+    const g = byFact.get(key) ?? [];
+    g.push(a);
+    byFact.set(key, g);
+  }
+  const out: Array<EvolutionCandidate<StandingRulePayload>> = [];
+  for (const group of byFact.values()) {
+    const projectIds = [...new Set(group.map((a) => a.projectId).filter((p): p is string => !!p))];
+    if (projectIds.length < minScopes) continue;
+    const fact = group[0]!.fact;
+    out.push(
+      proposeCandidate<StandingRulePayload>({
+        kind: 'standing-global-rule',
+        description: `standing global rule candidate (recurs in ${projectIds.length} projects): ${fact.slice(0, 80)}`,
+        payload: {
+          fact,
+          scope: 'global',
+          pinnedCandidate: true,
+          projectIds,
+          atomIds: group.map((a) => a.id),
+        },
+      }),
+    );
+  }
+  return out;
+}
+
+/**
+ * Scoped memory-rule proposals (#85): rule atoms grouped by
+ * (projectId × category pattern) — the memory-side mirror of
+ * routing-learn's (taskType × message-pattern) pairing. A group with
+ * ≥ minRecurrence atoms in ONE project becomes a scoped candidate.
+ */
+export function proposeScopedMemoryRules(
+  store: TieredMemoryStore,
+  botId: string,
+  opts: { minRecurrence?: number } = {},
+): Array<EvolutionCandidate<ScopedRulePayload>> {
+  const minRecurrence = opts.minRecurrence ?? 2;
+  const atoms = store.getAtoms(botId, 5000).filter(isRuleAtom);
+  const groups = new Map<string, AtomCard[]>();
+  for (const a of atoms) {
+    if (!a.projectId) continue;
+    const key = `${a.projectId}::${a.category}`;
+    const g = groups.get(key) ?? [];
+    g.push(a);
+    groups.set(key, g);
+  }
+  const out: Array<EvolutionCandidate<ScopedRulePayload>> = [];
+  for (const [key, group] of groups) {
+    if (group.length < minRecurrence) continue;
+    const [projectId, pattern] = key.split('::') as [string, string];
+    // One candidate per distinct rule fact in the group.
+    const byFact = new Map<string, AtomCard[]>();
+    for (const a of group) {
+      const k = normRuleFact(a.fact);
+      const g = byFact.get(k) ?? [];
+      g.push(a);
+      byFact.set(k, g);
+    }
+    for (const sameFact of byFact.values()) {
+      out.push(
+        proposeCandidate<ScopedRulePayload>({
+          kind: 'scoped-memory-rule',
+          description: `scoped rule for project "${projectId}" (${pattern}): ${sameFact[0]!.fact.slice(0, 80)}`,
+          payload: {
+            fact: sameFact[0]!.fact,
+            projectId,
+            pattern,
+            atomIds: sameFact.map((a) => a.id),
+          },
+        }),
+      );
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Composed learning-evolution pass (#82 + #84 + #85, closure-fix)
+//
+// The pieces existed as separate units — multi-pass synthesis (#84),
+// standing-global / scoped rule proposals (#85), and the generic
+// verifier → shadow pipeline (#82) — but no single entry point composed
+// them, and the host upkeep loop (capture + tidy only) never ran any of
+// them. This pass is that composition: one call produces every learning
+// candidate for a bot and, when a verifier is supplied, runs each
+// candidate through the independent verifier stage into a BOUNDED
+// shadow trial (verifyCandidate stamps the expiry). Candidates are
+// returned, never applied: promotion still requires beating the shadow
+// bar (evolutionEligible), and applying a promoted synthesis remains
+// the explicit applySynthesisProposal step.
+//
+// HOST WIRING: call runUpkeepPassWithLearning (below) from the idle /
+// nightly upkeep loop in place of the capture+tidy-only pass, passing
+// the host's verifier (or none — candidates then stay 'candidate' for
+// later human/API review).
+// ---------------------------------------------------------------------------
+
+export interface LearningEvolutionResult {
+  /** Synthesis proposals (#84) wrapped as evolution candidates. */
+  synthesis: Array<EvolutionCandidate<SynthesisProposal>>;
+  /** Standing global rule candidates (#85). */
+  standing: Array<EvolutionCandidate<StandingRulePayload>>;
+  /** Scoped memory rule candidates (#85). */
+  scoped: Array<EvolutionCandidate<ScopedRulePayload>>;
+  /** All candidates, post-verification when a verifier was supplied. */
+  candidates: Array<EvolutionCandidate<unknown>>;
+  verified: number;
+  shadowed: number;
+  rejected: number;
+}
+
+export async function runLearningEvolutionPass(
+  store: TieredMemoryStore,
+  botId: string,
+  opts: {
+    verifier?: CandidateVerifier<unknown>;
+    composer?: SynthesisComposer;
+    windowMs?: number;
+    now?: string;
+    minScopes?: number;
+    minRecurrence?: number;
+  } = {},
+): Promise<LearningEvolutionResult> {
+  const proposals = await runSynthesisPass(store, botId, {
+    ...(opts.composer ? { composer: opts.composer } : {}),
+  });
+  const synthesis = proposals.map(synthesisProposalToCandidate);
+  const standing = proposeStandingGlobalRules(store, botId, { minScopes: opts.minScopes ?? 2 });
+  const scoped = proposeScopedMemoryRules(store, botId, { minRecurrence: opts.minRecurrence ?? 2 });
+  let candidates: Array<EvolutionCandidate<unknown>> = [
+    ...(synthesis as Array<EvolutionCandidate<unknown>>),
+    ...(standing as Array<EvolutionCandidate<unknown>>),
+    ...(scoped as Array<EvolutionCandidate<unknown>>),
+  ];
+  let verified = 0;
+  if (opts.verifier) {
+    const out: Array<EvolutionCandidate<unknown>> = [];
+    for (const c of candidates) {
+      out.push(
+        await verifyCandidate(c, opts.verifier, {
+          ...(opts.windowMs !== undefined ? { windowMs: opts.windowMs } : {}),
+          ...(opts.now ? { now: opts.now } : {}),
+        }),
+      );
+    }
+    candidates = out;
+    verified = candidates.length;
+  }
+  return {
+    synthesis: candidates.slice(0, synthesis.length) as Array<EvolutionCandidate<SynthesisProposal>>,
+    standing: candidates.slice(synthesis.length, synthesis.length + standing.length) as Array<
+      EvolutionCandidate<StandingRulePayload>
+    >,
+    scoped: candidates.slice(synthesis.length + standing.length) as Array<
+      EvolutionCandidate<ScopedRulePayload>
+    >,
+    candidates,
+    verified,
+    shadowed: candidates.filter((c) => c.status === 'shadow').length,
+    rejected: candidates.filter((c) => c.status === 'rejected').length,
+  };
+}
+
+/**
+ * Full upkeep + learning in one call (#80/#82/#84/#85): the synchronous
+ * runUpkeepPass (tidy with the merge verifier forwarded + watermark
+ * budgets) followed by the composed learning-evolution pass. This is
+ * the entry point a host idle/nightly loop should call so synthesis,
+ * standing-rule detection, and verifier-gated evolution actually run
+ * in production instead of existing only as library units.
+ */
+export async function runUpkeepPassWithLearning(
+  store: TieredMemoryStore,
+  journal: MemoryJournal,
+  botId: string,
+  opts: {
+    mergeVerifier?: MergeVerifier;
+    nearDuplicateThreshold?: number;
+    budgets?: WatermarkBudgets;
+    maxPairs?: number;
+    verifier?: CandidateVerifier<unknown>;
+    composer?: SynthesisComposer;
+    windowMs?: number;
+    now?: string;
+  } = {},
+): Promise<{ tidy: TidyResult; watermarks: WatermarkResult; learning: LearningEvolutionResult }> {
+  const { tidy, watermarks } = runUpkeepPass(store, journal, botId, {
+    mergeVerifier: opts.mergeVerifier,
+    nearDuplicateThreshold: opts.nearDuplicateThreshold,
+    budgets: opts.budgets,
+    maxPairs: opts.maxPairs,
+  });
+  const learning = await runLearningEvolutionPass(store, botId, {
+    ...(opts.verifier ? { verifier: opts.verifier } : {}),
+    ...(opts.composer ? { composer: opts.composer } : {}),
+    ...(opts.windowMs !== undefined ? { windowMs: opts.windowMs } : {}),
+    ...(opts.now ? { now: opts.now } : {}),
+  });
+  return { tidy, watermarks, learning };
 }

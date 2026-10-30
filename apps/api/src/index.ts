@@ -19,15 +19,21 @@ import path from 'node:path';
 import {
   AgentRuntime,
   SpanStore,
-  createEmbedderFromEnv,
+  createCacheWarmerForBot,
+  createMcpFacade,
+  createProvider,
+  createToolFacade,
+  defaultElicitationRouter,
   discoverLocalTools,
   parseModelProfiles,
   resolveBotWorkspaceDir,
+  selectDefaultEmbedder,
+  toolTransportFromEnv,
 } from '@mvp/agent-runtime';
-import type { BotConfig } from '@mvp/agent-runtime';
+import type { BotConfig, ToolDefinition } from '@mvp/agent-runtime';
 import { DEFAULT_POLICY, GovernanceGateway, sanitizeTelemetry } from '@mvp/governance';
 import { TelemetryCollector } from '@mvp/agent-runtime';
-import { Scheduler, TriggerStore, WorkflowRunner } from '@mvp/workflows';
+import { Scheduler, TriggerStore, WorkflowRunner, runEventsFromRun } from '@mvp/workflows';
 import type { WorkflowRun } from '@mvp/workflows';
 import { loadConfig } from './config.js';
 import {
@@ -63,7 +69,14 @@ import { createAgentImportRouter } from './agent-import-routes.js';
 import { createAnalyticsRouter } from './analytics-routes.js';
 import { createLocalLlmRouter } from './local-llm-routes.js';
 import { LocalLlmManager } from '@mvp/agent-runtime';
-import { LazyMcpManager, PerBotMcpManager } from '@mvp/agent-runtime';
+import {
+  LazyMcpManager,
+  PerBotMcpManager,
+  BackgroundRunRegistry,
+  FileBackgroundRunStore,
+  SessionStandingRules,
+  FileStandingRuleStore,
+} from '@mvp/agent-runtime';
 import { createSelfUpdateRouter } from './self-update-routes.js';
 import { IdleAutoUpdater, SelfUpdateManager } from '@mvp/agent-runtime';
 import { createFusionRouter, shutdownFusionRuns } from './fusion-routes.js';
@@ -135,7 +148,19 @@ import {
   registerInterconnectionTools,
 } from './interconnect-tools.js';
 import { publishPagePolicyRules, registerPublishTools } from './publish-tools.js';
-import { registerPublicPageServing } from './public-pages.js';
+import {
+  registerPublicPageServing,
+  PagePublicationStore,
+  publicPathForSlug,
+} from './public-pages.js';
+import { renderTranscriptMarkdown } from './session-share.js';
+import {
+  loadRoutingRules,
+  saveRoutingRules,
+  promoteRule,
+  retireRule,
+  getSupervisorStats,
+} from '@mvp/agent-runtime';
 import { registerWorktreeRoutes } from './worktrees-routes.js';
 import { createWorktreeTools } from '@mvp/agent-runtime/dist/worktrees.js';
 import { HookBus, loadPlugins } from '@mvp/agent-runtime/dist/hooks.js';
@@ -210,7 +235,10 @@ import { registerSignInCodeTools, signInCodePolicyRules } from './sign-in-code-t
 // executors, and the billing-area purchases routes (mounted via routes.ts).
 import { createPurchaseWiring, purchasePolicyRules, registerPurchaseTools } from './purchases.js';
 import { createMcpManageTool } from './mcp-manage-tool.js';
-import { createScheduleTools } from './schedule-tools.js';
+import { createScheduleTools, GenericMonitorService } from './schedule-tools.js';
+import { createWsElicitationBridge, registerCompanionElicitationSurface } from './elicitation-ws.js';
+import { SessionOverlayStore } from './session-overlays.js';
+import type { SessionCommandService } from './session-commands-routes.js';
 import { CostTracker, SpendCapStore } from '@mvp/billing';
 
 // Pipe/JSON chat mode: `mvp-server chat --bot <id> [--json]`. Parsed at the
@@ -262,7 +290,7 @@ function resolveSeedDir(configured: string): string {
  * tools and chat with a bot; the governance approval policy still applies —
  * require-approval tools never execute silently (see mcp-server.ts).
  */
-function buildPlatformMcpServer(opts: {
+function buildPlatformMcpServerOptions(opts: {
   toolRegistry: Map<string, import('@mvp/agent-runtime').ToolDefinition>;
   /** The GovernanceAdapter (runtime governance surface), not the raw gateway. */
   governance: import('@mvp/agent-runtime').GovernanceGateway;
@@ -282,7 +310,7 @@ function buildPlatformMcpServer(opts: {
   annotationStore?: AnnotationStore;
   /** Runtime telemetry collector → read-only kriyadot://telemetry/* resources. */
   telemetry: import('@mvp/agent-runtime').TelemetryCollector;
-}): PlatformMcpServer {
+}): import('@mvp/agent-runtime').PlatformMcpServerOptions {
   const fallbackBot = opts.bots[0];
   let tools: ToolProvider = toolProviderFromRegistry(opts.toolRegistry);
   if (opts.connectionClass === 'read-only-assistant') {
@@ -292,7 +320,7 @@ function buildPlatformMcpServer(opts: {
     tools = createReadOnlyAssistantProvider(tools, opts.annotationStore);
     console.log('[mcp] connection class: read-only-assistant (reads allowed, only annotations.append may write)');
   }
-  return new PlatformMcpServer({
+  return {
     tools,
     governance: opts.governance,
     botId: 'mcp-gateway',
@@ -315,7 +343,13 @@ function buildPlatformMcpServer(opts: {
           },
         }
       : undefined,
-  });
+  };
+}
+
+function buildPlatformMcpServer(
+  opts: Parameters<typeof buildPlatformMcpServerOptions>[0],
+): PlatformMcpServer {
+  return new PlatformMcpServer(buildPlatformMcpServerOptions(opts));
 }
 
 async function boot(): Promise<void> {
@@ -404,6 +438,10 @@ async function boot(): Promise<void> {
   // <dataDir>/bot-approval-modes.json.
   const { applyBotApprovalModes } = await import('./bot-approval-modes.js');
   applyBotApprovalModes(seed.bots, config.dataDir);
+  // Per-bot layer pipelines (Octomind parity #41): overlay from
+  // <dataDir>/bot-layers.json.
+  const { applyBotLayers } = await import('./bot-layers.js');
+  applyBotLayers(seed.bots, config.dataDir);
   // Per-bot memory fabric settings (Atomic parity: reflection + live
   // distiller flags): overlay from <dataDir>/bot-memory-settings.json.
   const { applyBotMemorySettings, wireMemoryDistillers } = await import('./memory-fabric.js');
@@ -624,6 +662,12 @@ async function boot(): Promise<void> {
     approvalObserver: purchaseWiring.onApprovalMinted,
   });
 
+  // Platform embedder (Octomind parity #13): probed ONCE at boot —
+  // neural (configured endpoint) > onnx seam > trigram hash fallback —
+  // and shared by the tool registry, the runtime, tiered memory and
+  // discovery so every surface embeds identically.
+  const platformEmbedder = (await selectDefaultEmbedder()).embedder;
+
   const { registry: toolRegistry, connections: mcpConnections, mcpClientsByServer, userSkillStore, connectMcp, close: closeMcp } =
     await buildToolRegistry({
       workspaceDir: config.workspaceDir,
@@ -636,6 +680,7 @@ async function boot(): Promise<void> {
       // Per-bot workspaces: file/shell/git tools resolve the calling bot's
       // workspace per tool-call (Octop-style isolation).
       getBotConfig: (id) => botsById.get(id),
+      embedder: platformEmbedder,
     });
 
   // Lazy MCP directory (OpenMausBot parity P1 #22): installed servers are
@@ -645,6 +690,10 @@ async function boot(): Promise<void> {
   const lazyMcpManager = new LazyMcpManager({
     dataDir: config.dataDir,
     pinDbPath: path.join(config.dataDir, 'mcp-pins.db'),
+    // Per-server config overrides (Octomind parity #54):
+    // <dataDir>/mcp-overrides/<serverId>.json wins over the directory
+    // entry field-by-field. Malformed override files fail loud by design.
+    overrideConfigDir: path.join(config.dataDir, 'mcp-overrides'),
   });
   lazyMcpManager.syncRegistry(toolRegistry);
   // Per-bot private MCP servers (W9): a bot's OWN servers — separate
@@ -863,12 +912,10 @@ async function boot(): Promise<void> {
   // the observability routes serve the same store to Activity → Runs.
   const spanStore = new SpanStore(`${config.dataDir}/spans.db`);
 
-  // One platform embedder (Octomind parity): neural when EMBEDDING_MODEL
-  // is configured, trigram offline fallback otherwise. Shared by the
-  // runtime (semantic discovery) and the memory store (recall re-rank).
-  const platformEmbedder = createEmbedderFromEnv();
+  // (platformEmbedder is selected once, before buildToolRegistry above,
+  // via selectDefaultEmbedder — neural > onnx seam > trigram hash.)
 
-  const agentRuntime = new AgentRuntime({
+  const agentRuntime: AgentRuntime = new AgentRuntime({
     dbPath: `${config.dataDir}/agent.db`,
     spanStore,
     skillsDir: path.join(seedDir, 'skills'),
@@ -882,10 +929,16 @@ async function boot(): Promise<void> {
     // W9: per-bot private MCP tools, scoped strictly to the owning bot.
     // Octomind parity: local project tools from the bot workspace's
     // .kriyadot/tools/ directory ride along (auto-registered per turn).
-    extraToolsForBot: (botId) => {
+    extraToolsForBot: (botId): ToolDefinition[] => {
       const bot = botsById.get(botId);
       const local = bot ? discoverLocalTools(workspaceDirForBotConfig(bot)).tools : [];
-      return [...perBotMcpManager.toolDefinitions(botId), ...local];
+      // Octomind parity #59: read_spilled_result must actually be
+      // registered — the spill preview directs the model to call it.
+      // The tool is bound to THIS bot's spill store, so it rides the
+      // per-bot extras channel (agentRuntime is initialized by the time
+      // any turn runs; same late-binding pattern as the worktree hook).
+      const spill: ToolDefinition[] = bot ? agentRuntime.createSpillTools(bot) : [];
+      return [...perBotMcpManager.toolDefinitions(botId), ...local, ...spill];
     },
     governance: governanceAdapter,
     toolRegistry,
@@ -899,6 +952,45 @@ async function boot(): Promise<void> {
     embedder: platformEmbedder,
     // Background specialist runs: roster lookup for delegate_background.
     resolveBot: (id) => botsById.get(id),
+    // Closure #44: background runs persist to a JSON file store so a
+    // restart never loses run history (the runtime default is in-memory).
+    backgroundRuns: new BackgroundRunRegistry({
+      store: new FileBackgroundRunStore(path.join(config.dataDir, 'background-runs.json')),
+    }),
+    // Closure #46: session standing rules, file-persisted like the
+    // background runs so rules survive restarts.
+    standingRules: new SessionStandingRules({
+      store: new FileStandingRuleStore(path.join(config.dataDir, 'standing-rules.json')),
+    }),
+    // Closure #139: the installed-MCP catalog feeds deterministic
+    // auto-activation; activated servers contribute their lazy stub
+    // tools (already synced into the shared registry).
+    mcpCatalog: () =>
+      lazyMcpManager
+        .list()
+        .filter((s) => s.enabled)
+        .map((s) => ({
+          kind: 'mcp' as const,
+          id: s.id,
+          name: s.label,
+          description: `Installed MCP server "${s.label}"`,
+        })),
+    toolsForMcpServer: (serverId: string) => {
+      const server = lazyMcpManager.list().find((s) => s.id === serverId);
+      if (!server) return [];
+      const prefix = `mcp:${server.label}:`;
+      return [...toolRegistry.entries()]
+        .filter(([name]) => name.startsWith(prefix))
+        .map(([, def]) => def);
+    },
+    // Closure #15: the bot roster feeds discover_specialists.
+    discoverableItems: () =>
+      [...botsById.values()].map((b) => ({
+        kind: 'bot' as const,
+        id: b.id,
+        name: b.name,
+        description: b.description ?? '',
+      })),
     retrospectiveSink: (info) => {
       memorySinkHolder.storeLesson?.(info.botId, info.lesson, info.sessionId);
     },
@@ -937,6 +1029,30 @@ async function boot(): Promise<void> {
   for (const tool of agentRuntime.createBackgroundTools()) {
     toolRegistry.set(tool.name, tool);
   }
+  // Named ephemeral agents (closure #18): register / list / invoke tools
+  // over a host-owned registry, seeded from <dataDir>/named-agents.json
+  // when present. Invocation dispatches through the same background-run
+  // path as delegate_background.
+  {
+    const { NamedAgentRegistry, createNamedAgentTools } = await import('@mvp/agent-runtime');
+    let seedProfiles: import('@mvp/agent-runtime').SubagentProfile[] = [];
+    try {
+      const raw = fs.readFileSync(path.join(config.dataDir, 'named-agents.json'), 'utf8');
+      const parsed = JSON.parse(raw) as {
+        profiles?: import('@mvp/agent-runtime').SubagentProfile[];
+      };
+      if (Array.isArray(parsed.profiles)) seedProfiles = parsed.profiles;
+    } catch {
+      // No persisted named agents yet — start empty.
+    }
+    const namedAgents = new NamedAgentRegistry(seedProfiles);
+    for (const tool of createNamedAgentTools({
+      namedAgents,
+      startBackgroundRun: (input) => agentRuntime.startBackgroundRun(input),
+    })) {
+      toolRegistry.set(tool.name, tool);
+    }
+  }
   // MCP management tool (Octomind parity): health/restart from inside a task.
   {
     const mcpManage = createMcpManageTool(lazyMcpManager);
@@ -958,6 +1074,35 @@ async function boot(): Promise<void> {
   // About-me context: the user's own profile rides into every bot turn.
   agentRuntime.addContextProvider(({ bot }) => aboutMeContext(config.dataDir, bot.id));
 
+  // Script hooks (Octomind parity #67/#101): bots whose config carries
+  // shell `hooks` entries get them registered on the shared HookBus as
+  // real script handlers (the production call site for
+  // createScriptHookHandler — plugin-routes.ts).
+  {
+    const { registerScriptHooksFromConfigs } = await import('./plugin-routes.js');
+    const scriptHooks = registerScriptHooksFromConfigs(hookBus, seed.bots);
+    if (scriptHooks.registered > 0) {
+      console.log(`[hooks] registered ${scriptHooks.registered} script hook(s) from bot configs`);
+    }
+  }
+
+  // Prompt-cache warmers (Octomind parity #137): one warmer per bot
+  // that opted in via BotConfig.cacheWarm AND uses a cache-capable
+  // (Anthropic-class) provider. Instances are stopped on shutdown.
+  const cacheWarmers: Array<{ stop(): void }> = [];
+  for (const bot of seed.bots) {
+    try {
+      const warmer = createCacheWarmerForBot(bot, { provider: () => createProvider(bot.provider) });
+      if (warmer) {
+        warmer.start();
+        cacheWarmers.push(warmer);
+        console.log(`[cache] warmer started for bot "${bot.id}" (provider ${bot.provider})`);
+      }
+    } catch (err) {
+      console.warn(`[cache] warmer for bot "${bot.id}" failed to start:`, (err as Error).message);
+    }
+  }
+
   // Phase 2: `delegate` subagent tool. The child runs under the same
   // governance policy; parent/child records + audit events land in
   // subagents.db and the audit log (visible in Audit/Activity).
@@ -969,6 +1114,8 @@ async function boot(): Promise<void> {
     governanceAdapter,
     getBotConfig: (id) => botsById.get(id),
     audit: (action, fields) => governance.audit(action, fields),
+    // Delegate children resolve purpose profiles + get a summarizer too.
+    modelProfiles,
   });
 
   // Bot-to-bot collaboration tools (Codync team parity): list_bots, ask_bot,
@@ -1234,7 +1381,21 @@ async function boot(): Promise<void> {
   // In-session schedule/monitor tools (Octomind parity): bots create
   // their own routines mid-conversation on this same store. The shared
   // registry Map means late registration is fine.
-  for (const tool of createScheduleTools(routineStore)) {
+  // Generic monitors (#91) with ORIGIN-session binding (#88): a monitor
+  // started inside a session steers its digest back into THAT session
+  // (GenericMonitorService.originOf, bound by the monitor_start tool
+  // from the tool-call ctx); monitors with no origin log instead.
+  const monitorService = new GenericMonitorService({
+    onDigest: (monitorId, digest) => {
+      const origin = monitorService.originOf(monitorId);
+      if (origin) {
+        agentRuntime.enqueueSteer(origin, digest);
+      } else {
+        console.log(`[monitor ${monitorId}]`, digest);
+      }
+    },
+  });
+  for (const tool of createScheduleTools(routineStore, { monitors: monitorService })) {
     toolRegistry.set(tool.name, tool);
   }
   // Trigger tools from chat (OMB §1.1): create/list/delete routine triggers
@@ -1267,6 +1428,24 @@ async function boot(): Promise<void> {
   const companionStore = new CompanionStore(config.dataDir);
   // CompanionHub is a value here (dynamic import); name its instance type.
   let companionHub!: InstanceType<typeof CompanionHub>;
+
+  // Companion session commands (#96) + elicitation answers (#51):
+  // - turnAbortRegistry is shared with the chat router (createRouter
+  //   deps below) so WS 'cancel' aborts the very turn the chat route is
+  //   running, and 'prompt' steers into the session's turn queue.
+  // - The SessionCommandService is built lazily (its full deps — incl.
+  //   tiered memory for /done distillation — exist later in boot); the
+  //   holder is filled in the mounts block below.
+  // - The WS elicitation bridge is registered on the shared default
+  //   router's 'ws' surface; client answers return via elicitationResolve.
+  const turnAbortRegistry = new Map<string, { controller: AbortController; botId: string; startedAt: number }>();
+  const sessionOverlays = new SessionOverlayStore(config.dataDir);
+  const sessionCommandServiceHolder: { service?: SessionCommandService } = {};
+  const elicitationBridge = createWsElicitationBridge((frame) => {
+    companionHub.broadcast(frame as never);
+  });
+  registerCompanionElicitationSurface(defaultElicitationRouter, elicitationBridge);
+
   companionHub = new CompanionHub(
     companionStore,
     (action, fields) => {
@@ -1298,6 +1477,33 @@ async function boot(): Promise<void> {
           return {};
         }
       },
+      // Session commands over WS (#96): slash frames dispatch through
+      // the same SessionCommandService as the HTTP surface; prompt
+      // steers into the session; cancel aborts via the shared registry;
+      // model has no per-session override store on this host and says so.
+      onSessionCommand: async (cmd) => {
+        const sessionId = cmd.sessionId ?? '';
+        if (cmd.type === 'prompt') {
+          if (!sessionId || !cmd.text) return { handled: false, reason: 'prompt needs sessionId and text' };
+          return { handled: true, steer: agentRuntime.enqueueSteer(sessionId, cmd.text) };
+        }
+        if (cmd.type === 'cancel') {
+          const live = sessionId ? turnAbortRegistry.get(sessionId) : undefined;
+          if (!live) return { handled: false, reason: 'no live turn for that session' };
+          live.controller.abort('cancelled from companion app');
+          return { handled: true };
+        }
+        if (cmd.type === 'model') {
+          return { handled: false, reason: 'per-session model override is not supported on this host' };
+        }
+        const service = sessionCommandServiceHolder.service;
+        if (!service) return { handled: false, reason: 'session commands are still starting up' };
+        if (!sessionId || !cmd.text) return { handled: false, reason: 'slash needs sessionId and text' };
+        const botId = agentRuntime.sessionStore.getSession(sessionId)?.botId ?? seed.bots[0]?.id ?? '';
+        return service.execute(sessionId, botId, cmd.text);
+      },
+      // Elicitation answers from companion clients (#51).
+      elicitationResolve: elicitationBridge.resolveByFrame,
     },
   );
   // Run health scoring + regression detection (features #2/#5): persisted
@@ -1341,7 +1547,7 @@ async function boot(): Promise<void> {
   // The server object is built unconditionally — it is inert until served —
   // so GET /api/mcp/tools works even when no MCP transport is configured.
   const mcpScopeStore = new McpScopeStore(path.join(config.dataDir, 'mcp-scopes.db'));
-  const platformMcpServer = buildPlatformMcpServer({
+  const platformMcpServerOptions = buildPlatformMcpServerOptions({
     toolRegistry,
     governance: governanceAdapter,
     agentRuntime,
@@ -1360,6 +1566,23 @@ async function boot(): Promise<void> {
       process.env.MCP_CONNECTION_CLASS === 'read-only-assistant' ? 'read-only-assistant' : 'standard',
     annotationStore: new AnnotationStore(config.dataDir),
   });
+  const platformMcpServer = new PlatformMcpServer(platformMcpServerOptions);
+
+  // Built-in MCP server suite (Octomind parity #52): with
+  // KRIYADOT_MCP_SUITE=1 the platform ALSO serves five focused servers
+  // (core / orchestration / runtime / agent / local — per-tool filters,
+  // chat only on 'agent', telemetry only on 'runtime') alongside the
+  // single full-surface server above, which stays the routes dep.
+  // Suite servers are served on MCP_SERVER_PORT+1..+5 when HTTP serving
+  // is on (see the serve block below); construction is inert otherwise.
+  const { createPlatformMcpServerSuite } = await import('@mvp/agent-runtime');
+  const platformMcpSuite =
+    process.env.KRIYADOT_MCP_SUITE === '1'
+      ? createPlatformMcpServerSuite(platformMcpServerOptions)
+      : null;
+  if (platformMcpSuite) {
+    console.log(`[mcp] built-in server suite enabled: ${platformMcpSuite.ids().join(', ')}`);
+  }
 
   // Phase 3: two-way MCP over stdio — serve the platform's tools to an
   // external MCP client on stdin/stdout instead of starting HTTP.
@@ -1642,6 +1865,57 @@ async function boot(): Promise<void> {
   if (Number.isFinite(mcpPort) && mcpPort > 0) {
     const { url } = await platformMcpServer.serveHttp({ port: mcpPort });
     console.log(`[mcp] platform MCP server on ${url}`);
+    // Suite partitions (#52) on the following ports, when enabled.
+    if (platformMcpSuite) {
+      let offset = 0;
+      for (const id of platformMcpSuite.ids()) {
+        offset += 1;
+        try {
+          const served = await platformMcpSuite.get(id).serveHttp({ port: mcpPort + offset });
+          console.log(`[mcp] suite server "${id}" on ${served.url}`);
+        } catch (err) {
+          console.warn(`[mcp] suite server "${id}" failed to serve:`, (err as Error).message);
+        }
+      }
+    }
+  }
+
+  // MCP-native tool transport (Octomind parity #48, OPT-IN):
+  // KRIYADOT_TOOL_TRANSPORT=mcp routes built-in tool calls through an
+  // in-process MCP facade — a real protocol round-trip over a loopback
+  // transport pair — instead of direct handler invocation. The facade
+  // is built from a SNAPSHOT of the registry (its server side dispatches
+  // to the original handlers; wrapping the live map would recurse).
+  // Default stays 'direct'. Known limits of the mcp mode: the facade
+  // server invokes handlers with a fixed ToolContext
+  // ({ sessionId: 'mcp-facade', botId: 'mcp-facade' }) because MCP has
+  // no caller-context channel — per-bot workspace/session-scoped tools
+  // degrade there, while runtime governance (evaluated before the
+  // handler choke point) still sees the real caller; results round-trip
+  // the MCP wire format; tools registered after this point (runtime
+  // plugin loads) keep direct handlers.
+  let mcpFacade: Awaited<ReturnType<typeof createMcpFacade>> | null = null;
+  if (toolTransportFromEnv() === 'mcp') {
+    try {
+      mcpFacade = await createMcpFacade([...toolRegistry.values()], {
+        pinDbPath: path.join(config.dataDir, 'mcp-pins.db'),
+      });
+      const facadeNames = new Set((await mcpFacade.listTools()).map((t) => t.name));
+      let wrapped = 0;
+      for (const [name, def] of toolRegistry) {
+        if (!facadeNames.has(name)) continue;
+        const facade = mcpFacade;
+        toolRegistry.set(name, {
+          ...def,
+          handler: (args, ctx) => facade.callTool(name, args, ctx),
+        });
+        wrapped += 1;
+      }
+      console.log(`[mcp] tool transport: mcp facade (${wrapped} built-in tools routed through the protocol path)`);
+    } catch (err) {
+      console.warn('[mcp] facade failed to start; falling back to direct tool transport:', (err as Error).message);
+      mcpFacade = null;
+    }
   }
 
   // 4. HTTP layer. API routes first, then the frontend.
@@ -1746,9 +2020,16 @@ async function boot(): Promise<void> {
       | undefined,
     runBotTurn: async ({ bot, message, sessionId, signal, onText, onApproval }) => {
       let memoryContext: string | undefined;
+      let voicePack: import('@mvp/agent-runtime').MemoryPack | undefined;
       try {
-        memoryContext = await tieredMemoryStore.recallForPromptNeural(bot.id, message) || undefined;
+        voicePack = await tieredMemoryStore.buildMemoryPackNeural(bot.id, message, {
+          tokenBudget: 512,
+          // #74: project/role-scoped recall when the bot declares a scope.
+          scope: bot.memoryScope,
+        });
+        memoryContext = tieredMemoryStore.renderMemoryPack(voicePack) || undefined;
       } catch {
+        voicePack = undefined;
         memoryContext = undefined; // memory must never break calls
       }
       await agentRuntime.runTurn({
@@ -1762,6 +2043,13 @@ async function boot(): Promise<void> {
           else if (e.type === 'approval_required') onApproval(e.approvalId, e.call.name);
         },
       });
+      // #78: credit material use after the completed turn, mirroring
+      // the chat route — atom usage feeds retention/promotion.
+      try {
+        if (voicePack) tieredMemoryStore.creditPackUse(voicePack.id, voicePack.atomIds);
+      } catch {
+        // Crediting must never break calls.
+      }
     },
     audit: (action, fields) => governance.audit(action, fields),
   });
@@ -1779,9 +2067,16 @@ async function boot(): Promise<void> {
       | undefined,
     runBotTurn: async ({ bot, message, sessionId, signal, onText, onApproval }) => {
       let memoryContext: string | undefined;
+      let voicePack: import('@mvp/agent-runtime').MemoryPack | undefined;
       try {
-        memoryContext = await tieredMemoryStore.recallForPromptNeural(bot.id, message) || undefined;
+        voicePack = await tieredMemoryStore.buildMemoryPackNeural(bot.id, message, {
+          tokenBudget: 512,
+          // #74: project/role-scoped recall when the bot declares a scope.
+          scope: bot.memoryScope,
+        });
+        memoryContext = tieredMemoryStore.renderMemoryPack(voicePack) || undefined;
       } catch {
+        voicePack = undefined;
         memoryContext = undefined; // memory must never break calls
       }
       await agentRuntime.runTurn({
@@ -1795,6 +2090,13 @@ async function boot(): Promise<void> {
           else if (e.type === 'approval_required') onApproval(e.approvalId, e.call.name);
         },
       });
+      // #78: credit material use after the completed turn, mirroring
+      // the chat route — atom usage feeds retention/promotion.
+      try {
+        if (voicePack) tieredMemoryStore.creditPackUse(voicePack.id, voicePack.atomIds);
+      } catch {
+        // Crediting must never break calls.
+      }
     },
     audit: (action, fields) => governance.audit(action, fields),
   });
@@ -2012,6 +2314,13 @@ async function boot(): Promise<void> {
       workflowRunner,
       mcpConnections,
       turnTracker,
+      // Shared with the companion WS hub: WS 'cancel' aborts live chat
+      // turns through this very registry (routes.ts uses it as its
+      // activeTurns map when provided).
+      turnAbortRegistry,
+      // Per-session /role + /skill overlays (session commands write,
+      // the chat route applies them per turn).
+      sessionOverlays,
       mcpServer: platformMcpServer,
       mcpScopeStore,
       threadScheduleStore,
@@ -2146,6 +2455,390 @@ async function boot(): Promise<void> {
       audit: (action, fields) => governance.audit(action, fields),
     }),
   );
+  // ---------------------------------------------------------------------
+  // Octomind closure mounts (2026-10-30): routers built by the closure
+  // workstreams, wired here. All sit behind the loopback auth middleware
+  // mounted earlier (none of these paths is auth-exempt).
+  {
+    const { createSessionCommandService, createSessionCommandsRouter } = await import('./session-commands-routes.js');
+    const { createWorkflowSurfaceRouter } = await import('./workflow-surface-routes.js');
+    const { createTapRouter } = await import('./tap-routes.js');
+    const { createDiscoveryRouter, createIntentSearchTool } = await import('./discovery-routes.js');
+    const { createDaemonInjectRouter, NamedSessionRegistry } = await import('./daemon-inject-routes.js');
+    const { createLogLevelRouter } = await import('./log-level.js');
+    const { createEvolutionRouter } = await import('./evolution-routes.js');
+    const { createCloudLightningRouter } = await import('./cloud-routes.js');
+    const { VaultCloudSecretStore, LIGHTNING_USER_ID_SECRET } = await import('./cloud-lightning.js');
+    const { createScriptWebhookRouter } = await import('./webhooks.js');
+    const { scriptHooksFromConfig } = await import('./hooks-config.js');
+    const { runStartupBootstrap } = await import('./boot-bootstrap.js');
+    const { MarketplaceRegistry, MarketplaceInstaller } = await import('@mvp/marketplace');
+    const { SkillLoader } = await import('@mvp/agent-runtime');
+
+    const audit = (action: string, fields: { actor?: string; detail?: unknown }): void => {
+      governance.audit(action, fields as never);
+    };
+
+    // -- Session commands (#114 + /role /skill overlays, /done #135) ----
+    // usageForSession aggregates this host's cost events for the session
+    // (the billing CostTracker has no session filter, so events are
+    // post-filtered from a bounded window — the same billing.db the
+    // billing routes read, via the established WAL multi-connection
+    // pattern). Cache figures are not tracked per cost event → null.
+    const usageCostTracker = new CostTracker(path.join(config.dataDir, 'billing.db'));
+    const sessionCommandDeps = {
+      getMessages: (sessionId: string) => agentRuntime.sessionStore.listThreadMessages(sessionId),
+      getBotId: (sessionId: string) => agentRuntime.sessionStore.getSession(sessionId)?.botId,
+      listArchives: (sessionId: string) =>
+        agentRuntime.sessionStore.listArchives(sessionId).map((a) => ({
+          id: a.id,
+          messageCount: a.messageCount,
+          createdAt: a.createdAt,
+        })),
+      compactNow: (sessionId: string) => agentRuntime.sessionStore.compactNow(sessionId),
+      createSession: (botId: string) => agentRuntime.sessionStore.createSession(botId),
+      // /done runs the REAL distill pipeline (#77 machinery: grounded
+      // verbatim quotes, session citation, reflection kickoff when a
+      // chat fn is available — here the pipeline runs without one, so
+      // reflection is skipped and the result says so).
+      runDistillPipeline: (botId: string, sessionId: string) =>
+        tieredMemoryStore.runDistillPipeline(botId, sessionId),
+      // /share (closure #114): publish the session transcript as a
+      // public page — same store + renderer as the REST share routes.
+      shareSession: (sessionId: string) => {
+        const rendered = renderTranscriptMarkdown(agentRuntime, sessionId);
+        if (!rendered) throw new Error('Nothing to share yet — the session has no messages.');
+        const pub = new PagePublicationStore(config.dataDir).publishArtifact({
+          title: rendered.title,
+          content: rendered.markdown,
+          contentKind: 'markdown',
+        });
+        return { slug: pub.slug, path: publicPathForSlug(pub.slug) };
+      },
+      // /learning (closure #114): tiered-memory atoms back list / show /
+      // delete / clear; evolution acts on the persisted learned routing
+      // rules (approve = promote shadow → active; reject and rollback =
+      // retire, the routing module's documented rollback state).
+      learning: {
+        list: (botId: string) =>
+          tieredMemoryStore.getAtoms(botId, 200).map((a) => ({
+            id: a.id,
+            category: a.category,
+            fact: a.fact,
+            pinned: a.pinned,
+          })),
+        show: (botId: string, id: string) => tieredMemoryStore.getAtom(botId, id) ?? null,
+        remove: (botId: string, id: string) => tieredMemoryStore.deleteAtom(botId, id),
+        clear: (botId: string) => {
+          let removed = 0;
+          for (const atom of tieredMemoryStore.getAtoms(botId, 5000, { includeInactive: true })) {
+            if (tieredMemoryStore.deleteAtom(botId, atom.id)) removed += 1;
+          }
+          return removed;
+        },
+        evolution: (action: 'approve' | 'reject' | 'rollback', id: string) => {
+          let rules = loadRoutingRules(config.dataDir);
+          if (!rules.some((r) => r.id === id)) {
+            throw new Error(`No learned routing rule "${id}".`);
+          }
+          rules = action === 'approve' ? promoteRule(rules, id) : retireRule(rules, id);
+          saveRoutingRules(config.dataDir, rules);
+          return rules.find((r) => r.id === id) ?? null;
+        },
+      },
+      usageForSession: (sessionId: string) => {
+        const events = usageCostTracker
+          .listEvents({ limit: 5000 })
+          .filter((e) => e.sessionId === sessionId);
+        return {
+          promptTokens: events.reduce((s, e) => s + e.inputTokens, 0),
+          completionTokens: events.reduce((s, e) => s + e.outputTokens, 0),
+          totalTokens: events.reduce((s, e) => s + e.inputTokens + e.outputTokens, 0),
+          costUsd: events.reduce((s, e) => s + e.costCents, 0) / 100,
+          cacheReadTokens: null,
+          cacheWriteTokens: null,
+          requests: events.slice(0, 50) as unknown as Array<Record<string, unknown>>,
+        };
+      },
+      statusAggregate: () => ({
+        bots: seed.bots.length,
+        sessions: agentRuntime.sessionStore.listSessions({ limit: 1000 }).length,
+        pendingApprovals: governance.listApprovals('pending').length,
+        activeTurns: turnAbortRegistry.size,
+      }),
+      scheduleIntoSession: (
+        sessionId: string,
+        botId: string,
+        cmd: { name: string; prompt: string; whenText: string },
+      ) => {
+        // Conservative whenText grammar: 5-field cron, "every <N>m|h|d",
+        // "in <N>m|h|d", "daily HH:MM", or an ISO datetime. Anything else
+        // is rejected loudly rather than silently mis-scheduled.
+        const base = { timezone: 'UTC', enabled: true, overlap: 'skip' as const };
+        const w = cmd.whenText.trim();
+        let schedule: Record<string, unknown>;
+        const every = /^every\s+(\d+)\s*([mhd])$/i.exec(w);
+        const inMatch = /^in\s+(\d+)\s*([mhd])$/i.exec(w);
+        const daily = /^daily\s+(\d{1,2}):(\d{2})$/i.exec(w);
+        const toMinutes = (n: string, unit: string): number =>
+          Number(n) * (unit.toLowerCase() === 'h' ? 60 : unit.toLowerCase() === 'd' ? 1440 : 1);
+        if (every) {
+          schedule = { ...base, kind: 'interval', everyMinutes: toMinutes(every[1]!, every[2]!) };
+        } else if (inMatch) {
+          schedule = {
+            ...base,
+            kind: 'once',
+            runAt: new Date(Date.now() + toMinutes(inMatch[1]!, inMatch[2]!) * 60_000).toISOString(),
+          };
+        } else if (daily) {
+          schedule = {
+            ...base,
+            kind: 'daily',
+            time: `${daily[1]!.padStart(2, '0')}:${daily[2]}`,
+            weekdays: [0, 1, 2, 3, 4, 5, 6],
+          };
+        } else if (/^\S+\s+\S+\s+\S+\s+\S+\s+\S+$/.test(w)) {
+          schedule = { ...base, kind: 'cron', expression: w };
+        } else if (!Number.isNaN(Date.parse(w))) {
+          schedule = { ...base, kind: 'once', runAt: new Date(Date.parse(w)).toISOString() };
+        } else {
+          throw new Error(
+            `Cannot parse schedule "${cmd.whenText}" — use a 5-field cron, "every 30m", "in 2h", "daily 09:00", or an ISO datetime.`,
+          );
+        }
+        const routine = routineStore.create({
+          sessionId,
+          name: cmd.name || 'Session schedule',
+          botId,
+          promptTemplate: cmd.prompt,
+          schedule: schedule as never,
+        });
+        return { routineId: routine.id, schedule };
+      },
+      sessionRole: {
+        get: (sessionId: string) => sessionOverlays.getRole(sessionId),
+        set: (sessionId: string, role: string | null) => sessionOverlays.setRole(sessionId, role),
+      },
+      sessionSkills: {
+        list: (sessionId: string) => sessionOverlays.listSkills(sessionId),
+        pin: (sessionId: string, skillName: string) => sessionOverlays.pinSkill(sessionId, skillName),
+        unpin: (sessionId: string, skillName: string) => sessionOverlays.unpinSkill(sessionId, skillName),
+        known: () => new SkillLoader(path.join(seedDir, 'skills')).list(),
+      },
+    };
+    const sessionCommandService = createSessionCommandService(sessionCommandDeps);
+    sessionCommandServiceHolder.service = sessionCommandService;
+    app.use('/api', createSessionCommandsRouter(sessionCommandDeps));
+
+    // -- Supervisor stats (#180): the deep-agent accumulator counters
+    // (steers, vetoes, relevance checks) as a read-only surface.
+    app.get('/api/supervisor/stats', (_req, res) => {
+      res.json({ stats: getSupervisorStats() });
+    });
+
+    // -- Workflow file surface (#143/#151) + taps (#153/#171) ------------
+    // User-saved workflow definitions persist in
+    // <dataDir>/user-workflows.json and register into the same runner
+    // the seed workflows use.
+    const userWorkflowsPath = path.join(config.dataDir, 'user-workflows.json');
+    const loadUserWorkflows = (): void => {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(userWorkflowsPath, 'utf8')) as {
+          workflows?: Array<Record<string, unknown>>;
+        };
+        for (const def of parsed.workflows ?? []) {
+          try {
+            workflowRunner.register(def as never);
+          } catch (err) {
+            console.warn('[workflows] saved definition failed validation, skipping:', (err as Error).message);
+          }
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+          console.warn('[workflows] user-workflows.json unreadable:', (err as Error).message);
+        }
+      }
+    };
+    const persistUserWorkflow = (def: { id: string }): void => {
+      let all: Array<Record<string, unknown>> = [];
+      try {
+        all = (JSON.parse(fs.readFileSync(userWorkflowsPath, 'utf8')) as { workflows?: Array<Record<string, unknown>> })
+          .workflows ?? [];
+      } catch {
+        all = [];
+      }
+      const idx = all.findIndex((d) => d.id === def.id);
+      if (idx >= 0) all[idx] = def as Record<string, unknown>;
+      else all.push(def as Record<string, unknown>);
+      fs.mkdirSync(config.dataDir, { recursive: true });
+      fs.writeFileSync(userWorkflowsPath, JSON.stringify({ workflows: all }, null, 2) + '\n', 'utf8');
+    };
+    loadUserWorkflows();
+    const saveWorkflow = (def: { id: string }): unknown => {
+      workflowRunner.register(def as never);
+      persistUserWorkflow(def);
+      return def;
+    };
+    app.use(
+      '/api',
+      createWorkflowSurfaceRouter({
+        getWorkflow: (id) => workflowRunner.getWorkflow(id) as never,
+        saveWorkflow: saveWorkflow as never,
+        // #152: run-history reads (dry-run reports + /workflows/runs).
+        getRun: (id) => workflowRunner.getRun(id) as never,
+        getRunEvents: (run) => runEventsFromRun(run as never) as never,
+      }),
+    );
+    const marketplaceInstaller = new MarketplaceInstaller(path.join(config.dataDir, 'marketplace'));
+    app.use(
+      '/api',
+      createTapRouter({
+        installer: marketplaceInstaller,
+        dataDir: config.dataDir,
+        saveWorkflow: saveWorkflow as never,
+      }),
+    );
+
+    // -- Discovery / intent search (#166) --------------------------------
+    const discoveryDeps = {
+      embedder: platformEmbedder,
+      items: async () => {
+        const items: Array<{ kind: 'bot' | 'skill' | 'mcp' | 'capability'; id: string; name: string; description: string }> = [];
+        for (const bot of seed.bots) {
+          items.push({ kind: 'bot', id: bot.id, name: bot.name, description: bot.description });
+        }
+        const skillLoader = new SkillLoader(path.join(seedDir, 'skills'));
+        for (const name of skillLoader.list()) {
+          const summary = await skillLoader.getSummary(name).catch(() => null);
+          items.push({ kind: 'skill', id: name, name, description: summary?.description ?? '' });
+        }
+        for (const name of Object.keys(seed.mcpServers)) {
+          items.push({ kind: 'mcp', id: name, name, description: `MCP server ${name}` });
+        }
+        try {
+          const registry = MarketplaceRegistry.fromFile(path.join(config.dataDir, 'marketplace-registry.json'));
+          for (const entry of registry.list({ kind: 'capability' as never })) {
+            items.push({ kind: 'capability', id: entry.id, name: entry.name, description: entry.description });
+          }
+        } catch {
+          // No registry file yet (first run) — capabilities are simply absent.
+        }
+        return items;
+      },
+    };
+    app.use('/api', createDiscoveryRouter(discoveryDeps));
+    const intentTool = createIntentSearchTool(discoveryDeps);
+    if (!toolRegistry.has(intentTool.name)) toolRegistry.set(intentTool.name, intentTool);
+
+    // -- Daemon inject (#102/#109) ---------------------------------------
+    app.use(
+      '/api',
+      createDaemonInjectRouter({
+        registry: new NamedSessionRegistry(),
+        enqueueSteer: (sessionId, text) => agentRuntime.enqueueSteer(sessionId, text),
+        isTurnRunning: (sessionId) => turnAbortRegistry.has(sessionId),
+      }),
+    );
+
+    // -- Runtime log level (#181) ----------------------------------------
+    app.use('/api', createLogLevelRouter({ audit }));
+
+    // -- Routing evolution reject (#83, reject-only on this host) --------
+    app.use('/api/routing', createEvolutionRouter({ dataDir: config.dataDir, only: ['reject'] }));
+
+    // -- Lightning cloud layer (per-user accounts; mock-tested) ----------
+    app.use(
+      '/api',
+      createCloudLightningRouter({
+        secretStore: new VaultCloudSecretStore(config.dataDir),
+        studioName: 'kriyadot',
+        tier: 'free',
+      }),
+    );
+
+    // -- Script webhooks (#67/#101 ingress) -------------------------------
+    // Auth model (platform-consistent): non-/api paths are exempt from
+    // the loopback token by design (see loopback-auth.ts — the same
+    // treatment /api/hooks gets), and the server binds loopback only.
+    // The router additionally enforces a per-hook `x-webhook-secret`
+    // whenever the host supplies one in `secrets`; bot-config hook
+    // entries carry no secret field today, so the record is empty and
+    // named hooks are reachable from local processes only.
+    app.use(
+      '/webhooks',
+      createScriptWebhookRouter({
+        hooks: () =>
+          seed.bots.flatMap(
+            (bot) => scriptHooksFromConfig({ hooks: (bot as unknown as { hooks?: unknown }).hooks }).entries,
+          ),
+        secrets: {},
+      }),
+    );
+
+    // -- Standalone status (#178) -----------------------------------------
+    const bootStartedAt = Date.now();
+    app.get('/api/status', (_req, res) => {
+      let cloudConnected = false;
+      try {
+        cloudConnected =
+          new VaultCloudSecretStore(config.dataDir).get('default-user', LIGHTNING_USER_ID_SECRET) !== undefined;
+      } catch {
+        cloudConnected = false;
+      }
+      res.json({
+        ok: true,
+        version: '0.1.0',
+        uptimeSeconds: Math.round((Date.now() - bootStartedAt) / 1000),
+        bots: seed.bots.length,
+        sessions: agentRuntime.sessionStore.listSessions({ limit: 1000 }).length,
+        pendingApprovals: governance.listApprovals('pending').length,
+        activeTurns: turnAbortRegistry.size,
+        toolTransport: toolTransportFromEnv(),
+        mcpSuite: platformMcpSuite ? platformMcpSuite.ids() : [],
+        cloud: { connected: cloudConnected },
+      });
+    });
+
+    // -- First-run startup bootstrap (#156) -------------------------------
+    // The main router above has (re)written marketplace-registry.json by
+    // now; the bootstrap consumes the same registry + installer and
+    // starts any planned MCP servers not already in the lazy directory.
+    try {
+      const report = runStartupBootstrap({
+        dataDir: config.dataDir,
+        registry: MarketplaceRegistry.fromFile(path.join(config.dataDir, 'marketplace-registry.json')),
+        installer: marketplaceInstaller,
+        startMcpServer: (entry) => {
+          const e = entry as {
+            label: string;
+            command: string;
+            args?: string[];
+            env?: Record<string, string>;
+            enabled?: boolean;
+          };
+          if (lazyMcpManager.list().some((s) => s.label === e.label)) return;
+          const installed = lazyMcpManager.installCustom(e.label, {
+            kind: 'stdio',
+            command: e.command,
+            args: e.args ?? [],
+            env: e.env ?? {},
+          });
+          if (e.enabled === false) lazyMcpManager.setEnabled(installed.id, false);
+          refreshMcpStubs();
+        },
+        audit,
+      });
+      if (report.mcpStarted.length > 0) {
+        console.log(`[bootstrap] started MCP server(s): ${report.mcpStarted.join(', ')}`);
+      }
+      if (report.blockers.length > 0) {
+        console.log(`[bootstrap] blockers: ${report.blockers.join('; ')}`);
+      }
+    } catch (err) {
+      console.warn('[bootstrap] startup bootstrap failed:', (err as Error).message);
+    }
+  }
+
   // Parity workstreams: routers. All factories; none of these existed before.
   // Per-bot computer view (WS at /api/computer/ws is handled in the upgrade
   // switch below; REST here).
@@ -3126,6 +3819,34 @@ async function boot(): Promise<void> {
     server.close();
     scheduler.stop();
     hookDeliveryWorker.stop();
+    // Octomind closure resources: cache warmers, generic monitors, the
+    // opt-in MCP tool facade, and the MCP suite partitions.
+    for (const warmer of cacheWarmers) {
+      try {
+        warmer.stop();
+      } catch {
+        // ignore
+      }
+    }
+    try {
+      monitorService.stopAll();
+    } catch {
+      // ignore
+    }
+    if (mcpFacade) {
+      try {
+        await mcpFacade.close();
+      } catch {
+        // ignore
+      }
+    }
+    if (platformMcpSuite) {
+      try {
+        await platformMcpSuite.closeAll();
+      } catch {
+        // ignore
+      }
+    }
     await closeMcp();
     try {
       await lazyMcpManager.close();

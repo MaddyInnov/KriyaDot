@@ -3,7 +3,15 @@
 /** Minimal durable DAG workflow runner for the MVP. */
 export * from './types.js';
 export { renderTemplate, type TemplateContext } from './template.js';
-export { WorkflowRunner, type WorkflowRunnerOptions, type RunUpdateCallback } from './runner.js';
+export {
+  WorkflowRunner,
+  type WorkflowRunnerOptions,
+  type RunUpdateCallback,
+  type WorkflowNodeExecutor,
+  type AgentNodeExecutionRequest,
+  type AgentNodeExecutionResult,
+  type RunEventCallback,
+} from './runner.js';
 export { WorkflowStore } from './store.js';
 export { Scheduler, TriggerStore } from './triggers.js';
 export type { Trigger, TriggerKind } from './triggers.js';
@@ -38,8 +46,10 @@ export {
   parseWorkflowFile,
   type WorkflowFile,
 } from './format.js';
+export { serializeWorkflowToml, parseWorkflowToml } from './toml-format.js';
 export {
   buildExecutionPlan,
+  dryRun,
   computeReachableNodeIds,
   computeTopologicalLevels,
   getSubordinateNodeIds,
@@ -49,7 +59,31 @@ export {
   type DryRunLevel,
   type DryRunPlanNode,
 } from './plan.js';
-export { extractCostUsd } from './cost.js';
+export {
+  extractCostUsd,
+  extractTokenUsage,
+  priceNodeOutputUsd,
+  priceUsageUsd,
+  type UsagePricer,
+} from './cost.js';
+export {
+  applyStepConfigToBot,
+  resolveStepConfig,
+  stepConfigOf,
+  validateStepConfig,
+  type ResolvedStepConfig,
+} from './step-config.js';
+export {
+  WorkflowRunEventCollector,
+  formatRunEventsJsonl,
+  parseRunEventsJsonl,
+  runEventsFromRun,
+  runEventsJsonlFromRun,
+  type WorkflowRunEvent,
+  type RunStartedEvent,
+  type StepCompletedEvent,
+  type RunFinishedEvent,
+} from './run-events.js';
 export {
   WORKFLOW_TEMPLATES,
   workflowTemplatesById,

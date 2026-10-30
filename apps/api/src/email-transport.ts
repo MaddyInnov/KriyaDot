@@ -12,9 +12,14 @@
  *   IMAP: LOGIN → SELECT INBOX → UID SEARCH UNSEEN → UID FETCH
  *         BODY.PEEK[] → UID STORE +\Seen → LOGOUT.
  *
- * TLS is implicit (port 465/993 style); plain connections work for
- * local relays. STARTTLS upgrade is NOT implemented — point at the
- * implicit-TLS port instead (documented in the channel setup notes).
+ * TLS modes: implicit (port 465/993 style), plain (local relays), and
+ * STARTTLS upgrade (SMTP port 587 / IMAP port 143 style): when
+ * `starttls: true` is set on a plain connection, the client issues
+ * STARTTLS after the greeting/EHLO and upgrades the socket in place
+ * (SMTP re-issues EHLO after the upgrade, per RFC 3207) before any
+ * credentials cross the wire. STARTTLS here is required-mode: if the
+ * server refuses or the channel cannot upgrade, the operation fails
+ * rather than silently continuing in plaintext.
  *
  * The socket is behind a MailChannel seam so tests drive the whole
  * protocol against a scripted fake server — zero network in tests.
@@ -34,6 +39,14 @@ export interface MailChannel {
   readBytes(n: number): Promise<Buffer>;
   write(data: string): void;
   close(): void;
+  /**
+   * Upgrade the live plaintext socket to TLS in place (STARTTLS).
+   * Optional: channels that cannot upgrade omit it, and a STARTTLS
+   * request against such a channel fails loudly. Buffered unread
+   * plaintext is discarded — callers upgrade only at a protocol point
+   * where the server has nothing further to say in plaintext.
+   */
+  upgradeToTls?: (servername: string) => Promise<void>;
 }
 
 type ConnectFn = (host: string, port: number, secure: boolean) => Promise<MailChannel>;
@@ -41,7 +54,7 @@ type ConnectFn = (host: string, port: number, secure: boolean) => Promise<MailCh
 /** Real socket channel over net/tls with buffered line/byte readers. */
 export const defaultMailConnect: ConnectFn = (host, port, secure) =>
   new Promise((resolve, reject) => {
-    const socket: Socket = secure
+    let socket: Socket = secure
       ? tlsConnect({ host, port, servername: host })
       : netConnect({ host, port });
     let buffer = Buffer.alloc(0);
@@ -75,12 +88,22 @@ export const defaultMailConnect: ConnectFn = (host, port, secure) =>
       for (const w of lineWaiters.splice(0)) w.reject(err);
       for (const w of byteWaiters.splice(0)) w.reject(err);
     };
-    socket.on('data', (chunk: Buffer) => {
+    const onData = (chunk: Buffer): void => {
       buffer = Buffer.concat([buffer, chunk]);
       pump();
-    });
-    socket.on('error', fail);
-    socket.on('close', () => fail(new Error('mail connection closed')));
+    };
+    const onClose = (): void => fail(new Error('mail connection closed'));
+    const attach = (sock: Socket): void => {
+      sock.on('data', onData);
+      sock.on('error', fail);
+      sock.on('close', onClose);
+    };
+    const detach = (sock: Socket): void => {
+      sock.removeListener('data', onData);
+      sock.removeListener('error', fail);
+      sock.removeListener('close', onClose);
+    };
+    attach(socket);
     socket.once(secure ? 'secureConnect' : 'connect', () => {
       resolve({
         readLine: () =>
@@ -101,9 +124,36 @@ export const defaultMailConnect: ConnectFn = (host, port, secure) =>
           socket.write(data);
         },
         close: () => socket.destroy(),
+        upgradeToTls: (servername) =>
+          new Promise<void>((res, rej) => {
+            if (failure) return rej(failure);
+            const plain = socket;
+            detach(plain);
+            // Any plaintext bytes buffered beyond the STARTTLS reply are
+            // protocol garbage post-upgrade; drop them (see interface doc).
+            buffer = Buffer.alloc(0);
+            const tlsSocket = tlsConnect({ socket: plain, servername });
+            tlsSocket.once('secureConnect', () => {
+              socket = tlsSocket as unknown as Socket;
+              attach(socket);
+              res();
+            });
+            tlsSocket.once('error', (err) => {
+              fail(err);
+              rej(err);
+            });
+          }),
       });
     });
   });
+
+/** Shared STARTTLS gate: fail loudly when the channel cannot upgrade. */
+async function requireUpgrade(channel: MailChannel, host: string, proto: string): Promise<void> {
+  if (!channel.upgradeToTls) {
+    throw new Error(`${proto} STARTTLS requested but the mail channel cannot upgrade to TLS`);
+  }
+  await channel.upgradeToTls(host);
+}
 
 // ---------------------------------------------------------------------------
 // SMTP send
@@ -113,6 +163,8 @@ export interface SmtpConfig {
   host: string;
   port: number;
   secure: boolean;
+  /** Plain connection + required STARTTLS upgrade (ignored when `secure`). */
+  starttls?: boolean;
   user?: string;
   pass?: string;
   from: string;
@@ -147,6 +199,15 @@ export async function sendSmtpMail(
     await smtpExpect(channel, ['220'], 'greeting');
     channel.write('EHLO kriyadot.local\r\n');
     await smtpExpect(channel, ['250'], 'EHLO');
+    if (config.starttls && !config.secure) {
+      // RFC 3207: STARTTLS, upgrade, then EHLO again over TLS — and all
+      // of it BEFORE AUTH, so credentials never cross a plaintext wire.
+      channel.write('STARTTLS\r\n');
+      await smtpExpect(channel, ['220'], 'STARTTLS');
+      await requireUpgrade(channel, config.host, 'SMTP');
+      channel.write('EHLO kriyadot.local\r\n');
+      await smtpExpect(channel, ['250'], 'EHLO after STARTTLS');
+    }
     if (config.user && config.pass) {
       channel.write('AUTH LOGIN\r\n');
       await smtpExpect(channel, ['334'], 'AUTH LOGIN');
@@ -192,6 +253,8 @@ export interface ImapConfig {
   host: string;
   port: number;
   secure: boolean;
+  /** Plain connection + required STARTTLS upgrade (ignored when `secure`). */
+  starttls?: boolean;
   user: string;
   pass: string;
   mailbox?: string;
@@ -286,6 +349,13 @@ export async function fetchUnseenMail(
   try {
     const greeting = await channel.readLine();
     if (!greeting.startsWith('* OK')) throw new Error(`IMAP greeting failed: ${greeting}`);
+    if (config.starttls && !config.secure) {
+      // RFC 2595: STARTTLS before LOGIN, so credentials never cross a
+      // plaintext wire. Required-mode: a refusal aborts the fetch.
+      const starttls = await imapCommand(channel, 'a0', 'STARTTLS');
+      if (!starttls.ok) throw new Error(`IMAP STARTTLS failed: ${starttls.finalLine}`);
+      await requireUpgrade(channel, config.host, 'IMAP');
+    }
     const login = await imapCommand(
       channel,
       'a1',

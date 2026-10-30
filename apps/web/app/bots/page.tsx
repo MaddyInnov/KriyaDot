@@ -15,6 +15,8 @@ import { RoutinesPanel } from '../../components/panels/routines-panel';
 import TeamsPanel from '../../components/panels/teams-panel';
 import PeoplePanel from '../../components/panels/people-panel';
 import { BotSetupPanel } from '../../components/panels/bot-setup-panel';
+import { LayersEditor } from '../../components/bots/layers-editor';
+import type { LayerStage } from '../../lib/octomind-api';
 
 const EFFECTS: BotPolicyEffect[] = ['allow', 'deny', 'require-approval'];
 
@@ -787,7 +789,7 @@ function BotsPageInner() {
   const [bots, setBots] = useState<BotConfig[]>([]);
   const [selectedBotId, setSelectedBotId] = useState('');
   const [error, setError] = useState('');
-  const [tab, setTab] = useState<'policy' | 'model' | 'robustness' | 'computer' | 'memory' | 'routines'>('policy');
+  const [tab, setTab] = useState<'policy' | 'model' | 'robustness' | 'computer' | 'memory' | 'routines' | 'layers'>('policy');
   const [pageTab, setPageTab] = useState<'bots' | 'teams'>('bots');
   const [showSetup, setShowSetup] = useState(false);
   const [mode] = useUxMode();
@@ -801,6 +803,7 @@ function BotsPageInner() {
     { id: 'computer' as const, label: t('bots.tabComputer') },
     { id: 'memory' as const, label: t('bots.tabMemory') },
     { id: 'routines' as const, label: t('bots.tabRoutines') },
+    { id: 'layers' as const, label: 'Layers' },
     // Pro surface: hidden in Simple mode.
     ...(mode === 'pro' ? [{ id: 'robustness' as const, label: t('bots.tabRobustness') }] : []),
   ];
@@ -889,6 +892,10 @@ function BotsPageInner() {
           : b,
       ),
     );
+  };
+
+  const onLayersSaved = (botId: string, layers: LayerStage[]) => {
+    setBots((prev) => prev.map((b) => (b.id === botId ? { ...b, layers } : b)));
   };
 
   const onVoiceSaved = (botId: string, voice: VoiceSettings) => {
@@ -1074,6 +1081,8 @@ function BotsPageInner() {
                 <MemoryPanel key={`memory-${selectedBot.id}`} botId={selectedBot.id} />
               ) : activeTab === 'routines' ? (
                 <RoutinesPanel key={`routines-${selectedBot.id}`} botId={selectedBot.id} />
+              ) : activeTab === 'layers' ? (
+                <LayersEditor key={`layers-${selectedBot.id}`} bot={selectedBot} onSaved={onLayersSaved} />
               ) : (
                 <RobustnessPanel key={`robustness-${selectedBot.id}`} bot={selectedBot} />
               )}

@@ -18,6 +18,7 @@ import {
 import type { CliLoginStatus, ModelsCatalogInfo, ProviderInfo, RateLimitSnapshot } from '../../lib/api';
 import { formatResetIn, formatTokens } from '../../lib/usage';
 import { ChannelsPanel } from '../../components/channels/channels-panel';
+import { KEYLESS_LANE_FALLBACKS, keylessLaneFor } from '../../lib/octomind-web';
 import { KeySuggestionCard } from '../../components/key-suggestion-card';
 
 /**
@@ -532,6 +533,46 @@ export default function ProvidersPage() {
       )}
 
       <h2 className="page-sub" style={{ marginTop: 24 }}>
+        Free &amp; keyless lanes
+      </h2>
+      <p className="small muted">
+        Ways to chat with no paid API key. Labels are honest about the trade-offs: local is
+        guaranteed, shared lanes are rate-limited and best-effort. Lane metadata comes from the
+        provider catalog when it exposes it; otherwise the built-in labels below apply.
+      </p>
+      {['ollama', 'ovh-anonymous', 'llm7-anonymous', 'aihorde', 'pollinations'].map((id) => {
+        const lane = KEYLESS_LANE_FALLBACKS[id]!;
+        const live = providers.find((p) => p.id === id);
+        return (
+          <div key={id} className="card">
+            <div className="row-between">
+              <div>
+                <strong>{live?.name ?? id}</strong>{' '}
+                {lane.byokOnly ? (
+                  <span className="chip amber">bring your own key</span>
+                ) : (
+                  <span className="chip green">no key needed</span>
+                )}{' '}
+                {live ? (
+                  <span className={`chip ${live.configured || lane.keyless ? 'green' : 'gray'}`}>
+                    {lane.keyless ? 'keyless lane' : live.configured ? 'configured' : 'no key'}
+                  </span>
+                ) : (
+                  <span className="chip gray">not in the current catalog</span>
+                )}
+              </div>
+              <span className="small muted mono">{id}</span>
+            </div>
+            <p className="small muted">
+              <strong>{lane.label}.</strong> {lane.note}
+              {lane.byokOnly && ' Use the API key field on its provider card below — there is no anonymous Pollinations lane.'}
+              {lane.chatOnly && ' Tool calls are not available on this lane.'}
+            </p>
+          </div>
+        );
+      })}
+
+      <h2 className="page-sub" style={{ marginTop: 24 }}>
         Local providers
       </h2>
       <p className="small muted">
@@ -563,6 +604,11 @@ export default function ProvidersPage() {
               ? `Models: ${shownModels(p).map((m) => modelLabel(m.id, m.free)).join(', ')}`
               : 'No models found — is Ollama running? Start it and pull a model, e.g. "ollama pull llama3.1".'}
           </p>
+          {keylessLaneFor(p) && (
+            <p className="small muted">
+              <strong>{keylessLaneFor(p)!.label}.</strong> {keylessLaneFor(p)!.note}
+            </p>
+          )}
           <RateLimitLine rateLimit={p.rateLimit} />
         </div>
       ))}
@@ -589,6 +635,12 @@ export default function ProvidersPage() {
                 ? 'No free models on this provider.'
                 : 'No catalog models.'}
           </p>
+          {keylessLaneFor(p) && (
+            <p className="small muted">
+              <strong>{keylessLaneFor(p)!.label}.</strong> {keylessLaneFor(p)!.note}
+              {keylessLaneFor(p)!.byokOnly && ' Pollinations is shown only as a bring-your-own-key provider — paste your own key below.'}
+            </p>
+          )}
           <RateLimitLine rateLimit={p.rateLimit} />
           <div className="grid-2">
             <div className="field">

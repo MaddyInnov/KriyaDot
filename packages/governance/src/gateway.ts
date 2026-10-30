@@ -11,6 +11,9 @@ import type { DatabaseSync } from 'node:sqlite';
 type Database = DatabaseSync;
 import { DENYLIST_COMMAND_RE } from './default-policy.js';
 import { checkHardFloor, type HardFloorConfig, type HardFloorHit } from './hard-floors.js';
+import { countMatchingHistory } from './history.js';
+import { checkDomainGrant } from './domains.js';
+import type { PolicySnapshot } from './policy-snapshot.js';
 import type {
   ActionClass,
   ApprovalRecord,
@@ -21,6 +24,7 @@ import type {
   EvaluateResult,
   Policy,
   PolicyRule,
+  SessionToolHistory,
   SimulationResult,
 } from './types.js';
 
@@ -34,6 +38,10 @@ interface PolicyDecision {
   floorHit: HardFloorHit | null;
   denylistHit: boolean;
   matchedRule?: PolicyRule;
+  /** #122: a domain-bound rule denied this call (host outside allowlist / undeterminable). */
+  domainDenied?: boolean;
+  domainReason?: string;
+  targetHost?: string;
 }
 
 /** One governance decision, reported to GatewayOptions.onDecision. */
@@ -318,6 +326,21 @@ export class GovernanceGateway {
   }
 
   /**
+   * Evaluate against a policy SNAPSHOT captured at session start (#70,
+   * opt-in — see policy-snapshot.ts). The snapshot's policy is frozen,
+   * so later edits to the live policy or its file cannot change the
+   * outcome for this session. The default path (`evaluate`) stays live.
+   */
+  async evaluateWithSnapshot(
+    toolName: string,
+    args: Record<string, unknown>,
+    ctx: EvalContext,
+    snapshot: PolicySnapshot,
+  ): Promise<EvaluateResult> {
+    return this.evaluateInner(toolName, args, ctx, snapshot.policy);
+  }
+
+  /**
    * Pure policy decision: hard floors → denylist → first matching rule →
    * default effect. No side effects (no approvals minted, no audit written)
    * — shared by evaluateInner() and simulate() so the simulator can never
@@ -327,7 +350,7 @@ export class GovernanceGateway {
     toolName: string,
     args: Record<string, unknown>,
     policy: Policy,
-    sessionToolHistory?: string[],
+    sessionToolHistory?: SessionToolHistory,
   ): PolicyDecision {
     const actionClass = this.classify(toolName);
 
@@ -354,15 +377,50 @@ export class GovernanceGateway {
       return { effect: 'deny', actionClass, floorHit: null, denylistHit: true };
     }
 
-    const matchedRule = policy.rules.find((r) =>
-      this.ruleMatches(r, toolName, actionClass, args, sessionToolHistory),
-    );
+    // First matching rule wins — with one hard exception (#122): when
+    // the matching rule is domain-bound and the call's target host is
+    // outside its allowlist (or cannot be determined), the call is
+    // DENIED here instead of falling through to a later, more
+    // permissive rule. A domain grant can never be widened by rule
+    // order.
+    for (const rule of policy.rules) {
+      if (!this.ruleMatches(rule, toolName, actionClass, args, sessionToolHistory)) continue;
+      if (rule.domains && rule.domains.length > 0) {
+        const check = checkDomainGrant(rule.domains, args);
+        if (!check.allowed) {
+          return {
+            effect: 'deny',
+            actionClass,
+            floorHit: null,
+            denylistHit: false,
+            matchedRule: rule,
+            domainDenied: true,
+            domainReason: check.reason,
+            targetHost: check.host ?? undefined,
+          };
+        }
+        return {
+          effect: rule.effect,
+          actionClass,
+          floorHit: null,
+          denylistHit: false,
+          matchedRule: rule,
+          targetHost: check.host ?? undefined,
+        };
+      }
+      return {
+        effect: rule.effect,
+        actionClass,
+        floorHit: null,
+        denylistHit: false,
+        matchedRule: rule,
+      };
+    }
     return {
-      effect: matchedRule?.effect ?? policy.defaultEffect,
+      effect: policy.defaultEffect,
       actionClass,
       floorHit: null,
       denylistHit: false,
-      matchedRule,
     };
   }
 
@@ -381,12 +439,16 @@ export class GovernanceGateway {
     toolName: string,
     args: Record<string, unknown>,
     policy?: Policy,
-    sessionToolHistory?: string[],
+    sessionToolHistory?: SessionToolHistory,
   ): Promise<SimulationResult> {
     const d = this.decidePolicy(toolName, args, policy ?? this.policy, sessionToolHistory);
     const reason =
       d.floorHit?.reason ??
-      (d.denylistHit ? 'denylist: destructive command pattern' : (d.matchedRule?.reason ?? 'default policy'));
+      (d.domainDenied
+        ? d.domainReason!
+        : d.denylistHit
+          ? 'denylist: destructive command pattern'
+          : (d.matchedRule?.reason ?? 'default policy'));
     return {
       effect: d.effect,
       actionClass: d.actionClass,
@@ -397,6 +459,8 @@ export class GovernanceGateway {
         ? { tier: d.floorHit.tier, reason: d.floorHit.reason, patternId: d.floorHit.patternId }
         : undefined,
       denylist: d.denylistHit || undefined,
+      domainDenied: d.domainDenied || undefined,
+      targetHost: d.targetHost,
       simulated: true,
     };
   }
@@ -464,6 +528,24 @@ export class GovernanceGateway {
         },
       });
       this.notifyDecision({ toolName, effect: 'deny', botId: ctx.botId, actor: ctx.actor, sessionId: ctx.sessionId, reason: 'denylist: destructive command pattern' });
+      return { effect: 'deny' };
+    }
+
+    if (d.domainDenied) {
+      this.audit('tool.evaluate', {
+        actor: ctx.actor,
+        sessionId: ctx.sessionId,
+        toolName,
+        decision: 'deny',
+        detail: {
+          reason: d.domainReason,
+          actionClass,
+          ruleId: rule?.id,
+          targetHost: d.targetHost,
+          args: redactSecrets(args),
+        },
+      });
+      this.notifyDecision({ toolName, effect: 'deny', botId: ctx.botId, actor: ctx.actor, sessionId: ctx.sessionId, reason: d.domainReason, ruleId: rule?.id });
       return { effect: 'deny' };
     }
 
@@ -849,7 +931,7 @@ export class GovernanceGateway {
     toolName: string,
     actionClass: ActionClass,
     args: Record<string, unknown>,
-    sessionToolHistory?: string[],
+    sessionToolHistory?: SessionToolHistory,
   ): boolean {
     if (rule.actionClass !== undefined && rule.actionClass !== actionClass) {
       return false;
@@ -879,15 +961,11 @@ export class GovernanceGateway {
     }
     // Guardrails as code: session-history condition ("allow X only
     // after Y ran"). Without a history the rule never matches.
+    // Argument-qualified conditions (#66) count only rich entries
+    // carrying the required digest/summary — see history.ts.
     if (rule.requiresHistory) {
       if (!sessionToolHistory) return false;
-      let histRe: RegExp;
-      try {
-        histRe = new RegExp(rule.requiresHistory.toolPattern, 'i');
-      } catch {
-        return false;
-      }
-      const count = sessionToolHistory.filter((n) => histRe.test(n)).length;
+      const count = countMatchingHistory(sessionToolHistory, rule.requiresHistory);
       if (count < (rule.requiresHistory.minCount ?? 1)) return false;
     }
     return true;

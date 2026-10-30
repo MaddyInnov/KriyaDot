@@ -18,7 +18,7 @@ describe('MarketplaceRegistry', () => {
   it('loads the bundled registry', () => {
     const reg = MarketplaceRegistry.fromFile(REGISTRY);
     expect(reg.count()).toBeGreaterThan(0);
-    expect(reg.kinds()).toEqual(['bot', 'skill', 'workflow', 'mcp-server']);
+    expect(reg.kinds()).toEqual(['bot', 'skill', 'workflow', 'mcp-server', 'capability']);
   });
 
   it('filters by kind and free-text query', () => {

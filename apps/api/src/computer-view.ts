@@ -40,6 +40,7 @@
 //
 // Mounting (index.ts is NOT edited by this module; the integrator wires it):
 //   import { createComputerView } from './computer-view.js';
+import { shouldDropOutbound, StuckBufferEvictor } from './ws-hub-util.js';
 //   const computerView = createComputerView({
 //     audit: (action, fields) => governance.audit(action, fields),
 //     listAudit: (limit) => governance.listAudit(limit),
@@ -177,6 +178,8 @@ export interface ViewerSocket {
   close(code?: number): void;
   onMessage(cb: (text: string) => void): void;
   onClose(cb: () => void): void;
+  /** Unsent bytes buffered by the transport (backpressure, #95). */
+  bufferedAmount?: number;
 }
 
 class MiniWsSocket implements ViewerSocket {
@@ -202,6 +205,10 @@ class MiniWsSocket implements ViewerSocket {
 
   onClose(cb: () => void): void {
     this.closeCb = cb;
+  }
+
+  get bufferedAmount(): number {
+    return (this.socket as { writableLength?: number }).writableLength ?? 0;
   }
 
   sendText(text: string): void {
@@ -431,6 +438,8 @@ export class ComputerViewHub {
   private readonly deps: Required<Pick<ComputerViewDeps, 'audit' | 'listAudit' | 'loopbackToken'>> &
     Pick<ComputerViewDeps, 'createLayer'> & { fps: number; drivingWindowMs: number };
   private readonly states = new Map<string, BotViewState>();
+  /** Dead-viewer eviction (#95): close viewers whose outbound buffer stays over-cap. */
+  private readonly stuckViewers = new StuckBufferEvictor();
 
   constructor(deps: ComputerViewDeps) {
     this.deps = {
@@ -754,6 +763,16 @@ export class ComputerViewHub {
             n: state.frames,
           });
           for (const viewer of [...state.viewers]) {
+            // Dead-client eviction (#95): a viewer continuously over the
+            // backpressure cap is gone/wedged — close it instead of
+            // dropping frames for it forever.
+            if (this.stuckViewers.observe(viewer)) {
+              state.viewers.delete(viewer);
+              this.stuckViewers.forget(viewer);
+              try { viewer.close(1011); } catch { /* already gone */ }
+              continue;
+            }
+            if (shouldDropOutbound(viewer, 'low')) continue; // slow viewer drops frames (#95)
             try {
               viewer.sendText(frame);
             } catch {

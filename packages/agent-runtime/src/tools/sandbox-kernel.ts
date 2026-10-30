@@ -4,11 +4,14 @@
  * Kernel sandbox backends for run_command (Octomind parity): Landlock
  * (Linux) and Seatbelt (macOS), used where the platform allows.
  *
- * Policy (matches the Docker backend's spirit — sandboxed commands are
- * compute, not workspace editors):
+ * Policy (#117 closure — the kernel sandbox is the DEFAULT confinement
+ * for local execution when no container backend is configured):
  *   - the whole filesystem is READ + EXECUTE only;
- *   - writes are confined to a fresh per-run temp directory (the cwd)
- *     and the system temp dir;
+ *   - writes are confined to the bot's workspace directory (threaded
+ *     through `SandboxCommandOptions.workspaceDir`; the cwd) and the
+ *     system temp dir. With no workspace dir supplied, a fresh per-run
+ *     temp directory is the writable root (previous behaviour, kept
+ *     for direct/unit callers);
  *   - Landlock (ABI ≤3) cannot filter network syscalls, so network
  *     denial is NOT claimed for Linux; Seatbelt profiles deny network
  *     unless the caller opted in.
@@ -25,8 +28,8 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import type { SandboxCommandOptions, SandboxCommandResult } from './sandbox.js';
 
 // ---------------------------------------------------------------------------
@@ -214,22 +217,81 @@ export function seatbeltAvailable(): boolean {
   return !res.error && res.status === 0;
 }
 
-/** Generate the Seatbelt profile for one run (exported for tests). */
-export function buildSeatbeltProfile(workdir: string, opts: { network?: boolean } = {}): string {
+/**
+ * Filesystem roots readable under Landlock: the helper grants
+ * READ+EXECUTE on `/` as a whole, so every root below is readable on
+ * Linux. The Seatbelt profile enumerates the same roots explicitly
+ * (plus a whole-`/` read rule) so the two backends carry the same
+ * read policy — #119 profile parity.
+ */
+export const KERNEL_READ_ROOTS: readonly string[] = [
+  '/usr',
+  '/System',
+  '/Library',
+  '/bin',
+  '/sbin',
+  '/etc',
+  '/private/etc',
+  '/dev',
+  '/opt',
+  '/usr/local',
+  '/private',
+  '/Users',
+  '/Volumes',
+];
+
+/**
+ * Generate the Seatbelt profile for one run (exported for tests).
+ *
+ * Parity with the Landlock policy (#119):
+ *   - READ: the whole filesystem is readable + executable, mirroring
+ *     Landlock's `allow_path("/", READ|EXECUTE)` — expressed both as
+ *     the enumerated KERNEL_READ_ROOTS and a whole-`/` read rule, so
+ *     no read path Landlock grants is missing on macOS.
+ *   - WRITE: confined to the workspace/workdir and the system temp
+ *     dirs, plus /dev/null + /dev/zero. Writes under $HOME are
+ *     explicitly denied BEFORE the workspace allow rule: Seatbelt
+ *     applies the last matching rule, so a workspace inside $HOME
+ *     stays writable while the rest of $HOME is write-denied —
+ *     exactly Landlock's outcome ($HOME readable, not writable).
+ *   - NETWORK: denied unless the caller opted in (Landlock ABI ≤3
+ *     cannot filter network; Seatbelt can, and does).
+ *
+ * NOTE: profile generation is fully tested on Linux; EXECUTION via
+ * sandbox-exec remains macOS-gated and unverifiable on a Linux host.
+ */
+export function buildSeatbeltProfile(
+  workdir: string,
+  opts: { network?: boolean; homeDir?: string } = {},
+): string {
   const esc = (p: string): string => p.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  return [
+  const home = opts.homeDir ?? homedir();
+  const readRoots = KERNEL_READ_ROOTS.map((r) => `(subpath "${esc(r)}")`).join(' ');
+  const lines = [
     '(version 1)',
     '(deny default)',
     '(allow process-exec)',
     '(allow process-fork)',
     '(allow sysctl-read)',
     '(allow mach-lookup)',
-    '(allow file-read* (subpath "/usr") (subpath "/System") (subpath "/Library") (subpath "/bin") (subpath "/sbin") (subpath "/etc") (subpath "/private/etc") (subpath "/dev"))',
+    '(allow signal (target self))',
+    '(allow file-read-metadata)',
+    // Landlock parity: read + execute across the whole filesystem.
+    `(allow file-read* ${readRoots})`,
+    '(allow file-read* (subpath "/"))',
+    '(allow process-exec* (subpath "/"))',
+  ];
+  // $HOME write denial comes BEFORE the workspace write allow (last
+  // matching rule wins under Seatbelt), so workspaces under $HOME
+  // remain writable while the rest of $HOME is write-confined.
+  if (home) lines.push(`(deny file-write* (subpath "${esc(home)}"))`);
+  lines.push(
     `(allow file-read* file-write* (subpath "${esc(workdir)}") (subpath "/tmp") (subpath "/private/tmp"))`,
     '(allow file-write* (literal "/dev/null") (literal "/dev/zero"))',
     opts.network ? '(allow network*)' : '(deny network*)',
     '',
-  ].join('\n');
+  );
+  return lines.join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +302,7 @@ async function runConfined(
   file: string,
   args: string[],
   cwd: string,
-  opts: SandboxCommandOptions,
+  opts: SandboxCommandOptions & { stdin?: string },
 ): Promise<SandboxCommandResult> {
   const timeoutMs =
     typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0
@@ -251,7 +313,15 @@ async function runConfined(
       ? Math.floor(opts.maxOutputBytes)
       : 256 * 1024;
   return new Promise<SandboxCommandResult>((resolve, reject) => {
-    const child = spawn(file, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const child = spawn(file, args, {
+      cwd,
+      stdio: [opts.stdin !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    if (opts.stdin !== undefined) {
+      child.stdin?.on('error', () => {});
+      child.stdin?.end(opts.stdin);
+    }
     const out: Buffer[] = [];
     const err: Buffer[] = [];
     let outBytes = 0;
@@ -261,13 +331,13 @@ async function runConfined(
       timedOut = true;
       child.kill('SIGKILL');
     }, timeoutMs);
-    child.stdout.on('data', (d: Buffer) => {
+    child.stdout?.on('data', (d: Buffer) => {
       if (outBytes < maxBytes) {
         out.push(d.subarray(0, maxBytes - outBytes));
         outBytes += d.length;
       }
     });
-    child.stderr.on('data', (d: Buffer) => {
+    child.stderr?.on('data', (d: Buffer) => {
       if (errBytes < maxBytes) {
         err.push(d.subarray(0, maxBytes - errBytes));
         errBytes += d.length;
@@ -293,35 +363,105 @@ function freshWorkdir(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
-/** Run under Landlock: writes confined to a fresh temp cwd + /tmp. */
-export async function runInLandlock(
-  cmd: string,
-  opts: SandboxCommandOptions = {},
+/**
+ * The kernel backend usable right now, probed asynchronously (the
+ * Landlock helper may need compiling on first use). Null when neither
+ * Landlock nor Seatbelt can confine a run on this host.
+ */
+export async function probeKernelBackend(): Promise<'landlock' | 'seatbelt' | null> {
+  if (process.platform === 'linux') {
+    return (await landlockAbiVersion()) >= 1 ? 'landlock' : null;
+  }
+  if (process.platform === 'darwin') {
+    return seatbeltAvailable() ? 'seatbelt' : null;
+  }
+  return null;
+}
+
+/**
+ * Run an argv (no shell) under Landlock: writes confined to
+ * `opts.workspaceDir` (the writable root + cwd) when supplied, else a
+ * fresh temp cwd; /tmp stays writable either way (helper policy).
+ */
+export async function runArgvInLandlock(
+  argv: string[],
+  opts: SandboxCommandOptions & { stdin?: string } = {},
 ): Promise<SandboxCommandResult> {
   const bin = await ensureLandlockHelper();
   if (!bin) throw new Error('Landlock backend unavailable (no compiler or not Linux)');
   const abi = await landlockAbiVersion();
   if (abi < 1) throw new Error('Landlock is not enabled in this kernel');
-  const workdir = freshWorkdir('kriyadot-landlock-run-');
+  if (argv.length === 0) throw new Error('runArgvInLandlock: empty argv');
+  const ownDir = opts.workspaceDir ? null : freshWorkdir('kriyadot-landlock-run-');
+  const workdir = opts.workspaceDir ? resolve(opts.workspaceDir) : ownDir!;
   try {
-    return await runConfined(bin, [workdir, '/bin/sh', '-c', cmd], workdir, opts);
+    if (opts.workspaceDir) mkdirSync(workdir, { recursive: true });
+    const res = await runConfined(bin, [workdir, ...argv], workdir, opts);
+    return { ...res, backend: 'landlock', sandboxed: true };
   } finally {
-    rmSync(workdir, { recursive: true, force: true });
+    if (ownDir) rmSync(ownDir, { recursive: true, force: true });
   }
 }
 
-/** Run under Seatbelt (macOS sandbox-exec). */
+/** Run a shell command under Landlock (workspace-confined per #117). */
+export async function runInLandlock(
+  cmd: string,
+  opts: SandboxCommandOptions = {},
+): Promise<SandboxCommandResult> {
+  return runArgvInLandlock(['/bin/sh', '-c', cmd], opts);
+}
+
+/**
+ * Run an argv (no shell) under Seatbelt. The profile is generated for
+ * the workspace dir (writable root) but stored in a scratch temp dir
+ * so runs never pollute the workspace. macOS-only execution.
+ */
+export async function runArgvInSeatbelt(
+  argv: string[],
+  opts: SandboxCommandOptions & { stdin?: string } = {},
+): Promise<SandboxCommandResult> {
+  if (!seatbeltAvailable()) throw new Error('Seatbelt backend unavailable (needs macOS sandbox-exec)');
+  if (argv.length === 0) throw new Error('runArgvInSeatbelt: empty argv');
+  const scratch = freshWorkdir('kriyadot-seatbelt-run-');
+  const ownWorkdir = opts.workspaceDir ? null : freshWorkdir('kriyadot-seatbelt-ws-');
+  const workdir = opts.workspaceDir ? resolve(opts.workspaceDir) : ownWorkdir!;
+  const profilePath = join(scratch, 'profile.sb');
+  try {
+    if (opts.workspaceDir) mkdirSync(workdir, { recursive: true });
+    writeFileSync(profilePath, buildSeatbeltProfile(workdir, { network: opts.network === true }));
+    const res = await runConfined('sandbox-exec', ['-f', profilePath, ...argv], workdir, opts);
+    return { ...res, backend: 'seatbelt', sandboxed: true };
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+    if (ownWorkdir) rmSync(ownWorkdir, { recursive: true, force: true });
+  }
+}
+
+/** Run a shell command under Seatbelt (macOS sandbox-exec). */
 export async function runInSeatbelt(
   cmd: string,
   opts: SandboxCommandOptions = {},
 ): Promise<SandboxCommandResult> {
-  if (!seatbeltAvailable()) throw new Error('Seatbelt backend unavailable (needs macOS sandbox-exec)');
-  const workdir = freshWorkdir('kriyadot-seatbelt-run-');
-  const profilePath = join(workdir, 'profile.sb');
-  try {
-    writeFileSync(profilePath, buildSeatbeltProfile(workdir, { network: opts.network === true }));
-    return await runConfined('sandbox-exec', ['-f', profilePath, '/bin/sh', '-c', cmd], workdir, opts);
-  } finally {
-    rmSync(workdir, { recursive: true, force: true });
+  return runArgvInSeatbelt(['/bin/sh', '-c', cmd], opts);
+}
+
+/**
+ * Run an argv under whichever kernel backend this host supports
+ * (Landlock on Linux, Seatbelt on macOS). Throws when neither is
+ * available — callers decide the fallback (host-with-warning or
+ * fail-closed in strict mode). Used by local tools (#117c), which are
+ * argv executables rather than shell commands.
+ */
+export async function runArgvConfined(
+  argv: string[],
+  opts: SandboxCommandOptions & { stdin?: string } = {},
+): Promise<SandboxCommandResult & { backend: 'landlock' | 'seatbelt' }> {
+  const backend = await probeKernelBackend();
+  if (backend === 'landlock') {
+    return { ...(await runArgvInLandlock(argv, opts)), backend };
   }
+  if (backend === 'seatbelt') {
+    return { ...(await runArgvInSeatbelt(argv, opts)), backend };
+  }
+  throw new Error('No kernel sandbox backend available on this host (Landlock/Seatbelt unavailable)');
 }

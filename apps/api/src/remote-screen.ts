@@ -29,6 +29,7 @@
 // (the `ok` frame message carries mock:true so clients can badge it).
 
 import { randomUUID } from 'node:crypto';
+import { shouldDropOutbound, StuckBufferEvictor } from './ws-hub-util.js';
 import { createRequire } from 'node:module';
 import type { ViewerSocket } from './computer-view.js';
 
@@ -209,6 +210,8 @@ export class RemoteScreenService {
     Pick<RemoteScreenDeps, 'captureFrame' | 'fps' | 'maxDurationMs' | 'approvalTimeoutMs' | 'now'>;
   private readonly sessions = new Map<string, RemoteScreenSession>();
   private readonly live = new Map<string, LiveState>();
+  /** Dead-viewer eviction (#95): close viewers whose outbound buffer stays over-cap. */
+  private readonly stuckViewers = new StuckBufferEvictor();
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(deps: RemoteScreenDeps) {
@@ -417,6 +420,14 @@ export class RemoteScreenService {
       mock: session.mock,
     });
     for (const v of [...st.viewers]) {
+      // Dead-client eviction (#95): continuously over-cap = gone/wedged.
+      if (this.stuckViewers.observe(v, this.now())) {
+        st.viewers.delete(v);
+        this.stuckViewers.forget(v);
+        try { v.close(1011); } catch { /* already gone */ }
+        continue;
+      }
+      if (shouldDropOutbound(v, 'low')) continue; // slow viewer drops frames (#95)
       try {
         v.sendText(msg);
       } catch {

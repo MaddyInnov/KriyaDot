@@ -11,14 +11,23 @@
  * context. Runs are listable and stoppable; stopping aborts the run's
  * turn via its AbortController.
  *
- * The registry is deliberately in-memory: background runs do not
- * survive a server restart (their sessions do — a lost run simply
- * never injects, which the origin bot can see from the run list).
+ * Persistence (closure #44): pass a `store` (e.g.
+ * FileBackgroundRunStore) and records — including completed-but-not-
+ * yet-injected results — survive a restart and still deliver. Without
+ * a store the registry stays in-memory as before.
+ *
+ * Resume (closure #14): `prepareResume` re-dispatches a stopped/failed
+ * run with the same spec plus a prior-context summary.
+ *
+ * Concurrency (closure #17): `SpawnConcurrencyGate` caps concurrent
+ * ACP + background spawns; the runtime acquires a slot before dispatch.
  */
 
 import { randomUUID } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 
-export type BackgroundRunStatus = 'running' | 'done' | 'failed' | 'stopped';
+export type BackgroundRunStatus = 'queued' | 'running' | 'done' | 'failed' | 'stopped';
 
 export interface BackgroundRunRecord {
   id: string;
@@ -36,11 +45,68 @@ export interface BackgroundRunRecord {
   finishedAt?: number;
   /** When the result was injected into the origin session (once only). */
   injectedAt?: number;
+  /** Closure #14: set on a resumed run — the run it resumes + prior context. */
+  resumedFromId?: string;
+  priorContext?: string;
+  /** Epoch ms when a queued run (cap, #17) actually started dispatching. */
+  dispatchedAt?: number;
+}
+
+/** Pluggable persistence for the registry (closure #44). */
+export interface BackgroundRunStore {
+  load(): BackgroundRunRecord[];
+  save(records: BackgroundRunRecord[]): void;
+}
+
+/** In-memory store (tests / explicit opt-out of persistence). */
+export class MemoryBackgroundRunStore implements BackgroundRunStore {
+  private data: BackgroundRunRecord[] = [];
+  load(): BackgroundRunRecord[] { return this.data.map((r) => ({ ...r })); }
+  save(records: BackgroundRunRecord[]): void { this.data = records.map((r) => ({ ...r })); }
+}
+
+/** JSON-file store using the same plain-file pattern as other host stores. */
+export class FileBackgroundRunStore implements BackgroundRunStore {
+  constructor(private readonly path: string) {}
+  load(): BackgroundRunRecord[] {
+    try {
+      const parsed = JSON.parse(readFileSync(this.path, 'utf8')) as unknown;
+      return Array.isArray(parsed) ? (parsed as BackgroundRunRecord[]) : [];
+    } catch { return []; }
+  }
+  save(records: BackgroundRunRecord[]): void {
+    try {
+      mkdirSync(dirname(this.path), { recursive: true });
+      writeFileSync(this.path, JSON.stringify(records));
+    } catch { /* persistence must never break a run */ }
+  }
 }
 
 export class BackgroundRunRegistry {
   private readonly runs = new Map<string, BackgroundRunRecord>();
   private readonly controllers = new Map<string, AbortController>();
+  private readonly store?: BackgroundRunStore;
+
+  constructor(opts: { store?: BackgroundRunStore } = {}) {
+    this.store = opts.store;
+    if (this.store) {
+      for (const rec of this.store.load()) {
+        // A run that was 'running' at shutdown can never finish; mark it
+        // failed so its (missing) result is honest, while completed-
+        // undelivered results stay injectable (#44).
+        if (rec.status === 'running' || rec.status === 'queued') {
+          rec.status = 'failed';
+          rec.error = rec.error ?? 'interrupted by a server restart before it finished';
+          rec.finishedAt = rec.finishedAt ?? Date.now();
+        }
+        this.runs.set(rec.id, rec);
+      }
+    }
+  }
+
+  private persist(): void {
+    this.store?.save([...this.runs.values()]);
+  }
 
   start(input: {
     botId: string;
@@ -65,6 +131,7 @@ export class BackgroundRunRegistry {
     };
     this.runs.set(id, record);
     this.controllers.set(id, controller);
+    this.persist();
     return { record, signal: controller.signal };
   }
 
@@ -75,6 +142,7 @@ export class BackgroundRunRegistry {
     record.result = result;
     record.finishedAt = Date.now();
     this.controllers.delete(id);
+    this.persist();
   }
 
   fail(id: string, error: string): void {
@@ -84,6 +152,7 @@ export class BackgroundRunRegistry {
     record.error = error;
     record.finishedAt = Date.now();
     this.controllers.delete(id);
+    this.persist();
   }
 
   /** Stop a running run (aborts its turn). Returns false if not running. */
@@ -94,6 +163,7 @@ export class BackgroundRunRegistry {
     record.finishedAt = Date.now();
     this.controllers.get(id)?.abort();
     this.controllers.delete(id);
+    this.persist();
     return true;
   }
 
@@ -124,7 +194,84 @@ export class BackgroundRunRegistry {
         (r.status === 'done' || r.status === 'failed' || r.status === 'stopped'),
     );
     for (const r of ready) r.injectedAt = Date.now();
+    if (ready.length > 0) this.persist();
     return ready.sort((a, b) => (a.finishedAt ?? 0) - (b.finishedAt ?? 0));
+  }
+
+  /** Finished, undelivered runs WITHOUT marking them injected (live-turn peek, #14). */
+  peekInjectable(originSessionId: string): BackgroundRunRecord[] {
+    return [...this.runs.values()].filter(
+      (r) =>
+        r.originSessionId === originSessionId &&
+        r.injectedAt === undefined &&
+        (r.status === 'done' || r.status === 'failed' || r.status === 'stopped'),
+    );
+  }
+
+  /**
+   * Resume (#14): prepare a NEW run for a stopped/failed run, carrying
+   * the same spec plus a prior-context summary (previous result excerpt
+   * or the failure). Returns undefined when the run is not resumable.
+   */
+  prepareResume(id: string): { record: BackgroundRunRecord; signal: AbortSignal } | undefined {
+    const prev = this.runs.get(id);
+    if (!prev || (prev.status !== 'stopped' && prev.status !== 'failed')) return undefined;
+    const priorContext =
+      prev.status === 'failed'
+        ? `A previous attempt at this task FAILED: ${prev.error ?? 'unknown error'}. Do not repeat the failing approach.`
+        : `A previous attempt at this task was stopped before finishing.${prev.result ? ` Partial result: ${prev.result.slice(0, 1000)}` : ''} Continue from there.`;
+    const { record, signal } = this.start({
+      botId: prev.botId,
+      botName: prev.botName,
+      ephemeral: prev.ephemeral,
+      originBotId: prev.originBotId,
+      originSessionId: prev.originSessionId,
+      task: prev.task,
+    });
+    record.resumedFromId = prev.id;
+    record.priorContext = priorContext;
+    this.persist();
+    return { record, signal };
+  }
+}
+
+/**
+ * Concurrency gate for ACP + background spawns (#17): at most `cap`
+ * holders run at once; further acquirers queue FIFO until a release.
+ */
+export class SpawnConcurrencyGate {
+  private active = 0;
+  private readonly waiters: Array<() => void> = [];
+  constructor(private readonly cap = 4) {}
+  get activeCount(): number { return this.active; }
+  get waitingCount(): number { return this.waiters.length; }
+  get limit(): number { return this.cap; }
+  async acquire(): Promise<() => void> {
+    if (this.active >= this.cap) {
+      await new Promise<void>((resolve) => this.waiters.push(resolve));
+    }
+    this.active += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.active -= 1;
+      const next = this.waiters.shift();
+      if (next) next();
+    };
+  }
+  /** Sync try-acquire: returns a release fn or null when at cap. */
+  tryAcquire(): (() => void) | null {
+    if (this.active >= this.cap) return null;
+    this.active += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.active -= 1;
+      const next = this.waiters.shift();
+      if (next) next();
+    };
   }
 }
 

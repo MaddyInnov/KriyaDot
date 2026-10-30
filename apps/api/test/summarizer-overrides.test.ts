@@ -9,15 +9,28 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const { mockChat, mockCreateProvider } = vi.hoisted(() => {
+const { mockChat, mockCreateProvider, mockCreateProviderWithKeylessFallback } = vi.hoisted(() => {
   const mockChat = vi.fn();
   const mockCreateProvider = vi.fn(() => ({ chat: mockChat }));
-  return { mockChat, mockCreateProvider };
+  // The summarizer now resolves its provider through the keyless-
+  // fallback seam (zero-setup installs fall back to a keyless lane
+  // instead of failing compaction). Mock that seam too: it returns the
+  // same fake provider, marked as not-fallen-back.
+  const mockCreateProviderWithKeylessFallback = vi.fn((providerId: string) => ({
+    provider: { chat: mockChat },
+    providerId,
+    fellBack: false,
+  }));
+  return { mockChat, mockCreateProvider, mockCreateProviderWithKeylessFallback };
 });
 
 vi.mock('@mvp/agent-runtime', async (importOriginal) => {
   const orig = await importOriginal<typeof import('@mvp/agent-runtime')>();
-  return { ...orig, createProvider: mockCreateProvider };
+  return {
+    ...orig,
+    createProvider: mockCreateProvider,
+    createProviderWithKeylessFallback: mockCreateProviderWithKeylessFallback,
+  };
 });
 
 import { PromptOverrideStore } from '@mvp/agent-runtime';
@@ -47,7 +60,7 @@ describe('createSummarizer prompt overrides', () => {
     mockChat.mockResolvedValue({ content: 'summary' });
     await createSummarizer(store)(messages);
 
-    expect(mockCreateProvider).toHaveBeenCalledWith('groq');
+    expect(mockCreateProviderWithKeylessFallback).toHaveBeenCalledWith('groq');
     const systemPrompt = mockChat.mock.calls[0][0][0].content as string;
     expect(systemPrompt).toContain('compact briefing');
   });

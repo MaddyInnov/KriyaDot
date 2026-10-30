@@ -4,6 +4,7 @@ import type {
   BotConfig,
   ChatMessage,
   LLMProvider,
+  MessageMedia,
   RichMessage,
   SandboxMode,
   StreamEvent,
@@ -18,7 +19,7 @@ import type { AuditEntry, GovernanceDecision, GovernanceGateway } from './govern
 // Privacy tiers: type-only (erased at compile) so the runtime never depends
 // on @mvp/governance at runtime. See RunTurnOptions.privacyGate.
 import type { EgressGate, TieredItem } from '@mvp/governance';
-import { createProvider } from './providers/factory.js';
+import { createProvider, isProviderConfigError, resolveViableKeylessProvider } from './providers/factory.js';
 import { reviewToolCall } from './reviewer.js';
 import {
   assertModelAllowed,
@@ -54,9 +55,10 @@ import {
   isUserOrigin,
   wrapPeerContent,
 } from './provenance.js';
-import { PLAN_APPROVAL_TOOL, buildPlanPrompt } from './approval-modes.js';
+import { PLAN_APPROVAL_TOOL, buildPlanPrompt, parsePlanSteps, type ExtendedLayerStage } from './approval-modes.js';
 import {
   ProgressGuard,
+  ToolErrorTracker,
   classifyTurnError,
   noProgressReport,
   type TurnFailureKind,
@@ -84,28 +86,41 @@ import { loadProjectInstructions } from './project-instructions.js';
 import { createRecallTools } from './tools/recall.js';
 import {
   BackgroundRunRegistry,
+  SpawnConcurrencyGate,
   renderRunInjection,
   type BackgroundRunRecord,
 } from './background-runs.js';
+import { resolveTemplateVariables } from './template-vars.js';
+import { SessionStandingRules, renderStandingRules } from './session-rules.js';
 import { createBackgroundTools } from './tools/background.js';
-import { verifyCompletionClaim, type TurnEvidence } from './supervisor.js';
-import { didYouMeanSuffix } from './tool-hints.js';
+import {
+  Supervisor,
+  SupervisorPlanStore,
+  renderSupervisorPlan,
+  supervisorStats,
+  verifyCompletionClaim,
+  type TurnEvidence,
+} from './supervisor.js';
+import { didYouMeanSuffix, withSemanticHint } from './tool-hints.js';
 import { evaluateQuestion, resolveEvaluateModel } from './evaluate.js';
 import {
   resolvePurposeProfile,
   type ModelProfiles,
 } from './model-profiles.js';
-import { runTurnValidators, validatorFailureMessage } from './validators.js';
+import { runEvaluateValidator, runTurnValidators, validatorFailureMessage, type ValidatorRunResult } from './validators.js';
 import {
+  createDiscoverSpecialistsTool,
   decideAutoActivation,
+  decideMcpAutoActivation,
   discoverByIntent,
   type DiscoverableItem,
 } from './discovery.js';
 import { TrigramEmbedder, type SyncEmbedder } from './hybrid-search.js';
 import { SteerQueue } from './steer.js';
 import { filterToolsForMode, type ConversationMode } from './conversation-modes.js';
-import { fitToolsToLimit } from './tool-fitting.js';
+import { fitToolsToLimit, selectToolsByIntentSync } from './tool-fitting.js';
 import { ToolSpillStore, createSpillTools } from './tool-spill.js';
+import { makeToolHistoryEntry } from './history-entry.js';
 import { providerHealth } from './failover.js';
 import { subagentProfiles } from './subagent-profiles.js';
 import { join, dirname } from 'node:path';
@@ -234,10 +249,55 @@ export interface AgentRuntimeOptions {
    */
   backgroundRuns?: BackgroundRunRegistry;
   /**
+   * Session standing rules (closure #46): session- + bot-scoped rules
+   * rendered into every turn's system context. Host-constructed (with a
+   * file store when persistence across restarts is wanted). Unset → no
+   * standing rules anywhere.
+   */
+  standingRules?: SessionStandingRules;
+  /**
    * Roster lookup for background delegation: botId → BotConfig. Without
    * it, delegate_background can only spawn ephemeral specialists.
    */
   resolveBot?: (botId: string) => BotConfig | undefined;
+  /**
+   * Closure #17: concurrency cap for ACP + background spawns
+   * (default 4). Spawns beyond the cap queue until a slot frees.
+   */
+  spawnConcurrencyCap?: number;
+  /**
+   * Closure #139: MCP server catalog for deterministic auto-activation
+   * (server id + description items) and the tools each server provides.
+   * Unset → MCP auto-activation is inert (documented host wiring).
+   */
+  mcpCatalog?: () => DiscoverableItem[];
+  toolsForMcpServer?: (serverId: string) => ToolDefinition[];
+  /** Closure #15: roster for the discover_specialists tool (bots/roles). */
+  discoverableItems?: () => DiscoverableItem[];
+}
+
+/**
+ * Closure-build per-bot extensions (structural — BotConfig in types.ts
+ * is widened by the parent merge; until then the runtime reads these
+ * through this cast type). All opt-in; defaults preserve prior behaviour.
+ */
+export interface BotClosureExtensions {
+  /** #20: 'standing' supervisor overseer; default 'gate'. */
+  supervisorMode?: 'gate' | 'standing';
+  /** #23: independent supervisor authorizer for mutating tool calls. */
+  supervisorAuthorizer?: boolean;
+  /** #20 bound: max supervisor steers per turn (default 3). */
+  supervisorMaxSteers?: number;
+  /** #138: intent-driven tool loading for large tool sets. */
+  intentToolLoading?: boolean;
+  /** #188: consecutive same-class failures before behaviour change (default 3; 0 disables). */
+  toolErrorThreshold?: number;
+  /** #41: extended layer stages (execute/verify kinds, outputMode, role). */
+  layers?: ExtendedLayerStage[];
+}
+
+export function botExt(bot: BotConfig): BotConfig & BotClosureExtensions {
+  return bot as BotConfig & BotClosureExtensions;
 }
 
 /**
@@ -285,6 +345,13 @@ export type TurnContextProvider = (info: {
 export interface RunTurnOptions {
   bot: BotConfig;
   message: string;
+  /**
+   * Native media attachments for this turn's user message (Octomind
+   * parity #38): attached to the stored user message and serialized by
+   * vision-capable drivers as native content parts. Hosts build these
+   * from uploaded files (see the API chat route's vision routing).
+   */
+  media?: MessageMedia[];
   sessionId?: string;
   /**
    * Multiplayer layer (W7): the person who owns the private 1:1 chat this
@@ -606,6 +673,8 @@ export class AgentRuntime {
   private readonly retrospectiveSink?: AgentRuntimeOptions['retrospectiveSink'];
   /** Background specialist runs (Octomind parity). */
   readonly backgroundRuns: BackgroundRunRegistry;
+  /** Session standing rules (#46), when the host supplied a store. */
+  readonly standingRules?: SessionStandingRules;
   private readonly resolveBot?: AgentRuntimeOptions['resolveBot'];
   /** Bot configs seen this process (origin-bot resolution for tools). */
   private readonly seenBots = new Map<string, BotConfig>();
@@ -645,6 +714,61 @@ export class AgentRuntime {
   readonly turnStates = new TurnStateRegistry();
   /** Mid-turn steering queue (item 1). */
   readonly steerQueue = new SteerQueue();
+  /** Closure #62: supervisor-owned persistent plan store (per session). */
+  readonly supervisorPlans = new SupervisorPlanStore();
+  /** Closure #180: supervisor statistics (process-wide singleton re-export). */
+  readonly supervisorStatsRef = supervisorStats;
+  /** Closure #17: spawn concurrency gate (ACP + background). */
+  readonly spawnGate: SpawnConcurrencyGate;
+  /** Closure #19: per-session dynamic tool registry. */
+  private readonly sessionTools = new Map<string, Map<string, ToolDefinition>>();
+  /** Closure #188: per-session per-tool error trackers. */
+  private readonly toolErrorTrackers = new Map<string, ToolErrorTracker>();
+  private readonly mcpCatalogFn?: AgentRuntimeOptions['mcpCatalog'];
+  private readonly toolsForMcpServerFn?: AgentRuntimeOptions['toolsForMcpServer'];
+  private readonly discoverableItemsFn?: AgentRuntimeOptions['discoverableItems'];
+
+  /** #19: register a tool visible ONLY to turns of `sessionId`. */
+  registerSessionTool(sessionId: string, def: ToolDefinition): void {
+    const map = this.sessionTools.get(sessionId) ?? new Map<string, ToolDefinition>();
+    map.set(def.name, def);
+    this.sessionTools.set(sessionId, map);
+  }
+  unregisterSessionTool(sessionId: string, name: string): boolean {
+    return this.sessionTools.get(sessionId)?.delete(name) ?? false;
+  }
+  /** #19: drop all session-scoped tools (call when the session closes). */
+  closeSessionTools(sessionId: string): void {
+    this.sessionTools.delete(sessionId);
+    this.toolErrorTrackers.delete(sessionId);
+  }
+  sessionToolNames(sessionId: string): string[] {
+    return [...(this.sessionTools.get(sessionId)?.keys() ?? [])];
+  }
+
+  /** #15: the discover_specialists tool over the host-supplied roster. */
+  createDiscoveryTools(): ToolDefinition[] {
+    return [
+      createDiscoverSpecialistsTool({
+        items: () =>
+          this.discoverableItemsFn?.() ?? [
+            ...[...this.seenBots.values()].map((b) => ({
+              kind: 'bot' as const,
+              id: b.id,
+              name: b.name,
+              description: b.description ?? '',
+            })),
+            ...(this.mcpCatalogFn?.() ?? []),
+          ],
+        embedder: this.embedder,
+      }),
+    ];
+  }
+
+  /** #62: read/update the supervisor plan for a session. */
+  getSupervisorPlan(sessionId: string) {
+    return this.supervisorPlans.get(sessionId);
+  }
   private readonly spillStores = new Map<string, ToolSpillStore>();
   enqueueSteer(sessionId: string, text: string): { id: string; running: boolean; pending: number } { const m = this.steerQueue.enqueue(sessionId, text); return { id: m.id, running: Boolean(this.turnStates.snapshot(sessionId)), pending: this.steerQueue.pending(sessionId) }; }
   isTurnRunning(sessionId: string): boolean { return Boolean(this.turnStates.snapshot(sessionId)); }
@@ -682,7 +806,12 @@ export class AgentRuntime {
     this.embedder = opts.embedder ?? new TrigramEmbedder();
     this.retrospectiveSink = opts.retrospectiveSink;
     this.backgroundRuns = opts.backgroundRuns ?? new BackgroundRunRegistry();
+    this.standingRules = opts.standingRules;
     this.resolveBot = opts.resolveBot;
+    this.spawnGate = new SpawnConcurrencyGate(opts.spawnConcurrencyCap ?? 4);
+    this.mcpCatalogFn = opts.mcpCatalog;
+    this.toolsForMcpServerFn = opts.toolsForMcpServer;
+    this.discoverableItemsFn = opts.discoverableItems;
     this.spanStoreExplicit = opts.spanStore;
     this.dbPath = opts.dbPath;
   }
@@ -870,6 +999,8 @@ export class AgentRuntime {
     });
     const runId = record.id;
     void (async () => {
+      // #17: concurrency cap — queue beyond the cap until a slot frees.
+      const release = await this.spawnGate.acquire();
       let content = '';
       try {
         await this.runTurn({
@@ -885,6 +1016,8 @@ export class AgentRuntime {
         else this.backgroundRuns.complete(runId, content);
       } catch (err) {
         this.backgroundRuns.fail(runId, err instanceof Error ? err.message : String(err));
+      } finally {
+        release();
       }
     })();
     this.audit({
@@ -902,6 +1035,120 @@ export class AgentRuntime {
 
   stopBackgroundRun(runId: string): boolean {
     return this.backgroundRuns.stop(runId);
+  }
+
+  /**
+   * Resume a stopped/failed background run (#14): re-dispatch with the
+   * same spec; the prior-context summary rides in the task so the
+   * specialist continues instead of restarting blind.
+   */
+  resumeBackgroundRun(runId: string): { runId: string; botName: string } | { error: string } {
+    const prev = this.backgroundRuns.get(runId);
+    if (!prev) return { error: `No background run "${runId}"` };
+    const prepared = this.backgroundRuns.prepareResume(runId);
+    if (!prepared) return { error: `Background run "${runId}" is ${prev.status} — only stopped/failed runs can be resumed` };
+    const { record, signal } = prepared;
+    const originBot = this.getBot(prev.originBotId) ?? {
+      id: prev.originBotId,
+      name: prev.originBotId,
+      description: '',
+      systemPrompt: '',
+      provider: 'groq',
+      model: 'default',
+      skills: [],
+      tools: [],
+      mcpServers: [],
+    } as BotConfig;
+    const execBot: BotConfig | undefined = prev.ephemeral
+      ? {
+          ...originBot,
+          id: prev.botId,
+          name: prev.botName,
+          description: 'Resumed ephemeral specialist',
+          systemPrompt:
+            'You are a specialist continuing a task that was interrupted. ' +
+            (record.priorContext ?? ''),
+        }
+      : this.resolveBot?.(prev.botId);
+    if (!execBot) {
+      this.backgroundRuns.fail(record.id, `bot "${prev.botId}" no longer resolvable for resume`);
+      return { error: `Bot "${prev.botId}" is no longer available for resume` };
+    }
+    const task = `${prev.task}
+
+[Resumed run — prior context]
+${record.priorContext ?? ''}`;
+    void (async () => {
+      const release = await this.spawnGate.acquire();
+      let content = '';
+      try {
+        await this.runTurn({
+          bot: execBot,
+          message: task,
+          sessionId: `bg-${record.id}`,
+          signal,
+          onEvent: (e) => {
+            if (e.type === 'token') content += e.content;
+          },
+        });
+        if (signal.aborted) this.backgroundRuns.fail(record.id, 'stopped');
+        else this.backgroundRuns.complete(record.id, content);
+      } catch (err) {
+        this.backgroundRuns.fail(record.id, err instanceof Error ? err.message : String(err));
+      } finally {
+        release();
+      }
+    })();
+    this.audit({
+      type: 'background_run.resumed',
+      sessionId: prev.originSessionId,
+      botId: prev.originBotId,
+      detail: { runId: record.id, resumedFromId: runId },
+    });
+    return { runId: record.id, botName: record.botName };
+  }
+
+  /** #62: plan read/update tools, registered per session by the runtime when a plan exists. */
+  createPlanTools(sessionId: string): ToolDefinition[] {
+    const store = this.supervisorPlans;
+    return [
+      {
+        name: 'get_plan',
+        description: 'Read the current structured plan for this session (steps with states), owned by the supervisor.',
+        parameters: { type: 'object', properties: {} },
+        mutating: false,
+        handler: async () => {
+          const plan = store.get(sessionId);
+          return plan ? { plan: renderSupervisorPlan(plan), steps: plan.steps, humanApproved: plan.humanApproved } : { plan: null, note: 'no plan yet for this session' };
+        },
+      },
+      {
+        name: 'update_plan_step',
+        description: 'Update one step of the session plan (status: pending|active|done|blocked, plus an optional note).',
+        parameters: {
+          type: 'object',
+          properties: {
+            step: { type: 'string', description: 'Step id (step-1, …) or 1-based index as a string' },
+            status: { type: 'string' },
+            note: { type: 'string' },
+          },
+          required: ['step'],
+        },
+        mutating: false,
+        handler: async (args) => {
+          const raw = String(args.step ?? '');
+          const idx = /^\d+$/.test(raw) ? Number(raw) - 1 : raw;
+          const status = ['pending', 'active', 'done', 'blocked'].includes(String(args.status))
+            ? (String(args.status) as 'pending' | 'active' | 'done' | 'blocked')
+            : undefined;
+          const plan = store.updateStep(sessionId, idx, {
+            status,
+            note: typeof args.note === 'string' ? args.note : undefined,
+          });
+          return plan ? { plan: renderSupervisorPlan(plan) } : { error: 'no plan or step not found for this session' };
+        },
+      },
+    ];
   }
 
   /**
@@ -957,7 +1204,13 @@ export class AgentRuntime {
   private async buildSystemPrompt(
     bot: BotConfig,
     memoryContext?: string,
-    sysOpts: { peerOriginated?: boolean; extraSkills?: string[] } = {},
+    sysOpts: {
+      peerOriginated?: boolean;
+      extraSkills?: string[];
+      sessionId?: string;
+      model?: string;
+      providerId?: string;
+    } = {},
   ): Promise<{ prompt: string; loadedSkills: string[] }> {
     // The untrusted-content floor rides along on every turn: the bot's own
     // prompt first, then the security instruction (it must hold regardless
@@ -995,6 +1248,16 @@ export class AgentRuntime {
     if (memoryContext && memoryContext.trim()) {
       parts.push('\n\n' + memoryContext.trim());
     }
+    // Standing rules (#46): session-scoped + bot-carried rules the user
+    // or agent set in-session; they ride every turn until removed.
+    if (this.standingRules && sysOpts.sessionId) {
+      try {
+        const rules = this.standingRules.rulesFor(sysOpts.sessionId, bot.id);
+        if (rules.length > 0) parts.push('\n\n' + renderStandingRules(rules));
+      } catch {
+        // Standing rules must never break a turn.
+      }
+    }
     const loadedSkills: string[] = [];
     // Semantic discovery (Octomind parity): skills the deterministic
     // auto-activation policy picked for THIS message join the bot's
@@ -1027,10 +1290,32 @@ export class AgentRuntime {
         }
       }
     }
-    return { prompt: parts.join(''), loadedSkills };
+    const joined = parts.join('');
+    // System template variables (#40): {{CWD}} {{ROLE}} {{BOT_ID}}
+    // {{SESSION_ID}} {{MODEL}} … resolve against this turn's context;
+    // variables with no value here (e.g. {{GIT_TREE}}, which only a
+    // host surface can supply) are left exactly as written.
+    const prompt = joined.includes('{{')
+      ? resolveTemplateVariables(joined, {
+          cwd: (() => {
+            try {
+              return this.workspaceDirForBot?.(bot) ?? undefined;
+            } catch {
+              return undefined;
+            }
+          })(),
+          role: bot.name,
+          botName: bot.name,
+          botId: bot.id,
+          sessionId: sysOpts.sessionId,
+          model: sysOpts.model,
+          providerId: sysOpts.providerId,
+        })
+      : joined;
+    return { prompt, loadedSkills };
   }
 
-  private resolveTools(bot: BotConfig): { tools: ToolDefinition[]; missing: string[] } {
+  private resolveTools(bot: BotConfig, sessionId?: string): { tools: ToolDefinition[]; missing: string[] } {
     const tools: ToolDefinition[] = [];
     const missing: string[] = [];
     for (const name of bot.tools) {
@@ -1060,6 +1345,31 @@ export class AgentRuntime {
     // ids printed in compaction headers.
     const recall = this.toolRegistry.get('recall_compacted_context');
     if (recall && !tools.some((t) => t.name === recall.name)) tools.push(recall);
+    // #15: discover_specialists joins the turn's tools once the runtime
+    // has seen more than one bot or the host supplied a catalog/roster —
+    // single-bot turns keep their exact legacy tool list.
+    if (this.seenBots.size > 1 || this.mcpCatalogFn || this.discoverableItemsFn) {
+      try {
+        for (const def of this.createDiscoveryTools()) {
+          if (!tools.some((t) => t.name === def.name)) tools.push(def);
+        }
+      } catch { /* discovery must never break tool assembly */ }
+    }
+    // #19: session-scoped dynamic tools — visible only to this session.
+    if (sessionId) {
+      const scoped = this.sessionTools.get(sessionId);
+      if (scoped) {
+        for (const def of scoped.values()) {
+          const idx = tools.findIndex((t) => t.name === def.name);
+          if (idx >= 0) tools[idx] = def;
+          else tools.push(def);
+        }
+      }
+      // #62: plan tools join when a supervisor plan exists for the session.
+      if (this.supervisorPlans.get(sessionId) && !tools.some((t) => t.name === 'get_plan')) {
+        tools.push(...this.createPlanTools(sessionId));
+      }
+    }
     return { tools, missing };
   }
 
@@ -1116,14 +1426,40 @@ export class AgentRuntime {
     // this turn (and only this turn) authenticates with the space's key.
     // AI failover (W1): `provider` is mutable — a hard limit failure swaps
     // it (plus providerId/model) for the backup exactly once per turn.
-    let provider: LLMProvider = opts.apiKeyOverride
-      ? createProvider(providerId, { apiKey: opts.apiKeyOverride })
-      : this.resolveProvider(providerId);
+    // Zero-setup fallback (free-LLM stack): when the resolved provider
+    // cannot even be constructed because no key is configured (the
+    // fresh-install state), walk the keyless chain instead of failing
+    // the turn — local Ollama (probed) → OVHcloud anonymous → LLM7 →
+    // AI Horde (chat-only lanes are skipped for tool-using bots). The
+    // user is told, via a notice, which lane answered and its limits.
+    let provider: LLMProvider;
+    let keylessNotice: string | undefined;
+    if (opts.apiKeyOverride) {
+      provider = createProvider(providerId, { apiKey: opts.apiKeyOverride });
+    } else {
+      try {
+        provider = this.resolveProvider(providerId);
+      } catch (err) {
+        if (!isProviderConfigError(err)) throw err;
+        const fb = await resolveViableKeylessProvider({ toolUse: (opts.bot.tools?.length ?? 0) > 0 });
+        if (!fb) throw err;
+        provider = fb.provider;
+        this.providerCache.set(fb.providerId, fb.provider);
+        keylessNotice =
+          `No API key is configured for "${providerId}", so this turn is running on the free built-in lane "${fb.lane.id}" (${fb.providerId}/${fb.model}). ${fb.lane.limitsNote} ` +
+          'Add a provider key in Providers settings for full speed and your own quota.';
+        providerId = fb.providerId;
+        model = fb.model;
+      }
+    }
     const maxIterations = opts.maxIterations ?? DEFAULT_MAX_ITERATIONS;
     const approvalTimeoutMs = opts.approvalTimeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS;
     const emit = async (e: StreamEvent): Promise<void> => {
       await opts.onEvent(e);
     };
+    if (keylessNotice) {
+      await emit({ type: 'notice', kind: 'keyless-fallback', message: keylessNotice });
+    }
 
     const sessionId =
       opts.sessionId ?? this.store.createSession(opts.bot.id, { ownerPersonId: opts.ownerPersonId });
@@ -1251,7 +1587,16 @@ export class AgentRuntime {
     // the deterministic policy (threshold + abstain-on-tie) pick skills
     // to activate for the turn. No LLM is involved in the decision.
     let autoActivatedSkills: string[] = [];
+    const autoActivatedMcpTools: ToolDefinition[] = [];
     if (opts.bot.autoActivateSkills) {
+      // #163: declarative frontmatter activation rules (keywords /
+      // patterns / exclude) are evaluated against the raw message and
+      // unioned with the embedding-based set computed below.
+      try {
+        for (const name of this.skills.skillsMatchingMessage(opts.message, opts.bot.skills)) {
+          if (!autoActivatedSkills.includes(name)) autoActivatedSkills.push(name);
+        }
+      } catch { /* rule activation must never break a turn */ }
       try {
         const items: DiscoverableItem[] = [];
         for (const name of this.skills.list()) {
@@ -1280,6 +1625,37 @@ export class AgentRuntime {
               detail: { skills: autoActivatedSkills, reason: decision.reason, embedder: this.embedder.name },
             });
           }
+          // #139: deterministic auto-activation over the MCP server
+          // catalog (same threshold/margin/abstain policy). Activated
+          // servers' tools join the turn via autoActivatedMcpTools.
+          if (this.mcpCatalogFn && this.toolsForMcpServerFn) {
+            try {
+              const mcpItems = this.mcpCatalogFn().filter((i) => !opts.bot.mcpServers.includes(i.id));
+              if (mcpItems.length > 0) {
+                const mcpHits = await discoverByIntent(opts.message, mcpItems, this.embedder, { topK: 8 });
+                const mcpDecision = decideMcpAutoActivation(mcpHits, {
+                  threshold: neural ? 0.32 : 0.18,
+                  margin: neural ? 0.04 : 0.03,
+                  maxActivate: 2,
+                });
+                if (!mcpDecision.abstained && mcpDecision.activate.length > 0) {
+                  for (const hit of mcpDecision.activate) {
+                    for (const def of this.toolsForMcpServerFn(hit.item.id)) {
+                      if (!autoActivatedMcpTools.some((t) => t.name === def.name)) autoActivatedMcpTools.push(def);
+                    }
+                  }
+                  this.audit({
+                    type: 'turn.mcp_auto_activated',
+                    sessionId,
+                    botId: opts.bot.id,
+                    detail: { servers: mcpDecision.activate.map((h) => h.item.id), reason: mcpDecision.reason },
+                  });
+                }
+              }
+            } catch {
+              // MCP auto-activation must never break a turn.
+            }
+          }
         }
       } catch {
         // Discovery must never break a turn.
@@ -1289,12 +1665,32 @@ export class AgentRuntime {
     const { prompt: systemPrompt, loadedSkills } = await this.buildSystemPrompt(
       opts.bot,
       await this.combineTurnContext(opts, sessionId),
-      { peerOriginated: botOriginated, extraSkills: autoActivatedSkills },
+      {
+        peerOriginated: botOriginated,
+        extraSkills: autoActivatedSkills,
+        sessionId,
+        model,
+        providerId,
+      },
     );
-    const resolvedTools = this.resolveTools(opts.bot);
+    const resolvedTools = this.resolveTools(opts.bot, sessionId);
     const modeFiltered = filterToolsForMode(resolvedTools.tools, { mode: opts.conversationMode, chiefHostRestricted: opts.chiefHostRestricted ?? (opts.bot as BotConfig & { chiefHostRestricted?: boolean }).chiefHostRestricted });
-    const fitting = fitToolsToLimit(modeFiltered);
-    const tools = fitting.tools;
+    // #138: intent-driven tool loading — for large tool sets on bots that
+    // opt in, select by intent instead of load-all-then-truncate. Bots
+    // with explicit SMALL tool lists stay exact (selector no-ops below
+    // its threshold, and explicitList bots are never touched).
+    let intentFiltered = modeFiltered;
+    if (botExt(opts.bot).intentToolLoading && opts.bot.tools.length > 32) {
+      const sel = selectToolsByIntentSync(modeFiltered, opts.message, { maxTools: 32 });
+      if (sel.reduced) {
+        intentFiltered = sel.tools;
+        this.audit({ type: 'turn.tools_intent_selected', sessionId, botId: opts.bot.id, detail: { kept: sel.kept.length, total: modeFiltered.length } });
+      }
+    }
+    const fitting = fitToolsToLimit(intentFiltered);
+    const tools = autoActivatedMcpTools.length > 0
+      ? fitToolsToLimit([...fitting.tools, ...autoActivatedMcpTools.filter((t) => !fitting.tools.some((x) => x.name === t.name))]).tools
+      : fitting.tools;
     const allowedToolNames = new Set(tools.map((t) => t.name));
     if (fitting.fitted) { await emit({ type: 'notice', kind: 'tools-fitted', message: `Tool list fitted to 128 for the provider (${fitting.originalCount} tools; ${fitting.stubbedSchemas} schemas stubbed, ${fitting.truncatedDescriptions} descriptions truncated).` }); }
     try { const budget = this.store.getContextBudget(sessionId); if (budget.level !== 'ok') { await emit({ type: 'notice', kind: 'context-budget', message: `Context budget ${budget.level}: ~${budget.estimatedTokens} of ${budget.budget} tokens (${Math.round(budget.ratio*100)}%).` }); } } catch { /* budget surface must never break a turn */ }
@@ -1312,14 +1708,20 @@ export class AgentRuntime {
         .catch(() => undefined);
       if (transformed?.transformed !== undefined) modelMessage = transformed.transformed;
     }
-    const userMessage: ChatMessage = { role: 'user', content: turnMessage };
+    const userMessage: ChatMessage = {
+      role: 'user',
+      content: turnMessage,
+      ...(opts.media && opts.media.length > 0 ? { media: opts.media } : {}),
+    };
     this.store.appendMessage(sessionId, userMessage);
 
     const history: RichMessage[] = (await this.store.getMessages(sessionId)).slice(0, -1);
     const messages: RichMessage[] = [
       { role: 'system', content: systemPrompt },
       ...history,
-      modelMessage === turnMessage ? userMessage : { role: 'user', content: modelMessage },
+      modelMessage === turnMessage
+        ? userMessage
+        : { role: 'user', content: modelMessage, ...(userMessage.media ? { media: userMessage.media } : {}) },
     ];
     // Background specialist runs (Octomind parity): results of runs
     // this session delegated are injected exactly once, as user notes
@@ -1336,10 +1738,12 @@ export class AgentRuntime {
       });
     }
     // Guardrails-as-code: seed the session tool history (for
-    // requiresHistory policy conditions) from prior turns' tool calls;
-    // this turn's executions append as they run.
+    // requiresHistory policy conditions) from prior turns' tool calls
+    // as RICH entries (name + arg digest/summary, #66) so
+    // argument-qualified history conditions can match; this turn's
+    // executions append as they run.
     ctx.sessionToolHistory = history.flatMap(
-      (m) => getMessageToolCalls(m)?.map((c) => c.name) ?? [],
+      (m) => getMessageToolCalls(m)?.map((c) => makeToolHistoryEntry(c.name, c.args)) ?? [],
     );
 
     // Spend-cap gate for this turn (OpenMausBot parity P1 #21): an
@@ -1384,6 +1788,32 @@ export class AgentRuntime {
     // tool call, with its outcome and a result excerpt.
     const turnEvidence: TurnEvidence[] = [];
     let toolsExecutedCount = 0;
+    // #20: standing supervisor (opt-in per bot; default 'gate' keeps the
+    // classic end-of-turn verify-gate only). Bound to this turn; its plan
+    // lands in the persistent per-session plan store (#62).
+    const standingSupervisor =
+      botExt(opts.bot).supervisorMode === 'standing'
+        ? new Supervisor(provider, {
+            profiles,
+            signal: opts.signal,
+            maxSteersPerTurn: botExt(opts.bot).supervisorMaxSteers ?? 3,
+            planStore: this.supervisorPlans,
+            sessionId,
+            botId: opts.bot.id,
+            steerQueue: this.steerQueue,
+          })
+        : undefined;
+    // #188: per-session tool error tracker (behaviour-changing).
+    const toolErrorThreshold = botExt(opts.bot).toolErrorThreshold ?? 3;
+    let toolErrorTracker: ToolErrorTracker | undefined;
+    if (toolErrorThreshold > 0) {
+      toolErrorTracker = this.toolErrorTrackers.get(sessionId);
+      if (!toolErrorTracker) {
+        toolErrorTracker = new ToolErrorTracker({ threshold: toolErrorThreshold });
+        this.toolErrorTrackers.set(sessionId, toolErrorTracker);
+      }
+    }
+    const droppedToolNames = new Set<string>();
     // End-of-turn check bounds (each check may send the turn back to
     // work a bounded number of times; the iteration budget is the
     // outer bound).
@@ -1445,28 +1875,46 @@ export class AgentRuntime {
           }),
         ];
         if (specs.length > 0) {
-          const wsDir = this.workspaceDirForBot?.(opts.bot);
-          if (wsDir) {
-            validatorAttempts += 1;
-            try {
-              const results = await runTurnValidators(specs, { workspaceDir: wsDir });
-              const failure = validatorFailureMessage(results);
-              if (failure) {
-                this.audit({
-                  type: 'turn.validator_failed',
-                  sessionId,
-                  botId: opts.bot.id,
-                  detail: {
-                    attempt: validatorAttempts,
-                    failed: results.filter((r) => !r.passed).map((r) => r.name),
-                  },
-                });
-                await emit({ type: 'notice', kind: 'validator-failed', message: 'End-of-turn validation failed — the bot is fixing the issues.' });
-                return failure;
-              }
-            } catch {
-              // Validator machinery itself broke — never block the turn.
+          validatorAttempts += 1;
+          try {
+            const results: ValidatorRunResult[] = [];
+            const commandSpecs = specs.filter((s) => s.command || s.builtin);
+            const evalSpecs = specs.filter(
+              (s) => !s.command && !s.builtin && typeof s.criterion === 'string' && s.criterion,
+            );
+            const wsDir = this.workspaceDirForBot?.(opts.bot);
+            if (commandSpecs.length > 0 && wsDir) {
+              results.push(...(await runTurnValidators(commandSpecs, { workspaceDir: wsDir })));
             }
+            // #28: semantic criteria are judged through the calibrated
+            // evaluate seam alongside the deterministic command
+            // validators (abstention passes — see runEvaluateValidator).
+            for (const spec of evalSpecs) {
+              results.push(
+                await runEvaluateValidator(
+                  provider,
+                  { name: spec.name, criterion: spec.criterion as string },
+                  { request: opts.message, output: finalContent },
+                  { profiles, signal: opts.signal },
+                ),
+              );
+            }
+            const failure = validatorFailureMessage(results);
+            if (failure) {
+              this.audit({
+                type: 'turn.validator_failed',
+                sessionId,
+                botId: opts.bot.id,
+                detail: {
+                  attempt: validatorAttempts,
+                  failed: results.filter((r) => !r.passed).map((r) => r.name),
+                },
+              });
+              await emit({ type: 'notice', kind: 'validator-failed', message: 'End-of-turn validation failed — the bot is fixing the issues.' });
+              return failure;
+            }
+          } catch {
+            // Validator machinery itself broke — never block the turn.
           }
         }
       }
@@ -1496,11 +1944,16 @@ export class AgentRuntime {
         gateRejections < maxGateRejections &&
         turnEvidence.some((e) => e.mutating)
       ) {
-        const verdict = await verifyCompletionClaim(
-          provider,
-          { request: opts.message, claim: finalContent, evidence: turnEvidence },
-          { profiles, signal: opts.signal },
-        );
+        // #20(c): in standing mode the gate runs through the turn's
+        // Supervisor instance; gate mode keeps the direct call.
+        const verdict = standingSupervisor
+          ? await standingSupervisor.verify({ request: opts.message, claim: finalContent, evidence: turnEvidence })
+          : await verifyCompletionClaim(
+              provider,
+              { request: opts.message, claim: finalContent, evidence: turnEvidence },
+              // #28(a): evaluate-confidence only when an evaluate profile is configured.
+              { profiles, signal: opts.signal, withConfidence: Boolean(profiles?.evaluate) },
+            );
         this.audit({
           type: 'turn.supervisor_gate',
           sessionId,
@@ -1530,12 +1983,15 @@ export class AgentRuntime {
     // main loop; each stage's output joins the context as a system note.
     // Stage failures are isolated — a broken stage never blocks the turn.
     if (opts.bot.layers) {
-      for (const stage of opts.bot.layers.filter((l) => l.kind === 'prepare')) {
+      // #41: 'execute' stages run through the prepare machinery as data.
+      for (const stage of opts.bot.layers.filter((l) => l.kind === 'prepare' || (l as ExtendedLayerStage).kind === 'execute')) {
         try {
+          const ext = stage as ExtendedLayerStage;
           const stageProvider = stage.providerId ? this.resolveProvider(stage.providerId) : provider;
+          const stagePrompt = ext.role ? `[role: ${ext.role}] ${stage.prompt}` : stage.prompt;
           const res = await stageProvider.chat(
             [
-              { role: 'system', content: stage.prompt },
+              { role: 'system', content: stagePrompt },
               { role: 'user', content: opts.message },
             ],
             [],
@@ -1556,6 +2012,21 @@ export class AgentRuntime {
             detail: { stage: stage.name, kind: 'prepare', error: err instanceof Error ? err.message : String(err) },
           });
         }
+      }
+    }
+
+    // #20(a): standing supervisor plan sketch at turn start.
+    if (standingSupervisor) {
+      try {
+        const sketch = await standingSupervisor.planSketch(opts.message);
+        if (sketch.length > 0) {
+          messages.push({
+            role: 'system',
+            content: `[Supervisor plan]\n${sketch.map((t, i) => `${i + 1}. ${t}`).join('\n')}`,
+          });
+        }
+      } catch {
+        // A failed sketch never blocks the turn.
       }
     }
 
@@ -1631,12 +2102,48 @@ export class AgentRuntime {
           return totalUsage;
         }
         messages.push(planOk.planMessage);
+        // #62: the human-approved plan becomes the supervisor's
+        // persistent structured plan object for this session.
+        try {
+          const titles = parsePlanSteps(planOk.planMessage.content.split('Recited checklist')[0]!);
+          if (titles.length > 0) {
+            this.supervisorPlans.set({
+              sessionId,
+              botId: opts.bot.id,
+              request: opts.message,
+              steps: titles,
+              humanApproved: true,
+            });
+          }
+        } catch {
+          // Plan persistence must never break a turn.
+        }
+        // #87: mirror the approved plan into the session store's
+        // protected plan state, so compaction folds can never summarize
+        // it away (the store re-injects it verbatim after every fold).
+        try {
+          this.store.setPlanState(sessionId, planOk.planMessage.content);
+        } catch {
+          // Plan state must never break a turn.
+        }
       }
       for (let iteration = 0; iteration < maxIterations; iteration++) {
         telIterations += 1;
         await emitStep('Thinking', iteration + 1, maxIterations);
         // Mid-turn steering (item 1): drain at the model-call boundary.
         { const steered = this.steerQueue.drain(sessionId); if (steered.length > 0) { const sm: ChatMessage = { role: 'user', content: SteerQueue.format(steered) }; this.store.appendMessage(sessionId, sm); messages.push(sm); await emit({ type: 'notice', kind: 'steering', message: `Steering applied (${steered.length} message(s)).` }); } }
+        // #14: live-turn injection — background runs that finished while
+        // THIS turn is in progress are injected at this tool boundary,
+        // not held for the next turn.
+        if (iteration > 0) {
+          for (const record of this.backgroundRuns.drainInjectable(sessionId)) {
+            const injection: ChatMessage = { role: 'user', content: renderRunInjection(record) };
+            this.store.appendMessage(sessionId, injection);
+            messages.push(injection);
+            await emit({ type: 'notice', kind: 'background-injected', message: `Background run ${record.id} (${record.botName}) result injected.` });
+            this.audit({ type: 'background_run.injected_live', sessionId, botId: opts.bot.id, detail: { runId: record.id, status: record.status } });
+          }
+        }
         opts.signal?.throwIfAborted();
         // Privacy-tier gate: the provider call is a cloud egress. When the
         // host attached tier-tagged items, a single `local-only` item denies
@@ -1949,7 +2456,8 @@ export class AgentRuntime {
         // draft final answer (no tool calls = the turn is ending) and
         // may replace it with a revision. Failures keep the draft.
         if (turn.toolCalls.length === 0 && opts.bot.layers) {
-          for (const stage of opts.bot.layers.filter((l) => l.kind === 'review')) {
+          // #41: 'verify' stages run through the review machinery as data.
+          for (const stage of opts.bot.layers.filter((l) => l.kind === 'review' || (l as ExtendedLayerStage).kind === 'verify')) {
             try {
               const stageProvider = stage.providerId ? this.resolveProvider(stage.providerId) : provider;
               const input =
@@ -1958,9 +2466,10 @@ export class AgentRuntime {
                   : stage.inputMode === 'user+draft'
                     ? `User request:\n${opts.message}\n\nDraft answer:\n${turn.content}`
                     : turn.content;
+              const ext = stage as ExtendedLayerStage;
               const res = await stageProvider.chat(
                 [
-                  { role: 'system', content: stage.prompt },
+                  { role: 'system', content: ext.role ? `[role: ${ext.role}] ${stage.prompt}` : stage.prompt },
                   { role: 'user', content: input },
                 ],
                 [],
@@ -1969,7 +2478,18 @@ export class AgentRuntime {
               totalUsage = addUsage(totalUsage, res.usage);
               const revised = res.content.trim();
               if (revised && revised !== turn.content.trim()) {
-                turn = { ...turn, content: revised };
+                // #41 outputMode: 'note'/'append' keep the draft and add
+                // the stage output; default ('replace') revises as before.
+                if (ext.outputMode === 'append') {
+                  turn = { ...turn, content: `${turn.content}
+
+${revised}` };
+                } else if (ext.outputMode === 'note') {
+                  messages.push({ role: 'system', content: `[Layer stage "${stage.name}" note]
+${revised}` });
+                } else {
+                  turn = { ...turn, content: revised };
+                }
               }
             } catch (err) {
               this.audit({
@@ -1983,7 +2503,15 @@ export class AgentRuntime {
         }
 
         const assistantMsg = withToolCalls(
-          { role: 'assistant', content: turn.content },
+          {
+            role: 'assistant',
+            content: turn.content,
+            // #34: provider-native items ride the persisted message so a
+            // resumed session replays them verbatim to the provider.
+            ...(Array.isArray(turn.nativeItems) && turn.nativeItems.length > 0
+              ? { nativeItems: turn.nativeItems }
+              : {}),
+          },
           turn.toolCalls,
         );
         this.store.appendMessage(sessionId, assistantMsg);
@@ -2039,6 +2567,12 @@ export class AgentRuntime {
         // require-approval → pause for a decision, allow → execute.
         const toExecute: Array<{ def: ToolDefinition; call: ToolCall; approvalId?: string }> = [];
         for (const call of turn.toolCalls) {
+          if (droppedToolNames.has(call.name) || toolErrorTracker?.isDropped(call.name)) {
+            const result = { denied: true, reason: `Tool "${call.name}" was disabled for this session after repeated failures.` };
+            await emit({ type: 'tool_result', call, result, denied: true });
+            const deniedMsg: ChatMessage = { role: 'tool', content: `Tool call denied: ${result.reason}`, toolCallId: call.id, toolName: call.name };
+            this.store.appendMessage(sessionId, deniedMsg); messages.push(deniedMsg); continue;
+          }
           if (!allowedToolNames.has(call.name)) {
             const result = { denied: true, reason: `Tool "${call.name}" is not available in this conversation mode.` };
             await emit({ type: 'tool_result', call, result, denied: true });
@@ -2227,6 +2761,33 @@ export class AgentRuntime {
             }
             // 'workspace-write' is the default (current behavior).
             // 'danger-full-access' allows everything (approvals still apply).
+          }
+
+          // #23: independent supervisor authorizer — OUTSIDE auto-approve
+          // mode, for mutating calls governance did NOT hard-deny. A deny
+          // blocks here with its reason; an allow never overrides a
+          // governance denial (this block is unreachable when denied).
+          if (
+            decision !== 'deny' &&
+            botExt(opts.bot).supervisorAuthorizer === true &&
+            (def.mutating === true || call.name.startsWith('mcp:'))
+          ) {
+            try {
+              const auth = await new Supervisor(provider, { profiles, signal: opts.signal }).authorize(call);
+              this.audit({
+                type: auth.allowed ? 'tool.supervisor_authorized' : 'tool.supervisor_authorizer_denied',
+                sessionId,
+                botId: ctx.botId,
+                call,
+                detail: { reason: auth.reason, model: auth.model, skipped: auth.skipped === true },
+              });
+              if (!auth.allowed) {
+                decision = 'deny';
+                reason = `supervisor authorizer denied: ${auth.reason}`;
+              }
+            } catch {
+              // Authorizer failure is fail-safe: governance flow continues.
+            }
           }
 
           if (decision === 'deny') {
@@ -2513,12 +3074,62 @@ export class AgentRuntime {
           } else {
             result = { error: settled.reason instanceof Error ? settled.reason.message : String(settled.reason) };
           }
+          // Semantic misuse hints (#58): conservative rules detect
+          // likely tool misuse from the call + result shape (web_fetch
+          // aimed at a search engine, web_search given a raw URL, a
+          // stale edit, …) and append a one-line corrective hint to the
+          // result the model sees. No rule fires → result untouched.
+          {
+            const errText =
+              result !== null && typeof result === 'object' && !Array.isArray(result) && typeof (result as { error?: unknown }).error === 'string'
+                ? (result as { error: string }).error
+                : undefined;
+            result = withSemanticHint(
+              { toolName: call.name, args: call.args, result, ...(errText ? { error: errText } : {}) },
+              result,
+            );
+          }
           // Octomind-parity bookkeeping: runtime evidence for the
           // supervisor verify-gate, the session tool history for
           // guardrail conditions, and the executed-tools counter that
           // gates end-of-turn validators.
           toolsExecutedCount += 1;
-          ctx.sessionToolHistory?.push(call.name);
+          ctx.sessionToolHistory?.push(makeToolHistoryEntry(call.name, call.args));
+          // #20(b): standing supervisor observes the outcome; steering is
+          // bounded and signal-gated inside Supervisor.observe.
+          if (standingSupervisor) {
+            const evOk = !(
+              result !== null && typeof result === 'object' && !Array.isArray(result) &&
+              typeof (result as { error?: unknown }).error === 'string'
+            );
+            const guidance = standingSupervisor.observe({
+              toolName: call.name,
+              ok: evOk,
+              excerpt: (typeof result === 'string' ? result : JSON.stringify(result) ?? '').slice(0, 200),
+              unproductiveStreak: progressGuard?.unproductiveStreak ?? 0,
+              repeated: !evOk,
+            });
+            if (guidance) {
+              const gm: ChatMessage = { role: 'user', content: guidance };
+              this.store.appendMessage(sessionId, gm);
+              messages.push(gm);
+              await emit({ type: 'notice', kind: 'supervisor-steering', message: 'Supervisor steering injected.' });
+            }
+            void standingSupervisor.maybeCondense().catch(() => false);
+            this.supervisorPlans.markToolComplete(sessionId, call.name);
+          }
+          // #188: repeated tool errors change behaviour (directive + drop).
+          if (toolErrorTracker) {
+            const directive = toolErrorTracker.observe(call.name, result);
+            if (directive) {
+              if (directive.dropTool) droppedToolNames.add(call.name);
+              const dm: ChatMessage = { role: 'user', content: directive.instruction };
+              this.store.appendMessage(sessionId, dm);
+              messages.push(dm);
+              this.audit({ type: 'tool.error_threshold', sessionId, botId: ctx.botId, detail: { tool: call.name, errorClass: directive.errorClass, failures: directive.failures, dropped: directive.dropTool } });
+              await emit({ type: 'notice', kind: 'tool-errors', message: directive.instruction });
+            }
+          }
           turnEvidence.push({
             toolName: call.name,
             ok: !(

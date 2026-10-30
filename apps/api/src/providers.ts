@@ -393,6 +393,9 @@ function isConfigured(providerId: string): boolean {
     // Local providers (Ollama) need no key — they're "configured" by
     // definition; reachability is checked live by listModels().
     if (preset?.local) return true;
+    // Keyless lanes (OVHcloud anonymous, LLM7, AI Horde) need no key by
+    // design — configured by definition, like local providers.
+    if (preset?.keyless) return true;
     return Boolean(resolveApiKey(providerId));
   } catch {
     return false;
@@ -472,6 +475,9 @@ export async function listProviders(dataDir: string): Promise<ProviderInfo[]> {
         return w ? { usedPercent: w.usedPercent, message: w.message, source: 'rate-limit' as const } : null;
       })(),
       local: preset.local === true,
+      keyless: preset.keyless === true,
+      bestEffort: preset.bestEffort === true,
+      limitsNote: preset.limitsNote,
     };
     if (preset.bridge) {
       const detection = detections.get(preset.bridge);

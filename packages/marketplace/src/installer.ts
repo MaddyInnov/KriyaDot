@@ -12,16 +12,23 @@
 // Tokens are single-use and bound to the entry id. Install targets are
 // sanitized to block path traversal.
 
-import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import type {
   MarketplaceBotPayload,
+  MarketplaceCapabilityPayload,
   MarketplaceEntry,
   MarketplaceMcpPayload,
   MarketplaceSkillPayload,
   MarketplaceWorkflowPayload,
 } from './registry.js';
+import { transformEntryForInstall } from './manifest.js';
+import type { OverrideMap, PlaceholderValues } from './manifest.js';
+
+export function checksumOf(content: string): string {
+  return createHash('sha256').update(content, 'utf8').digest('hex');
+}
 
 export const MCP_INSTALL_TOOL = 'mcp_server_install';
 
@@ -49,6 +56,14 @@ export interface InstallResult {
   /** True when the install was gated behind an MCP approval. */
   gated: boolean;
   alreadyInstalled: boolean;
+  /** SHA-256 of the installed artifact content (#155/#165 auditability). */
+  checksum?: string;
+  /** Explicit install blockers (unresolved placeholders, missing env) — never silent (#158). */
+  blockers?: string[];
+  /** True when a per-capability override was applied (#158). */
+  overrideApplied?: boolean;
+  /** Effective enabled state after overrides / bundle semantics. */
+  enabled?: boolean;
 }
 
 export interface InstallOptions {
@@ -56,6 +71,14 @@ export interface InstallOptions {
   mcpApprovalToken?: string;
   /** Overwrite an existing install of the same id. Default false. */
   overwrite?: boolean;
+  /** Placeholder substitution values: `{{env:X}}` / `{{config:key}}` (#158). */
+  values?: PlaceholderValues;
+  /** Per-capability/model overrides keyed by entry id or package name (#158). */
+  overrides?: OverrideMap;
+  /** Extra override lookup keys (e.g. the containing bundle's package name). */
+  overrideKeys?: string[];
+  /** Unresolved placeholders: 'throw' (default) or 'block' (report, don't abort). */
+  onUnresolvedPlaceholders?: 'throw' | 'block';
 }
 
 const SAFE_ID = /^[a-z0-9][a-z0-9-_]{0,63}$/i;
@@ -76,6 +99,11 @@ export class MarketplaceInstaller {
 
   constructor(targetDir: string) {
     this.targetDir = resolve(targetDir);
+  }
+
+  /** Root the installer writes under (`<targetDir>/installed/...`). */
+  getTargetDir(): string {
+    return this.targetDir;
   }
 
   /**
@@ -120,34 +148,44 @@ export class MarketplaceInstaller {
     return full;
   }
 
-  install(entry: MarketplaceEntry, opts: InstallOptions = {}): InstallResult {
-    const id = safeId(entry.id, 'entry');
-    if (entry.kind === 'mcp-server') {
-      if (!opts.mcpApprovalToken) throw new McpInstallApprovalRequired(entry.id);
-      this.consumeToken(entry.id, opts.mcpApprovalToken);
+  install(rawEntry: MarketplaceEntry, opts: InstallOptions = {}): InstallResult {
+    const id = safeId(rawEntry.id, 'entry');
+    if (rawEntry.kind === 'mcp-server') {
+      if (!opts.mcpApprovalToken) throw new McpInstallApprovalRequired(rawEntry.id);
+      this.consumeToken(rawEntry.id, opts.mcpApprovalToken);
     }
+
+    // #158: placeholder substitution + per-capability overrides, applied
+    // on top of the manifest at install time. Unresolved placeholders
+    // throw by default (never silent nulls).
+    const transformed = transformEntryForInstall(rawEntry, {
+      values: opts.values,
+      overrides: opts.overrides,
+      overrideKeys: opts.overrideKeys,
+      onUnresolved: opts.onUnresolvedPlaceholders ?? 'throw',
+    });
+    const entry = transformed.entry;
 
     let installedPath: string;
     let content: string;
     switch (entry.kind) {
       case 'bot': {
-        const p = entry.payload as MarketplaceBotPayload;
+        const p = entry.payload as MarketplaceBotPayload & { config?: Record<string, unknown> };
         installedPath = this.targetPath('bots', `${id}.json`);
-        content = JSON.stringify(
-          {
-            id: p.id,
-            name: p.name,
-            description: p.description,
-            systemPrompt: p.systemPrompt,
-            provider: p.provider,
-            model: p.model,
-            skills: p.skills,
-            tools: p.tools,
-            mcpServers: p.mcpServers,
-          },
-          null,
-          2,
-        );
+        const botJson: Record<string, unknown> = {
+          id: p.id,
+          name: p.name,
+          description: p.description,
+          systemPrompt: p.systemPrompt,
+          provider: p.provider,
+          model: p.model,
+          skills: p.skills,
+          tools: p.tools,
+          mcpServers: p.mcpServers,
+        };
+        if (p.config) botJson.config = p.config;
+        if (!transformed.enabled) botJson.enabled = false;
+        content = JSON.stringify(botJson, null, 2);
         break;
       }
       case 'skill': {
@@ -171,35 +209,125 @@ export class MarketplaceInstaller {
         installedPath = this.targetPath('mcp-servers', `${id}.json`);
         // Env VALUES are never shipped: the registry only names required
         // env vars. The installer records them as unconfigured placeholders.
-        content = JSON.stringify(
-          {
-            id: p.id,
-            label: p.label,
-            command: p.command,
-            args: p.args,
-            env: Object.fromEntries(p.requiredEnv.map((name) => [name, null])),
-            description: p.description,
-            installedFrom: { entry: entry.id, version: entry.version },
-          },
-          null,
-          2,
-        );
+        const mcpJson: Record<string, unknown> = {
+          id: p.id,
+          label: p.label,
+          command: p.command,
+          args: p.args,
+          env: Object.fromEntries(p.requiredEnv.map((name) => [name, null])),
+          description: p.description,
+          installedFrom: { entry: entry.id, version: entry.version },
+        };
+        mcpJson.checksum = checksumOf(JSON.stringify(mcpJson));
+        content = JSON.stringify(mcpJson, null, 2);
+        break;
+      }
+      case 'capability': {
+        // #165: a capability bundle installs as ONE unit: its MCP server
+        // configs (env placeholders, disabled until the host enables
+        // them) plus its tool filters land in a single artifact.
+        const p = entry.payload as MarketplaceCapabilityPayload;
+        installedPath = this.targetPath('capabilities', `${id}.json`);
+        const capJson: Record<string, unknown> = {
+          id: p.id,
+          name: p.name,
+          description: p.description,
+          mcpServers: p.mcpServers.map((s) => ({
+            id: s.id,
+            label: s.label,
+            command: s.command,
+            args: s.args,
+            env: Object.fromEntries(s.requiredEnv.map((name) => [name, null])),
+            enabled: false,
+          })),
+          toolFilters: p.toolFilters,
+          requiredEnv: p.requiredEnv ?? [...new Set(p.mcpServers.flatMap((s) => s.requiredEnv))],
+          dependencies: p.dependencies ?? [],
+          enabled: transformed.enabled,
+          installedFrom: { entry: entry.id, version: entry.version },
+        };
+        capJson.checksum = checksumOf(JSON.stringify(capJson));
+        content = JSON.stringify(capJson, null, 2);
         break;
       }
       default:
         throw new Error(`unknown marketplace kind: ${(entry as { kind: string }).kind}`);
     }
 
+    const checksum = checksumOf(content);
     const alreadyInstalled = existsSync(installedPath);
     if (alreadyInstalled && !opts.overwrite) {
-      return { entryId: entry.id, kind: entry.kind, installedPath, gated: entry.kind === 'mcp-server', alreadyInstalled: true };
+      return {
+        entryId: entry.id, kind: entry.kind, installedPath, gated: entry.kind === 'mcp-server',
+        alreadyInstalled: true, checksum,
+        ...(transformed.blockers.length ? { blockers: transformed.blockers } : {}),
+        overrideApplied: transformed.overrideApplied, enabled: transformed.enabled,
+      };
     }
     writeFileSync(installedPath, content, 'utf8');
-    return { entryId: entry.id, kind: entry.kind, installedPath, gated: entry.kind === 'mcp-server', alreadyInstalled };
+    return {
+      entryId: entry.id, kind: entry.kind, installedPath, gated: entry.kind === 'mcp-server',
+      alreadyInstalled, checksum,
+      ...(transformed.blockers.length ? { blockers: transformed.blockers } : {}),
+      overrideApplied: transformed.overrideApplied, enabled: transformed.enabled,
+    };
+  }
+
+  /**
+   * Bundle-mode MCP install (#155): bundle MCP entries ARE installed —
+   * registered into the same MCP config store the installer writes —
+   * but WITHOUT consuming the standalone approval flow. Bundle
+   * semantics: the server lands DISABLED (`enabled: false`) with a
+   * content checksum; the host enables it only after the user approves
+   * the bundle's MCP set (host wiring: flip `enabled` in the written
+   * JSON or re-install standalone with an approval token).
+   */
+  installMcpServerForBundle(
+    payload: MarketplaceMcpPayload,
+    opts: { sourceId?: string; env?: Record<string, string | undefined>; overwrite?: boolean } = {},
+  ): InstallResult {
+    const id = safeId(payload.id, 'entry');
+    const installedPath = this.targetPath('mcp-servers', `${id}.json`);
+    const mcpJson: Record<string, unknown> = {
+      id: payload.id,
+      label: payload.label,
+      command: payload.command,
+      args: payload.args,
+      env: Object.fromEntries(payload.requiredEnv.map((name) => [name, opts.env?.[name] ?? null])),
+      description: payload.description,
+      enabled: false,
+      installedVia: 'bundle',
+      installedFrom: { entry: opts.sourceId ?? payload.id },
+    };
+    mcpJson.checksum = checksumOf(JSON.stringify(mcpJson));
+    const content = JSON.stringify(mcpJson, null, 2);
+    const alreadyInstalled = existsSync(installedPath);
+    if (alreadyInstalled && !opts.overwrite) {
+      // Preserve an already-enabled/approved standalone install.
+      try {
+        const existing = JSON.parse(readFileSync(installedPath, 'utf8')) as { enabled?: boolean };
+        if (existing.enabled !== false) {
+          return { entryId: payload.id, kind: 'mcp-server', installedPath, gated: false, alreadyInstalled: true, checksum: checksumOf(readFileSync(installedPath, 'utf8')), enabled: true };
+        }
+      } catch { /* fall through to rewrite */ }
+      return { entryId: payload.id, kind: 'mcp-server', installedPath, gated: false, alreadyInstalled: true, checksum: checksumOf(content), enabled: false };
+    }
+    writeFileSync(installedPath, content, 'utf8');
+    return { entryId: payload.id, kind: 'mcp-server', installedPath, gated: false, alreadyInstalled, checksum: checksumOf(content), enabled: false };
+  }
+
+  /** Read back an installed MCP server config (bundle/standalone); null when absent/corrupt. */
+  readInstalledMcp(id: string): Record<string, unknown> | null {
+    try {
+      const parsed = JSON.parse(readFileSync(join(this.targetDir, 'installed', 'mcp-servers', `${safeId(id, 'entry')}.json`), 'utf8')) as unknown;
+      return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : null;
+    } catch {
+      return null;
+    }
   }
 
   /** Remove an installed artifact (idempotent). */
-  uninstall(kindDir: 'bots' | 'skills' | 'workflows' | 'mcp-servers', id: string): boolean {
+  uninstall(kindDir: 'bots' | 'skills' | 'workflows' | 'mcp-servers' | 'capabilities', id: string): boolean {
     const target = this.targetPath(kindDir, `${safeId(id, 'entry')}.${kindDir === 'skills' ? 'md' : 'json'}`);
     if (!existsSync(target)) return false;
     // Recoverable delete would need a trash dir; MVP: unlink. Callers that

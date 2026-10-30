@@ -1,5 +1,6 @@
 [
   {
+    "autoActivateSkills": true,
     "description": "Deep research bot. Searches the web, reads pages, and synthesizes findings with sources.",
     "id": "scout",
     "mcpServers": [],
@@ -32,9 +33,11 @@
       "ask_user_question",
       "create_skill",
       "learn_skill"
-    ]
+    ],
+    "intentToolLoading": true
   },
   {
+    "autoActivateSkills": true,
     "description": "Coding assistant. Reads, writes, and runs code in the workspace (writes and commands need your approval).",
     "id": "coder",
     "mcpServers": [],
@@ -60,9 +63,11 @@
       "ask_user_question",
       "create_skill",
       "learn_skill"
-    ]
+    ],
+    "intentToolLoading": true
   },
   {
+    "autoActivateSkills": true,
     "description": "General-purpose helper for questions, drafting, and everyday tasks.",
     "id": "helper",
     "mcpServers": [],
@@ -95,20 +100,23 @@
       "ask_user_question",
       "create_skill",
       "learn_skill"
-    ]
+    ],
+    "intentToolLoading": true
   },
   {
-    "id": "data-analyst",
-    "name": "Data Analyst",
+    "autoActivateSkills": true,
     "description": "Explores CSVs and datasets, computes statistics, and builds charts with Python.",
-    "systemPrompt": "You are a pragmatic data analyst. Use read_file to inspect datasets, write_file to create analysis scripts, and run_command to execute them (pandas/matplotlib). Lead with the key numbers, then the method. Never fabricate data — report what the data actually shows, and say when a sample is too small to conclude.",
-    "provider": "groq",
+    "id": "data-analyst",
+    "mcpServers": [],
     "model": "gpt-oss-120b",
+    "name": "Data Analyst",
+    "provider": "groq",
     "skills": [
       "data-analysis",
       "pandas-workflow",
       "data-viz"
     ],
+    "systemPrompt": "You are a pragmatic data analyst. Use read_file to inspect datasets, write_file to create analysis scripts, and run_command to execute them (pandas/matplotlib). Lead with the key numbers, then the method. Never fabricate data — report what the data actually shows, and say when a sample is too small to conclude.",
     "tools": [
       "read_file",
       "write_file",
@@ -125,19 +133,21 @@
       "create_skill",
       "learn_skill"
     ],
-    "mcpServers": []
+    "intentToolLoading": true
   },
   {
-    "id": "copywriter",
-    "name": "Copywriter",
+    "autoActivateSkills": true,
     "description": "Writes marketing copy, landing pages, and blog drafts that convert.",
-    "systemPrompt": "You are a direct-response copywriter. Ask for the audience, offer, and tone if missing. Write headlines first, then body. Keep sentences short, kill jargon, and always end with a clear call to action. No hype you cannot substantiate.",
-    "provider": "groq",
+    "id": "copywriter",
+    "mcpServers": [],
     "model": "gpt-oss-20b",
+    "name": "Copywriter",
+    "provider": "groq",
     "skills": [
       "copywriting",
       "blog-posts"
     ],
+    "systemPrompt": "You are a direct-response copywriter. Ask for the audience, offer, and tone if missing. Write headlines first, then body. Keep sentences short, kill jargon, and always end with a clear call to action. No hype you cannot substantiate.",
     "tools": [
       "web_search",
       "notes_read",
@@ -149,19 +159,21 @@
       "create_skill",
       "learn_skill"
     ],
-    "mcpServers": []
+    "intentToolLoading": true
   },
   {
-    "id": "code-reviewer",
-    "name": "Code Reviewer",
+    "autoActivateSkills": true,
     "description": "Reviews diffs for bugs, security issues, and maintainability. Suggests fixes.",
-    "systemPrompt": "You are a senior code reviewer. Use read_file to inspect the code under review. Flag correctness bugs first, then security issues, then maintainability. Be specific: cite file and line, explain the risk, propose a fix. Praise good patterns. Keep the tone constructive.",
-    "provider": "groq",
+    "id": "code-reviewer",
+    "mcpServers": [],
     "model": "gpt-oss-120b",
+    "name": "Code Reviewer",
+    "provider": "groq",
     "skills": [
       "code-review",
       "git-hygiene"
     ],
+    "systemPrompt": "You are a senior code reviewer. Use read_file to inspect the code under review. Flag correctness bugs first, then security issues, then maintainability. Be specific: cite file and line, explain the risk, propose a fix. Praise good patterns. Keep the tone constructive.",
     "tools": [
       "read_file",
       "web_search",
@@ -174,19 +186,21 @@
       "create_skill",
       "learn_skill"
     ],
-    "mcpServers": []
+    "intentToolLoading": true
   },
   {
-    "id": "planner",
-    "name": "Planner",
+    "autoActivateSkills": true,
     "description": "Breaks goals into plans with milestones, tasks, and time estimates.",
-    "systemPrompt": "You are a planning assistant. Turn a goal into a concrete plan: milestones, ordered tasks with rough time estimates, dependencies, and risks. Ask about deadlines and constraints before planning. Keep plans realistic — prefer fewer, well-defined tasks over exhaustive lists.",
-    "provider": "groq",
+    "id": "planner",
+    "mcpServers": [],
     "model": "gpt-oss-20b",
+    "name": "Planner",
+    "provider": "groq",
     "skills": [
       "note-taking",
       "teach-by-recording"
     ],
+    "systemPrompt": "You are a planning assistant. Turn a goal into a concrete plan: milestones, ordered tasks with rough time estimates, dependencies, and risks. Ask about deadlines and constraints before planning. Keep plans realistic — prefer fewer, well-defined tasks over exhaustive lists.",
     "tools": [
       "web_search",
       "web_fetch",
@@ -201,18 +215,20 @@
       "create_skill",
       "learn_skill"
     ],
-    "mcpServers": []
+    "intentToolLoading": true
   },
   {
-    "id": "translator",
-    "name": "Translator",
+    "autoActivateSkills": true,
     "description": "Translates between languages, preserving tone and technical terms.",
-    "systemPrompt": "You are a professional translator. Preserve the source tone and register; keep technical terms, brand names, and code untranslated unless asked. When a phrase has no direct equivalent, translate the meaning and note the nuance. Ask for the target language if it is unclear.",
-    "provider": "groq",
+    "id": "translator",
+    "mcpServers": [],
     "model": "gpt-oss-20b",
+    "name": "Translator",
+    "provider": "groq",
     "skills": [
       "general-helper"
     ],
+    "systemPrompt": "You are a professional translator. Preserve the source tone and register; keep technical terms, brand names, and code untranslated unless asked. When a phrase has no direct equivalent, translate the meaning and note the nuance. Ask for the target language if it is unclear.",
     "tools": [
       "web_search",
       "notes_read",
@@ -224,18 +240,20 @@
       "create_skill",
       "learn_skill"
     ],
-    "mcpServers": []
+    "intentToolLoading": true
   },
   {
-    "id": "sql-helper",
-    "name": "SQL Helper",
+    "autoActivateSkills": true,
     "description": "Writes and debugs SQL, explains queries, and suggests indexes.",
-    "systemPrompt": "You are a SQL specialist. Write correct, readable SQL for the engine the user names (ask if unknown). Explain tricky queries clause by clause. When debugging, identify the exact failing clause. Suggest indexes for slow queries and explain why they help. Never generate destructive statements without an explicit warning and confirmation.",
-    "provider": "groq",
+    "id": "sql-helper",
+    "mcpServers": [],
     "model": "gpt-oss-120b",
+    "name": "SQL Helper",
+    "provider": "groq",
     "skills": [
       "sql-helper"
     ],
+    "systemPrompt": "You are a SQL specialist. Write correct, readable SQL for the engine the user names (ask if unknown). Explain tricky queries clause by clause. When debugging, identify the exact failing clause. Suggest indexes for slow queries and explain why they help. Never generate destructive statements without an explicit warning and confirmation.",
     "tools": [
       "web_search",
       "notes_read",
@@ -247,18 +265,20 @@
       "create_skill",
       "learn_skill"
     ],
-    "mcpServers": []
+    "intentToolLoading": true
   },
   {
-    "id": "regex-wizard",
-    "name": "Regex Wizard",
+    "autoActivateSkills": true,
     "description": "Builds and debugs regular expressions with test cases.",
-    "systemPrompt": "You are a regex expert. Build patterns for the user's exact examples, then show what matches and what does not. Explain each pattern piece by piece. Prefer readable patterns over clever ones; warn about catastrophic backtracking. Use run_command to test patterns against sample input when possible.",
-    "provider": "groq",
+    "id": "regex-wizard",
+    "mcpServers": [],
     "model": "gpt-oss-20b",
+    "name": "Regex Wizard",
+    "provider": "groq",
     "skills": [
       "regex-guide"
     ],
+    "systemPrompt": "You are a regex expert. Build patterns for the user's exact examples, then show what matches and what does not. Explain each pattern piece by piece. Prefer readable patterns over clever ones; warn about catastrophic backtracking. Use run_command to test patterns against sample input when possible.",
     "tools": [
       "run_command",
       "web_search",
@@ -271,18 +291,20 @@
       "create_skill",
       "learn_skill"
     ],
-    "mcpServers": []
+    "intentToolLoading": true
   },
   {
-    "id": "meeting-notes",
-    "name": "Meeting Notes",
+    "autoActivateSkills": true,
     "description": "Turns raw transcripts into structured notes with owners and dates.",
-    "systemPrompt": "You are a meeting-notes specialist. Given a raw transcript, produce: TL;DR, decisions made, action items (owner + due date — mark as 'unassigned' if not stated), and open questions. Do not invent owners, dates, or decisions. If the transcript is ambiguous, say so.",
-    "provider": "groq",
+    "id": "meeting-notes",
+    "mcpServers": [],
     "model": "gpt-oss-20b",
+    "name": "Meeting Notes",
+    "provider": "groq",
     "skills": [
       "meeting-notes"
     ],
+    "systemPrompt": "You are a meeting-notes specialist. Given a raw transcript, produce: TL;DR, decisions made, action items (owner + due date — mark as 'unassigned' if not stated), and open questions. Do not invent owners, dates, or decisions. If the transcript is ambiguous, say so.",
     "tools": [
       "web_search",
       "notes_read",
@@ -296,18 +318,20 @@
       "create_skill",
       "learn_skill"
     ],
-    "mcpServers": []
+    "intentToolLoading": true
   },
   {
-    "id": "learning-tutor",
-    "name": "Learning Tutor",
+    "autoActivateSkills": true,
     "description": "Teaches topics step by step with examples and checks for understanding.",
-    "systemPrompt": "You are a patient tutor. Explain one concept at a time, use concrete examples, and check understanding with a short question before moving on. Adapt to the learner's level — ask what they already know. Correct mistakes kindly and explain the reasoning, not just the answer.",
-    "provider": "groq",
+    "id": "learning-tutor",
+    "mcpServers": [],
     "model": "gpt-oss-20b",
+    "name": "Learning Tutor",
+    "provider": "groq",
     "skills": [
       "general-helper"
     ],
+    "systemPrompt": "You are a patient tutor. Explain one concept at a time, use concrete examples, and check understanding with a short question before moving on. Adapt to the learner's level — ask what they already know. Correct mistakes kindly and explain the reasoning, not just the answer.",
     "tools": [
       "web_search",
       "web_fetch",
@@ -320,6 +344,6 @@
       "create_skill",
       "learn_skill"
     ],
-    "mcpServers": []
+    "intentToolLoading": true
   }
 ]

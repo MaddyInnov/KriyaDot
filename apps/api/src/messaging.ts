@@ -314,9 +314,13 @@ registerMessageProvider('whatsapp', (dataDir) =>
 //
 // Configuration (env first; password may come from the encrypted store
 // via providerId "custom-email" → CUSTOM_EMAIL_API_KEY):
-//   SMTP_HOST SMTP_PORT SMTP_SECURE(1/0) SMTP_USER SMTP_PASS EMAIL_FROM
-//   IMAP_HOST IMAP_PORT IMAP_SECURE IMAP_USER IMAP_PASS (default: SMTP
-//   credentials) EMAIL_POLL_MS (default 60000)
+//   SMTP_HOST SMTP_PORT SMTP_SECURE(1/0) SMTP_STARTTLS(1/0) SMTP_USER
+//   SMTP_PASS EMAIL_FROM
+//   IMAP_HOST IMAP_PORT IMAP_SECURE IMAP_STARTTLS IMAP_USER IMAP_PASS
+//   (default: SMTP credentials) EMAIL_POLL_MS (default 60000)
+// STARTTLS defaults ON for the conventional plaintext submission/IMAP
+// ports (587 / 143) when implicit TLS is off, and can be forced with
+// SMTP_STARTTLS=1 / IMAP_STARTTLS=1 on any plain port.
 // ---------------------------------------------------------------------------
 
 export const EMAIL_FROM_ENV = 'EMAIL_FROM';
@@ -334,10 +338,13 @@ export function resolveEmailSmtpConfig(dataDir: string): SmtpConfig {
   const pass = process.env.SMTP_PASS ?? process.env['CUSTOM_EMAIL_API_KEY'];
   const secureRaw = (process.env.SMTP_SECURE ?? '').trim().toLowerCase();
   const port = Number(process.env.SMTP_PORT ?? '') || 465;
+  const secure = secureRaw === '0' || secureRaw === 'false' ? false : port === 465 || secureRaw === '1' || secureRaw === 'true';
+  const starttlsRaw = (process.env.SMTP_STARTTLS ?? '').trim().toLowerCase();
   return {
     host,
     port,
-    secure: secureRaw === '0' || secureRaw === 'false' ? false : port === 465 || secureRaw === '1' || secureRaw === 'true',
+    secure,
+    starttls: !secure && (starttlsRaw === '1' || starttlsRaw === 'true' || port === 587),
     user: (process.env.SMTP_USER ?? '').trim() || undefined,
     pass: pass || undefined,
     from,
@@ -353,10 +360,13 @@ export function resolveEmailImapConfig(dataDir: string): ImapConfig | null {
   if (!pass) return null;
   const secureRaw = (process.env.IMAP_SECURE ?? '').trim().toLowerCase();
   const port = Number(process.env.IMAP_PORT ?? '') || 993;
+  const secure = secureRaw === '0' || secureRaw === 'false' ? false : port === 993 || secureRaw === '1' || secureRaw === 'true';
+  const starttlsRaw = (process.env.IMAP_STARTTLS ?? '').trim().toLowerCase();
   return {
     host,
     port,
-    secure: secureRaw === '0' || secureRaw === 'false' ? false : port === 993 || secureRaw === '1' || secureRaw === 'true',
+    secure,
+    starttls: !secure && (starttlsRaw === '1' || starttlsRaw === 'true' || port === 143),
     user,
     pass,
   };

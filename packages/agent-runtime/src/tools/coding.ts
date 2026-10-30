@@ -24,6 +24,21 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import type { ToolDefinition } from '../types.js';
 import { resolveWorkspaceDir, type WorkspaceSource } from '../workspaces.js';
 import { confineRealpath } from '../confine.js';
+import { lineHash } from './line-hash.js';
+import { cosineSimilarity, type SyncEmbedder } from '../hybrid-search.js';
+
+/**
+ * Embedder injection for `search_code_semantic` (#60): the platform
+ * embedder reaches coding tools through the factory options — the
+ * same dependency path other tool factories use for services (cf.
+ * WebSearchOptions' fetchFn/env in builtin.ts), since ToolContext
+ * carries no embedder. Hosts pass the runtime's embedder (neural when
+ * configured); unset → the tool degrades to lexical-only and says so.
+ */
+export interface CodingToolsOptions {
+  workspaceDir: WorkspaceSource;
+  embedder?: SyncEmbedder;
+}
 
 /**
  * Resolve `p` inside `workspaceDir`, following symlinks (M3). Throws if the
@@ -262,30 +277,94 @@ function editTool(workspaceDir: WorkspaceSource): ToolDefinition {
     name: 'edit',
     mutating: true,
     description:
-      'Surgically replace text in a workspace file. Fails if oldText is not found, ' +
-      'or if the number of occurrences does not match expectedCount (when given).',
+      'Surgically replace text in a workspace file. Two modes: (1) exact-string mode — ' +
+      'replace oldText with newText; fails if oldText is not found, or if the number of ' +
+      'occurrences does not match expectedCount (when given). (2) Range mode (#184) — ' +
+      'replace lines startLine..endLine (1-based, inclusive) with newText, but ONLY when ' +
+      'expectedStartHash/expectedEndHash match the current boundary-line hashes from a ' +
+      'read_file withHashes read; a mismatch fails with a stale-file error and writes nothing.',
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'Workspace-relative file path' },
-        oldText: { type: 'string', description: 'Exact text to replace' },
-        newText: { type: 'string', description: 'Replacement text' },
+        oldText: { type: 'string', description: 'Exact text to replace (exact-string mode)' },
+        newText: { type: 'string', description: 'Replacement text (both modes; empty string deletes the range in range mode)' },
         expectedCount: {
           type: 'number',
-          description: 'Require exactly this many occurrences of oldText (default: 1)',
+          description: 'Require exactly this many occurrences of oldText (default: 1; exact-string mode)',
+        },
+        startLine: { type: 'number', description: 'Range mode: first line to replace (1-based)' },
+        endLine: { type: 'number', description: 'Range mode: last line to replace (1-based, inclusive)' },
+        expectedStartHash: {
+          type: 'string',
+          description: 'Range mode: hash of the current startLine content, from read_file withHashes (e.g. "a3f9c2")',
+        },
+        expectedEndHash: {
+          type: 'string',
+          description: 'Range mode: hash of the current endLine content, from read_file withHashes',
         },
       },
-      required: ['path', 'oldText', 'newText'],
+      required: ['path', 'newText'],
       additionalProperties: false,
     },
     handler: async (args, ctx) => {
       const ws = resolveWorkspaceDir(workspaceDir, ctx);
       const file = confine(ws, String(args.path));
+      if (!existsSync(file)) throw new Error(`edit: file does not exist: "${args.path}"`);
+      const content = readFileSync(file, 'utf8');
+
+      // --- Range mode (#184): hashed boundary lines, stale-safe. ---
+      if (args.startLine !== undefined || args.endLine !== undefined) {
+        const startLine = Number(args.startLine);
+        const endLine = Number(args.endLine);
+        if (!Number.isInteger(startLine) || !Number.isInteger(endLine) || startLine < 1 || endLine < startLine) {
+          throw new Error('edit: range mode needs integer line numbers with 1 <= startLine <= endLine');
+        }
+        const expectedStartHash = typeof args.expectedStartHash === 'string' ? args.expectedStartHash : '';
+        const expectedEndHash = typeof args.expectedEndHash === 'string' ? args.expectedEndHash : '';
+        if (!expectedStartHash || !expectedEndHash) {
+          throw new Error(
+            'edit: range mode requires expectedStartHash and expectedEndHash (from read_file with withHashes=true) — refusing an unverified range edit',
+          );
+        }
+        const lines = content.split('\n');
+        if (endLine > lines.length) {
+          throw new Error(`edit: endLine ${endLine} is past the end of "${args.path}" (${lines.length} lines)`);
+        }
+        const startActual = lineHash(lines[startLine - 1]!);
+        if (startActual !== expectedStartHash) {
+          throw new Error(
+            `edit: stale file — line ${startLine} of "${args.path}" has hash ${startActual}, expected ${expectedStartHash}. ` +
+              'The file changed since it was read; re-read it with read_file (withHashes=true) and retry.',
+          );
+        }
+        const endActual = lineHash(lines[endLine - 1]!);
+        if (endActual !== expectedEndHash) {
+          throw new Error(
+            `edit: stale file — line ${endLine} of "${args.path}" has hash ${endActual}, expected ${expectedEndHash}. ` +
+              'The file changed since it was read; re-read it with read_file (withHashes=true) and retry.',
+          );
+        }
+        const newText = String(args.newText ?? '');
+        const replacement = newText === '' ? [] : newText.split('\n');
+        const nextLines = [
+          ...lines.slice(0, startLine - 1),
+          ...replacement,
+          ...lines.slice(endLine),
+        ];
+        writeFileSync(file, nextLines.join('\n'), 'utf8');
+        return {
+          path: String(args.path),
+          mode: 'range',
+          replacements: 1,
+          linesReplaced: endLine - startLine + 1,
+        };
+      }
+
+      // --- Exact-string mode (unchanged behaviour). ---
       const oldText = String(args.oldText ?? '');
       const newText = String(args.newText ?? '');
       if (oldText.length === 0) throw new Error('edit: "oldText" must not be empty');
-      if (!existsSync(file)) throw new Error(`edit: file does not exist: "${args.path}"`);
-      const content = readFileSync(file, 'utf8');
       const count = content.split(oldText).length - 1;
       const expected = args.expectedCount === undefined ? 1 : Number(args.expectedCount);
       if (!Number.isInteger(expected) || expected < 1) {
@@ -480,6 +559,209 @@ function grepTool(workspaceDir: WorkspaceSource): ToolDefinition {
         }
       }
       return { pattern, matches, truncated: matches.length === MAX_GREP_MATCHES };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// search_code_semantic (#60) — hybrid lexical + embedding code search
+// ---------------------------------------------------------------------------
+
+const MAX_SEMANTIC_FILES = 500;
+const MAX_SEMANTIC_FILE_CHARS = 8_000;
+const DEFAULT_SEMANTIC_LIMIT = 10;
+const MAX_SEMANTIC_LIMIT = 50;
+
+interface SemanticIndexEntry {
+  rel: string;
+  mtimeMs: number;
+  size: number;
+  /** Content excerpt used for lexical scoring + snippets. */
+  text: string;
+  /** Embedding of `text`, tagged with the embedder that produced it. */
+  vector?: Float32Array;
+  vectorEmbedder?: string;
+}
+
+/**
+ * In-memory index cache, keyed by workspace root. Entries are
+ * validated per call against file mtime/size — a changed file is
+ * re-read (and re-embedded) on the next search, a deleted file drops
+ * out. No on-disk index: the scan is on-demand by design.
+ */
+const semanticIndexCache = new Map<string, Map<string, SemanticIndexEntry>>();
+
+/** Test hook: drop the semantic index cache. */
+export function clearSemanticIndexCache(): void {
+  semanticIndexCache.clear();
+}
+
+function lexicalTokens(text: string): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const tok of text.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? []) {
+    if (tok.length < 2) continue;
+    counts.set(tok, (counts.get(tok) ?? 0) + 1);
+  }
+  return counts;
+}
+
+/** Lexical score: fraction-weighted query-token coverage of one file. */
+function lexicalScore(queryTokens: Map<string, number>, fileTokens: Map<string, number>): number {
+  let score = 0;
+  for (const [tok, qCount] of queryTokens) {
+    const fCount = fileTokens.get(tok) ?? 0;
+    if (fCount > 0) score += Math.min(qCount, 2) * (1 + Math.log(fCount));
+  }
+  return score;
+}
+
+function snippetFor(text: string, queryTokens: Map<string, number>): string {
+  const lines = text.split('\n');
+  for (const line of lines) {
+    const lower = line.toLowerCase();
+    for (const tok of queryTokens.keys()) {
+      if (lower.includes(tok)) return line.trim().slice(0, 200);
+    }
+  }
+  const first = lines.find((l) => l.trim().length > 0);
+  return (first ?? '').trim().slice(0, 200);
+}
+
+function semanticSearchTool(
+  workspaceDir: WorkspaceSource,
+  embedder: SyncEmbedder | undefined,
+): ToolDefinition {
+  return {
+    name: 'search_code_semantic',
+    description:
+      'Search workspace code by MEANING, not just keywords: hybrid ranking that fuses a lexical ' +
+      'scan with embedding similarity over file contents, so a query like "car handling" can find ' +
+      'the file about "automobile steering". With no embedder configured it degrades to ' +
+      'lexical-only ranking and says so in the result (mode: "lexical-only").',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Natural-language description of the code you are looking for' },
+        limit: { type: 'number', description: 'Max results (default 10, max 50)' },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+    handler: async (args, ctx) => {
+      const ws = resolveWorkspaceDir(workspaceDir, ctx);
+      const root = resolve(ws);
+      const query = String(args.query ?? '').trim();
+      if (!query) throw new Error('search_code_semantic: "query" must not be empty');
+      const limitRaw = typeof args.limit === 'number' && Number.isFinite(args.limit) ? Math.floor(args.limit) : DEFAULT_SEMANTIC_LIMIT;
+      const limit = Math.min(MAX_SEMANTIC_LIMIT, Math.max(1, limitRaw));
+
+      // On-demand scan with an mtime-keyed in-memory cache.
+      const all: string[] = [];
+      walkFiles(root, all);
+      let cache = semanticIndexCache.get(root);
+      if (!cache) {
+        cache = new Map();
+        semanticIndexCache.set(root, cache);
+      }
+      const seen = new Set<string>();
+      const entries: SemanticIndexEntry[] = [];
+      for (const abs of all.slice(0, MAX_SEMANTIC_FILES * 4)) {
+        if (entries.length >= MAX_SEMANTIC_FILES) break;
+        if (isBinaryFile(abs)) continue;
+        let st;
+        try {
+          st = statSync(abs);
+        } catch {
+          continue;
+        }
+        const rel = wsRelative(ws, abs).split(sep).join('/');
+        seen.add(rel);
+        const cached = cache.get(rel);
+        if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+          entries.push(cached);
+          continue;
+        }
+        let text: string;
+        try {
+          text = readFileSync(abs, 'utf8').slice(0, MAX_SEMANTIC_FILE_CHARS);
+        } catch {
+          continue;
+        }
+        const entry: SemanticIndexEntry = { rel, mtimeMs: st.mtimeMs, size: st.size, text };
+        cache.set(rel, entry);
+        entries.push(entry);
+      }
+      for (const rel of [...cache.keys()]) {
+        if (!seen.has(rel)) cache.delete(rel);
+      }
+
+      const queryTokens = lexicalTokens(query);
+      const scored = entries.map((entry) => ({
+        entry,
+        lexical: lexicalScore(queryTokens, lexicalTokens(`${entry.rel} ${entry.text}`)),
+      }));
+
+      // Embedding leg (skipped entirely with no embedder configured).
+      let semanticScores: Map<string, number> | null = null;
+      let embedderName: string | undefined;
+      if (embedder) {
+        try {
+          const needEmbed = entries.filter((e) => !e.vector || e.vectorEmbedder !== embedder.name);
+          if (needEmbed.length > 0) {
+            const vectors = await embedder.embed(needEmbed.map((e) => `${e.rel}\n${e.text}`));
+            needEmbed.forEach((e, i) => {
+              e.vector = vectors[i];
+              e.vectorEmbedder = embedder.name;
+            });
+          }
+          const [queryVector] = await embedder.embed([query]);
+          if (queryVector) {
+            semanticScores = new Map(
+              entries.map((e) => [e.rel, e.vector ? cosineSimilarity(queryVector, e.vector) : 0] as const),
+            );
+            embedderName = embedder.name;
+          }
+        } catch {
+          // A failing embedder degrades to lexical-only, honestly labelled.
+          semanticScores = null;
+        }
+      }
+
+      const maxLexical = Math.max(1, ...scored.map((s) => s.lexical));
+      const results = scored
+        .map((s) => {
+          const lexicalNorm = s.lexical / maxLexical;
+          const semantic = semanticScores ? Math.max(0, semanticScores.get(s.entry.rel) ?? 0) : undefined;
+          // Hybrid fusion: the embedding leg carries the meaning
+          // signal (0.6) over normalized lexical overlap (0.4) when it
+          // ran — lexical alone is the degraded mode, not the peer.
+          const score = semantic !== undefined ? 0.4 * lexicalNorm + 0.6 * semantic : lexicalNorm;
+          return {
+            path: s.entry.rel,
+            score: Number(score.toFixed(4)),
+            lexicalScore: Number(s.lexical.toFixed(4)),
+            ...(semantic !== undefined ? { semanticScore: Number(semantic.toFixed(4)) } : {}),
+            snippet: snippetFor(s.entry.text, queryTokens),
+          };
+        })
+        .filter((r) => r.score > 0)
+        .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
+        .slice(0, limit);
+
+      return {
+        query,
+        mode: semanticScores ? 'hybrid' : 'lexical-only',
+        ...(embedderName ? { embedder: embedderName } : {}),
+        ...(semanticScores
+          ? {}
+          : {
+              note: embedder
+                ? 'The configured embedder failed for this search — results are lexical-only.'
+                : 'No embedder is configured for semantic code search — results are lexical-only. Configure the platform embedder to enable meaning-based ranking.',
+            }),
+        filesScanned: entries.length,
+        results,
+      };
     },
   };
 }
@@ -715,14 +997,17 @@ function lspHoverTool(workspaceDir: WorkspaceSource): ToolDefinition {
  * Build the coding tool set, confined to `workspaceDir`.
  * Returned tools are plain ToolDefinitions; the tool registry applies
  * governance (deny-by-default / approvals) exactly as for built-in tools.
+ * `opts.embedder` (optional) powers `search_code_semantic`'s semantic
+ * leg; without it that tool runs lexical-only (#60).
  */
-export function createCodingTools(opts: { workspaceDir: WorkspaceSource }): ToolDefinition[] {
+export function createCodingTools(opts: CodingToolsOptions): ToolDefinition[] {
   const { workspaceDir } = opts;
   return [
     patchTool(workspaceDir),
     editTool(workspaceDir),
     globTool(workspaceDir),
     grepTool(workspaceDir),
+    semanticSearchTool(workspaceDir, opts.embedder),
     lspDefinitionTool(workspaceDir),
     lspHoverTool(workspaceDir),
   ];

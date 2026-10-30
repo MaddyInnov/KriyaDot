@@ -84,6 +84,89 @@ describe('SMTP send', () => {
   });
 });
 
+/** FakeChannel that also supports the STARTTLS upgrade step. */
+class UpgradingFakeChannel extends FakeChannel {
+  upgradedWith: string | null = null;
+  async upgradeToTls(servername: string): Promise<void> {
+    this.upgradedWith = servername;
+  }
+}
+
+describe('STARTTLS upgrade', () => {
+  it('SMTP: upgrades after EHLO, re-EHLOs, and only then sends AUTH', async () => {
+    const channel = new UpgradingFakeChannel([
+      '220 mx.example ESMTP ready',
+      '250-Hello',
+      '250 STARTTLS',
+      '220 2.0.0 Ready to start TLS',
+      '250-Hello over TLS',
+      '250 AUTH LOGIN',
+      '334 VXNlcm5hbWU6',
+      '334 UGFzc3dvcmQ6',
+      '235 Authentication successful',
+      '250 OK',
+      '250 OK',
+      '354 End data with <CR><LF>.<CR><LF>',
+      '250 2.0.0 Ok: queued as TLS42',
+    ]);
+    const result = await sendSmtpMail(
+      { host: 'mx.example', port: 587, secure: false, starttls: true, user: 'bot@example.com', pass: 'pw', from: 'bot@example.com' },
+      { to: 'user@example.org', subject: 'Secure hi', text: 'body' },
+      async () => channel,
+    );
+    expect(result.id).toBe('TLS42');
+    expect(channel.upgradedWith).toBe('mx.example');
+    const sent = channel.writes.join('');
+    const starttlsAt = sent.indexOf('STARTTLS\r\n');
+    const authAt = sent.indexOf('AUTH LOGIN\r\n');
+    expect(starttlsAt).toBeGreaterThan(-1);
+    expect(authAt).toBeGreaterThan(starttlsAt);
+    // EHLO appears twice: once plaintext, once after the upgrade.
+    expect(sent.match(/EHLO kriyadot\.local/g)).toHaveLength(2);
+    expect(channel.exhausted).toBe(true);
+  });
+
+  it('SMTP: fails rather than sending credentials when the channel cannot upgrade', async () => {
+    const channel = new FakeChannel([
+      '220 mx.example ESMTP ready',
+      '250 Hello',
+      '220 2.0.0 Ready to start TLS',
+    ]);
+    await expect(
+      sendSmtpMail(
+        { host: 'mx.example', port: 587, secure: false, starttls: true, user: 'bot@example.com', pass: 'pw', from: 'bot@example.com' },
+        { to: 'user@example.org', subject: 'x', text: 'y' },
+        async () => channel,
+      ),
+    ).rejects.toThrow(/cannot upgrade/);
+    expect(channel.writes.join('')).not.toContain('AUTH LOGIN');
+  });
+
+  it('IMAP: upgrades before LOGIN', async () => {
+    const channel = new UpgradingFakeChannel([
+      '* OK IMAP ready',
+      'a0 OK Begin TLS negotiation now',
+      'a1 OK logged in',
+      '* 0 EXISTS',
+      'a2 OK selected',
+      '* SEARCH',
+      'a3 OK search done',
+      '* BYE bye',
+      'a4 OK logout',
+    ]);
+    const mails = await fetchUnseenMail(
+      { host: 'imap.example', port: 143, secure: false, starttls: true, user: 'bot@example.com', pass: 'pw' },
+      async () => channel,
+    );
+    expect(mails).toEqual([]);
+    expect(channel.upgradedWith).toBe('imap.example');
+    const sent = channel.writes.join('');
+    expect(sent.indexOf('a0 STARTTLS')).toBeGreaterThan(-1);
+    expect(sent.indexOf('LOGIN')).toBeGreaterThan(sent.indexOf('a0 STARTTLS'));
+    expect(channel.exhausted).toBe(true);
+  });
+});
+
 describe('parseRawMail', () => {
   it('extracts from/subject/body from a plain message', () => {
     const parsed = parseRawMail(

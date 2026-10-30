@@ -308,9 +308,29 @@ export class AcpSessionManager {
   private readonly inFlight = new Map<string, InFlight>();
   /** Per-session spawn env (memory-only; see AcpCreateOptions.env). */
   private readonly spawnEnv = new Map<string, Record<string, string>>();
+  /**
+   * Cross-session prompt concurrency cap (closure #17): at most this
+   * many ACP prompts run at once across ALL sessions of this manager.
+   * Synchronous prompt() refuses beyond the cap ('busy'); promptAsync
+   * queues FIFO until a slot frees. Default 4 (matches the runtime's
+   * background spawn gate).
+   */
+  private readonly maxConcurrentPrompts: number;
+  private readonly asyncWaiters: Array<() => void> = [];
 
-  constructor(store: AcpSessionStore) {
+  constructor(store: AcpSessionStore, opts: { maxConcurrentPrompts?: number } = {}) {
     this.store = store;
+    this.maxConcurrentPrompts = Math.max(1, Math.floor(opts.maxConcurrentPrompts ?? 4));
+  }
+
+  /** Number of ACP prompts currently in flight across all sessions. */
+  get activePromptCount(): number {
+    return this.inFlight.size;
+  }
+
+  /** The configured cross-session prompt concurrency cap (#17). */
+  get promptConcurrencyCap(): number {
+    return this.maxConcurrentPrompts;
   }
 
   /** Close all live processes (host shutdown). */
@@ -421,6 +441,12 @@ export class AcpSessionManager {
     if (this.inFlight.has(id)) {
       throw new AcpSessionError('busy', 'This ACP session already has a prompt in flight. Cancel it first.');
     }
+    if (this.inFlight.size >= this.maxConcurrentPrompts) {
+      throw new AcpSessionError(
+        'busy',
+        `ACP concurrency cap reached (${this.maxConcurrentPrompts} prompts in flight across sessions). Retry shortly, or use promptAsync to queue.`,
+      );
+    }
     const message = text?.trim();
     if (!message) throw new AcpSessionError('unknown', 'Prompt text is required.');
     if (message.length > 200_000) throw new AcpSessionError('unknown', 'Prompt is too long (max 200,000 characters).');
@@ -454,7 +480,59 @@ export class AcpSessionManager {
       throw mapped;
     } finally {
       this.inFlight.delete(id);
+      // Wake one queued promptAsync waiter (#17) now a slot freed.
+      this.asyncWaiters.shift()?.();
     }
+  }
+
+  /**
+   * Async ACP prompt (closure #17): fire-and-forget counterpart of
+   * prompt(). Returns as soon as the request is ACCEPTED (session
+   * exists, text valid); the prompt itself runs in the background —
+   * queueing FIFO while the session is busy or the cross-session
+   * concurrency cap is reached — and the final result (or the mapped
+   * error) is delivered to `hooks.onComplete`, which is where the
+   * host injects the completion into the originating conversation.
+   * Never rejects after acceptance: failures arrive via onComplete.
+   */
+  async promptAsync(
+    id: string,
+    text: string,
+    hooks: AcpPromptHooks & {
+      onComplete?: (result: { ok: true; text: string } | { ok: false; error: AcpSessionError }) => void;
+    } = {},
+  ): Promise<{ accepted: true; sessionId: string }> {
+    this.requireSession(id);
+    const message = text?.trim();
+    if (!message) throw new AcpSessionError('unknown', 'Prompt text is required.');
+    if (message.length > 200_000) throw new AcpSessionError('unknown', 'Prompt is too long (max 200,000 characters).');
+    const { onComplete, ...promptHooks } = hooks;
+    void (async () => {
+      // FIFO-ish dispatch with retry-on-busy: prompt() registers its
+      // in-flight entry only after the process attach, so a pre-check
+      // here would race. Instead, attempt the prompt and, while the
+      // manager reports 'busy' (session busy or cap reached), wait —
+      // prompt()'s finally wakes one waiter per completion, and a
+      // short poll covers the attach race — then retry.
+      for (;;) {
+        try {
+          const finalText = await this.prompt(id, message, promptHooks);
+          onComplete?.({ ok: true, text: finalText });
+          return;
+        } catch (err) {
+          const mapped = mapAcpError(err);
+          if (mapped.kind !== 'busy') {
+            onComplete?.({ ok: false, error: mapped });
+            return;
+          }
+          await new Promise<void>((resolve) => {
+            this.asyncWaiters.push(resolve);
+            setTimeout(resolve, 50);
+          });
+        }
+      }
+    })();
+    return { accepted: true, sessionId: id };
   }
 
   /**

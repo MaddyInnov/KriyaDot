@@ -46,3 +46,88 @@ export class SubagentProfileRegistry {
   }
 }
 export const subagentProfiles = new SubagentProfileRegistry();
+
+// ---------------------------------------------------------------------------
+// Ephemeral-agent lifecycle (closure #18): named registration for
+// runtime-minted agents — add / enable / disable / remove / re-invoke
+// by name — persisted via serialize()/restore() (host stores the JSON
+// alongside its other stores). Disabled agents cannot be invoked.
+// ---------------------------------------------------------------------------
+
+export interface NamedAgent {
+  profile: SubagentProfile;
+  enabled: boolean;
+  createdAt: number;
+  invokeCount: number;
+}
+
+export class NamedAgentRegistry {
+  private readonly agents = new Map<string, NamedAgent>();
+
+  constructor(profiles: SubagentProfile[] = []) {
+    for (const p of profiles) this.add(p);
+  }
+
+  /** Register (or replace) a named agent. */
+  add(profile: SubagentProfile): NamedAgent {
+    const existing = this.agents.get(profile.id);
+    const entry: NamedAgent = {
+      profile,
+      enabled: existing?.enabled ?? true,
+      createdAt: existing?.createdAt ?? Date.now(),
+      invokeCount: existing?.invokeCount ?? 0,
+    };
+    this.agents.set(profile.id, entry);
+    return entry;
+  }
+
+  get(idOrName: string): NamedAgent | undefined {
+    return this.agents.get(idOrName) ?? [...this.agents.values()].find((a) => a.profile.name === idOrName);
+  }
+
+  list(): NamedAgent[] { return [...this.agents.values()]; }
+  get size(): number { return this.agents.size; }
+
+  setEnabled(idOrName: string, enabled: boolean): boolean {
+    const a = this.get(idOrName);
+    if (!a) return false;
+    a.enabled = enabled;
+    return true;
+  }
+
+  remove(idOrName: string): boolean {
+    const a = this.get(idOrName);
+    if (!a) return false;
+    return this.agents.delete(a.profile.id);
+  }
+
+  /** Ephemeral bot definition for a re-invocation by id or NAME. Undefined when unknown/disabled. */
+  ephemeralFor(idOrName: string): { name: string; systemPrompt: string; tools: string[] } | undefined {
+    const a = this.get(idOrName);
+    if (!a || !a.enabled) return undefined;
+    a.invokeCount += 1;
+    return { name: a.profile.name, systemPrompt: a.profile.systemPrompt, tools: [...a.profile.suggestedTools] };
+  }
+
+  serialize(): string {
+    return JSON.stringify([...this.agents.values()]);
+  }
+
+  restore(json: string): void {
+    try {
+      const arr = JSON.parse(json) as NamedAgent[];
+      if (!Array.isArray(arr)) return;
+      this.agents.clear();
+      for (const a of arr) {
+        if (a?.profile?.id && typeof a.profile.systemPrompt === 'string') {
+          this.agents.set(a.profile.id, {
+            profile: a.profile,
+            enabled: a.enabled !== false,
+            createdAt: a.createdAt ?? Date.now(),
+            invokeCount: a.invokeCount ?? 0,
+          });
+        }
+      }
+    } catch { /* corrupt snapshot must never break startup */ }
+  }
+}

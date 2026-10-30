@@ -26,12 +26,23 @@ export interface BotPolicyRule {
   /** Guardrails as code: argument-value condition (see PolicyRule.argPattern). */
   argPattern?: { arg: string; pattern: string };
   /** Guardrails as code: session-history condition (see PolicyRule.requiresHistory). */
-  requiresHistory?: { toolPattern: string; minCount?: number };
+  requiresHistory?: { toolPattern: string; minCount?: number; argDigest?: string; argPattern?: string };
+  /** Domain-bound capability (#122): egress allowlist (see PolicyRule.domains). */
+  domains?: string[];
 }
 
 /** Per-bot governance policy — field-compatible with agent-runtime's BotPolicy. */
 export interface BotPolicy {
   rules: BotPolicyRule[];
+  /**
+   * Opt-in policy snapshot mode (#70): when true, the host captures an
+   * immutable snapshot of the effective merged policy at session start
+   * and evaluates the whole session against it (see
+   * policy-snapshot.ts). Absent/false (DEFAULT) = live evaluation.
+   * NOTE: agent-runtime's BotPolicy needs the same optional field for
+   * the flag to flow from bot config — see the closure report.
+   */
+  policySnapshot?: boolean;
 }
 
 /**
@@ -47,6 +58,7 @@ export function mergeBotPolicy(globalPolicy: Policy, botPolicy?: BotPolicy): Pol
     reason: r.reason,
     argPattern: r.argPattern,
     requiresHistory: r.requiresHistory,
+    domains: r.domains,
   }));
   return {
     defaultEffect: globalPolicy.defaultEffect,

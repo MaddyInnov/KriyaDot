@@ -212,6 +212,85 @@ export interface AtomCard {
    * conflict resolution are kept (audit trail) but marked inactive.
    */
   active: boolean;
+  /**
+   * Grounding kind (Octomind parity #75): how this atom was verified
+   * before storage. 'verbatim-quote' = a user rule/preference stored via
+   * storeVerbatimQuote with a quote checked literally against the source
+   * message. 'experience-citation' = an experience atom (lesson/procedure)
+   * backed by a session:// citation in evidenceLinks. Absent = legacy /
+   * ordinary distilled atom (no grounding claim).
+   */
+  grounding?: AtomGrounding;
+  /** Project scoping (#74): absent = global (visible in every scope). */
+  projectId?: string;
+  /**
+   * Role filter (#74): when non-empty, the atom is only visible to recall
+   * scopes whose roles intersect this list. Absent/empty = all roles.
+   */
+  roles?: string[];
+  /**
+   * Evidence links (#79): typed links plus `session://<sessionId>#<messageId>`
+   * evidence citations pointing at the exact message that backs this atom.
+   */
+  evidenceLinks?: string[];
+  /**
+   * Cold tier (#81): archived atoms are out of hot recall but live in the
+   * cold archive catalog (lexically searchable, promotable on material use).
+   */
+  archived?: boolean;
+  /** Material-use credit (#78): how often this atom was actually used. */
+  useCredit?: number;
+}
+
+/** The two grounded atom types (#75), modelled distinctly. */
+export type AtomGrounding = 'verbatim-quote' | 'experience-citation';
+
+/** Retrieval scope (#74): project + roles a recall is performed for. */
+export interface MemoryScope {
+  projectId?: string;
+  roles?: string[];
+}
+
+/** Build a `session://<sessionId>#<messageId>` evidence link (#79). */
+export function sessionEvidenceLink(sessionId: string, messageId: string): string {
+  return `session://${sessionId}#${messageId}`;
+}
+
+const SESSION_LINK_RE = /^session:\/\/([^#\s]+)#(\S+)$/;
+
+/** Parse a `session://` evidence link; null when it is not one. */
+export function parseSessionEvidenceLink(
+  link: string,
+): { sessionId: string; messageId: string } | null {
+  const m = SESSION_LINK_RE.exec(link);
+  return m ? { sessionId: m[1]!, messageId: m[2]! } : null;
+}
+
+/** Is `link` a `session://` evidence link? */
+export function isSessionEvidenceLink(link: string): boolean {
+  return SESSION_LINK_RE.test(link);
+}
+
+/**
+ * Scope visibility (#74): an atom is visible in a scope when its project
+ * matches (unscoped atoms are global) and its role filter intersects the
+ * scope's roles (unfiltered atoms are visible to every role; a scope with
+ * no roles sees only unfiltered atoms).
+ */
+export function atomInScope(atom: Pick<AtomCard, 'projectId' | 'roles'>, scope?: MemoryScope): boolean {
+  if (!scope) return true;
+  if (scope.projectId && atom.projectId && atom.projectId !== scope.projectId) return false;
+  const atomRoles = atom.roles ?? [];
+  if (atomRoles.length > 0) {
+    const scopeRoles = scope.roles ?? [];
+    if (!atomRoles.some((r) => scopeRoles.includes(r))) return false;
+  }
+  return true;
+}
+
+/** Cheap deterministic token estimate for one atom (~4 chars/token + framing). */
+export function estimateAtomTokens(atom: Pick<AtomCard, 'fact'>): number {
+  return Math.ceil(atom.fact.length / 4) + 4;
 }
 
 /** Durable memory categories (Engram + Atomic parity). */
@@ -254,6 +333,15 @@ export interface DistilledFact {
   confidence: number;
   /** Optional explicit category (used by the advanced LLM distiller for lessons/procedures). */
   category?: MemoryCategory;
+  /**
+   * Optional verbatim quote the distiller claims grounds this fact (#75).
+   * Verified literally against the source user text before storage; an
+   * ungrounded quote gets the candidate rejected fail-closed.
+   */
+  quote?: string;
+  /** Scope stamping (#74): project / roles this fact belongs to. */
+  projectId?: string;
+  roles?: string[];
 }
 
 /** A typed link between two memory atoms (Atomic parity). */
@@ -495,6 +583,17 @@ function normFact(fact: string): string {
   return fact.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+/** Parse a JSON string-array column; [] on anything malformed. */
+function parseStringArray(v: string | null | undefined): string[] {
+  if (!v) return [];
+  try {
+    const parsed = JSON.parse(v) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Read a tier column back: NULL or an unknown value falls back to the
  * write-time default for the memory source (`cloud-ok`) — fail open to the
@@ -519,6 +618,81 @@ function inferCategory(factText: string): MemoryCategory {
   if (/\b(i (?:like|love|prefer|hate|dislike|enjoy)|preferred name is)\b/.test(t)) return 'preference';
   if (/\b(decided|agreed|chosen|will use|going with)\b/.test(t)) return 'decision';
   return 'fact';
+}
+
+/** Outcome of one grounded distillation store pass (#75/#77). */
+export interface DistillStoreResult {
+  stored: number;
+  /** Candidates rejected fail-closed by the grounding check. */
+  rejected: number;
+  atomIds: string[];
+}
+
+/** One journaled grounding rejection (#75). */
+export interface GroundingRejection {
+  fact: string;
+  reason: string;
+  sourceRef: string | null;
+  ts: number;
+}
+
+/** Extract the user leg from a `User: ...\nAssistant: ...` turn text. */
+function extractUserText(turnText: string): string {
+  const m = /^User:\s*([\s\S]*?)(?:\nAssistant:|$)/.exec(turnText);
+  return (m ? m[1]! : turnText).trim();
+}
+
+const GROUNDING_STOPWORDS = new Set(
+  'the,user,users,that,this,with,from,have,has,will,would,should,their,them,they,about,into,over,under,after,before,when,what,remember'.split(','),
+);
+
+function contentTokens(text: string): Set<string> {
+  return new Set(
+    normFact(text)
+      .split(' ')
+      .filter((t) => t.length > 2 && !GROUNDING_STOPWORDS.has(t)),
+  );
+}
+
+/**
+ * Is this distilled fact a USER RULE / preference (#75)? Preferences by
+ * category, plus imperative/declarative rule wording (always/never/must/
+ * prefer/remember…). These are the candidates that must be grounded in a
+ * verbatim quote of the user's own words before storage.
+ */
+export function isUserRuleFact(fact: DistilledFact, category: MemoryCategory): boolean {
+  if (category === 'preference') return true;
+  return /\b(always|never|must|shall|prefer(?:s|red)?|rule|remember(?:\s+that)?|don'?t forget)\b/i.test(fact.fact);
+}
+
+/**
+ * Find the sentence of `userText` that best grounds `fact`: the sentence
+ * with the highest content-token overlap with the fact, returned only
+ * when the overlap covers at least ~40% of the fact's content tokens
+ * AND at least 2 tokens (a single shared word never grounds a rule).
+ * The returned sentence is a literal substring of the user text, so
+ * storeVerbatimQuote's substring check passes for it by construction.
+ */
+export function findGroundingQuote(fact: string, userText: string): string | null {
+  const factTokens = contentTokens(fact);
+  if (factTokens.size === 0 || !userText.trim()) return null;
+  const sentences = userText
+    .split(/(?<=[.!?\n])\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 4);
+  let best: string | null = null;
+  let bestScore = 0;
+  for (const s of sentences) {
+    const sentTokens = contentTokens(s);
+    let overlap = 0;
+    for (const t of factTokens) if (sentTokens.has(t)) overlap++;
+    const score = overlap / factTokens.size;
+    if (overlap >= 2 && score >= 0.4 && score > bestScore) {
+      best = s;
+      bestScore = score;
+    }
+  }
+  return best;
 }
 
 /**
@@ -595,6 +769,72 @@ export interface TieredMemoryOptions {
   neuralEmbedder?: SyncEmbedder;
 }
 
+/** One orientation-store entry (#76): context overwritten in place by key. */
+export interface OrientationEntry {
+  botId: string;
+  key: string;
+  value: string;
+  /** Who wrote it: 'user' | 'system' | 'about-me' (adapter) | … */
+  source: string;
+  updatedAt: number;
+}
+
+/** A materialized per-turn Memory Pack (#78). */
+export interface MemoryPack {
+  id: string;
+  botId: string;
+  query: string;
+  scope?: MemoryScope;
+  atoms: AtomCard[];
+  atomIds: string[];
+  /** Explicit token budget the pack was selected under. */
+  tokenBudget: number;
+  /** Estimated tokens the selected atoms consume. */
+  tokensUsed: number;
+  createdAt: number;
+}
+
+/** Result of crediting material use against a pack (#78). */
+export interface PackCreditResult {
+  packId: string;
+  /** Pack atoms credited with material use. */
+  credited: string[];
+  /** Credited atoms this use promoted out of the cold tier (#81). */
+  promoted: string[];
+}
+
+/** Result of one runDistillPipeline pass (#77). */
+export interface DistillPipelineResult {
+  botId: string;
+  sessionId: string;
+  /** User turns distilled. */
+  turns: number;
+  stored: number;
+  /** Candidates rejected fail-closed by grounding (#75). */
+  rejected: number;
+  atomIds: string[];
+  /** Reflection outcome; null when no chat fn was provided. */
+  reflection: ReflectionResult | null;
+}
+
+/** One page of cold-archive recall (#81). */
+export interface ColdSearchPage {
+  atoms: AtomCard[];
+  /** Total cold hits for the query (across all pages). */
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
+/** Outcome of recording one material use of an atom (#78/#81). */
+export interface MaterialUseResult {
+  atomId: string;
+  /** Use-credit after this use. */
+  useCredit: number;
+  /** True when this use promoted the atom out of the cold tier. */
+  promoted: boolean;
+}
+
 /** One hybrid-recall hit: the atom plus how it was retrieved. */
 export interface HybridRecallHit {
   atom: AtomCard;
@@ -602,6 +842,11 @@ export interface HybridRecallHit {
   score: number;
   /** Which retrieval legs returned this atom. */
   sources: Array<'vector' | 'lexical'>;
+  /**
+   * True when this hit arrived via one-hop link expansion (#79) from a
+   * primary hit, not from the query legs themselves.
+   */
+  expansion?: boolean;
 }
 
 export class TieredMemoryStore {
@@ -653,6 +898,52 @@ export class TieredMemoryStore {
     if (!atomCols.some((c) => c.name === 'quote_source')) {
       this.db.exec('ALTER TABLE memory_atoms ADD COLUMN quote_source TEXT');
     }
+    // Octomind closure (#74/#75/#78/#79/#81): grounding kind, project/role
+    // scoping, session:// evidence links, cold-tier archive flag, and
+    // material-use credit. All idempotent; NULL/0 reads back as legacy.
+    if (!atomCols.some((c) => c.name === 'grounding')) {
+      this.db.exec('ALTER TABLE memory_atoms ADD COLUMN grounding TEXT');
+    }
+    if (!atomCols.some((c) => c.name === 'project_id')) {
+      this.db.exec('ALTER TABLE memory_atoms ADD COLUMN project_id TEXT');
+    }
+    if (!atomCols.some((c) => c.name === 'roles_json')) {
+      this.db.exec('ALTER TABLE memory_atoms ADD COLUMN roles_json TEXT');
+    }
+    if (!atomCols.some((c) => c.name === 'evidence_json')) {
+      this.db.exec('ALTER TABLE memory_atoms ADD COLUMN evidence_json TEXT');
+    }
+    if (!atomCols.some((c) => c.name === 'archived')) {
+      this.db.exec('ALTER TABLE memory_atoms ADD COLUMN archived INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!atomCols.some((c) => c.name === 'use_credit')) {
+      this.db.exec('ALTER TABLE memory_atoms ADD COLUMN use_credit INTEGER NOT NULL DEFAULT 0');
+    }
+    // Orientation store (#76): distinct from experience atoms —
+    // key/value context overwritten in place, never accumulated.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_orientation (
+        bot_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'user',
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (bot_id, key)
+      );
+    `);
+    // Grounding rejection journal (#75): every candidate the fail-closed
+    // grounding check dropped, so rejections are counted AND inspectable.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_grounding_rejections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bot_id TEXT NOT NULL,
+        fact TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        source_ref TEXT,
+        ts INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_grounding_rej_bot ON memory_grounding_rejections(bot_id, ts);
+    `);
     const eventCols = this.db.prepare('PRAGMA table_info(memory_events)').all() as Array<{ name: string }>;
     if (!eventCols.some((c) => c.name === 'tier')) {
       this.db.exec('ALTER TABLE memory_events ADD COLUMN tier TEXT');
@@ -734,9 +1025,10 @@ export class TieredMemoryStore {
    * The keeper is cheap by design: turns with trivial user text (< 20 chars
    * or no alphanumeric content) skip distillation entirely.
    */
-  ingestTurn(botId: string, sessionId: string, userText: string, assistantText: string, toolCalls: string[] = [], tier?: PrivacyTier): void {
+  ingestTurn(botId: string, sessionId: string, userText: string, assistantText: string, toolCalls: string[] = [], tier?: PrivacyTier, scope?: MemoryScope): void {
+    let userEventId: string | undefined;
     try {
-      this.recordEvent(botId, sessionId, 'user', userText, [], tier);
+      userEventId = this.recordEvent(botId, sessionId, 'user', userText, [], tier).id;
       this.recordEvent(botId, sessionId, 'assistant', assistantText, toolCalls, tier);
     } catch {
       return; // memory must never break chat
@@ -746,23 +1038,153 @@ export class TieredMemoryStore {
     if (!substantive) return;
     // Fire-and-forget distillation.
     const turnText = `User: ${userText}\nAssistant: ${assistantText}`;
-    void this.distillAndStore(botId, sessionId, turnText).catch(() => undefined);
+    void this.distillAndStore(botId, sessionId, turnText, { userText, userEventId, scope, tier }).catch(() => undefined);
   }
 
-  private async distillAndStore(botId: string, sessionId: string, turnText: string): Promise<void> {
+  private async distillAndStore(
+    botId: string,
+    sessionId: string,
+    turnText: string,
+    ctx: { userText?: string; userEventId?: string; scope?: MemoryScope; tier?: PrivacyTier } = {},
+  ): Promise<DistillStoreResult> {
     let facts: DistilledFact[];
     try {
       const distiller = this.botDistillers.get(botId) ?? this.distiller;
       facts = distiller ? await distiller(turnText) : heuristicDistill(turnText);
     } catch {
-      return;
+      return { stored: 0, rejected: 0, atomIds: [] };
     }
+    // Grounding source is the USER's text only: rules/preferences are the
+    // user's words, never the assistant's paraphrase of them.
+    const userText = ctx.userText ?? extractUserText(turnText);
+    return this.storeDistilledFacts(botId, facts, {
+      sessionId,
+      userText,
+      userEventId: ctx.userEventId,
+      scope: ctx.scope,
+      tier: ctx.tier,
+    });
+  }
+
+  /**
+   * The grounded storage path (#75) shared by per-turn distillation,
+   * runDistillPipeline (#77), and the upkeep capture pass:
+   * - user rules / preferences → routed through storeVerbatimQuote with
+   *   the source user text; ungrounded candidates are REJECTED
+   *   fail-closed (counted via droppedUngroundedQuotes and journaled in
+   *   memory_grounding_rejections via listGroundingRejections).
+   * - experience atoms (lessons / procedures) → stored only with a
+   *   session:// citation (grounding='experience-citation'); without a
+   *   session+message citation they are rejected the same way.
+   * - everything else keeps the legacy ungrounded path.
+   * Scope (#74) from the call or the fact itself is stamped on the atom.
+   */
+  storeDistilledFacts(
+    botId: string,
+    facts: DistilledFact[],
+    ctx: {
+      sessionId: string;
+      userText: string;
+      userEventId?: string;
+      scope?: MemoryScope;
+      tier?: PrivacyTier;
+    },
+  ): DistillStoreResult {
+    const out: DistillStoreResult = { stored: 0, rejected: 0, atomIds: [] };
     for (const f of facts) {
       try {
-        this.storeAtom(botId, f, sessionId, undefined, { category: f.category });
+        const category = normalizeCategory(f.category ?? inferCategory(f.fact));
+        const scopeOpts = {
+          projectId: f.projectId ?? ctx.scope?.projectId,
+          roles: f.roles ?? ctx.scope?.roles,
+        };
+        if (isUserRuleFact(f, category)) {
+          // Candidate quote: the distiller's claimed quote when present,
+          // else the best-matching sentence of the user's own text.
+          const quote = f.quote ?? findGroundingQuote(f.fact, ctx.userText);
+          if (!quote) {
+            this.logGroundingRejection(botId, f.fact, 'no grounding quote in user text', ctx.sessionId);
+            out.rejected++;
+            continue;
+          }
+          const id = this.storeVerbatimQuote(
+            botId,
+            {
+              quote,
+              sourceText: ctx.userText,
+              sourceRef: ctx.userEventId
+                ? sessionEvidenceLink(ctx.sessionId, ctx.userEventId)
+                : ctx.sessionId,
+              entities: f.entities,
+              confidence: f.confidence,
+              fact: f.fact,
+              category,
+              ...scopeOpts,
+              ...(ctx.userEventId
+                ? { evidenceLinks: [sessionEvidenceLink(ctx.sessionId, ctx.userEventId)] }
+                : {}),
+            },
+            ctx.tier,
+          );
+          if (id === null) {
+            this.logGroundingRejection(botId, f.fact, 'quote not present in source text', ctx.sessionId);
+            out.rejected++;
+            continue;
+          }
+          out.stored++;
+          out.atomIds.push(id);
+          continue;
+        }
+        if (category === 'lesson' || category === 'procedure') {
+          // Experience atoms require a session/message citation (#75).
+          if (!ctx.sessionId || !ctx.userEventId) {
+            this.logGroundingRejection(botId, f.fact, 'experience atom without session citation', ctx.sessionId);
+            out.rejected++;
+            continue;
+          }
+          const citation = sessionEvidenceLink(ctx.sessionId, ctx.userEventId);
+          const id = this.storeAtom(botId, f, ctx.sessionId, ctx.tier, {
+            category,
+            grounding: 'experience-citation',
+            evidenceLinks: [citation],
+            ...scopeOpts,
+          });
+          out.stored++;
+          out.atomIds.push(id);
+          continue;
+        }
+        const id = this.storeAtom(botId, f, ctx.sessionId, ctx.tier, { category, ...scopeOpts });
+        out.stored++;
+        out.atomIds.push(id);
       } catch {
         // skip bad facts, keep going
       }
+    }
+    return out;
+  }
+
+  /** Journal one grounding rejection (#75) — inspectable, not just counted. */
+  private logGroundingRejection(botId: string, fact: string, reason: string, sourceRef?: string): void {
+    this.droppedUngrounded++;
+    try {
+      this.db
+        .prepare('INSERT INTO memory_grounding_rejections (bot_id, fact, reason, source_ref, ts) VALUES (?, ?, ?, ?, ?)')
+        .run(botId, fact.slice(0, 500), reason, sourceRef ?? null, Date.now());
+    } catch {
+      // the counter above is the floor; journaling is best-effort
+    }
+  }
+
+  /** Grounding rejections journaled for a bot (#75), newest first. */
+  listGroundingRejections(botId: string, limit = 50): GroundingRejection[] {
+    try {
+      return this.db
+        .prepare(
+          'SELECT fact, reason, source_ref AS sourceRef, ts FROM memory_grounding_rejections WHERE bot_id = ? ORDER BY ts DESC, id DESC LIMIT ?',
+        )
+        .all(botId, Math.min(Math.max(limit, 1), 500)) as unknown as GroundingRejection[];
+    } catch {
+      return [];
     }
   }
 
@@ -783,14 +1205,26 @@ export class TieredMemoryStore {
       /** Verbatim-quote provenance (set by storeVerbatimQuote after grounding). */
       quote?: string;
       quoteSource?: string;
+      /** Grounding kind (#75). */
+      grounding?: AtomGrounding;
+      /** Project scoping (#74). */
+      projectId?: string;
+      /** Role filter (#74). */
+      roles?: string[];
+      /** Evidence links incl. session:// citations (#79). */
+      evidenceLinks?: string[];
     } = {},
   ): string {
     const factText = fact.fact.trim().slice(0, 500);
     if (!factText) throw new Error('fact must be non-empty');
     const factNorm = normFact(factText);
+    // Dedupe is scope-aware (#74/#85): the same fact learned in two
+    // different projects is two scoped atoms (that recurrence is exactly
+    // what standing-global-rule detection looks for); within one scope
+    // (including the legacy unscoped scope) it still dedupes to one.
     const existing = this.db
-      .prepare('SELECT id FROM memory_atoms WHERE bot_id = ? AND fact_norm = ? LIMIT 1')
-      .get(botId, factNorm) as { id: string } | undefined;
+      .prepare('SELECT id FROM memory_atoms WHERE bot_id = ? AND fact_norm = ? AND project_id IS ? LIMIT 1')
+      .get(botId, factNorm, opts.projectId ?? null) as { id: string } | undefined;
     if (existing) return existing.id;
 
     const id = randomUUID();
@@ -798,7 +1232,7 @@ export class TieredMemoryStore {
     const category = normalizeCategory(opts.category ?? inferCategory(factText));
     this.db
       .prepare(
-        'INSERT INTO memory_atoms (id, bot_id, fact, fact_norm, entities_json, confidence, source_turn, created_at, tier, pinned, category, quote, quote_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO memory_atoms (id, bot_id, fact, fact_norm, entities_json, confidence, source_turn, created_at, tier, pinned, category, quote, quote_source, grounding, project_id, roles_json, evidence_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         id,
@@ -814,6 +1248,12 @@ export class TieredMemoryStore {
         category,
         opts.quote ?? null,
         opts.quoteSource ?? null,
+        opts.grounding ?? null,
+        opts.projectId ?? null,
+        opts.roles && opts.roles.length > 0 ? JSON.stringify([...new Set(opts.roles)]) : null,
+        opts.evidenceLinks && opts.evidenceLinks.length > 0
+          ? JSON.stringify([...new Set(opts.evidenceLinks)])
+          : null,
       );
     this.indexAtomForSearch(botId, id, factText, entities);
     this.refreshEntityPages(botId, entities, id);
@@ -839,6 +1279,19 @@ export class TieredMemoryStore {
       sourceRef: string;
       entities?: string[];
       confidence?: number;
+      /**
+       * Distilled fact text to store as the atom (#75 live path). The
+       * QUOTE is still what gets verified against the source; the atom
+       * carries both (fact + quote provenance). Defaults to the quote
+       * itself (original behavior).
+       */
+      fact?: string;
+      category?: MemoryCategory;
+      /** Scope stamping (#74). */
+      projectId?: string;
+      roles?: string[];
+      /** Evidence links incl. session:// citations (#79). */
+      evidenceLinks?: string[];
     },
     tier?: PrivacyTier,
   ): string | null {
@@ -851,11 +1304,33 @@ export class TieredMemoryStore {
     }
     return this.storeAtom(
       botId,
-      { fact: quote, entities: input.entities ?? [], confidence: input.confidence ?? 0.95 },
+      { fact: input.fact ?? quote, entities: input.entities ?? [], confidence: input.confidence ?? 0.95 },
       input.sourceRef,
       tier,
-      { quote, quoteSource: input.sourceRef },
+      {
+        quote,
+        quoteSource: input.sourceRef,
+        grounding: 'verbatim-quote',
+        ...(input.category ? { category: input.category } : {}),
+        ...(input.projectId ? { projectId: input.projectId } : {}),
+        ...(input.roles ? { roles: input.roles } : {}),
+        ...(input.evidenceLinks ? { evidenceLinks: input.evidenceLinks } : {}),
+      },
     );
+  }
+
+  /**
+   * Attach an evidence link (#79) to an existing atom (deduped). Used to
+   * add session:// citations after the fact. Returns false for unknown atoms.
+   */
+  addEvidenceLink(botId: string, atomId: string, link: string): boolean {
+    const atom = this.getAtom(botId, atomId);
+    if (!atom) return false;
+    const links = [...new Set([...(atom.evidenceLinks ?? []), link])];
+    this.db
+      .prepare('UPDATE memory_atoms SET evidence_json = ? WHERE bot_id = ? AND id = ?')
+      .run(JSON.stringify(links), botId, atomId);
+    return true;
   }
 
   /**
@@ -929,6 +1404,130 @@ export class TieredMemoryStore {
     return res.changes > 0;
   }
 
+  // ---- Cold tier (#81) + archive-after-replace (#80) ----------------------
+  //
+  // Archived atoms ARE the cold tier: active=0 + archived=1. They leave
+  // hot recall/search but stay in the archive catalog — lexically
+  // searchable via searchCold with paged results — and material use
+  // (recordMaterialUse) promotes them straight back to hot.
+
+  /**
+   * Move an atom to the cold archive (archive-after-replace, #80/#81):
+   * deactivated AND flagged archived, so it is retrievable from the cold
+   * catalog instead of merely inactive in place. Returns false when the
+   * atom is unknown or already archived.
+   */
+  archiveAtom(botId: string, id: string): boolean {
+    const res = this.db
+      .prepare('UPDATE memory_atoms SET active = 0, archived = 1 WHERE bot_id = ? AND id = ? AND archived = 0')
+      .run(botId, id);
+    return res.changes > 0;
+  }
+
+  /** Promote a cold (archived) atom back to the hot tier. */
+  promoteFromCold(botId: string, id: string): boolean {
+    const res = this.db
+      .prepare('UPDATE memory_atoms SET active = 1, archived = 0 WHERE bot_id = ? AND id = ? AND archived = 1')
+      .run(botId, id);
+    return res.changes > 0;
+  }
+
+  /** All cold (archived) atoms for a bot, newest first. */
+  listColdAtoms(botId: string, limit = 500): AtomCard[] {
+    return this.getAtoms(botId, Math.min(Math.max(limit, 1), 5000), { includeInactive: true }).filter(
+      (a) => a.archived,
+    );
+  }
+
+  /**
+   * Paged lexical recall over the cold archive catalog (#81): FTS/BM25
+   * ranked, returned in pages so a caller can walk a large archive
+   * without materializing it. `page` is 0-based.
+   */
+  searchCold(
+    botId: string,
+    query: string,
+    opts: { page?: number; pageSize?: number; scope?: MemoryScope } = {},
+  ): ColdSearchPage {
+    const pageSize = Math.min(Math.max(opts.pageSize ?? 10, 1), 100);
+    const page = Math.max(opts.page ?? 0, 0);
+    const q = query.trim();
+    if (!q) return { atoms: [], total: 0, page, pageSize };
+    const match = buildFtsMatchQuery(q);
+    if (!match) return { atoms: [], total: 0, page, pageSize };
+    let ids: string[] = [];
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT atom_id AS id FROM memory_atoms_fts
+           WHERE memory_atoms_fts MATCH ? AND bot_id = ?
+           ORDER BY bm25(memory_atoms_fts) LIMIT 500`,
+        )
+        .all(match, botId) as Array<{ id: string }>;
+      ids = rows.map((r) => r.id);
+    } catch {
+      return { atoms: [], total: 0, page, pageSize };
+    }
+    if (ids.length === 0) return { atoms: [], total: 0, page, pageSize };
+    const byId = new Map(
+      this.getAtoms(botId, 5000, { includeInactive: true }).map((a) => [a.id, a]),
+    );
+    const ranked = ids
+      .map((id) => byId.get(id))
+      .filter((a): a is AtomCard => !!a && !!a.archived && atomInScope(a, opts.scope));
+    return {
+      atoms: ranked.slice(page * pageSize, page * pageSize + pageSize),
+      total: ranked.length,
+      page,
+      pageSize,
+    };
+  }
+
+  /**
+   * Cold recall rendered as a prompt block (#81, closure-fix): the
+   * one-call surface hosts were missing — searchCold existed as a paged
+   * catalog API but nothing turned a cold hit into context. Returns ''
+   * when the archive has nothing for the query. Rendering a cold atom
+   * into a prompt does NOT promote it; promotion stays tied to
+   * material use (recordMaterialUse / creditPackUse), per #81.
+   */
+  recallColdForPrompt(
+    botId: string,
+    query: string,
+    maxChars = 2000,
+    opts: { pageSize?: number; scope?: MemoryScope } = {},
+  ): string {
+    const page = this.searchCold(botId, query, { page: 0, pageSize: opts.pageSize ?? 5, scope: opts.scope });
+    if (page.atoms.length === 0) return '';
+    let block = '# From the archive (cold memory — recalled on demand)\n';
+    for (const atom of page.atoms) {
+      const line = `- ${atom.fact}\n`;
+      if (block.length + line.length > maxChars) break;
+      block += line;
+    }
+    return block.trimEnd();
+  }
+
+  /**
+   * Record MATERIAL use of an atom (#78/#81): the atom was recalled and
+   * then actually used/cited. Increments its use-credit (which feeds
+   * retention/promotion decisions in upkeep) and, when the atom sits in
+   * the cold tier, promotes it back to hot. Returns the outcome, or null
+   * for an unknown atom.
+   */
+  recordMaterialUse(botId: string, atomId: string): MaterialUseResult | null {
+    const atom = this.getAtom(botId, atomId);
+    if (!atom) return null;
+    this.db
+      .prepare('UPDATE memory_atoms SET use_credit = use_credit + 1 WHERE bot_id = ? AND id = ?')
+      .run(botId, atomId);
+    let promoted = false;
+    if (atom.archived) {
+      promoted = this.promoteFromCold(botId, atomId);
+    }
+    return { atomId, useCredit: (atom.useCredit ?? 0) + 1, promoted };
+  }
+
   /** Recent L0 raw turn events for a bot, newest first (memory-upkeep capture pass). */
   listRecentEvents(botId: string, limit = 200): MemoryEvent[] {
     const rows = this.db
@@ -963,7 +1562,7 @@ export class TieredMemoryStore {
    * Returns matching atoms ordered by relevance; pinned atoms sort first
    * on ties. Deleting via deleteAtom() removes the FTS row too (forget).
    */
-  searchAtoms(botId: string, query: string, limit = 20): AtomCard[] {
+  searchAtoms(botId: string, query: string, limit = 20, opts: { scope?: MemoryScope } = {}): AtomCard[] {
     const q = query.trim();
     if (!q) return [];
     const match = buildFtsMatchQuery(q);
@@ -985,7 +1584,7 @@ export class TieredMemoryStore {
     const hits: AtomCard[] = [];
     for (const r of rows) {
       const atom = byId.get(r.id);
-      if (atom) hits.push(atom);
+      if (atom && atomInScope(atom, opts.scope)) hits.push(atom);
     }
     // Pinned first, then FTS rank order (already BM25-sorted).
     hits.sort((a, b) => Number(b.pinned) - Number(a.pinned));
@@ -1046,6 +1645,8 @@ export class TieredMemoryStore {
         confidence: number; source_turn: string; created_at: number; tier: string | null;
         pinned: number | null; category: string | null; active: number | null;
         quote: string | null; quote_source: string | null;
+        grounding: string | null; project_id: string | null; roles_json: string | null;
+        evidence_json: string | null; archived: number | null; use_credit: number | null;
       }>;
     return rows.map((r) => ({
       id: r.id,
@@ -1061,6 +1662,16 @@ export class TieredMemoryStore {
       active: (r.active ?? 1) === 1,
       ...(r.quote ? { quote: r.quote } : {}),
       ...(r.quote_source ? { quoteSource: r.quote_source } : {}),
+      ...(r.grounding === 'verbatim-quote' || r.grounding === 'experience-citation'
+        ? { grounding: r.grounding as AtomGrounding }
+        : {}),
+      ...(r.project_id ? { projectId: r.project_id } : {}),
+      ...(parseStringArray(r.roles_json).length > 0 ? { roles: parseStringArray(r.roles_json) } : {}),
+      ...(parseStringArray(r.evidence_json).length > 0
+        ? { evidenceLinks: parseStringArray(r.evidence_json) }
+        : {}),
+      archived: (r.archived ?? 0) === 1,
+      useCredit: r.use_credit ?? 0,
     }));
   }
 
@@ -1161,9 +1772,11 @@ export class TieredMemoryStore {
    * default (`cloud-ok`) keeps `local-only` atoms out of cloud prompts —
    * this is the memory leg of the privacy-tier enforcement.
    */
-  recallForPrompt(botId: string, query: string, maxChars = 2000, opts: { maxTier?: PrivacyTier } = {}): string {
+  recallForPrompt(botId: string, query: string, maxChars = 2000, opts: { maxTier?: PrivacyTier; scope?: MemoryScope } = {}): string {
     const maxTier = opts.maxTier ?? 'cloud-ok';
-    const atoms = this.getAtoms(botId, 500).filter((a) => tierAtMost(a.tier, maxTier));
+    const atoms = this.getAtoms(botId, 500)
+      .filter((a) => tierAtMost(a.tier, maxTier))
+      .filter((a) => atomInScope(a, opts.scope));
     if (atoms.length === 0) return '';
     const qTokens = new Set(normFact(query).split(' ').filter((t) => t.length > 2));
     if (qTokens.size === 0) return '';
@@ -1202,7 +1815,13 @@ export class TieredMemoryStore {
    * Additive path — recallForPrompt() keeps its original keyword-overlap
    * behavior. Prefer this when you want the best recall.
    */
-  recallHybrid(botId: string, query: string, topK = 5, maxTier: PrivacyTier = 'cloud-ok'): HybridRecallHit[] {
+  recallHybrid(
+    botId: string,
+    query: string,
+    topK = 5,
+    maxTier: PrivacyTier = 'cloud-ok',
+    opts: { scope?: MemoryScope; expandLinks?: boolean } = {},
+  ): HybridRecallHit[] {
     const q = query.trim();
     if (!q) return [];
     const k = Math.min(Math.max(topK, 1), 50);
@@ -1263,10 +1882,37 @@ export class TieredMemoryStore {
       const atom = byId.get(f.id);
       // Privacy: drop atoms above maxTier before they can reach a prompt.
       if (!atom || !tierAtMost(atom.tier, maxTier)) continue;
+      // Scope (#74): out-of-scope atoms never surface.
+      if (!atomInScope(atom, opts.scope)) continue;
       const sources: Array<'vector' | 'lexical'> = [];
       if (vecSet.has(f.id)) sources.push('vector');
       if (lexSet.has(f.id)) sources.push('lexical');
       hits.push({ atom, score: Math.round(f.score * 1e6) / 1e6, sources });
+    }
+    // One-hop link expansion (#79): a primary hit's linked neighbors are
+    // included — marked as expansion — only while budget (topK slots)
+    // remains. Evidence session:// links point at messages, not atoms,
+    // so expansion follows the typed atom↔atom links.
+    if (opts.expandLinks && hits.length > 0 && hits.length < k) {
+      const seen = new Set(hits.map((h) => h.atom.id));
+      for (const primary of [...hits]) {
+        if (hits.length >= k) break;
+        let links: MemoryLink[] = [];
+        try {
+          links = this.getLinksForAtom(botId, primary.atom.id);
+        } catch {
+          links = [];
+        }
+        for (const link of links) {
+          if (hits.length >= k) break;
+          const neighborId = link.fromAtomId === primary.atom.id ? link.toAtomId : link.fromAtomId;
+          if (seen.has(neighborId)) continue;
+          const neighbor = byId.get(neighborId);
+          if (!neighbor || !tierAtMost(neighbor.tier, maxTier) || !atomInScope(neighbor, opts.scope)) continue;
+          seen.add(neighborId);
+          hits.push({ atom: neighbor, score: primary.score / 2, sources: [], expansion: true });
+        }
+      }
     }
     return hits;
   }
@@ -1352,6 +1998,383 @@ export class TieredMemoryStore {
     return block;
   }
 
+  // ---- Orientation store (#76) -------------------------------------------
+  //
+  // Orientation memory is WHO/WHAT/WHERE context (user profile facts,
+  // project overviews): a distinct store from long-lived experience
+  // atoms, with its own recall entry point and its own retention —
+  // orientation entries are OVERWRITTEN IN PLACE by key as facts change,
+  // while experience atoms accumulate (and dedupe/conflict/archive).
+
+  /** Set (or overwrite in place) one orientation entry. */
+  setOrientation(botId: string, key: string, value: string, source = 'user'): OrientationEntry {
+    const k = key.trim();
+    if (!k) throw new Error('orientation key must be non-empty');
+    const v = value.trim().slice(0, 4000);
+    const now = Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO memory_orientation (bot_id, key, value, source, updated_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(bot_id, key) DO UPDATE SET value = excluded.value, source = excluded.source, updated_at = excluded.updated_at`,
+      )
+      .run(botId, k, v, source, now);
+    return { botId, key: k, value: v, source, updatedAt: now };
+  }
+
+  /** One orientation entry by key (undefined when unset). */
+  getOrientation(botId: string, key: string): OrientationEntry | undefined {
+    const row = this.db
+      .prepare('SELECT bot_id AS botId, key, value, source, updated_at AS updatedAt FROM memory_orientation WHERE bot_id = ? AND key = ?')
+      .get(botId, key.trim()) as OrientationEntry | undefined;
+    return row;
+  }
+
+  /** Delete one orientation entry. */
+  deleteOrientation(botId: string, key: string): boolean {
+    const res = this.db
+      .prepare('DELETE FROM memory_orientation WHERE bot_id = ? AND key = ?')
+      .run(botId, key.trim());
+    return res.changes > 0;
+  }
+
+  /**
+   * Orientation recall (#76): the orientation store's own entry point.
+   * With a query, entries are filtered/ranked by token overlap of
+   * key+value; without one, all entries come back newest-first.
+   */
+  recallOrientation(botId: string, query?: string): OrientationEntry[] {
+    const rows = this.db
+      .prepare('SELECT bot_id AS botId, key, value, source, updated_at AS updatedAt FROM memory_orientation WHERE bot_id = ? ORDER BY updated_at DESC')
+      .all(botId) as unknown as OrientationEntry[];
+    if (!query || !query.trim()) return rows;
+    const qTokens = contentTokens(query);
+    if (qTokens.size === 0) return rows;
+    return rows
+      .map((e) => {
+        const hay = contentTokens(`${e.key} ${e.value}`);
+        let overlap = 0;
+        for (const t of qTokens) if (hay.has(t)) overlap++;
+        return { e, overlap };
+      })
+      .filter((s) => s.overlap > 0)
+      .sort((a, b) => b.overlap - a.overlap || b.e.updatedAt - a.e.updatedAt)
+      .map((s) => s.e);
+  }
+
+  // ---- Per-turn Memory Pack (#78) ------------------------------------------
+
+  private readonly memoryPacks = new Map<string, MemoryPack>();
+
+  /**
+   * Build a materialized per-turn Memory Pack (#78): atoms selected
+   * under an explicit token budget for one query/scope. The pack is a
+   * real object (id, atoms, budget, usage) — not just a rendered block —
+   * so the runtime can report back which atoms it actually used via
+   * creditPackUse. Selection: pinned first, then hybrid-recall order
+   * (or recency when there is no query), greedily while budget remains.
+   */
+  buildMemoryPack(
+    botId: string,
+    query: string,
+    opts: {
+      tokenBudget?: number;
+      scope?: MemoryScope;
+      maxTier?: PrivacyTier;
+      expandLinks?: boolean;
+    } = {},
+  ): MemoryPack {
+    const tokenBudget = Math.max(opts.tokenBudget ?? 2000, 16);
+    const maxTier = opts.maxTier ?? 'cloud-ok';
+    let candidates: AtomCard[];
+    if (query.trim()) {
+      candidates = this.recallHybrid(botId, query, 50, maxTier, {
+        scope: opts.scope,
+        expandLinks: opts.expandLinks,
+      }).map((h) => h.atom);
+    } else {
+      candidates = this.getAtoms(botId, 200)
+        .filter((a) => tierAtMost(a.tier, maxTier))
+        .filter((a) => atomInScope(a, opts.scope));
+    }
+    // Pinned atoms lead the pack regardless of retrieval order.
+    candidates = [
+      ...candidates.filter((a) => a.pinned),
+      ...candidates.filter((a) => !a.pinned),
+    ];
+    const atoms: AtomCard[] = [];
+    let tokensUsed = 0;
+    const seen = new Set<string>();
+    for (const atom of candidates) {
+      if (seen.has(atom.id)) continue;
+      const cost = estimateAtomTokens(atom);
+      if (tokensUsed + cost > tokenBudget) continue;
+      seen.add(atom.id);
+      atoms.push(atom);
+      tokensUsed += cost;
+    }
+    const pack: MemoryPack = {
+      id: randomUUID(),
+      botId,
+      query,
+      ...(opts.scope ? { scope: opts.scope } : {}),
+      atoms,
+      atomIds: atoms.map((a) => a.id),
+      tokenBudget,
+      tokensUsed,
+      createdAt: Date.now(),
+    };
+    this.memoryPacks.set(pack.id, pack);
+    // Bound the in-memory registry; packs are per-turn ephemera.
+    if (this.memoryPacks.size > 200) {
+      const oldest = this.memoryPacks.keys().next().value as string;
+      this.memoryPacks.delete(oldest);
+    }
+    return pack;
+  }
+
+  /** Fetch a previously built pack by id (undefined when evicted/unknown). */
+  getMemoryPack(packId: string): MemoryPack | undefined {
+    return this.memoryPacks.get(packId);
+  }
+
+  /**
+   * Async neural twin of buildMemoryPack (#78): candidates come from
+   * recallHybridNeural with the same relevance gate recallForPromptNeural
+   * applies (lexical agreement, or a combined score above the single-leg
+   * RRF floor), so a host swapping recallForPromptNeural →
+   * buildMemoryPackNeural + renderMemoryPack keeps the same recall
+   * quality while gaining the materialized pack (budget + crediting).
+   * Pinned atoms lead, as in the sync builder.
+   */
+  async buildMemoryPackNeural(
+    botId: string,
+    query: string,
+    opts: {
+      tokenBudget?: number;
+      scope?: MemoryScope;
+      maxTier?: PrivacyTier;
+      /**
+       * One-hop link expansion (#79): primary candidates' typed-link
+       * neighbors are appended (scope/tier-filtered, budget-gated
+       * below). DEFAULT ON here — this is the live host path (chat /
+       * voice routes call it with no options), so recall traverses
+       * links in production, not only when a caller opts in. Pass
+       * false to disable. (The sync buildMemoryPack / recallHybrid
+       * keep their opt-in default; this method previously accepted
+       * the flag and silently ignored it.)
+       */
+      expandLinks?: boolean;
+    } = {},
+  ): Promise<MemoryPack> {
+    const tokenBudget = Math.max(opts.tokenBudget ?? 2000, 16);
+    const maxTier = opts.maxTier ?? 'cloud-ok';
+    let candidates: AtomCard[] = [];
+    if (query.trim()) {
+      const hits = await this.recallHybridNeural(botId, query, 50, maxTier);
+      candidates = hits
+        .filter((h) => h.sources.includes('lexical') || h.score > 1 / 61)
+        .map((h) => h.atom)
+        .filter((a) => atomInScope(a, opts.scope));
+      // One-hop expansion (#79): neighbors ride AFTER primaries, so
+      // the token-budget fill below spends on primaries first.
+      if (opts.expandLinks !== false && candidates.length > 0) {
+        const seen = new Set(candidates.map((a) => a.id));
+        const byId = new Map(this.getAtoms(botId, 2000).map((a) => [a.id, a]));
+        const expanded: AtomCard[] = [];
+        for (const primary of candidates) {
+          let links: MemoryLink[] = [];
+          try {
+            links = this.getLinksForAtom(botId, primary.id);
+          } catch {
+            links = [];
+          }
+          for (const link of links) {
+            const neighborId = link.fromAtomId === primary.id ? link.toAtomId : link.fromAtomId;
+            if (seen.has(neighborId)) continue;
+            const neighbor = byId.get(neighborId);
+            if (!neighbor || !tierAtMost(neighbor.tier, maxTier) || !atomInScope(neighbor, opts.scope)) continue;
+            seen.add(neighborId);
+            expanded.push(neighbor);
+          }
+        }
+        candidates = [...candidates, ...expanded];
+      }
+    } else {
+      candidates = this.getAtoms(botId, 200)
+        .filter((a) => tierAtMost(a.tier, maxTier))
+        .filter((a) => atomInScope(a, opts.scope));
+    }
+    candidates = [
+      ...candidates.filter((a) => a.pinned),
+      ...candidates.filter((a) => !a.pinned),
+    ];
+    const atoms: AtomCard[] = [];
+    let tokensUsed = 0;
+    const seen = new Set<string>();
+    for (const atom of candidates) {
+      if (seen.has(atom.id)) continue;
+      const cost = estimateAtomTokens(atom);
+      if (tokensUsed + cost > tokenBudget) continue;
+      seen.add(atom.id);
+      atoms.push(atom);
+      tokensUsed += cost;
+    }
+    const pack: MemoryPack = {
+      id: randomUUID(),
+      botId,
+      query,
+      ...(opts.scope ? { scope: opts.scope } : {}),
+      atoms,
+      atomIds: atoms.map((a) => a.id),
+      tokenBudget,
+      tokensUsed,
+      createdAt: Date.now(),
+    };
+    this.memoryPacks.set(pack.id, pack);
+    if (this.memoryPacks.size > 200) {
+      const oldest = this.memoryPacks.keys().next().value as string;
+      this.memoryPacks.delete(oldest);
+    }
+    return pack;
+  }
+
+  /**
+   * Render a pack as the prompt memory block — the same format
+   * recallForPrompt produces ("# What I remember" + one fact per line),
+   * so hosts can swap recallForPrompt → buildMemoryPack +
+   * renderMemoryPack without changing what the model sees. Empty pack
+   * renders as '' (hosts then omit the block entirely).
+   */
+  renderMemoryPack(pack: MemoryPack, maxChars = 8000): string {
+    if (pack.atoms.length === 0) return '';
+    let block = '# What I remember (from past conversations)\n';
+    for (const atom of pack.atoms) {
+      const line = `- ${atom.fact}\n`;
+      if (block.length + line.length > maxChars) break;
+      block += line;
+    }
+    return block.trimEnd();
+  }
+
+  /**
+   * Material-use credit for a pack (#78): the runtime calls this after a
+   * turn with the ids of packed atoms it ACTUALLY used/cited. Only atoms
+   * in the pack are credited (ids outside the pack are ignored — credit
+   * cannot be farmed for un-packed atoms). Crediting records material
+   * use per atom, which promotes cold atoms back to hot (#81) and feeds
+   * retention decisions in upkeep (#80).
+   *
+   * HOST CALL POINT (wired): apps/api's chat route builds the turn's
+   * pack (buildMemoryPackNeural), renders it into the turn's memory
+   * context, and — in its turn-completion finally, only when the turn
+   * did not error — credits every atom that was rendered into that
+   * context. Per-atom citation by the model is not observable, so
+   * "material use" here means precisely: the atom was surfaced into a
+   * completed turn's context.
+   */
+  creditPackUse(packId: string, usedAtomIds: string[]): PackCreditResult {
+    const pack = this.memoryPacks.get(packId);
+    if (!pack) throw new Error(`Unknown memory pack "${packId}"`);
+    const inPack = new Set(pack.atomIds);
+    const credited: string[] = [];
+    const promoted: string[] = [];
+    for (const id of [...new Set(usedAtomIds)]) {
+      if (!inPack.has(id)) continue;
+      const res = this.recordMaterialUse(pack.botId, id);
+      if (!res) continue;
+      credited.push(id);
+      if (res.promoted) promoted.push(id);
+    }
+    return { packId, credited, promoted };
+  }
+
+  // ---- Distill pipeline (#77) ----------------------------------------------
+
+  /** L0 events for one session, chronological (oldest first). */
+  listSessionEvents(botId: string, sessionId: string, limit = 1000): MemoryEvent[] {
+    const rows = this.db
+      .prepare(
+        'SELECT id, ts, bot_id AS botId, session_id AS sessionId, role, text, tool_calls_json AS toolCallsJson, tier FROM memory_events WHERE bot_id = ? AND session_id = ? ORDER BY ts ASC, rowid ASC LIMIT ?',
+      )
+      .all(botId, sessionId, Math.min(Math.max(limit, 1), 5000)) as Array<{
+        id: string; ts: number; botId: string; sessionId: string;
+        role: string; text: string; toolCallsJson: string; tier: string | null;
+      }>;
+    return rows.map((r) => ({
+      id: r.id,
+      ts: r.ts,
+      botId: r.botId,
+      sessionId: r.sessionId,
+      role: (r.role === 'assistant' ? 'assistant' : 'user') as 'user' | 'assistant',
+      text: r.text,
+      toolCalls: (() => {
+        try {
+          const v = JSON.parse(r.toolCallsJson) as unknown;
+          return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+        } catch {
+          return [];
+        }
+      })(),
+      tier: readTier(r.tier),
+    }));
+  }
+
+  /**
+   * Explicit distill pipeline (#77) — extraction-on-demand over a whole
+   * session; this is what a `/done` command calls. Synchronously runs
+   * the same grounded per-turn machinery ingestTurn uses (rules →
+   * verbatim-quote grounding, experiences → session citation) over
+   * every recorded turn of the session, then kicks off a reflection
+   * pass when a chat fn is provided (opts.chat, or opts.reflect=false
+   * to skip). Returns exactly what was stored / rejected / reflected.
+   */
+  async runDistillPipeline(
+    botId: string,
+    sessionId: string,
+    opts: {
+      scope?: MemoryScope;
+      tier?: PrivacyTier;
+      /** Chat fn enabling the reflection kickoff; reflection is skipped without it. */
+      chat?: KeeperChatFn;
+      reflect?: boolean;
+    } = {},
+  ): Promise<DistillPipelineResult> {
+    const events = this.listSessionEvents(botId, sessionId);
+    const totals: DistillStoreResult = { stored: 0, rejected: 0, atomIds: [] };
+    let turns = 0;
+    // Pair each user event with the assistant event that follows it.
+    for (let i = 0; i < events.length; i++) {
+      const ev = events[i]!;
+      if (ev.role !== 'user') continue;
+      const next = events[i + 1];
+      const assistantText = next && next.role === 'assistant' ? next.text : '';
+      turns++;
+      const turnText = `User: ${ev.text}\nAssistant: ${assistantText}`;
+      const res = await this.distillAndStore(botId, sessionId, turnText, {
+        userText: ev.text,
+        userEventId: ev.id,
+        scope: opts.scope,
+        tier: opts.tier,
+      });
+      totals.stored += res.stored;
+      totals.rejected += res.rejected;
+      totals.atomIds.push(...res.atomIds);
+    }
+    let reflection: ReflectionResult | null = null;
+    if (opts.chat && opts.reflect !== false) {
+      reflection = await this.runReflectionPass(botId, opts.chat);
+    }
+    return {
+      botId,
+      sessionId,
+      turns,
+      stored: totals.stored,
+      rejected: totals.rejected,
+      atomIds: totals.atomIds,
+      reflection,
+    };
+  }
+
   // ---- Memory fabric (Atomic parity): links, conflicts, reflection --------
 
   private static readonly LINK_KINDS: ReadonlySet<string> = new Set(['relates', 'contradicts', 'supersedes']);
@@ -1429,7 +2452,11 @@ export class TieredMemoryStore {
     if (k === 'contradicts') {
       this.openConflict(botId, fromAtomId, toAtomId, createdBy);
     } else if (k === 'supersedes') {
-      this.db.prepare('UPDATE memory_atoms SET active = 0 WHERE bot_id = ? AND id = ?').run(botId, toAtomId);
+      // Archive-after-replace (#80): the replaced atom moves to the cold
+      // archive — deactivated AND archived, retrievable via searchCold.
+      this.db
+        .prepare('UPDATE memory_atoms SET active = 0, archived = 1 WHERE bot_id = ? AND id = ?')
+        .run(botId, toAtomId);
     }
     return id;
   }
@@ -1531,7 +2558,10 @@ export class TieredMemoryStore {
       throw new Error('winnerId must be one of the two conflicting atoms');
     }
     const loserId = winnerId === conflict.atomAId ? conflict.atomBId : conflict.atomAId;
-    this.db.prepare('UPDATE memory_atoms SET active = 0 WHERE bot_id = ? AND id = ?').run(botId, loserId);
+    // Archive-after-replace (#80): loser moves to the cold archive.
+    this.db
+      .prepare('UPDATE memory_atoms SET active = 0, archived = 1 WHERE bot_id = ? AND id = ?')
+      .run(botId, loserId);
     // Supersede link (dedupe-safe): the winner replaces the loser.
     try {
       this.createLink(botId, winnerId, loserId, 'supersedes', 'system');

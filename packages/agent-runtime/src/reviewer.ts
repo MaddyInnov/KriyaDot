@@ -21,6 +21,7 @@ import {
   type ModelProfiles,
   type PurposeModelProfile,
 } from './model-profiles.js';
+import { purposeChatOptions } from './evaluate.js';
 
 export type ReviewerVerdict = 'yes' | 'no' | 'skip';
 
@@ -88,7 +89,8 @@ export async function reviewToolCall(
     const res = await provider.chat(
       [{ role: 'user', content: prompt }],
       [],
-      { model: model!, signal: opts.signal },
+      // #8/#11: forward the reviewer profile's full knob set + retry/timeout.
+      { model: model!, signal: opts.signal, ...purposeChatOptions(profile) },
     );
     const text = (res.content ?? '').trim().toUpperCase();
     const reason = (res.content ?? '').trim().split('\n')[0]?.slice(0, 200) ?? '';

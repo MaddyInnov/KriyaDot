@@ -515,6 +515,211 @@ export function recordShadowCorrection(
 }
 
 // ---------------------------------------------------------------------------
+// Generic shadow-trial evolution (Octomind parity #82 — generalized).
+//
+// The pipeline above evolved ROUTING RULES only, and scored candidates
+// by agreement with corrections. This generalization lets ANY learned
+// candidate (memory atoms, lessons, synthesis proposals, standing
+// rules) run the same gauntlet, with one addition the routing pipeline
+// lacked: an INDEPENDENT VERIFIER stage — a pluggable verifier fn,
+// distinct from agreement scoring — that a candidate must pass before
+// it may enter shadow at all. Trials are BOUNDED: a candidate carries
+// an expiry (window from shadow entry); trials after expiry do not
+// count and the candidate can no longer promote. Promotion uses the
+// existing bar: DEFAULT_SHADOW_BAR (3 trials / 80% agreement).
+//
+// Routing-rule behavior above is untouched; this section is additive.
+// ---------------------------------------------------------------------------
+
+export type EvolutionCandidateStatus =
+  | 'candidate' // proposed, not yet verified
+  | 'rejected' // verifier said no (terminal)
+  | 'shadow' // verified; being trial-scored, never applied
+  | 'promoted' // beat the shadow bar within its window
+  | 'expired' // trial window elapsed before promotion (terminal)
+  | 'retired'; // human rollback (terminal)
+
+export interface EvolutionCandidate<T = unknown> {
+  id: string;
+  /** Candidate family: 'routing-rule' | 'memory' | 'lesson' | 'memory-synthesis' | 'standing-global-rule' | 'scoped-memory-rule' | … */
+  kind: string;
+  description: string;
+  payload: T;
+  status: EvolutionCandidateStatus;
+  /** Shadow-trial counters (only meaningful in/after 'shadow'). */
+  trials: number;
+  agreements: number;
+  disagreements: number;
+  createdAt: string;
+  /** ISO time the shadow window opened (verification time). */
+  shadowSince?: string;
+  /** ISO time the bounded trial window closes. Promotion after this is impossible. */
+  expiresAt?: string;
+  /** Why the verifier rejected (or a note it attached on approval). */
+  verifierNote?: string;
+  promotedAt?: string;
+}
+
+/**
+ * Independent verifier for evolution candidates (#82). Distinct from
+ * agreement scoring: it judges the candidate ITSELF (grounding,
+ * safety, quality) before any trial runs. Returns boolean or a verdict
+ * object; throwing vetoes fail-closed (candidate rejected).
+ */
+export type CandidateVerifier<T = unknown> =
+  | ((candidate: EvolutionCandidate<T>) => boolean | { ok: boolean; reason?: string })
+  | ((candidate: EvolutionCandidate<T>) => Promise<boolean | { ok: boolean; reason?: string }>);
+
+/** Default bounded trial window: 7 days from shadow entry. */
+export const DEFAULT_TRIAL_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+let evolutionCounter = 0;
+
+function newEvolutionId(): string {
+  evolutionCounter += 1;
+  const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  return `ev-${day}-${String(evolutionCounter).padStart(4, '0')}`;
+}
+
+/** Propose a candidate. It does nothing until verified + trialed. */
+export function proposeCandidate<T>(input: {
+  kind: string;
+  description: string;
+  payload: T;
+  at?: string;
+}): EvolutionCandidate<T> {
+  return {
+    id: newEvolutionId(),
+    kind: input.kind,
+    description: input.description,
+    payload: input.payload,
+    status: 'candidate',
+    trials: 0,
+    agreements: 0,
+    disagreements: 0,
+    createdAt: input.at ?? new Date().toISOString(),
+  };
+}
+
+/**
+ * Run the independent verifier stage (#82). Pass → 'shadow' with a
+ * bounded trial window (opts.windowMs, default 7 days). Fail or throw
+ * → 'rejected' (fail-closed). Non-candidates pass through unchanged.
+ */
+export async function verifyCandidate<T>(
+  candidate: EvolutionCandidate<T>,
+  verifier: CandidateVerifier<T>,
+  opts: { windowMs?: number; now?: string } = {},
+): Promise<EvolutionCandidate<T>> {
+  if (candidate.status !== 'candidate') return candidate;
+  const now = opts.now ?? new Date().toISOString();
+  let ok = false;
+  let reason: string | undefined;
+  try {
+    const verdict = await verifier(candidate);
+    if (typeof verdict === 'boolean') {
+      ok = verdict;
+    } else {
+      ok = verdict.ok;
+      reason = verdict.reason;
+    }
+  } catch (err) {
+    ok = false;
+    reason = err instanceof Error ? err.message : 'verifier error';
+  }
+  if (!ok) {
+    return { ...candidate, status: 'rejected', verifierNote: reason ?? 'verifier rejected' };
+  }
+  const expiresAt = new Date(Date.parse(now) + (opts.windowMs ?? DEFAULT_TRIAL_WINDOW_MS)).toISOString();
+  return {
+    ...candidate,
+    status: 'shadow',
+    shadowSince: now,
+    expiresAt,
+    ...(reason ? { verifierNote: reason } : {}),
+  };
+}
+
+/** Has this candidate's bounded trial window closed by `now`? */
+export function evolutionExpired(candidate: EvolutionCandidate<unknown>, now: string = new Date().toISOString()): boolean {
+  return (
+    candidate.status === 'shadow' &&
+    candidate.expiresAt !== undefined &&
+    Date.parse(now) > Date.parse(candidate.expiresAt)
+  );
+}
+
+/**
+ * Record one shadow-trial outcome for a candidate. Trials recorded
+ * after the window closes do NOT count — the candidate flips to
+ * 'expired' instead. Non-shadow candidates pass through unchanged.
+ */
+export function recordEvolutionTrial<T>(
+  candidate: EvolutionCandidate<T>,
+  agreed: boolean,
+  now: string = new Date().toISOString(),
+): EvolutionCandidate<T> {
+  if (candidate.status !== 'shadow') return candidate;
+  if (evolutionExpired(candidate as EvolutionCandidate<unknown>, now)) {
+    return { ...candidate, status: 'expired' };
+  }
+  return {
+    ...candidate,
+    trials: candidate.trials + 1,
+    agreements: candidate.agreements + (agreed ? 1 : 0),
+    disagreements: candidate.disagreements + (agreed ? 0 : 1),
+  };
+}
+
+/**
+ * Promotion eligibility (#82): in shadow, window still open, and the
+ * trial record beats the bar (default: the routing bar, 3 trials / 80%).
+ */
+export function evolutionEligible(
+  candidate: EvolutionCandidate<unknown>,
+  bar: ShadowPromotionBar = DEFAULT_SHADOW_BAR,
+  now: string = new Date().toISOString(),
+): boolean {
+  if (candidate.status !== 'shadow') return false;
+  if (evolutionExpired(candidate, now)) return false;
+  if (candidate.trials < bar.minTrials) return false;
+  return candidate.agreements / candidate.trials >= bar.minAgreementRate;
+}
+
+/**
+ * Promote a candidate iff it is eligible; an expired shadow candidate
+ * flips to 'expired' (and can never promote). Anything else is
+ * returned unchanged.
+ */
+export function promoteEvolutionCandidate<T>(
+  candidate: EvolutionCandidate<T>,
+  bar: ShadowPromotionBar = DEFAULT_SHADOW_BAR,
+  now: string = new Date().toISOString(),
+): EvolutionCandidate<T> {
+  if (candidate.status !== 'shadow') return candidate;
+  if (evolutionExpired(candidate as EvolutionCandidate<unknown>, now)) {
+    return { ...candidate, status: 'expired' };
+  }
+  if (!evolutionEligible(candidate as EvolutionCandidate<unknown>, bar, now)) return candidate;
+  return { ...candidate, status: 'promoted', promotedAt: now };
+}
+
+/** Sweep: flip every shadow candidate past its window to 'expired'. */
+export function expireEvolutionCandidates<T>(
+  candidates: EvolutionCandidate<T>[],
+  now: string = new Date().toISOString(),
+): EvolutionCandidate<T>[] {
+  return candidates.map((c) =>
+    evolutionExpired(c as EvolutionCandidate<unknown>, now) ? { ...c, status: 'expired' as const } : c,
+  );
+}
+
+/** Human rollback for a generic candidate (kept for audit, terminal). */
+export function retireEvolutionCandidate<T>(candidate: EvolutionCandidate<T>): EvolutionCandidate<T> {
+  return { ...candidate, status: 'retired' };
+}
+
+// ---------------------------------------------------------------------------
 // Prompt/context injection for LLM-based routers.
 // ---------------------------------------------------------------------------
 

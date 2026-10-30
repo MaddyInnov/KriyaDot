@@ -15,6 +15,12 @@
  *     ]
  *   }
  *
+ * Rules may also carry argument-qualified history conditions
+ * (`requiresHistory.argDigest` / `.argPattern`, #66) and domain
+ * allowlists (`domains`, #122). The top level may carry
+ * `"policySnapshot": true` to opt the workspace into snapshot-mode
+ * evaluation at session start (#70; default is live evaluation).
+ *
  * The file is parsed into BotPolicy rules and merged AHEAD of the bot's
  * own configured rules (the workspace is the most specific scope — the
  * project itself gets the final say on its guardrails), which in turn
@@ -34,6 +40,14 @@ export interface PolicyFileResult {
   errors: string[];
   /** Path of the policy file, when one exists. */
   path?: string;
+  /**
+   * Opt-in policy snapshot mode (#70): true when the policy file
+   * carries `"policySnapshot": true`. The host captures an immutable
+   * snapshot of the effective merged policy at session start and
+   * evaluates against it (see policy-snapshot.ts). Absent = live
+   * evaluation (the default, deliberate KriyaDot difference).
+   */
+  policySnapshot?: boolean;
 }
 
 const cache = new Map<string, { signature: string; result: PolicyFileResult }>();
@@ -97,10 +111,34 @@ function parseRule(raw: unknown, index: number, errors: string[]): BotPolicyRule
       errors.push(`rule "${id}": invalid requiresHistory — rule skipped`);
       return null;
     }
+    // Argument-qualified conditions (#66): optional argDigest (exact
+    // hex digest) and/or argPattern (RegExp over the entry's summary).
+    if (rh.argPattern !== undefined && (typeof rh.argPattern !== 'string' || !validRegex(rh.argPattern))) {
+      errors.push(`rule "${id}": invalid requiresHistory.argPattern — rule skipped`);
+      return null;
+    }
+    if (rh.argDigest !== undefined && (typeof rh.argDigest !== 'string' || !/^[0-9a-f]{64}$/i.test(rh.argDigest))) {
+      errors.push(`rule "${id}": invalid requiresHistory.argDigest (want 64 hex chars) — rule skipped`);
+      return null;
+    }
     rule.requiresHistory = {
       toolPattern: rh.toolPattern,
       minCount: typeof rh.minCount === 'number' && rh.minCount > 0 ? Math.floor(rh.minCount) : undefined,
+      argDigest: typeof rh.argDigest === 'string' ? rh.argDigest : undefined,
+      argPattern: typeof rh.argPattern === 'string' ? rh.argPattern : undefined,
     };
+  }
+  if (r.domains !== undefined) {
+    // Domain-bound capability (#122): a non-empty array of domain strings.
+    if (
+      !Array.isArray(r.domains) ||
+      r.domains.length === 0 ||
+      r.domains.some((d) => typeof d !== 'string' || !d.trim())
+    ) {
+      errors.push(`rule "${id}": invalid domains (want a non-empty string array) — rule skipped`);
+      return null;
+    }
+    rule.domains = (r.domains as string[]).map((d) => d.trim());
   }
   return rule;
 }
@@ -120,22 +158,38 @@ export function loadWorkspacePolicy(workspaceDir: string): PolicyFileResult {
 
   const errors: string[] = [];
   let policy: BotPolicy = { rules: [] };
+  let policySnapshot = false;
   try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8')) as { rules?: unknown };
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as {
+      rules?: unknown;
+      policySnapshot?: unknown;
+    };
+    if (parsed.policySnapshot !== undefined) {
+      if (typeof parsed.policySnapshot === 'boolean') {
+        policySnapshot = parsed.policySnapshot;
+      } else {
+        errors.push('policy.json: "policySnapshot" must be a boolean — ignored');
+      }
+    }
     if (Array.isArray(parsed.rules)) {
       const rules: BotPolicyRule[] = [];
       parsed.rules.forEach((raw, i) => {
         const rule = parseRule(raw, i, errors);
         if (rule) rules.push(rule);
       });
-      policy = { rules };
+      policy = { rules, ...(policySnapshot ? { policySnapshot: true } : {}) };
     } else {
       errors.push('policy.json: "rules" must be an array');
     }
   } catch (err) {
     errors.push(`policy.json: unreadable (${err instanceof Error ? err.message : String(err)})`);
   }
-  const result: PolicyFileResult = { policy, errors, path };
+  const result: PolicyFileResult = {
+    policy,
+    errors,
+    path,
+    ...(policySnapshot ? { policySnapshot: true } : {}),
+  };
   cache.set(path, { signature, result });
   return result;
 }

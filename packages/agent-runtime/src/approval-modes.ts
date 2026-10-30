@@ -60,3 +60,73 @@ export function validateApprovalMode(
   }
   return { mode, errors: [] };
 }
+
+// ---------------------------------------------------------------------------
+// Closure build (2026-10-30): plan-step parsing (#62) + extended layers (#41).
+// ---------------------------------------------------------------------------
+
+/** Parse plan text into step titles (numbered or bulleted lines). */
+export function parsePlanSteps(planText: string): string[] {
+  const out: string[] = [];
+  for (const line of planText.split('\n')) {
+    const m = line.match(/^\s*(?:\d+[.)]|[-*•])\s+(.+)$/);
+    if (m && m[1]!.trim().length >= 3) out.push(m[1]!.trim().slice(0, 200));
+  }
+  return out.slice(0, 25);
+}
+
+/**
+ * Extended layer stage (#41): BotConfig.layers in types.ts only knows
+ * 'prepare' | 'review' with fixed output behaviour. This structural
+ * extension adds per-stage outputMode, role/profile, and 'execute' /
+ * 'verify' kinds AS DATA; the runtime executes them through the
+ * existing layer machinery ('execute' runs in the prepare phase,
+ * 'verify' in the review phase). Parent merge step: widen
+ * LayerStageSpec.kind/outputMode/role in types.ts to this shape.
+ */
+export type ExtendedLayerKind = 'prepare' | 'review' | 'execute' | 'verify';
+
+export interface ExtendedLayerStage {
+  name: string;
+  kind: ExtendedLayerKind;
+  prompt: string;
+  model?: string;
+  providerId?: string;
+  inputMode?: 'user' | 'draft' | 'user+draft';
+  /** How the stage output is applied: note (system note), replace (draft), append. Default by kind. */
+  outputMode?: 'note' | 'replace' | 'append';
+  /** Persona/role label prepended to the stage prompt by the runtime. */
+  role?: string;
+  /** Purpose profile name whose model resolves this stage when `model` is unset. */
+  profile?: string;
+}
+
+export function validateExtendedLayers(
+  raw: unknown,
+  where: string,
+): { layers?: ExtendedLayerStage[]; errors: string[] } {
+  if (raw === undefined || raw === null) return { errors: [] };
+  if (!Array.isArray(raw)) return { errors: [`${where}.layers: must be an array`] };
+  const errors: string[] = [];
+  const layers: ExtendedLayerStage[] = [];
+  const kinds: readonly string[] = ['prepare', 'review', 'execute', 'verify'];
+  raw.forEach((entry, i) => {
+    const e = entry as Record<string, unknown>;
+    if (typeof e?.name !== 'string' || typeof e?.prompt !== 'string' || !kinds.includes(String(e?.kind))) {
+      errors.push(`${where}.layers[${i}]: needs name, prompt, and kind prepare|review|execute|verify`);
+      return;
+    }
+    layers.push({
+      name: e.name as string,
+      kind: e.kind as ExtendedLayerKind,
+      prompt: e.prompt as string,
+      ...(typeof e.model === 'string' ? { model: e.model } : {}),
+      ...(typeof e.providerId === 'string' ? { providerId: e.providerId } : {}),
+      ...(e.inputMode === 'user' || e.inputMode === 'draft' || e.inputMode === 'user+draft' ? { inputMode: e.inputMode } : {}),
+      ...(e.outputMode === 'note' || e.outputMode === 'replace' || e.outputMode === 'append' ? { outputMode: e.outputMode } : {}),
+      ...(typeof e.role === 'string' ? { role: e.role } : {}),
+      ...(typeof e.profile === 'string' ? { profile: e.profile } : {}),
+    });
+  });
+  return errors.length > 0 ? { errors } : { layers, errors };
+}

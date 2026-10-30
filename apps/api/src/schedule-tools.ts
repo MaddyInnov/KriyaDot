@@ -88,7 +88,20 @@ function toRoutineSchedule(when: WhenArg): RoutineSchedule | { error: string } {
   }
 }
 
-export function createScheduleTools(store: RoutineStore): ToolDefinition[] {
+/** Originating session for in-session scheduling (#88): a valid session id from the tool context, else undefined. */
+export function originSessionOf(ctx: { sessionId?: string }): string | undefined {
+  const id = typeof ctx.sessionId === 'string' ? ctx.sessionId : '';
+  // RoutineStore validates session ids against this shape; anything else
+  // keeps the legacy fresh-session behaviour rather than failing create.
+  return /^[a-zA-Z0-9_-]{1,128}$/.test(id) ? id : undefined;
+}
+
+export interface ScheduleToolsOptions {
+  /** Generic long-lived monitors (#91). When set, monitor_start/stop/list tools are added. */
+  monitors?: GenericMonitorService;
+}
+
+export function createScheduleTools(store: RoutineStore, opts: ScheduleToolsOptions = {}): ToolDefinition[] {
   const scheduleTask: ToolDefinition = {
     name: 'schedule_task',
     description:
@@ -111,8 +124,9 @@ export function createScheduleTools(store: RoutineStore): ToolDefinition[] {
       const schedule = toRoutineSchedule((args.when ?? {}) as WhenArg);
       if ('error' in schedule) return schedule;
       try {
-        const routine = store.create({ name, botId: ctx.botId, promptTemplate: prompt, schedule });
-        return { scheduled: true, id: routine.id, name: routine.name, schedule: describeSchedule(schedule) };
+        const originSessionId = originSessionOf(ctx);
+        const routine = store.create({ name, botId: ctx.botId, promptTemplate: prompt, schedule, ...(originSessionId ? { sessionId: originSessionId } : {}) });
+        return { scheduled: true, id: routine.id, name: routine.name, schedule: describeSchedule(schedule), ...(originSessionId ? { originSessionId, firesInto: 'originating session' } : { firesInto: 'fresh routine session' }) };
       } catch (err) {
         return { error: err instanceof Error ? err.message : String(err) };
       }
@@ -185,7 +199,9 @@ export function createScheduleTools(store: RoutineStore): ToolDefinition[] {
         'If the condition IS tripped, escalate: summarize what changed with concrete values, and notify the user (and the team inbox if this is a team bot). Do not repeat an escalation you already sent for the same unchanged state.',
       ].join('\n');
       try {
+        const originSessionId = originSessionOf(ctx);
         const routine = store.create({
+          ...(originSessionId ? { sessionId: originSessionId } : {}),
           name: `Monitor: ${name}`.slice(0, 120),
           botId: ctx.botId,
           promptTemplate,
@@ -198,5 +214,194 @@ export function createScheduleTools(store: RoutineStore): ToolDefinition[] {
     },
   };
 
-  return [scheduleTask, listSchedules, cancelSchedule, createMonitor];
+  const tools: ToolDefinition[] = [scheduleTask, listSchedules, cancelSchedule, createMonitor];
+  if (opts.monitors) tools.push(...createGenericMonitorTools(opts.monitors));
+  return tools;
+}
+
+// ---------------------------------------------------------------------------
+// Generic monitors (#91): long-lived event streams with batched,
+// rate-limited inbox injection.
+//
+// A monitor watches a COMMAND (spawned; stdout lines are events) or a
+// FEED (a URL polled through an injected fetch; a changed body is an
+// event). Events accumulate in a per-monitor buffer and are injected as
+// ONE digest message per batch interval at most — a noisy stream can
+// never flood the session inbox. Process/fetch/timer seams are all
+// injectable so tests run with fakes (no real processes or network).
+// ---------------------------------------------------------------------------
+
+export interface MonitorEvent { monitorId: string; source: 'command' | 'feed'; text: string; at: number }
+export type MonitorDigestSink = (monitorId: string, digest: string, events: MonitorEvent[]) => void | Promise<void>;
+/** Runs a command and streams stdout lines. Returns a stop function. */
+export type MonitorCommandRunner = (command: string[], emit: (line: string) => void) => { stop: () => void };
+export type MonitorFetch = (url: string) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
+
+export interface MonitorRecord {
+  id: string; name: string; kind: 'command' | 'feed'; target: string;
+  batchMs: number; startedAt: number; eventsSeen: number; digestsSent: number; running: boolean;
+}
+
+interface LiveMonitor extends MonitorRecord {
+  stopSource: () => void;
+  buffer: MonitorEvent[];
+  flushTimer: ReturnType<typeof setInterval> | null;
+  pollTimer: ReturnType<typeof setInterval> | null;
+  lastFeedBody?: string;
+}
+
+const defaultCommandRunner: MonitorCommandRunner = (command, emit) => {
+  // Production path only — tests always inject a fake runner.
+  const { spawn } = require('node:child_process') as typeof import('node:child_process');
+  const child = spawn(command[0]!, command.slice(1), { stdio: ['ignore', 'pipe', 'ignore'] });
+  let pending = '';
+  child.stdout?.on('data', (d: Buffer) => {
+    pending += d.toString('utf8');
+    let idx: number;
+    while ((idx = pending.indexOf('\n')) >= 0) { const line = pending.slice(0, idx).trim(); pending = pending.slice(idx + 1); if (line) emit(line); }
+  });
+  return { stop: () => { try { child.kill(); } catch { /* already gone */ } } };
+};
+
+export class GenericMonitorService {
+  private readonly monitors = new Map<string, LiveMonitor>();
+  /** Monitor id → session that started it (digests steer back into it). */
+  private readonly origins = new Map<string, string>();
+  private seq = 0;
+
+  /** Record which session started a monitor (host/tool wiring). */
+  bindOrigin(monitorId: string, sessionId: string): void {
+    if (sessionId) this.origins.set(monitorId, sessionId);
+  }
+
+  /** The session that started a monitor, if bound. */
+  originOf(monitorId: string): string | undefined {
+    return this.origins.get(monitorId);
+  }
+  constructor(private readonly deps: {
+    onDigest: MonitorDigestSink;
+    commandRunner?: MonitorCommandRunner;
+    fetchFn?: MonitorFetch;
+    /** Hard cap on buffered events per monitor between digests. */
+    maxBuffered?: number;
+  }) {}
+
+  startCommand(input: { name: string; command: string[]; batchMs?: number }): MonitorRecord {
+    if (!Array.isArray(input.command) || input.command.length === 0) throw new Error('monitor command must be a non-empty argv array');
+    const rec = this.fresh(input.name, 'command', input.command.join(' '), input.batchMs);
+    const runner = this.deps.commandRunner ?? defaultCommandRunner;
+    const handle = runner(input.command, (line) => this.push(rec, { text: line }));
+    rec.stopSource = handle.stop;
+    this.armFlush(rec);
+    return this.view(rec);
+  }
+
+  startFeed(input: { name: string; url: string; batchMs?: number; pollMs?: number }): MonitorRecord {
+    const rec = this.fresh(input.name, 'feed', input.url, input.batchMs);
+    const fetchFn: MonitorFetch = this.deps.fetchFn ?? (async (url) => { const r = await fetch(url); return { ok: r.ok, status: r.status, text: () => r.text() }; });
+    const poll = async (): Promise<void> => {
+      try {
+        const res = await fetchFn(input.url);
+        if (!res.ok) return;
+        const body = (await res.text()).slice(0, 20000);
+        if (rec.lastFeedBody !== undefined && body !== rec.lastFeedBody) this.push(rec, { text: body.slice(0, 500) });
+        rec.lastFeedBody = body;
+      } catch { /* a failed poll is not an event */ }
+    };
+    void poll();
+    rec.pollTimer = setInterval(() => { void poll(); }, Math.max(250, input.pollMs ?? 5000));
+    (rec.pollTimer as unknown as { unref?: () => void }).unref?.();
+    this.armFlush(rec);
+    return this.view(rec);
+  }
+
+  private fresh(name: string, kind: LiveMonitor['kind'], target: string, batchMs?: number): LiveMonitor {
+    const rec: LiveMonitor = {
+      id: `mon_${++this.seq}_${Date.now().toString(36)}`, name: name || 'monitor', kind, target,
+      batchMs: Math.max(250, batchMs ?? 5000), startedAt: Date.now(), eventsSeen: 0, digestsSent: 0,
+      running: true, stopSource: () => {}, buffer: [], flushTimer: null, pollTimer: null,
+    };
+    this.monitors.set(rec.id, rec);
+    return rec;
+  }
+
+  private push(rec: LiveMonitor, e: { text: string }): void {
+    if (!rec.running) return;
+    rec.eventsSeen += 1;
+    rec.buffer.push({ monitorId: rec.id, source: rec.kind, text: e.text.slice(0, 500), at: Date.now() });
+    const cap = this.deps.maxBuffered ?? 200;
+    if (rec.buffer.length > cap) rec.buffer.splice(0, rec.buffer.length - cap);
+  }
+
+  private armFlush(rec: LiveMonitor): void {
+    rec.flushTimer = setInterval(() => { void this.flush(rec.id); }, rec.batchMs);
+    (rec.flushTimer as unknown as { unref?: () => void }).unref?.();
+  }
+
+  /** Deliver the buffered events as ONE digest (rate limit: at most one per batch interval, by construction). */
+  async flush(id: string): Promise<number> {
+    const rec = this.monitors.get(id);
+    if (!rec || rec.buffer.length === 0) return 0;
+    const events = rec.buffer.splice(0, rec.buffer.length);
+    const digest = [`[monitor ${rec.name}] ${events.length} event(s):`, ...events.slice(0, 20).map((e) => `- ${e.text}`), ...(events.length > 20 ? [`… and ${events.length - 20} more`] : [])].join('\n');
+    rec.digestsSent += 1;
+    await this.deps.onDigest(id, digest, events);
+    return events.length;
+  }
+
+  stop(id: string): boolean {
+    const rec = this.monitors.get(id);
+    if (!rec) return false;
+    rec.running = false;
+    try { rec.stopSource(); } catch { /* ignore */ }
+    if (rec.flushTimer) clearInterval(rec.flushTimer);
+    if (rec.pollTimer) clearInterval(rec.pollTimer);
+    this.monitors.delete(id);
+    this.origins.delete(id);
+    return true;
+  }
+
+  list(): MonitorRecord[] { return [...this.monitors.values()].map((m) => this.view(m)); }
+  stopAll(): void { for (const id of [...this.monitors.keys()]) this.stop(id); }
+  private view(m: LiveMonitor): MonitorRecord {
+    const { id, name, kind, target, batchMs, startedAt, eventsSeen, digestsSent, running } = m;
+    return { id, name, kind, target, batchMs, startedAt, eventsSeen, digestsSent, running };
+  }
+}
+
+export function createGenericMonitorTools(service: GenericMonitorService): ToolDefinition[] {
+  return [
+    {
+      name: 'monitor_start', mutating: true,
+      description: 'Start a long-lived monitor over a command (argv array; stdout lines are events) or a feed URL. Events are batched and injected into this session as at most one digest per batch interval.',
+      parameters: { type: 'object', properties: { name: { type: 'string' }, kind: { type: 'string', enum: ['command', 'feed'] }, command: { type: 'array', items: { type: 'string' } }, url: { type: 'string' }, batchMs: { type: 'number' } }, required: ['name', 'kind'] },
+      handler: async (args, ctx) => {
+        try {
+          if (args.kind === 'command') {
+            const rec = service.startCommand({ name: String(args.name), command: (args.command as string[]) ?? [], batchMs: typeof args.batchMs === 'number' ? args.batchMs : undefined });
+            if (ctx?.sessionId) service.bindOrigin(rec.id, ctx.sessionId);
+            return { monitoring: true, ...rec };
+          }
+          if (args.kind === 'feed') {
+            const rec = service.startFeed({ name: String(args.name), url: String(args.url ?? ''), batchMs: typeof args.batchMs === 'number' ? args.batchMs : undefined });
+            if (ctx?.sessionId) service.bindOrigin(rec.id, ctx.sessionId);
+            return { monitoring: true, ...rec };
+          }
+          return { error: 'kind must be "command" or "feed"' };
+        } catch (e) { return { error: e instanceof Error ? e.message : String(e) }; }
+      },
+    },
+    {
+      name: 'monitor_stop', mutating: true,
+      description: 'Stop a running monitor by id (from monitor_start / monitor_list).',
+      parameters: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+      handler: async (args) => service.stop(String(args.id)) ? { stopped: true, id: String(args.id) } : { error: `no monitor "${String(args.id)}"` },
+    },
+    {
+      name: 'monitor_list',
+      description: 'List running monitors with event/digest counts.',
+      parameters: { type: 'object', properties: {} },
+      handler: async () => ({ monitors: service.list() }),
+    },
+  ];
 }

@@ -160,6 +160,58 @@ export function createRoutineWebhookRouter(opts: RoutineWebhookRouterOptions): R
   return router;
 }
 
+// ---------------------------------------------------------------------------
+// Script webhooks (#101): POST /script/:name fires a CONFIGURED script
+// hook (kind 'script' from hooks-config.ts) with the request body as the
+// hook payload — distinct from the routine/workflow webhook kinds above.
+// The script's failure-stdout injection is returned to the caller.
+// Mount: app.use('/webhooks', createScriptWebhookRouter({ hooks, secrets }))
+// ---------------------------------------------------------------------------
+
+export interface ScriptWebhookRouterOptions {
+  /** Configured script-hook entries (from parseScriptHookConfig). */
+  hooks: import('./hooks-config.js').ScriptHookEntry[] | (() => import('./hooks-config.js').ScriptHookEntry[]);
+  /** Optional per-hook shared secret, checked as `x-webhook-secret` (timing-safe). */
+  secrets?: Record<string, string>;
+  /** Injectable runner for tests (defaults to runScriptHookOnce). */
+  runHook?: (
+    entry: import('./hooks-config.js').ScriptHookEntry,
+    payload: unknown,
+  ) => Promise<{ injections: string[]; errors: string[] }>;
+}
+
+export function createScriptWebhookRouter(opts: ScriptWebhookRouterOptions): Router {
+  const router = Router();
+  router.post('/script/:name', async (req: Request, res: Response) => {
+    const { findScriptHook, runScriptHookOnce } = await import('./hooks-config.js');
+    const entries = typeof opts.hooks === 'function' ? opts.hooks() : opts.hooks;
+    const entry = findScriptHook(entries, req.params.name);
+    if (!entry) {
+      res.status(404).json({ error: `unknown script hook "${req.params.name}"` });
+      return;
+    }
+    const secret = opts.secrets?.[req.params.name];
+    if (secret && !secretsMatch(req.header('x-webhook-secret'), secret)) {
+      res.status(401).json({ error: 'invalid webhook secret' });
+      return;
+    }
+    try {
+      const run = opts.runHook ?? ((e, p) => runScriptHookOnce(e, p));
+      const result = await run(entry, { source: 'webhook', hook: req.params.name, body: req.body ?? {} });
+      res.status(202).json({
+        ok: true,
+        hook: req.params.name,
+        fired: true,
+        injections: result.injections,
+        ...(result.errors.length ? { errors: result.errors } : {}),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'script hook failed' });
+    }
+  });
+  return router;
+}
+
 export function createWebhookRouter(opts: WebhookRouterOptions): Router {
   const router = Router();
 

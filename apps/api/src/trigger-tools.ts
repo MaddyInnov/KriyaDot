@@ -10,6 +10,7 @@
 import type { ToolDefinition } from '@mvp/agent-runtime';
 import type { RoutineStore } from './bot-routines.js';
 import { describeSchedule, validateRoutineSchedule, type RoutineSchedule } from './routine-schedules.js';
+import { originSessionOf } from './schedule-tools.js';
 
 export function triggerCard(routine: { id: string; name: string; botId: string; schedule?: RoutineSchedule | null }) {
   return {
@@ -34,7 +35,7 @@ export function createTriggerTools(store: RoutineStore): ToolDefinition[] {
         if (!name || !prompt) return { error: 'name and prompt are required' };
         let schedule: RoutineSchedule | null = null;
         if (args.schedule) { try { schedule = validateRoutineSchedule(args.schedule); } catch (e) { return { error: e instanceof Error ? e.message : String(e) }; } }
-        try { const r = store.create({ name, botId: ctx.botId, promptTemplate: prompt, schedule }); return { created: true, id: r.id, name: r.name, widget: triggerCard(r) }; }
+        try { const originSessionId = originSessionOf(ctx); const r = store.create({ name, botId: ctx.botId, promptTemplate: prompt, schedule, ...(originSessionId ? { sessionId: originSessionId } : {}) }); return { created: true, id: r.id, name: r.name, ...(originSessionId ? { originSessionId } : {}), widget: triggerCard(r) }; }
         catch (e) { return { error: e instanceof Error ? e.message : String(e) }; }
       },
     },

@@ -21,12 +21,31 @@
  * result with the stderr excerpt. Discovery is cached per directory on
  * an mtime/size signature; broken declarations are reported in
  * `errors` and skipped — never thrown.
+ *
+ * Security model (#117c / #126 — the runtime half; the user-facing
+ * documentation and the default-policy `local:` rule are a separate
+ * workstream):
+ *   - CONFINEMENT: local tools execute under the same kernel
+ *     confinement as `run_command` BY DEFAULT — Landlock on Linux /
+ *     Seatbelt on macOS, with the bot workspace as the writable root.
+ *     When the kernel backend is unavailable the tool runs on the host
+ *     with a loud warning (console + `__sandbox` metadata on object
+ *     results), mirroring the sandbox fallback — UNLESS strict mode
+ *     (SANDBOX_STRICT=1) is configured, in which case the call fails
+ *     closed. Explicit opt-out: SANDBOX_ALLOW_HOST=1 or
+ *     SANDBOX_DISABLE_KERNEL=1 runs on the host deliberately.
+ *   - MUTATING IS FAIL-CLOSED: the `mutating` header is governance-
+ *     visible metadata, and it is NOT self-declared trust anymore. A
+ *     tool that does not explicitly declare `mutating:` is treated as
+ *     mutating=true (plan-mode gate + approval policy apply). Only an
+ *     explicit `mutating: false` marks a local tool read-only.
  */
 
 import { execFile } from 'node:child_process';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ToolDefinition } from './types.js';
+import { probeKernelBackend, runArgvConfined } from './tools/sandbox-kernel.js';
 
 const HEADER_READ_BYTES = 8_192;
 const DEFAULT_TIMEOUT_MS = 60_000;
@@ -41,7 +60,13 @@ interface DeclaredTool {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
+  /**
+   * Effective mutating flag carried by the ToolDefinition (#126):
+   * true unless the header EXPLICITLY declares `mutating: false`.
+   */
   mutating: boolean;
+  /** True when the header declared `mutating:` at all. */
+  mutatingDeclared: boolean;
   timeoutMs: number;
   file: string;
 }
@@ -97,48 +122,107 @@ function parseDeclaration(
     }
   }
   const timeoutRaw = Number(fields.get('timeoutms') ?? '');
+  // #126 fail-closed: only an explicit `mutating: false` is read-only.
+  // An undeclared flag (or any other value) is treated as mutating —
+  // the header is metadata for governance, not self-granted trust.
+  const mutatingDeclared = fields.has('mutating');
+  const mutating = !(fields.get('mutating') === 'false');
   return {
     decl: {
       name,
       description: fields.get('description') ?? `Local project tool ${name}`,
       parameters,
-      mutating: fields.get('mutating') === 'true',
+      mutating,
+      mutatingDeclared,
       timeoutMs: Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? Math.floor(timeoutRaw) : DEFAULT_TIMEOUT_MS,
       file,
     },
   };
 }
 
+/** Kernel confinement opt-out / strict knobs — same env contract as tools/sandbox.ts (#117). */
+function localToolHostOptedOut(): boolean {
+  return process.env.SANDBOX_ALLOW_HOST === '1' || process.env.SANDBOX_DISABLE_KERNEL === '1';
+}
+function localToolStrict(): boolean {
+  return process.env.SANDBOX_STRICT === '1';
+}
+
+interface LocalRun {
+  out: string;
+  err: string;
+  code: number;
+  /** Set when the run was NOT kernel-confined (host fallback/opt-out). */
+  sandboxWarning?: string;
+}
+
+/** Execute the tool file once, kernel-confined by default (#117c). */
+async function runLocalTool(decl: DeclaredTool, workspaceDir: string, stdinJson: string): Promise<LocalRun> {
+  if (!localToolHostOptedOut() && (await probeKernelBackend()) !== null) {
+    const res = await runArgvConfined([decl.file], {
+      workspaceDir,
+      timeoutMs: decl.timeoutMs,
+      maxOutputBytes: 4 * 1024 * 1024,
+      stdin: stdinJson,
+    });
+    return { out: res.stdout, err: res.stderr, code: res.exitCode };
+  }
+  if (localToolStrict() && !localToolHostOptedOut()) {
+    return {
+      out: '',
+      err: 'kernel sandbox unavailable and SANDBOX_STRICT=1 (fail-closed)',
+      code: 126,
+      sandboxWarning: 'local tool refused: no kernel sandbox available in strict mode',
+    };
+  }
+  // Host fallback / explicit opt-out: loud warning, mirroring the
+  // run_command fallback — never a silent unsandboxed run.
+  const warning =
+    'WARNING: local tool executed UNSANDBOXED on the host — no kernel sandbox backend was available (or host execution was explicitly opted into).';
+  console.warn(`[local-tools] ${warning} tool=${decl.name}`);
+  const res = await new Promise<{ out: string; err: string; code: number }>((resolve) => {
+    const child = execFile(
+      decl.file,
+      [],
+      { cwd: workspaceDir, timeout: decl.timeoutMs, maxBuffer: 4 * 1024 * 1024 },
+      (err, out, errOut) => {
+        resolve({
+          out: String(out ?? ''),
+          err: String(errOut ?? ''),
+          code: err ? (typeof (err as { code?: unknown }).code === 'number' ? (err as { code: number }).code : 1) : 0,
+        });
+      },
+    );
+    child.stdin?.end(stdinJson);
+  });
+  return { ...res, sandboxWarning: warning };
+}
+
 function makeHandler(decl: DeclaredTool, workspaceDir: string): ToolDefinition['handler'] {
   return async (args) => {
-    const stdout = await new Promise<{ out: string; err: string; code: number }>((resolve) => {
-      const child = execFile(
-        decl.file,
-        [],
-        { cwd: workspaceDir, timeout: decl.timeoutMs, maxBuffer: 4 * 1024 * 1024 },
-        (err, out, errOut) => {
-          resolve({
-            out: String(out ?? ''),
-            err: String(errOut ?? ''),
-            code: err ? (typeof (err as { code?: unknown }).code === 'number' ? (err as { code: number }).code : 1) : 0,
-          });
-        },
-      );
-      child.stdin?.end(JSON.stringify(args ?? {}));
-    });
+    const stdout = await runLocalTool(decl, workspaceDir, JSON.stringify(args ?? {}));
     if (stdout.code !== 0) {
       return {
         error:
           `local tool ${decl.name} exited ${stdout.code}: ` +
           (stdout.err || stdout.out).slice(0, 1_000),
+        ...(stdout.sandboxWarning ? { __sandbox: { sandboxed: false, warning: stdout.sandboxWarning } } : {}),
       };
     }
     const text = stdout.out.trim().slice(0, MAX_OUTPUT_CHARS);
+    let parsed: unknown;
     try {
-      return JSON.parse(text) as unknown;
+      parsed = JSON.parse(text) as unknown;
     } catch {
-      return { output: text };
+      parsed = { output: text };
     }
+    if (stdout.sandboxWarning && typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      return {
+        ...(parsed as Record<string, unknown>),
+        __sandbox: { sandboxed: false, warning: stdout.sandboxWarning },
+      };
+    }
+    return parsed;
   };
 }
 

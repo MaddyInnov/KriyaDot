@@ -20,6 +20,12 @@ type DatabaseSyncType = DatabaseSync;
  * the `read_skill` tool (see createSkillTools). Full loads are TOFU-pinned:
  * the content hash is pinned at first load and later drift is gated behind
  * a human approval — same pattern Phase 1 used for MCP schema pinning.
+ *
+ * Environment gating (#123): frontmatter `requiredEnv: [KEY_A, KEY_B]`
+ * declares env keys the skill needs. A skill whose keys are missing is
+ * SKIPPED at load/activation (getSummary/loadFull throw
+ * SkillNotUsableError; the reason is recorded in getSkippedSkills()) —
+ * it never surfaces as a call-time failure mid-workflow.
  */
 
 export interface SkillSummary {
@@ -35,6 +41,17 @@ export interface LoadedSkill {
   sha256: string;
   /** End-of-turn validators declared in frontmatter (Octomind parity). */
   validators?: TurnValidatorSpec[];
+  /** Env keys the skill requires (frontmatter `requiredEnv`, #123). */
+  requiredEnv?: string[];
+  /** Declarative activation rules from frontmatter `activation:` (#163). */
+  activation?: SkillActivationRules;
+}
+
+/** A skill skipped at load/activation because required env is missing (#123). */
+export interface SkippedSkill {
+  name: string;
+  missingEnv: string[];
+  reason: string;
 }
 
 export interface SkillPin {
@@ -84,6 +101,12 @@ export interface SkillLoaderOptions {
    * gated on active status + scope.
    */
   usabilityGate?: (name: string, botId?: string) => boolean;
+  /**
+   * Env source for `requiredEnv` gating (#123). Defaults to
+   * `process.env`; injectable so hosts/tests can evaluate skills
+   * against a specific environment.
+   */
+  env?: Record<string, string | undefined>;
 }
 
 /** SQLite TOFU pin store for skill content hashes (one row per skill name). */
@@ -133,6 +156,112 @@ interface RawSkill {
   content: string;
   /** End-of-turn validators declared in frontmatter (Octomind parity). */
   validators: TurnValidatorSpec[];
+  /** Env keys required by frontmatter `requiredEnv` (#123). */
+  requiredEnv: string[];
+  /** Declarative activation rules from frontmatter `activation:` (#163). */
+  activation: SkillActivationRules;
+}
+
+/**
+ * Declarative skill activation rules (Octomind parity #163).
+ *
+ * A skill may declare in frontmatter WHEN it should auto-activate,
+ * evaluated deterministically per user message — no LLM involved:
+ *
+ * ```yaml
+ * activation:
+ *   keywords: [deploy, release]      # any keyword (case-insensitive substring)
+ *   patterns: ["\\bship it\\b"]       # any regex (case-insensitive)
+ *   exclude: [rollback, undo]        # any hit vetoes activation
+ * ```
+ *
+ * A rule set matches when it declares at least one positive condition
+ * (keyword or pattern), at least one positive condition hits, and no
+ * `exclude` entry hits. A skill with NO activation block never matches
+ * through this path (embedding-based activation, #139, is separate).
+ * Invalid regexes are dropped at parse time (fail-safe: they simply
+ * never match) rather than throwing at load.
+ */
+export interface SkillActivationRules {
+  keywords: string[];
+  patterns: string[];
+  exclude: string[];
+}
+
+/** Normalize a frontmatter `activation:` value into rule lists. */
+export function parseActivationRules(value: unknown): SkillActivationRules {
+  const empty: SkillActivationRules = { keywords: [], patterns: [], exclude: [] };
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return empty;
+  const rec = value as Record<string, unknown>;
+  const list = (v: unknown): string[] =>
+    parseRequiredEnv(v).map((s) => s.toLowerCase());
+  const patterns = parseRequiredEnv(rec.patterns).filter((p) => {
+    try {
+      new RegExp(p, 'i');
+      return true;
+    } catch {
+      return false; // invalid regex: dropped, never matches
+    }
+  });
+  return { keywords: list(rec.keywords), patterns, exclude: list(rec.exclude) };
+}
+
+/** True when `rules` declare at least one positive condition. */
+export function hasActivationRules(rules: SkillActivationRules): boolean {
+  return rules.keywords.length > 0 || rules.patterns.length > 0;
+}
+
+/**
+ * Evaluate declarative activation rules against one user message.
+ * Pure + deterministic. Empty rule sets never match.
+ */
+export function evaluateActivationRules(rules: SkillActivationRules, message: string): boolean {
+  if (!hasActivationRules(rules)) return false;
+  const text = message.toLowerCase();
+  for (const veto of rules.exclude) {
+    if (veto && text.includes(veto)) return false;
+  }
+  for (const kw of rules.keywords) {
+    if (kw && text.includes(kw)) return true;
+  }
+  for (const pattern of rules.patterns) {
+    try {
+      if (new RegExp(pattern, 'i').test(message)) return true;
+    } catch {
+      // Already filtered at parse; a hand-built rule set stays fail-safe.
+    }
+  }
+  return false;
+}
+
+/** One entry of a skill pack's resource catalog (#162). */
+export interface SkillResourceCatalogEntry {
+  name: string;
+  kind: 'scripts' | 'references' | 'assets';
+  /** Path relative to the pack directory, e.g. `scripts/check.mjs`. */
+  path: string;
+  sizeBytes: number;
+}
+
+/**
+ * A skill pack's resource catalog (#162): the manifest of every
+ * scripts/ + references/ + assets/ file a directory skill ships, so
+ * hosts can surface pack contents via tool/API/UI instead of the
+ * enumeration being invisible. Single-file skills have an empty catalog.
+ */
+export interface SkillResourceCatalog {
+  skill: string;
+  isPack: boolean;
+  scripts: SkillResourceCatalogEntry[];
+  references: SkillResourceCatalogEntry[];
+  assets: SkillResourceCatalogEntry[];
+  totalFiles: number;
+}
+
+/** Normalize a frontmatter `requiredEnv` value: string or string array. */
+export function parseRequiredEnv(value: unknown): string[] {
+  const raw = Array.isArray(value) ? value : typeof value === 'string' ? [value] : [];
+  return [...new Set(raw.filter((v): v is string => typeof v === 'string').map((v) => v.trim()).filter(Boolean))];
 }
 
 /**
@@ -147,13 +276,75 @@ export class SkillLoader {
    * called per skill per turn; without this it's 2+ sync file ops per skill
    * per turn. Invalidated on mtime/size change.
    */
-  private readonly summaryCache = new Map<string, { mtimeMs: number; size: number; summary: SkillSummary }>();
+  private readonly summaryCache = new Map<
+    string,
+    { mtimeMs: number; size: number; summary: SkillSummary; requiredEnv: string[] }
+  >();
+  /** #123: skills skipped for missing env, with the recorded reason. */
+  private readonly skipped = new Map<string, SkippedSkill>();
 
   constructor(
     private readonly skillsDir: string,
     private readonly options: SkillLoaderOptions = {},
   ) {
     this.pinStore = options.pinDbPath ? new SkillPinStore(options.pinDbPath) : null;
+  }
+
+  /** Env source used for requiredEnv gating (#123). */
+  private env(): Record<string, string | undefined> {
+    return this.options.env ?? process.env;
+  }
+
+  /** Missing required env keys for a raw skill under the loader env. */
+  private missingEnv(raw: RawSkill): string[] {
+    const env = this.env();
+    return raw.requiredEnv.filter((k) => {
+      const v = env[k];
+      return typeof v !== 'string' || v.trim() === '';
+    });
+  }
+
+  /**
+   * Enforce `requiredEnv` (#123): a skill whose required env keys are
+   * missing is SKIPPED at load/activation — never disclosed, never
+   * loaded — with the reason recorded in `getSkippedSkills()`. Throws
+   * SkillNotUsableError, which the runtime already treats as "skip
+   * this skill" (same channel as the usability gate).
+   */
+  private assertEnvSatisfied(raw: RawSkill): void {
+    const missing = this.missingEnv(raw);
+    if (missing.length === 0) {
+      this.skipped.delete(raw.name);
+      return;
+    }
+    const reason =
+      `Skill "${raw.name}" skipped: required env ${missing.join(', ')} not set ` +
+      `(declared via requiredEnv frontmatter). Set the missing key(s) to enable this skill.`;
+    this.skipped.set(raw.name, { name: raw.name, missingEnv: missing, reason });
+    throw new SkillNotUsableError(reason);
+  }
+
+  /** Skills skipped so far for missing env, with reasons (#123). */
+  getSkippedSkills(): SkippedSkill[] {
+    return [...this.skipped.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /**
+   * Names from list() that are env-satisfied right now. Evaluating a
+   * skill records its skip reason when it is gated out.
+   */
+  listAvailable(): string[] {
+    const available: string[] = [];
+    for (const name of this.list()) {
+      try {
+        const raw = this.readSkill(name);
+        this.assertEnvSatisfied(raw);
+        available.push(name);
+      } catch (err) {
+        if (!(err instanceof SkillNotUsableError)) throw err;
+      }
+    }
+    return available;
   }
 
   /** Release the pin-store SQLite connection (no-op when pinning is off). */
@@ -193,21 +384,33 @@ export class SkillLoader {
         const cached = this.summaryCache.get(name);
         if (cached && cached.mtimeMs === s.mtimeMs && cached.size === s.size) {
           this.assertUsable(cached.summary.name, botId);
+          // Env gating is evaluated per call, never cached away (#123).
+          this.assertEnvSatisfied({
+            name: cached.summary.name,
+            description: cached.summary.description,
+            content: '',
+            validators: [],
+            requiredEnv: cached.requiredEnv,
+            activation: { keywords: [], patterns: [], exclude: [] },
+          });
           return cached.summary;
         }
         const raw = this.readSkillFile(file, name);
         this.assertUsable(raw.name, botId);
+        this.assertEnvSatisfied(raw);
         const summary = { name: raw.name, description: raw.description };
-        this.summaryCache.set(name, { mtimeMs: s.mtimeMs, size: s.size, summary });
+        this.summaryCache.set(name, { mtimeMs: s.mtimeMs, size: s.size, summary, requiredEnv: raw.requiredEnv });
         return summary;
       } catch (err) {
-        // SkillNotUsableError must propagate (it is the gate); anything
-        // else falls through to the uncached path below.
+        // SkillNotUsableError must propagate (it is the gate — disabled
+        // or env-gated skills are skipped, #123); anything else falls
+        // through to the uncached path below.
         if (err instanceof SkillNotUsableError) throw err;
       }
     }
     const raw = this.readSkill(name);
     this.assertUsable(raw.name, botId);
+    this.assertEnvSatisfied(raw);
     return { name: raw.name, description: raw.description };
   }
 
@@ -233,6 +436,10 @@ export class SkillLoader {
   async loadFull(name: string, botId?: string): Promise<LoadedSkill> {
     const raw = this.readSkill(name);
     this.assertUsable(raw.name, botId);
+    // #123: env-gated skills are skipped at activation, before pinning
+    // or content disclosure — a missing key is a skip, not a call-time
+    // failure inside the skill's workflow.
+    this.assertEnvSatisfied(raw);
     const sha256 = createHash('sha256').update(raw.content, 'utf8').digest('hex');
     await this.checkPin(raw.name, sha256);
     return { ...raw, sha256 };
@@ -271,6 +478,8 @@ export class SkillLoader {
       description: typeof data.description === 'string' ? data.description : '',
       content: parsed.content.trim(),
       validators: parseValidatorSpecs(data.validators),
+      requiredEnv: parseRequiredEnv(data.requiredEnv),
+      activation: parseActivationRules(data.activation),
     };
   }
 
@@ -279,13 +488,81 @@ export class SkillLoader {
    * parsed into turn-validator specs. The runtime runs these at end of
    * turn for bots that loaded the skill. Sync + gate-free by design: it
    * only reads the declarations, never the gated content path.
+   * Env-gated skills (#123) contribute NO validators — a skipped skill
+   * must not run checks at end of turn.
    */
   getValidators(name: string): TurnValidatorSpec[] {
     try {
-      return this.readSkill(name).validators;
+      const raw = this.readSkill(name);
+      if (this.missingEnv(raw).length > 0) return [];
+      return raw.validators;
     } catch {
       return [];
     }
+  }
+
+  /**
+   * Activation rules a skill declares in frontmatter (`activation:`,
+   * #163), parsed into keyword/pattern/exclude lists. Env-gated skills
+   * (#123) contribute NO rules — a skipped skill must never activate.
+   */
+  getActivationRules(name: string): SkillActivationRules {
+    try {
+      const raw = this.readSkill(name);
+      if (this.missingEnv(raw).length > 0) return { keywords: [], patterns: [], exclude: [] };
+      return raw.activation;
+    } catch {
+      return { keywords: [], patterns: [], exclude: [] };
+    }
+  }
+
+  /**
+   * Skills whose declarative frontmatter rules match this user message
+   * (#163). Deterministic, no LLM. HOST WIRING (runtime.ts, fenced for
+   * this workstream): call per turn with the user's message and union
+   * the result with the embedding-based auto-activation set (#139)
+   * before disclosure.
+   */
+  skillsMatchingMessage(message: string, candidates?: string[]): string[] {
+    const names = candidates ?? this.list();
+    const matched: string[] = [];
+    for (const name of names) {
+      if (evaluateActivationRules(this.getActivationRules(name), message)) matched.push(name);
+    }
+    return matched.sort();
+  }
+
+  /**
+   * The resource catalog of a skill pack (#162): every scripts/,
+   * references/ and assets/ file with its size, as one manifest.
+   * Single-file skills return an empty, non-pack catalog.
+   */
+  getResourceCatalog(name: string): SkillResourceCatalog {
+    const resources = this.listPackResources(name);
+    const dir = this.getPackDir(name);
+    const toEntries = (kind: 'scripts' | 'references' | 'assets'): SkillResourceCatalogEntry[] =>
+      resources[kind].map((fileName) => {
+        let sizeBytes = 0;
+        if (dir) {
+          try {
+            sizeBytes = statSync(join(dir, kind, fileName)).size;
+          } catch {
+            sizeBytes = 0;
+          }
+        }
+        return { name: fileName, kind, path: `${kind}/${fileName}`, sizeBytes };
+      });
+    const scripts = toEntries('scripts');
+    const references = toEntries('references');
+    const assets = toEntries('assets');
+    return {
+      skill: name,
+      isPack: dir !== null,
+      scripts,
+      references,
+      assets,
+      totalFiles: scripts.length + references.length + assets.length,
+    };
   }
 
   /**
@@ -405,6 +682,8 @@ export function createSkillTools(skillLoader: SkillLoader): ToolDefinition[] {
           description: skill.description,
           content: skill.content,
           sha256: skill.sha256,
+          // Pack resource catalog (#162): empty for single-file skills.
+          resources: skillLoader.getResourceCatalog(skill.name),
         };
       },
     },

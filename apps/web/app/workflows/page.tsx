@@ -19,6 +19,31 @@ import type {
   WorkflowDefinition,
   WorkflowRun,
 } from '../../lib/api';
+import {
+  dryRunWorkflowById,
+  dryRunWorkflowDefinition,
+  exportWorkflowFile,
+  importWorkflowFile,
+  isAbsent,
+} from '../../lib/octomind-api';
+import {
+  detectWorkflowFileKind,
+  normalizeDryRunPlan,
+  parseWorkflowJsonFile,
+  serializeWorkflowJson,
+  serializeWorkflowToml,
+  type DryRunView,
+} from '../../lib/octomind-web';
+
+function downloadText(filename: string, text: string, type: string) {
+  const blob = new Blob([text], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 function fmtTs(ts: number): string {
   return new Date(ts).toLocaleString();
@@ -58,6 +83,13 @@ export default function WorkflowsPage() {
   const [importReport, setImportReport] = useState<UnmappedN8nNode[] | null>(null);
   const [importedName, setImportedName] = useState('');
   const [exportingId, setExportingId] = useState('');
+  // kriyadot.workflow file import/export (#143) + dry-run (#151).
+  const [fileBusy, setFileBusy] = useState(false);
+  const [fileNote, setFileNote] = useState('');
+  const [dryRunFor, setDryRunFor] = useState<WorkflowDefinition | null>(null);
+  const [dryRunView, setDryRunView] = useState<DryRunView | null>(null);
+  const [dryRunBusy, setDryRunBusy] = useState(false);
+  const [dryRunError, setDryRunError] = useState('');
 
   const refresh = useCallback(async () => {
     try {
@@ -110,6 +142,77 @@ export default function WorkflowsPage() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setStarting('');
+    }
+  };
+
+  /** Import a kriyadot.workflow file (JSON or TOML) via the import-file endpoint. */
+  const importKriyadotFile = async (file: File) => {
+    setFileBusy(true);
+    setFileNote('');
+    setError('');
+    try {
+      const text = await file.text();
+      const format = detectWorkflowFileKind(text, file.name);
+      if (format === 'json') parseWorkflowJsonFile(text); // local validation → clear errors before upload
+      const res = await importWorkflowFile({ format, content: text, filename: file.name });
+      const name = (res.workflow as { name?: string } | undefined)?.name ?? file.name;
+      setFileNote(`Imported workflow file "${name}" (${format.toUpperCase()}).`);
+      await refresh();
+    } catch (err) {
+      setError(
+        isAbsent(err)
+          ? 'Workflow file import is not available yet: POST /api/workflows/import has not landed on this API. The file was validated locally only; nothing was registered.'
+          : err instanceof Error ? err.message : String(err),
+      );
+    } finally {
+      setFileBusy(false);
+    }
+  };
+
+  /** Export one workflow as a kriyadot.workflow file; local serializer is the fallback. */
+  const exportKriyadotFile = async (def: WorkflowDefinition, format: 'json' | 'toml') => {
+    setFileBusy(true);
+    setError('');
+    try {
+      let text: string;
+      try {
+        text = await exportWorkflowFile(def.id, format);
+      } catch (err) {
+        if (!isAbsent(err)) throw err;
+        // Endpoint absent: serialize the definition we already hold locally.
+        text = format === 'json' ? serializeWorkflowJson(def) : serializeWorkflowToml(def);
+      }
+      downloadText(`${def.id}.workflow.${format === 'json' ? 'json' : 'toml'}`, text, format === 'json' ? 'application/json' : 'text/plain');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setFileBusy(false);
+    }
+  };
+
+  /** Dry-run (#151): ask the API for the execution plan — spawns nothing. */
+  const dryRun = async (def: WorkflowDefinition) => {
+    setDryRunFor(def);
+    setDryRunView(null);
+    setDryRunError('');
+    setDryRunBusy(true);
+    try {
+      let raw: unknown;
+      try {
+        raw = await dryRunWorkflowById(def.id);
+      } catch (err) {
+        if (!isAbsent(err)) throw err;
+        raw = await dryRunWorkflowDefinition(def);
+      }
+      setDryRunView(normalizeDryRunPlan(raw));
+    } catch (err) {
+      setDryRunError(
+        isAbsent(err)
+          ? 'Workflow dry-run is not available yet: neither POST /api/workflows/:id/dry-run nor POST /api/workflows/dry-run has landed on this API. Nothing was run.'
+          : err instanceof Error ? err.message : String(err),
+      );
+    } finally {
+      setDryRunBusy(false);
     }
   };
 
@@ -212,6 +315,78 @@ export default function WorkflowsPage() {
         )}
       </div>
 
+      <div className="card mt">
+        <div className="row-between" style={{ flexWrap: 'wrap', gap: 8 }}>
+          <div>
+            <strong>KriyaDot workflow files</strong>
+            <p className="small muted mt0">
+              Import or export the versioned <span className="mono">kriyadot.workflow</span> file
+              format — JSON or TOML. Per-step role/model/toolset/skills travel in the file.
+            </p>
+          </div>
+          <label className="btn btn-sm" style={{ cursor: 'pointer' }}>
+            {fileBusy ? 'Working…' : 'Import workflow file (.json / .toml)'}
+            <input
+              type="file"
+              accept="application/json,text/plain,.json,.toml"
+              style={{ display: 'none' }}
+              disabled={fileBusy}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                e.target.value = '';
+                if (f) void importKriyadotFile(f);
+              }}
+            />
+          </label>
+        </div>
+        {fileNote && <p className="small mt">{fileNote}</p>}
+      </div>
+
+      {dryRunFor && (
+        <div className="card mt" role="dialog" aria-label={`Dry-run plan for ${dryRunFor.name}`}>
+          <div className="row-between" style={{ flexWrap: 'wrap', gap: 8 }}>
+            <strong>Dry-run plan — {dryRunFor.name}</strong>
+            <button type="button" className="btn btn-sm" onClick={() => { setDryRunFor(null); setDryRunView(null); setDryRunError(''); }}>
+              Close
+            </button>
+          </div>
+          <p className="small muted">Validation + execution plan only — a dry run spawns nothing and costs nothing.</p>
+          {dryRunBusy && <p className="small muted">Building the plan…</p>}
+          {dryRunError && <div className="error-box">{dryRunError}</div>}
+          {dryRunView && (
+            <div>
+              {dryRunView.errors.length > 0 && (
+                <div className="error-box">
+                  <strong>Validation errors</strong>
+                  <ul style={{ margin: '4px 0', paddingLeft: 18 }}>
+                    {dryRunView.errors.map((e, i) => <li key={i}>{e}</li>)}
+                  </ul>
+                </div>
+              )}
+              {dryRunView.warnings.length > 0 && (
+                <p className="small">Warnings: {dryRunView.warnings.join('; ')}</p>
+              )}
+              <p className="small">
+                Steps: {dryRunView.steps.length}
+                {dryRunView.estimatedCostUsd !== null && <> · Cost figure reported by the API: ${dryRunView.estimatedCostUsd}</>}
+                {dryRunView.skipped.length > 0 && <> · Skipped (unreachable): {dryRunView.skipped.join(', ')}</>}
+              </p>
+              <ol style={{ paddingLeft: 20 }}>
+                {dryRunView.steps.map((s) => (
+                  <li key={s.id} className="small" style={{ marginBottom: 4 }}>
+                    <strong>{s.name}</strong> <span className="muted mono">{s.id}{s.type ? ` · ${s.type}` : ''}</span>
+                    {s.detail && <span className="muted"> — {s.detail}</span>}
+                  </li>
+                ))}
+              </ol>
+              {dryRunView.steps.length === 0 && dryRunView.errors.length === 0 && (
+                <p className="small muted">The API returned an empty plan for this workflow.</p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       <div className="grid-2">
         {defs.map((d) => (
           <div key={d.id} className="card">
@@ -262,6 +437,30 @@ export default function WorkflowsPage() {
               title="Download this workflow in n8n format (best-effort)"
             >
               {exportingId === d.id ? 'Exporting…' : 'Export n8n'}
+            </button>{' '}
+            <button
+              className="btn btn-sm"
+              disabled={dryRunBusy && dryRunFor?.id === d.id}
+              onClick={() => void dryRun(d)}
+              title="Dry-run: validate and show the execution plan — spawns nothing"
+            >
+              {dryRunBusy && dryRunFor?.id === d.id ? 'Planning…' : 'Dry-run'}
+            </button>{' '}
+            <button
+              className="btn btn-sm"
+              disabled={fileBusy}
+              onClick={() => void exportKriyadotFile(d, 'json')}
+              title="Download the kriyadot.workflow JSON file"
+            >
+              Export JSON
+            </button>{' '}
+            <button
+              className="btn btn-sm"
+              disabled={fileBusy}
+              onClick={() => void exportKriyadotFile(d, 'toml')}
+              title="Download the kriyadot.workflow TOML file"
+            >
+              Export TOML
             </button>
           </div>
         ))}

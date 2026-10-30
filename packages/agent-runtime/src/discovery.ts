@@ -177,3 +177,102 @@ export function decideAutoActivation(
 export function clearDiscoveryCache(): void {
   itemVectorCache.clear();
 }
+
+// ---------------------------------------------------------------------------
+// Closure build (2026-10-30): bot/role discovery (#15) + MCP auto-activation
+// (#139) + a discover_specialists tool surface.
+// ---------------------------------------------------------------------------
+
+import type { ToolDefinition } from './types.js';
+
+export interface RankableBot {
+  id: string;
+  name: string;
+  description?: string;
+}
+
+/** Rank BOTS/roles by intent embedding (#15) — discoverByIntent over kind:'bot'. */
+export async function rankBotsByIntent(
+  intent: string,
+  bots: RankableBot[],
+  embedder: SyncEmbedder,
+  opts: { topK?: number; minScore?: number } = {},
+): Promise<DiscoveryHit[]> {
+  const items: DiscoverableItem[] = bots.map((b) => ({
+    kind: 'bot',
+    id: b.id,
+    name: b.name,
+    description: b.description ?? '',
+  }));
+  return discoverByIntent(intent, items, embedder, opts);
+}
+
+/** Pick the best bot for an intent, or undefined when nothing clears minScore. */
+export async function pickBotForIntent(
+  intent: string,
+  bots: RankableBot[],
+  embedder: SyncEmbedder,
+  opts: { minScore?: number } = {},
+): Promise<RankableBot | undefined> {
+  const hits = await rankBotsByIntent(intent, bots, embedder, { topK: 1, minScore: opts.minScore ?? 0.15 });
+  const top = hits[0];
+  return top ? bots.find((b) => b.id === top.item.id) : undefined;
+}
+
+/**
+ * Deterministic auto-activation over the MCP server / capability catalog
+ * (#139): the SAME decideAutoActivation policy (threshold + margin +
+ * abstain-on-tie, no LLM), restricted to mcp/capability hits.
+ */
+export function decideMcpAutoActivation(
+  hits: DiscoveryHit[],
+  opts: { threshold?: number; margin?: number; maxActivate?: number } = {},
+): ActivationDecision {
+  return decideAutoActivation(
+    hits.filter((h) => h.item.kind === 'mcp' || h.item.kind === 'capability'),
+    opts,
+  );
+}
+
+/**
+ * The `discover_specialists` tool (#15): ranks bots/roles (and optionally
+ * skills/MCP items) by intent embedding and returns the ranked list.
+ * Hosts register it like other runtime-created tools; delegation paths
+ * (bot-team/delegate) can consult `rankBotsByIntent` directly.
+ */
+export function createDiscoverSpecialistsTool(deps: {
+  items: () => DiscoverableItem[] | Promise<DiscoverableItem[]>;
+  embedder: SyncEmbedder;
+}): ToolDefinition {
+  return {
+    name: 'discover_specialists',
+    description:
+      'Discover which bot/role (or skill/MCP capability) best matches an intent, ranked by semantic similarity. ' +
+      'Use before delegating when you are unsure which specialist fits.',
+    parameters: {
+      type: 'object',
+      properties: {
+        intent: { type: 'string', description: 'What needs doing, in plain language.' },
+        kind: { type: 'string', description: 'Optional filter: bot | skill | mcp | capability' },
+      },
+      required: ['intent'],
+    },
+    mutating: false,
+    handler: async (args) => {
+      const intent = typeof args.intent === 'string' ? args.intent : '';
+      if (!intent.trim()) return { error: 'intent is required' };
+      const all = await deps.items();
+      const kind = typeof args.kind === 'string' ? args.kind : undefined;
+      const items = kind ? all.filter((i) => i.kind === kind) : all;
+      const hits = await discoverByIntent(intent, items, deps.embedder, { topK: 5 });
+      return {
+        matches: hits.map((h) => ({
+          kind: h.item.kind,
+          id: h.item.id,
+          name: h.item.name,
+          score: Math.round(h.score * 1000) / 1000,
+        })),
+      };
+    },
+  };
+}

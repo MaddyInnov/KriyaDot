@@ -9,3 +9,6 @@ export * from './gateway.js';
 export * from './privacy-tiers.js';
 export * from './processing-rules.js';
 export * from './policy-file.js';
+export * from './history.js';
+export * from './domains.js';
+export * from './policy-snapshot.js';

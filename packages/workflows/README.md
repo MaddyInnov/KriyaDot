@@ -36,6 +36,43 @@ and inspect every run from SQLite.
 Branch edges: `edges` entries may be `[from, to]` or `[from, to, 'true'|'false']`.
 Labels are only valid on edges leaving an `if` node (validated at register).
 
+## Per-step agent config, TOML format, parallelism, pricing, dry-run, JSONL (Octomind parity)
+
+- **Per-step config (#143)** — `agent` / `bot-turn` node configs accept
+  `role`, `provider`, `model`, `toolset` (alias `tools`) and `skills`
+  alongside `botId` / `prompt`. The runner builds an *effective* bot per
+  step (`applyStepConfigToBot` in `src/step-config.ts`): overrides replace
+  the bot's provider/model/tools/skills for that step only and the role is
+  folded into its system prompt; the registered bot is never mutated.
+- **File formats (#143)** — JSON: `serializeWorkflow` / `parseWorkflowFile`
+  (`src/format.ts`). TOML variant: `serializeWorkflowToml` /
+  `parseWorkflowToml` (`src/toml-format.ts`), same validation, round-trip
+  tested; TOML cannot represent `null` (serializing one throws). Hosts wire
+  these to import/export surfaces.
+- **`maxParallel` (#145)** — workflow-level cap on nodes executing
+  concurrently within one topological level (worker-pool in the runner).
+  Positive integer, default `8` (`DEFAULT_MAX_PARALLEL`); the file formats
+  also accept `max_parallel` and normalize it.
+- **Priced usage (#150)** — agent/bot-turn turns capture the `TokenUsage`
+  returned by `agentRuntime.runTurn` (previously discarded) and price it
+  with the agent-runtime price table (`priceUsageUsd` in `src/cost.ts`),
+  so node `costUsd` is real and workflow budgets cap LLM spend. Hosts may
+  inject `WorkflowRunnerOptions.nodeExecutor` (replaces `runTurn` for
+  agent/bot-turn nodes; returns `{ text, usage?, costUsd? }`) and/or
+  `usagePricer` (custom price table).
+- **Dry-run (#151)** — standalone `dryRun(def)` (also
+  `runner.dryRun(def)`): validates and returns the plan — levels with
+  raw/effective width, per-step agent config on plan nodes, subordinate
+  loop/match nodes, skipped nodes, budget, `maxParallel` — spawning
+  nothing.
+- **JSONL observability (#152)** — run events `run_started` /
+  `step_completed` (with `costUsd`, `usage`, provider/model, running
+  total) / `run_finished` (with aggregated total + per-step breakdown).
+  Subscribe via `runner.onRunEvent(cb)` or `WorkflowRunnerOptions.onRunEvent`;
+  export via `runner.exportRunEventsJsonl(runId)`,
+  `formatRunEventsJsonl`, `runEventsJsonlFromRun`, or collect with
+  `WorkflowRunEventCollector`.
+
 ## Definition versioning
 
 `saveWorkflow` archives the previous definition whenever the JSON changes

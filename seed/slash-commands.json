@@ -1,1 +1,18 @@
-{"plan":{"description":"Explore and plan without changing anything (read-only).","prompt":"Explore the codebase to understand this request, then present a detailed plan. DO NOT make any changes — this is read-only exploration.\n\nRequest: {args}\n\nYour plan should include:\n1. What exists today (files, relevant code)\n2. Proposed approach (steps)\n3. Files to create/modify\n4. Risks and open questions\n\nEnd with: 'Ready to implement? Turn off plan mode or say go.'"},"review":{"description":"Review recent changes for bugs, security, and quality.","prompt":"Review the recent changes in this session for:\n1. Bugs (logic errors, edge cases, off-by-ones)\n2. Security issues (injection, secrets, auth)\n3. Code quality (clarity, duplication, naming)\n\nBe specific: file, line, issue, suggested fix. If the changes look good, say so and why.\n\nFocus area: {args}"},"work":{"description":"Implement the feature: plan, build, and verify (Claude Code /work pattern).","prompt":"You are implementing a feature. Follow this workflow:\n\n1. **Understand**: Read the relevant code first. Summarize what exists.\n2. **Plan**: Write a short plan (steps, files to touch, risks). If plan mode is on, stop here and present the plan.\n3. **Build**: Implement the change in small steps. Run relevant tests after each step.\n4. **Verify**: Run the full test suite for affected packages. Report what passed.\n\nFeature request: {args}\n\nBe thorough but efficient. If anything is ambiguous, make a reasonable choice and note it."}}
+{
+  "plan": {
+    "description": "Explore and plan without changing anything (read-only).",
+    "prompt": "Explore the codebase to understand this request, then present a detailed plan. DO NOT make any changes \u2014 this is read-only exploration.\n\nRequest: {args}\n\nYour plan should include:\n1. What exists today (files, relevant code)\n2. Proposed approach (steps)\n3. Files to create/modify\n4. Risks and open questions\n\nEnd with: 'Ready to implement? Turn off plan mode or say go.'"
+  },
+  "review": {
+    "description": "Review recent changes for bugs, security, and quality.",
+    "prompt": "Review the recent changes in this session for:\n1. Bugs (logic errors, edge cases, off-by-ones)\n2. Security issues (injection, secrets, auth)\n3. Code quality (clarity, duplication, naming)\n\nBe specific: file, line, issue, suggested fix. If the changes look good, say so and why.\n\nFocus area: {args}"
+  },
+  "work": {
+    "description": "Implement the feature: plan, build, and verify (Claude Code /work pattern).",
+    "prompt": "You are implementing a feature. Follow this workflow:\n\n1. **Understand**: Read the relevant code first. Summarize what exists.\n2. **Plan**: Write a short plan (steps, files to touch, risks). If plan mode is on, stop here and present the plan.\n3. **Build**: Implement the change in small steps. Run relevant tests after each step.\n4. **Verify**: Run the full test suite for affected packages. Report what passed.\n\nFeature request: {args}\n\nBe thorough but efficient. If anything is ambiguous, make a reasonable choice and note it."
+  },
+  "reduce": {
+    "description": "Reduce this conversation to a compact state summary (decisions, facts, open threads) and continue from it.",
+    "prompt": "Reduce our conversation so far into a compact state summary, then confirm you are continuing from it.\n\nProduce:\n1. **Goal** \u2014 what we are trying to achieve\n2. **Decisions made** \u2014 each with the reason\n3. **Key facts** \u2014 names, numbers, constraints established so far\n4. **Open threads** \u2014 unresolved questions and next steps\n\nBe complete but terse: this summary replaces the full history as your working context. Do not ask follow-up questions; end with 'Reduced. Continuing from the summary above.'\n\nAdditional focus (may be empty): {args}"
+  }
+}

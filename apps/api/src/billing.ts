@@ -63,6 +63,12 @@ import type {
   SpendCapScope,
 } from '@mvp/billing';
 import { MockBillingProvider } from '@mvp/billing';
+import {
+  approveThresholdDecision,
+  denyThresholdDecision,
+  listThresholdDecisions,
+  spendThresholdCentsFromEnv,
+} from './spend-caps.js';
 
 export interface BillingDeps {
   dataDir: string;
@@ -366,6 +372,39 @@ export function registerBillingRoutes(router: Router, deps: BillingDeps): void {
     } catch (err) {
       res.status(400).json({ error: errMessage(err, 'invalid spend cap') });
     }
+  });
+
+  // ---- Incremental spend thresholds (#72, opt-in) -------------------------
+  // Active only when KRIYADOT_SPEND_THRESHOLD_CENTS is set (see
+  // spend-caps.ts): crossing each threshold multiple of cumulative bot
+  // spend stops the turn with resumable (exit-75) semantics and records
+  // a decision here; approving lets spend continue to the NEXT multiple.
+  // GET  /threshold-decisions                 → [{ botId, decision }]
+  // POST /threshold-decisions/:id/approve     → { ok: true }
+  // POST /threshold-decisions/:id/deny        → { ok: true }
+
+  router.get('/threshold-decisions', (_req: Request, res: Response) => {
+    try {
+      res.json({ decisions: listThresholdDecisions(), enabled: spendThresholdCentsFromEnv() > 0 });
+    } catch (err) {
+      res.status(500).json({ error: errMessage(err, 'failed to list threshold decisions') });
+    }
+  });
+
+  router.post('/threshold-decisions/:id/approve', (req: Request, res: Response) => {
+    if (!approveThresholdDecision(req.params.id)) {
+      res.status(404).json({ error: `unknown threshold decision: ${req.params.id}` });
+      return;
+    }
+    res.json({ ok: true });
+  });
+
+  router.post('/threshold-decisions/:id/deny', (req: Request, res: Response) => {
+    if (!denyThresholdDecision(req.params.id)) {
+      res.status(404).json({ error: `unknown threshold decision: ${req.params.id}` });
+      return;
+    }
+    res.json({ ok: true });
   });
 
   // ---- Usage ledger (OpenMausBot parity P1 #21) --------------------------

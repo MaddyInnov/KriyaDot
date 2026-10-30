@@ -42,9 +42,13 @@ import { registerComputerSurfaceRoutes } from './computer-surface-routes.js';
 import { registerVpsRoutes } from './vps-routes.js';
 import {
   deleteSlashCommand,
+  envForcedSkills,
+  executeRunCommand,
   expandSlashCommand,
   loadSlashCommands,
   loadSlashCommandsCached,
+  mergeForcedSkills,
+  parseRunCommand,
   saveSlashCommand,
 } from './slash-commands.js';
 import { ThreadScheduler, ThreadScheduleStore } from './thread-scheduler.js';
@@ -90,10 +94,14 @@ import {
   buildContextReport,
   buildQuotedReply,
   formatContextSummary,
+  isFragmentReplyMessage,
   parseReplyCommand,
   registerSessionContextRoute,
+  validateFragmentReply,
 } from './session-craft.js';
 import { registerHumanAccountingRoute } from './human-accounting.js';
+import { decideVisionRoute, modelSupportsVision, MAX_IMAGE_BYTES_FOR_VISION } from './vision-pipeline.js';
+import type { MessageMedia } from '@mvp/agent-runtime';
 import { registerTerminalRoutes } from './terminal-routes.js';
 import { registerTeamRoutes } from './teams-routes.js';
 import { resolvePersonContext } from './people.js';
@@ -118,6 +126,7 @@ import { createVoiceCallRouter } from './voice-call-routes.js';
 import { createRealtimeVoiceRouter } from './voice-realtime-routes.js';
 import { saveBotVoice } from './bot-voice.js';
 import { saveBotApprovalModeForBot } from './bot-approval-modes.js';
+import { saveBotLayersForBot } from './bot-layers.js';
 import { buildBotChatFn, saveBotMemorySettings, wireMemoryDistillers } from './memory-fabric.js';
 import { createMemoryFabricRouter } from './memory-fabric-routes.js';
 import { createMemoryUpkeepRouter } from './memory-upkeep-routes.js';
@@ -225,11 +234,24 @@ export interface RouteDeps {
   /** Tiered memory store (L0 events → L2 atoms → L3 entity pages). */
   tieredMemoryStore: TieredMemoryStore;
   /**
+   * Per-session overlays (/role, /skill): the chat route applies the
+   * session's role instruction + pinned skills to each turn. Optional —
+   * without it the commands still record nothing and turns are unchanged.
+   */
+  sessionOverlays?: import('./session-overlays.js').SessionOverlayStore;
+  /**
    * In-flight chat turn tracker (crash recovery). The chat route marks
    * turns; the boot sweep treats leftovers as interrupted. Optional —
    * the route works without it.
    */
   turnTracker?: TurnTracker;
+  /**
+   * Shared in-flight turn registry (sessionId → AbortController). The
+   * host (index.ts) supplies one map so the companion WebSocket hub can
+   * cancel turns and report run state for the same turns the chat route
+   * runs. Absent → the router keeps a private map (previous behavior).
+   */
+  turnAbortRegistry?: Map<string, { controller: AbortController; botId: string; startedAt: number }>;
   /** Run health scores + metric samples (features #2/#5). */
   runHealth: RunHealthStore;
   /**
@@ -502,8 +524,9 @@ export function createRouter(deps: RouteDeps): express.Router {
   //
   // The companion app (phone → PC) reads this map for its run list and can
   // abort turns through it (see the runControls passed to the companion
-  // routes below); the hub itself never mutates it.
-  const activeTurns = new Map<string, { controller: AbortController; botId: string; startedAt: number }>();
+  // routes below); the hub itself never mutates it. The host may inject
+  // the map (deps.turnAbortRegistry) so the WebSocket hub shares it.
+  const activeTurns = deps.turnAbortRegistry ?? new Map<string, { controller: AbortController; botId: string; startedAt: number }>();
 
   // Resolve a bot's effective workspace root (Octop-style per-bot isolation).
   // Bots without a workspace use the global workspaceDir.
@@ -1397,6 +1420,34 @@ export function createRouter(deps: RouteDeps): express.Router {
     res.json({ ok: true, botId: bot.id, approvalMode: bot.approvalMode ?? 'auto' });
   });
 
+  // ---- Per-bot layer pipeline (Octomind parity #41) -----------------------
+  // PUT body: { layers: LayerStageSpec[] } — validated by the runtime's
+  // own validateExtendedLayers (kinds prepare/review/execute/verify,
+  // per-stage outputMode/role/profile). Persisted to
+  // <dataDir>/bot-layers.json and applied to the in-memory bot (see
+  // bot-layers.ts). Empty array clears the pipeline.
+
+  router.put('/bots/:id/layers', (req, res) => {
+    const body = (req.body ?? {}) as { layers?: unknown };
+    try {
+      const layers = saveBotLayersForBot(config.dataDir, bots, req.params.id, body.layers);
+      res.json({ ok: true, botId: req.params.id, layers });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const status = message.startsWith('Unknown bot') ? 404 : 400;
+      res.status(status).json(errorBody('Failed to save bot layers', message));
+    }
+  });
+
+  router.get('/bots/:id/layers', (req, res) => {
+    const bot = bots.find((b) => b.id === req.params.id);
+    if (!bot) {
+      res.status(404).json(errorBody(`Unknown bot "${req.params.id}"`));
+      return;
+    }
+    res.json({ ok: true, botId: bot.id, layers: bot.layers ?? [] });
+  });
+
   // ---- Per-bot memory fabric settings (Atomic parity) ----------------------
   // PUT body: { memoryReflection?: boolean, memoryLiveDistill?: boolean }.
   // Persisted to <dataDir>/bot-memory-settings.json and applied to the
@@ -1670,6 +1721,50 @@ export function createRouter(deps: RouteDeps): express.Router {
       body.message = wrapped;
     }
 
+    // Fragment replies (#37): a composed message quoting a selection
+    // from an earlier message is validated against the real history —
+    // the quoted fragment must be a verbatim substring of the cited
+    // message, so a forged quote never reaches the model as fact.
+    if (sessionKey && isFragmentReplyMessage(body.message)) {
+      const valid = validateFragmentReply(agentRuntime.listThreadMessages(sessionKey), body.message);
+      if (!valid) {
+        res.status(400).json(
+          errorBody('Fragment reply does not match the session history (the quoted selection must be verbatim).'),
+        );
+        return;
+      }
+    }
+
+    // /run <name> [args] (closure #42): dispatch by name to a workflow
+    // or a prompt-template command. Workflow runs execute immediately
+    // and answer as JSON; command targets expand and continue as the
+    // turn message. Unknown targets fail visible with a 400.
+    const runCommand = parseRunCommand(body.message);
+    if (runCommand) {
+      try {
+        const workflowDefs = workflowRunner.listWorkflows();
+        const result = await executeRunCommand(runCommand, {
+          workflows: workflowDefs.map((d) => d.name),
+          runWorkflow: async (name, args) => {
+            const def = workflowDefs.find((d) => d.name === name);
+            if (!def) throw new Error(`Workflow "${name}" not found`);
+            const run = await workflowRunner.startRun(def.id, args ? { args } : {});
+            return { runId: run.id, workflowId: def.id, status: run.status };
+          },
+          commands: loadSlashCommandsCached(config.dataDir),
+        });
+        if (result.target.kind === 'command') {
+          body.message = result.expanded ?? body.message;
+        } else {
+          res.json({ ok: true, target: result.target, run: result.output });
+          return;
+        }
+      } catch (err) {
+        res.status(400).json(errorBody(err instanceof Error ? err.message : String(err)));
+        return;
+      }
+    }
+
     // Custom slash commands: expand `/name args` before the agent sees it.
     // Done before the queue check so queued messages are stored expanded.
     // Unknown `/command` → 400 with the list of known commands.
@@ -1891,6 +1986,13 @@ export function createRouter(deps: RouteDeps): express.Router {
       turnToolCalls = [];
       // Inject attached file contents into the message.
       let messageWithFiles = turnMessage;
+      // Native media (#38): image/video bytes queued during the loop; the
+      // vision-routing decision after the loop decides whether they ride
+      // the turn as native parts (turnMedia) or fall back to text notes.
+      const pendingMedia: Array<MessageMedia & { name: string }> = [];
+      let visionProviderId: string | undefined;
+      let visionModelOverride: string | undefined;
+      let turnMedia: MessageMedia[] | undefined;
       if (turnOpts.fileIds && turnOpts.fileIds.length > 0) {
         const fileSections: string[] = [];
         for (const fid of turnOpts.fileIds) {
@@ -1909,6 +2011,26 @@ export function createRouter(deps: RouteDeps): express.Router {
               if (meta.mimeType) mimeType = meta.mimeType;
             } catch {
               // ignore
+            }
+            // Native media (#38): queue image/video bytes as media parts;
+            // whether they ride the turn is decided after the loop (the
+            // effective model must be vision-capable or upgradeable).
+            let mediaQueued = false;
+            if (mimeType.startsWith('image/') || mimeType.startsWith('video/')) {
+              try {
+                const bytes = readFileSync(filePath);
+                if (bytes.length > 0 && bytes.length <= MAX_IMAGE_BYTES_FOR_VISION) {
+                  pendingMedia.push({
+                    kind: mimeType.startsWith('video/') ? 'video' : 'image',
+                    mediaType: mimeType,
+                    dataBase64: bytes.toString('base64'),
+                    name,
+                  });
+                  mediaQueued = true;
+                }
+              } catch {
+                // media capture is best-effort; text handling below stands
+              }
             }
             // Text-extracted documents (PDF/DOCX/XLSX/PPTX/text): inject
             // extracted content (up to 100KB). Others: note presence.
@@ -1934,7 +2056,7 @@ export function createRouter(deps: RouteDeps): express.Router {
             } else if (mimeType.startsWith('text/') || /\.(txt|md|json|js|ts|py|csv|log)$/i.test(name)) {
               const content = readFileSync(filePath, 'utf8').slice(0, 100_000);
               fileSections.push(`[Attached file: ${name}]\n${content}`);
-            } else {
+            } else if (!mediaQueued) {
               fileSections.push(`[Attached file: ${name} (${mimeType}) — preview not available, use read_file tool to access if needed]`);
             }
           } catch {
@@ -1945,10 +2067,52 @@ export function createRouter(deps: RouteDeps): express.Router {
           messageWithFiles = `${fileSections.join('\n\n')}\n\n${turnMessage}`;
         }
       }
+      // Vision routing (#38): native media parts ride the turn only when
+      // the effective model can see them — the bot's own model when it is
+      // vision-capable, otherwise the configured vision fallback
+      // (modelOptions.visionModel) via decideVisionRoute. When neither
+      // holds, the parts are dropped and the legacy note is prepended so
+      // the model still knows a file was attached.
+      if (pendingMedia.length > 0) {
+        const decision = decideVisionRoute({
+          hasImageAttachment: pendingMedia.some((p) => p.kind === 'image'),
+          provider: turnOpts.providerId ?? bot.provider,
+          model: turnOpts.model ?? bot.model,
+          visionModel: bot.modelOptions?.visionModel,
+        });
+        const capable =
+          decision.reason === 'primary-is-vision' ||
+          decision.upgraded ||
+          modelSupportsVision(decision.provider, decision.model);
+        if (capable) {
+          turnMedia = pendingMedia.map(({ name: _name, ...part }) => part);
+          if (decision.upgraded) {
+            visionProviderId = decision.provider;
+            visionModelOverride = decision.model;
+          }
+        } else {
+          const notes = pendingMedia.map(
+            (p) => `[Attached file: ${p.name} (${p.mediaType}) — preview not available, use read_file tool to access if needed]`,
+          );
+          messageWithFiles = `${notes.join('\n\n')}\n\n${messageWithFiles}`;
+        }
+      }
       let memoryContext: string | undefined;
+      // Per-turn Memory Pack (#78): recall is materialized as a pack
+      // under an explicit token budget (neural hybrid recall, same gate
+      // as recallForPromptNeural) and rendered in the usual format.
+      // After a successful turn the pack is credited below
+      // (creditPackUse), so atom usage feeds retention/promotion (#80/#81).
+      let memoryPack: import('@mvp/agent-runtime').MemoryPack | undefined;
       try {
-        memoryContext = await tieredMemoryStore.recallForPromptNeural(bot.id, turnMessage) || undefined;
+        memoryPack = await tieredMemoryStore.buildMemoryPackNeural(bot.id, turnMessage, {
+          tokenBudget: 512,
+          // #74: project/role-scoped recall when the bot declares a scope.
+          scope: bot.memoryScope,
+        });
+        memoryContext = tieredMemoryStore.renderMemoryPack(memoryPack) || undefined;
       } catch {
+        memoryPack = undefined;
         memoryContext = undefined; // memory must never break chat
       }
       // Departments: the bot's department instructions ride the same
@@ -1960,6 +2124,31 @@ export function createRouter(deps: RouteDeps): express.Router {
         }
       } catch {
         // Departments must never break chat.
+      }
+      // Session overlays (/role, /skill session commands): the session's
+      // role instruction rides the context channel; pinned skills merge
+      // into a per-turn bot clone (the shared bot config never mutates).
+      let turnBot = bot;
+      try {
+        const overlay = sessionKey ? deps.sessionOverlays?.get(sessionKey) : undefined;
+        if (overlay?.role) {
+          memoryContext = [memoryContext, `[Session role] ${overlay.role}`].filter(Boolean).join('\n\n');
+        }
+        if (overlay && overlay.skills.length > 0) {
+          turnBot = { ...bot, skills: [...new Set([...bot.skills, ...overlay.skills])] };
+        }
+      } catch {
+        // Overlays must never break chat.
+      }
+      // Env force-load (#164): KRIYADOT_FORCE_SKILLS skills ride every
+      // turn on this host, merged ahead of the turn's selected skills.
+      try {
+        const forced = envForcedSkills();
+        if (forced.length > 0) {
+          turnBot = { ...turnBot, skills: mergeForcedSkills(turnBot.skills, forced) };
+        }
+      } catch {
+        // Force-load must never break chat.
       }
       // Run-health turn telemetry (features #2/#5): latency, tokens, errors
       // are recorded for health scoring + regression detection. The
@@ -2023,8 +2212,10 @@ export function createRouter(deps: RouteDeps): express.Router {
         // assistant reply (streamed tokens or completion tokens).
         const executeTurn = async (): Promise<boolean> => {
           turnUsage = await agentRuntime.runTurn({
-          bot,
+          bot: turnBot,
           message: messageWithFiles,
+          // Native media parts (#38) for the stored user message.
+          media: turnMedia,
           sessionId: body.sessionId,
           // W7: a new private chat created by this turn is owned by the
           // acting person (x-person-id header / body personId; UI-level
@@ -2034,10 +2225,11 @@ export function createRouter(deps: RouteDeps): express.Router {
           // Per-bot computers (P1 #14): this chat's conversation id, so a
           // pinned "Works on" surface for this conversation applies.
           conversationId: body.sessionId,
-          providerId: turnOpts.providerId,
+          providerId: visionProviderId ?? turnOpts.providerId,
           // Spaces: an explicit call-site model wins; otherwise the space's
           // model override applies (bot pin / smart routing as before when unset).
-          model: turnOpts.model ?? spaceCtx?.space.modelOverride,
+          // The vision fallback (#38) outranks both when it upgraded the turn.
+          model: visionModelOverride ?? turnOpts.model ?? spaceCtx?.space.modelOverride,
           taskType: turnOpts.taskType,
           signal: turnController!.signal,
           autoApprove: turnOpts.autoApprove,
@@ -2157,6 +2349,16 @@ export function createRouter(deps: RouteDeps): express.Router {
         } catch {
           // Metrics must never break chat.
         }
+        // Memory-pack credit (#78): the turn completed with the pack's
+        // atoms in its context — credit them as materially used. Only
+        // on success (an errored turn shaped nothing). Never breaks chat.
+        if (memoryPack && turnError === null && memoryPack.atomIds.length > 0) {
+          try {
+            tieredMemoryStore.creditPackUse(memoryPack.id, memoryPack.atomIds);
+          } catch {
+            // Crediting must never break chat.
+          }
+        }
         // Cost dashboard metering (feature #8): one cost event per turn so
         // GET /api/usage/breakdown shows real spend. Cost in USD cents is
         // auto-estimated from tokens by CostTracker (local price config,
@@ -2181,7 +2383,16 @@ export function createRouter(deps: RouteDeps): express.Router {
       // Fire-and-forget by design — ingestTurn never throws into the caller.
       // The keeper is per-bot toggleable (bot.memoryKeeper, default true).
       if (bot.memoryKeeper !== false) {
-        tieredMemoryStore.ingestTurn(bot.id, sessionKey ?? 'default', turnMessage, turnAssistantText, turnToolCalls);
+        tieredMemoryStore.ingestTurn(
+          bot.id,
+          sessionKey ?? 'default',
+          turnMessage,
+          turnAssistantText,
+          turnToolCalls,
+          undefined,
+          // #74: stamp distilled atoms with the bot's project/role scope.
+          bot.memoryScope,
+        );
       }
       // Memory fabric: periodic reflection pass (opt-in per bot via
       // memoryReflection). Every 50 turns the bot's own model reviews its

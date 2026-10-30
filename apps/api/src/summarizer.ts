@@ -7,7 +7,7 @@
 // honest extractive summary (first/last messages + counts) so compaction
 // NEVER breaks a session for lack of a key. The fallback is clearly labeled.
 
-import { createProvider } from '@mvp/agent-runtime';
+import { createProviderWithKeylessFallback } from '@mvp/agent-runtime';
 import type { ChatMessage } from '@mvp/agent-runtime';
 import { PromptOverrideStore } from '@mvp/agent-runtime';
 import { resolvePurposeProfile } from '@mvp/agent-runtime';
@@ -71,9 +71,17 @@ export function createSummarizer(
     // hot-reload without a restart.
     const store = promptStore ?? promptOverrides;
     const systemPrompt = store.resolve('summarizer', BUILTIN_SUMMARIZER_PROMPT).text;
-    const profile = resolvePurposeProfile('compression', { profiles });
+    // Closure #8/#11: the 'summarizer' purpose profile wins; 'compression'
+    // remains the fallback (session compaction shares this driver).
+    const profile =
+      resolvePurposeProfile('summarizer', { profiles }) ??
+      resolvePurposeProfile('compression', { profiles });
     try {
-      const provider = createProvider(profile?.providerId ?? 'groq');
+      // Zero-setup installs: fall back to a keyless lane when the
+      // profile's provider has no key configured (fresh install), so
+      // compaction still summarizes instead of failing outright.
+      const resolved = createProviderWithKeylessFallback(profile?.providerId ?? 'groq');
+      const provider = resolved.provider;
       const turn = await provider.chat(
         [
           {
@@ -84,9 +92,14 @@ export function createSummarizer(
         ],
         [],
         {
-          model: profile?.modelId ?? 'llama-3.1-8b-instant',
+          model: resolved.fellBack && resolved.model ? resolved.model : (profile?.modelId ?? 'llama-3.1-8b-instant'),
+          // Full knob set forwarded (#8), incl. retry/timeout (#11).
           ...(profile?.temperature !== undefined ? { temperature: profile.temperature } : {}),
+          ...(profile?.topP !== undefined ? { topP: profile.topP } : {}),
           ...(profile?.maxTokens !== undefined ? { maxTokens: profile.maxTokens } : {}),
+          ...(profile?.reasoningEffort !== undefined ? { reasoningEffort: profile.reasoningEffort } : {}),
+          ...(profile?.maxRetries !== undefined ? { maxRetries: profile.maxRetries } : {}),
+          ...(profile?.timeoutMs !== undefined ? { timeoutMs: profile.timeoutMs } : {}),
         },
       );
       const summary = turn.content?.trim();

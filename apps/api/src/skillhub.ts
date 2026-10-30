@@ -195,6 +195,87 @@ export async function installSkillFromRegistry(
 }
 
 // ---------------------------------------------------------------------------
+// Tap distribution channels (Octomind parity #103 / #153).
+//
+// A "tap" is a named distribution channel for packages — skills here,
+// and workflows/bots/capabilities through the marketplace installer
+// (see tap-routes.ts, which performs the actual multi-kind installs).
+// This module owns the SkillHub-side ref grammar so every surface
+// classifies a tap reference the same way:
+//
+//   github:owner/repo[@branch]   a GitHub repository tap
+//   owner/repo                    shorthand for the same GitHub tap
+//   local:/abs/path               a local tap directory
+//   channel:<name>                a named channel, resolved through the
+//                                 caller's channel table (name → ref)
+//   https://…/index.json          a SkillHub registry index URL
+//
+// parseSkillHubTapRef is pure classification (no I/O); resolving a
+// channel name needs the host's channel table, passed in by the caller.
+// ---------------------------------------------------------------------------
+
+export type SkillHubTapRef =
+  | { kind: 'github'; owner: string; repo: string; branch?: string; ref: string }
+  | { kind: 'local'; path: string; ref: string }
+  | { kind: 'channel'; name: string; ref: string }
+  | { kind: 'index'; url: string; ref: string };
+
+/** Classify a tap reference. Throws SkillHubError on malformed refs. */
+export function parseSkillHubTapRef(raw: string): SkillHubTapRef {
+  const ref = raw.trim();
+  if (!ref) throw new SkillHubError('tap ref is empty');
+  if (ref.startsWith('channel:')) {
+    const name = ref.slice('channel:'.length).trim();
+    if (!name) throw new SkillHubError('channel tap ref needs a name: "channel:<name>"');
+    return { kind: 'channel', name, ref };
+  }
+  if (ref.startsWith('local:')) {
+    const path = ref.slice('local:'.length).trim();
+    if (!path) throw new SkillHubError('local tap ref needs a path: "local:/abs/path"');
+    return { kind: 'local', path, ref };
+  }
+  if (/^https?:\/\//.test(ref)) {
+    assertHttpUrl(ref, 'Tap index URL');
+    return { kind: 'index', url: ref, ref };
+  }
+  const gh = ref.startsWith('github:') ? ref.slice('github:'.length) : ref;
+  const m = /^([\w.-]+)\/([\w.-]+)(?:@([\w./-]+))?$/.exec(gh);
+  if (m) {
+    return { kind: 'github', owner: m[1]!, repo: m[2]!, ...(m[3] ? { branch: m[3] } : {}), ref };
+  }
+  throw new SkillHubError(
+    `unrecognized tap ref "${raw}" (expected github:owner/repo, owner/repo, local:/path, channel:<name>, or an https index URL)`,
+  );
+}
+
+/**
+ * Resolve a tap ref to a concrete (non-channel) ref, following the
+ * host's named-channel table. Channel entries may themselves point at
+ * any other ref kind (but not at another channel — no chains).
+ */
+export function resolveSkillHubTapRef(
+  raw: string,
+  channels: Record<string, string> = {},
+): Exclude<SkillHubTapRef, { kind: 'channel' }> {
+  const parsed = parseSkillHubTapRef(raw);
+  if (parsed.kind !== 'channel') return parsed;
+  const target = channels[parsed.name];
+  if (!target) {
+    throw new SkillHubError(
+      `unknown tap channel "${parsed.name}" (known: ${Object.keys(channels).join(', ') || 'none'})`,
+    );
+  }
+  const resolved = parseSkillHubTapRef(target);
+  if (resolved.kind === 'channel') {
+    throw new SkillHubError(`tap channel "${parsed.name}" points at another channel — chains are not allowed`);
+  }
+  return resolved;
+}
+
+/** The built-in tap: this SkillHub's own registry, always available. */
+export const BUILTIN_TAP_NAME = 'builtin';
+
+// ---------------------------------------------------------------------------
 // Routes (router factory — the parent mounts this next to the skill store
 // router, e.g. app.use('/api/skills', createSkillHubRouter({...}))):
 //   GET  /hub/index?url=<registryUrl>     → browse a registry index

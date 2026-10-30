@@ -1,0 +1,102 @@
+{
+  "provider": "mock",
+  "model": "mock-model",
+  "env": {
+    "node": "v24.22.1",
+    "platform": "linux/x64",
+    "date": "2026-10-29T19:29:56.489Z"
+  },
+  "summary": {
+    "total": 8,
+    "passed": 8,
+    "meanScore": 1,
+    "byCategory": {
+      "fix-the-bug": {
+        "total": 2,
+        "passed": 2,
+        "scoreSum": 2
+      },
+      "extract-values": {
+        "total": 2,
+        "passed": 2,
+        "scoreSum": 2
+      },
+      "follow-instructions": {
+        "total": 2,
+        "passed": 2,
+        "scoreSum": 2
+      },
+      "tool-use": {
+        "total": 2,
+        "passed": 2,
+        "scoreSum": 2
+      }
+    }
+  },
+  "results": [
+    {
+      "id": "fix-bug-cart-discount",
+      "category": "fix-the-bug",
+      "score": 1,
+      "pass": true,
+      "ms": 0,
+      "detail": "all 4 assertions passed"
+    },
+    {
+      "id": "fix-bug-clamp-range",
+      "category": "fix-the-bug",
+      "score": 1,
+      "pass": true,
+      "ms": 0,
+      "detail": "all 5 assertions passed"
+    },
+    {
+      "id": "extract-invoice-fields",
+      "category": "extract-values",
+      "score": 1,
+      "pass": true,
+      "ms": 0,
+      "detail": "all 5 fields exact"
+    },
+    {
+      "id": "extract-event-dates",
+      "category": "extract-values",
+      "score": 1,
+      "pass": true,
+      "ms": 0,
+      "detail": "all 4 fields exact"
+    },
+    {
+      "id": "follow-json-only",
+      "category": "follow-instructions",
+      "score": 1,
+      "pass": true,
+      "ms": 0,
+      "detail": "exact JSON-only reply"
+    },
+    {
+      "id": "follow-three-bullets",
+      "category": "follow-instructions",
+      "score": 1,
+      "pass": true,
+      "ms": 0,
+      "detail": "3 non-empty line(s), 3 bullet line(s); need exactly 3 of each"
+    },
+    {
+      "id": "tool-use-read-file",
+      "category": "tool-use",
+      "score": 1,
+      "pass": true,
+      "ms": 0,
+      "detail": "exactly one read_file call for notes/plan.md"
+    },
+    {
+      "id": "tool-use-answer-directly",
+      "category": "tool-use",
+      "score": 1,
+      "pass": true,
+      "ms": 0,
+      "detail": "answered 42 directly, no tool calls"
+    }
+  ]
+}

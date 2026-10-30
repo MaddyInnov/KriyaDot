@@ -1,0 +1,22 @@
+{
+  // KriyaDot as an external ACP agent in Zed.
+  //
+  // Merge this "agent_servers" block into your Zed settings:
+  //   Linux/macOS: ~/.config/zed/settings.json
+  //   Windows:     %APPDATA%\Zed\settings.json
+  // (Zed: open the settings file with the `zed: open settings file`
+  // command.) Use an ABSOLUTE path for "command" if mvp-server is not
+  // on your PATH — e.g. "/home/you/kriyadot/dist/mvp-server" for the
+  // standalone binary built by scripts/build-server-binary.sh.
+  //
+  // Change the bot with the --bot arg: any bot id from seed/bots.json
+  // (helper is the server default when --bot is omitted; coder is the
+  // coding bot and the right default for editor use).
+  "agent_servers": {
+    "KriyaDot": {
+      "command": "mvp-server",
+      "args": ["acp", "--bot", "coder"],
+      "env": {}
+    }
+  }
+}

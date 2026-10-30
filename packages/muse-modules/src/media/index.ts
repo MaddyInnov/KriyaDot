@@ -81,13 +81,23 @@ export class MockMediaProvider implements MediaProvider {
   }
 }
 
+export { OpenAIImagesProvider, openAIImagesProviderFromEnv } from './openai-images.js';
+export type { MediaFetch, OpenAIImagesProviderOptions } from './openai-images.js';
+
+import { openAIImagesProviderFromEnv, type MediaFetch } from './openai-images.js';
+
 /**
- * Resolve the configured media provider. Today this always returns the mock;
- * when the founder supplies provider credentials (env vars, see
- * docs/founder-setup.d/workstream-e.md) this becomes the seam where a real
- * provider is constructed. Never throws for missing keys — it falls back to
- * the mock so the MVP works out of the box.
+ * Resolve the configured media provider (closure C9). When the
+ * OpenAI-compatible images key is configured (MEDIA_IMAGES_API_KEY, with
+ * optional MEDIA_IMAGES_BASE_URL / MEDIA_IMAGES_MODEL) the real provider
+ * is selected; otherwise this falls back to the mock so the MVP works
+ * out of the box. Never throws for missing keys. Live verification of
+ * the real provider is credential-gated: no key exists in tests/CI, so
+ * the real path is proven there only against an injected fake fetch.
  */
-export function resolveMediaProvider(): MediaProvider {
-  return new MockMediaProvider();
+export function resolveMediaProvider(
+  env: Record<string, string | undefined> = process.env,
+  fetchFn?: MediaFetch,
+): MediaProvider {
+  return openAIImagesProviderFromEnv(env, fetchFn) ?? new MockMediaProvider();
 }

@@ -16,6 +16,7 @@
 // are keyed as "openrouter/anthropic/claude-sonnet-4-5".
 
 import type { TokenUsage } from './types.js';
+import { cacheTokensOf, type CacheAwareTokenUsage } from './usage.js';
 import { isFreeModel } from './providers/catalog.js';
 
 export interface ModelPrice {
@@ -23,8 +24,27 @@ export interface ModelPrice {
   inputPer1M: number;
   /** USD per 1M output (completion) tokens. */
   outputPer1M: number;
+  /**
+   * USD per 1M prompt-cache READ tokens (Octomind parity #137).
+   * Absent → cache reads are billed at the base input rate
+   * ({@link cacheRatesFor} applies that default).
+   */
+  cacheReadPer1M?: number;
+  /**
+   * USD per 1M prompt-cache WRITE (creation) tokens (#137).
+   * Absent → cache writes are billed at the base input rate.
+   */
+  cacheWritePer1M?: number;
   /** True when the price is a public-list-price estimate (see header). */
   estimate: boolean;
+}
+
+/** Resolved cache rates for a price: known rates win, else base input. */
+export function cacheRatesFor(price: ModelPrice): { cacheReadPer1M: number; cacheWritePer1M: number } {
+  return {
+    cacheReadPer1M: price.cacheReadPer1M ?? price.inputPer1M,
+    cacheWritePer1M: price.cacheWritePer1M ?? price.inputPer1M,
+  };
 }
 
 export const MODEL_PRICES: Record<string, ModelPrice> = {
@@ -38,17 +58,27 @@ export const MODEL_PRICES: Record<string, ModelPrice> = {
   'groq/groq/compound': { inputPer1M: 0.15, outputPer1M: 0.6, estimate: true },
   'groq/groq/compound-mini': { inputPer1M: 0.1, outputPer1M: 0.5, estimate: true },
   // --- OpenAI (list prices, Oct 2026) ---
-  'openai/gpt-4o': { inputPer1M: 2.5, outputPer1M: 10.0, estimate: true },
-  'openai/gpt-4o-mini': { inputPer1M: 0.15, outputPer1M: 0.6, estimate: true },
+  // Prompt-cache reads bill at half the input rate; writes carry no
+  // separate published rate, so they default to the base input rate.
+  'openai/gpt-4o': { inputPer1M: 2.5, outputPer1M: 10.0, cacheReadPer1M: 1.25, estimate: true },
+  'openai/gpt-4o-mini': { inputPer1M: 0.15, outputPer1M: 0.6, cacheReadPer1M: 0.075, estimate: true },
   // --- Anthropic (list prices, Oct 2026) ---
-  'anthropic/claude-3-5-sonnet-latest': { inputPer1M: 3.0, outputPer1M: 15.0, estimate: true },
-  'anthropic/claude-3-5-haiku-latest': { inputPer1M: 0.8, outputPer1M: 4.0, estimate: true },
+  // Prompt caching: reads 0.1x base input, writes 1.25x base input.
+  'anthropic/claude-3-5-sonnet-latest': {
+    inputPer1M: 3.0, outputPer1M: 15.0, cacheReadPer1M: 0.3, cacheWritePer1M: 3.75, estimate: true,
+  },
+  'anthropic/claude-3-5-haiku-latest': {
+    inputPer1M: 0.8, outputPer1M: 4.0, cacheReadPer1M: 0.08, cacheWritePer1M: 1.0, estimate: true,
+  },
   // --- OpenRouter: popular models (OpenRouter list prices, Oct 2026) ---
-  'openrouter/anthropic/claude-sonnet-4-5': { inputPer1M: 3.0, outputPer1M: 15.0, estimate: true },
+  'openrouter/anthropic/claude-sonnet-4-5': {
+    inputPer1M: 3.0, outputPer1M: 15.0, cacheReadPer1M: 0.3, cacheWritePer1M: 3.75, estimate: true,
+  },
   'openrouter/openai/gpt-4o': { inputPer1M: 2.5, outputPer1M: 10.0, estimate: true },
   // --- DeepSeek direct (list prices, Oct 2026) ---
-  'deepseek/deepseek-chat': { inputPer1M: 0.27, outputPer1M: 1.1, estimate: true },
-  'deepseek/deepseek-reasoner': { inputPer1M: 0.55, outputPer1M: 2.19, estimate: true },
+  // Context-cache hits bill at 0.1x the cache-miss input rate.
+  'deepseek/deepseek-chat': { inputPer1M: 0.27, outputPer1M: 1.1, cacheReadPer1M: 0.027, estimate: true },
+  'deepseek/deepseek-reasoner': { inputPer1M: 0.55, outputPer1M: 2.19, cacheReadPer1M: 0.055, estimate: true },
   'openrouter/deepseek/deepseek-chat': { inputPer1M: 0.27, outputPer1M: 1.1, estimate: true },
   'openrouter/deepseek/deepseek-r1': { inputPer1M: 0.55, outputPer1M: 2.19, estimate: true },
   'openrouter/google/gemini-2.5-flash': { inputPer1M: 0.3, outputPer1M: 2.5, estimate: true },
@@ -89,7 +119,15 @@ export interface UsageCost {
   input: number;
   /** USD for completion tokens. */
   output: number;
-  /** input + output, in USD. */
+  /**
+   * USD for prompt-cache READ tokens (#137). Only present when the
+   * usage record actually reported cache tokens, so cache-free callers
+   * see exactly the pre-#137 shape.
+   */
+  cacheRead?: number;
+  /** USD for prompt-cache WRITE tokens (#137). Same presence rule. */
+  cacheWrite?: number;
+  /** input + output (+ cache buckets when reported), in USD. */
   total: number;
   /**
    * True when the number is a public-list-price estimate OR the price is
@@ -113,5 +151,23 @@ export function costOfUsage(
   if (!price) return { input: 0, output: 0, total: 0, estimated: true };
   const input = (usage.promptTokens / 1_000_000) * price.inputPer1M;
   const output = (usage.completionTokens / 1_000_000) * price.outputPer1M;
-  return { input, output, total: input + output, estimated: price.estimate };
+  // Cache buckets (#137): reported as separate buckets alongside
+  // promptTokens (see CacheAwareTokenUsage in usage.ts), priced at the
+  // model's cache rates, defaulting to the base input rate when the
+  // catalog entry carries no cache rates.
+  const cache = cacheTokensOf(usage as CacheAwareTokenUsage);
+  if (cache.cacheReadTokens === 0 && cache.cacheWriteTokens === 0) {
+    return { input, output, total: input + output, estimated: price.estimate };
+  }
+  const rates = cacheRatesFor(price);
+  const cacheRead = (cache.cacheReadTokens / 1_000_000) * rates.cacheReadPer1M;
+  const cacheWrite = (cache.cacheWriteTokens / 1_000_000) * rates.cacheWritePer1M;
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    total: input + output + cacheRead + cacheWrite,
+    estimated: price.estimate,
+  };
 }

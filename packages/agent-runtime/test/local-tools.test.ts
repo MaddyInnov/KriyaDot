@@ -58,7 +58,10 @@ describe('discoverLocalTools', () => {
     expect(tools).toHaveLength(1);
     expect(tools[0]!.name).toBe('local:echo-args');
     expect(tools[0]!.description).toBe('Echo the JSON args back');
-    expect(tools[0]!.mutating).toBe(false);
+    // #126: ECHO_TOOL declares no `mutating:` header — fail-closed, an
+    // undeclared local tool is treated as mutating (was: self-declared
+    // false). See the explicit-declaration tests below.
+    expect(tools[0]!.mutating).toBe(true);
     const result = await tools[0]!.handler({ text: 'hello' }, { sessionId: 's', botId: 'b' } as never);
     expect(result).toEqual({ echoed: { text: 'hello' } });
   });
@@ -110,5 +113,53 @@ describe('discoverLocalTools', () => {
       '#!/usr/bin/env node\n// @tool\n// name: mutator\n// mutating: true\nconsole.log("{}");\n',
     );
     expect(discoverLocalTools(dir).tools[0]!.mutating).toBe(true);
+  });
+
+  it('treats only an explicit `mutating: false` as read-only (#126 fail-closed)', () => {
+    writeTool(
+      'reader.mjs',
+      '#!/usr/bin/env node\n// @tool\n// name: reader\n// mutating: false\nconsole.log("{}");\n',
+    );
+    writeTool(
+      'silent.mjs',
+      '#!/usr/bin/env node\n// @tool\n// name: silent\nconsole.log("{}");\n',
+    );
+    const { tools } = discoverLocalTools(dir);
+    const byName = new Map(tools.map((t) => [t.name, t]));
+    expect(byName.get('local:reader')!.mutating).toBe(false);
+    expect(byName.get('local:silent')!.mutating).toBe(true);
+  });
+
+  it('executes local tools under kernel confinement when available (#117c)', async () => {
+    // A tool that tries to write into $HOME must be blocked by the
+    // kernel ruleset (Landlock on this Linux VM); the same write into
+    // the workspace (its cwd / writable root) must succeed. Mirrors
+    // the ABI-gated pattern of the sandbox-kernel tests: when the
+    // kernel has no Landlock, the confined path is unavailable and
+    // this assertion does not apply.
+    const { landlockAbiVersion } = await import('../src/tools/sandbox-kernel.js');
+    if (process.platform !== 'linux' || (await landlockAbiVersion()) < 1) return;
+    writeTool(
+      'writer.cjs',
+      `#!/usr/bin/env node
+// @tool
+// name: writer
+// mutating: true
+const fs = require('node:fs');
+let homeBlocked = false;
+try { fs.writeFileSync(process.env.HOME + '/local-tool-escape-marker', 'x'); } catch { homeBlocked = true; }
+fs.writeFileSync('workspace-marker.txt', 'ok');
+console.log(JSON.stringify({ homeBlocked }));
+`,
+    );
+    const { tools, errors } = discoverLocalTools(dir);
+    expect(errors).toEqual([]);
+    const result = (await tools[0]!.handler({}, { sessionId: 's', botId: 'b' } as never)) as {
+      homeBlocked?: boolean;
+    };
+    expect(result.homeBlocked).toBe(true);
+    // The workspace write landed in the real workspace dir.
+    const { existsSync } = await import('node:fs');
+    expect(existsSync(join(dir, 'workspace-marker.txt'))).toBe(true);
   });
 });

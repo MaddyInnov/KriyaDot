@@ -471,6 +471,31 @@ export function createChatThreadsRouter(deps: ChatThreadsDeps): Router {
    * Management flags (bot context-menu): pin/unpin, mark unread/read,
    * hide/unhide. PATCH /:threadId/flags { pinned?, unread?, hidden? }.
    */
+  // Rename a thread (Octomind parity #32): PATCH /:threadId/title
+  // { title } → persists via the same TitleStore the branch/duplicate
+  // flows use. Empty titles are rejected; titles are trimmed + capped.
+  router.patch('/:threadId/title', async (req, res) => {
+    const threadId = req.params.threadId;
+    if (!threadId || threadId.length > 256) {
+      res.status(400).json(errorBody('threadId is required'));
+      return;
+    }
+    const body = (req.body ?? {}) as { title?: unknown };
+    if (typeof body.title !== 'string' || body.title.trim().length === 0) {
+      res.status(400).json(errorBody('"title" must be a non-empty string'));
+      return;
+    }
+    const messages = await deps.listThreadMessages(threadId);
+    if (messages.length === 0) {
+      res.status(404).json(errorBody(`Unknown thread "${threadId}"`));
+      return;
+    }
+    const title = body.title.trim().slice(0, 200);
+    titles.setTitle(threadId, title);
+    deps.audit('chat.thread_title', { actor: 'api', sessionId: threadId, detail: { title } });
+    res.json({ ok: true, threadId, title });
+  });
+
   router.patch('/:threadId/flags', async (req, res) => {
     const threadId = req.params.threadId;
     if (!threadId || threadId.length > 256) {

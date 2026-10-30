@@ -42,6 +42,45 @@ jobs:
           path: dist/mvp-server
           if-no-files-found: error
 
+  # Published checksums (#116): one SHA256SUMS covering the release
+  # artifacts built as workflow artifacts, attached to the same release
+  # so installers (scripts/install.sh, Homebrew/Scoop templates under
+  # scripts/dist/) can verify downloads. Desktop installers are uploaded
+  # to the release directly by tauri-action; their hashes can be added
+  # here once they are also staged as workflow artifacts.
+  checksums:
+    needs: [server-binary]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-artifacts
+          find . -type f -print0 | sort -z | xargs -0 sha256sum | sed 's| \./[^/]*/|  |' > ../SHA256SUMS
+          cat ../SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: SHA256SUMS
+          if-no-files-found: error
+
+      - name: Attach SHA256SUMS to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release upload "$TAG" SHA256SUMS --clobber
+
   desktop:
     strategy:
       fail-fast: false

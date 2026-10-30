@@ -5,10 +5,14 @@ import { describe, expect, it } from 'vitest';
 import type { IdentifiedMessage } from '@mvp/agent-runtime';
 import {
   buildContextReport,
+  buildFragmentReply,
   buildQuotedReply,
   formatContextSummary,
+  isFragmentReplyMessage,
+  parseFragmentReply,
   parseReplyCommand,
   resolveQuotedMessage,
+  validateFragmentReply,
 } from '../src/session-craft.js';
 
 const messages: IdentifiedMessage[] = [
@@ -46,6 +50,38 @@ describe('/reply parsing + resolution', () => {
     const wrapped = buildQuotedReply(long, { ref: '#5', text: 'ok' })!;
     expect(wrapped.length).toBeLessThan(900);
     expect(wrapped).toContain('…');
+  });
+});
+
+describe('#37 fragment (selection) replies', () => {
+  it('composes the web wire format: marker, selection header, fragment quote, response', () => {
+    const out = buildFragmentReply(messages, { ref: '#12', fragment: 'Done in 40s.', text: 'why so fast?' });
+    expect(out).not.toBeNull();
+    expect(out!.startsWith('<!-- quotedFragment -->\n')).toBe(true);
+    expect(out).toContain('[Replying to a selection from message #12 (assistant)]');
+    expect(out).toContain('> Done in 40s.');
+    expect(out).not.toContain('Deploying now.');
+    expect(out).toContain('\n\nwhy so fast?');
+    expect(isFragmentReplyMessage(out!)).toBe(true);
+  });
+
+  it('is fail-closed: fragments that are not verbatim substrings are rejected', () => {
+    expect(buildFragmentReply(messages, { ref: '#12', fragment: 'Done in 41s.', text: 'x' })).toBeNull();
+    expect(buildFragmentReply(messages, { ref: '#12', fragment: '   ', text: 'x' })).toBeNull();
+    expect(buildFragmentReply(messages, { ref: '#999', fragment: 'Done in 40s.', text: 'x' })).toBeNull();
+  });
+
+  it('parses a composed fragment reply back and validates it against history', () => {
+    const out = buildFragmentReply(messages, { ref: '2', fragment: 'Deploying now.', text: 'go on' })!;
+    const parsed = parseFragmentReply(out);
+    expect(parsed).toEqual({ messageId: 12, role: 'assistant', fragment: 'Deploying now.', text: 'go on' });
+    expect(validateFragmentReply(messages, out)).toEqual(parsed);
+    // Tampered quote (not in the source message) fails validation.
+    const tampered = out.replace('Deploying now.', 'Deploying slowly.');
+    expect(validateFragmentReply(messages, tampered)).toBeNull();
+    // A plain message is not a fragment reply.
+    expect(parseFragmentReply('hello')).toBeNull();
+    expect(validateFragmentReply(messages, 'hello')).toBeNull();
   });
 });
 

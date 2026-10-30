@@ -8,14 +8,29 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ToolDefinition } from './types.js';
 export const DEFAULT_SPILL_THRESHOLD_BYTES = 32 * 1024;
+/**
+ * Token-based spill threshold (Octomind parity #59): what the model can
+ * actually hold is measured in tokens, not bytes. The estimator matches
+ * the codebase convention (chars / 4, see sessions.ts). The byte cap
+ * above remains as a hard storage ceiling; a result spills when EITHER
+ * threshold is exceeded.
+ */
+export const DEFAULT_SPILL_THRESHOLD_TOKENS = 8_000;
+export function estimateSpillTokens(content: string): number {
+  return Math.ceil(content.length / 4);
+}
 export interface SpillRef { id: string; path: string; bytes: number; preview: string; }
 let seq = 0;
 export class ToolSpillStore {
-  constructor(private readonly dir: string, readonly thresholdBytes = DEFAULT_SPILL_THRESHOLD_BYTES) {}
+  constructor(
+    private readonly dir: string,
+    readonly thresholdBytes = DEFAULT_SPILL_THRESHOLD_BYTES,
+    readonly thresholdTokens = DEFAULT_SPILL_THRESHOLD_TOKENS,
+  ) {}
   get spillDir(): string { return this.dir; }
   maybeSpill(toolName: string, content: string): SpillRef | null {
     const bytes = Buffer.byteLength(content, 'utf8');
-    if (bytes <= this.thresholdBytes) return null;
+    if (bytes <= this.thresholdBytes && estimateSpillTokens(content) <= this.thresholdTokens) return null;
     mkdirSync(this.dir, { recursive: true });
     const id = `spill_${Date.now().toString(36)}_${++seq}`;
     const path = join(this.dir, `${id}.txt`);

@@ -85,15 +85,20 @@ describe('bundles', () => {
     }
   });
 
-  it('installs a bundle, skipping MCP entries and reporting missing ones', () => {
+  it('installs a bundle, installing MCP entries disabled and reporting missing ones', () => {
     const registry = MarketplaceRegistry.fromFile(registryPath);
     const installer = new MarketplaceInstaller(join(dir, 'marketplace'));
     const bundle = { id: 'test-bundle', name: 'T', description: 'd', entryIds: ['meeting-scribe', 'meeting-notes', 'postgres-local', 'nope'] };
     const result = installBundle(bundle, registry, installer);
     expect(result.installed.map((r) => r.entryId).sort()).toEqual(['meeting-notes', 'meeting-scribe']);
-    expect(result.skippedMcp).toEqual(['postgres-local']);
+    // #155: bundle MCP entries are installed (disabled, checksummed), not skipped.
+    expect(result.installedMcp.map((r) => r.entryId)).toEqual(['postgres-local']);
+    expect(result.skippedMcp).toEqual([]);
     expect(result.missing).toEqual(['nope']);
     expect(existsSync(join(dir, 'marketplace', 'installed', 'skills', 'meeting-notes.md'))).toBe(true);
+    const mcp = JSON.parse(readFileSync(join(dir, 'marketplace', 'installed', 'mcp-servers', 'postgres-local.json'), 'utf8')) as { enabled: boolean; checksum: string };
+    expect(mcp.enabled).toBe(false);
+    expect(typeof mcp.checksum).toBe('string');
   });
 });
 

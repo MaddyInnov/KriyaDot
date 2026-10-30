@@ -12,10 +12,20 @@
  * Minimal embedder contract for hybrid search. `embedSync` exists because
  * some call sites (e.g. TieredMemoryStore.storeAtom) are synchronous;
  * hash embedders are fast enough that sync is always fine.
+ *
+ * `kind` (parity #13) lets discovery/auto-activation judge embedding
+ * quality: 'neural' (HTTP model) and 'onnx' (bundled local model) are
+ * semantic; 'hash' (the trigram fallback) is lexical-only. The DEFAULT
+ * selection story lives in embeddings.ts (`selectDefaultEmbedder`):
+ * neural when a local endpoint is reachable/configured, bundled ONNX
+ * when a model file is configured and present, trigram hash as the
+ * offline fallback — this module stays the dependency-free floor.
  */
 export interface SyncEmbedder {
   readonly name: string;
   readonly dim: number;
+  /** Embedding quality tier, when the embedder declares one. */
+  readonly kind?: 'hash' | 'neural' | 'onnx';
   embedSync(texts: string[]): Float32Array[];
   embed(texts: string[]): Float32Array[] | Promise<Float32Array[]>;
 }
@@ -47,6 +57,7 @@ function l2Normalize(v: Float32Array): Float32Array {
 export class TrigramEmbedder implements SyncEmbedder {
   readonly name = 'trigram-384';
   readonly dim = 384;
+  readonly kind = 'hash' as const;
 
   embedSync(texts: string[]): Float32Array[] {
     return texts.map((t) => {

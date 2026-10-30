@@ -54,7 +54,7 @@ export interface MarketplaceDeps extends Pick<RouteDeps, 'config' | 'governance'
   revenue: RevenueLedger;
 }
 
-const VALID_KINDS: ReadonlySet<string> = new Set(['bot', 'skill', 'workflow', 'mcp-server']);
+const VALID_KINDS: ReadonlySet<string> = new Set(['bot', 'skill', 'workflow', 'mcp-server', 'capability']);
 
 export function registerMarketplaceRoutes(router: Router, deps: MarketplaceDeps): void {
   const { registry, installer, revenue, governance } = deps;

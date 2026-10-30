@@ -12,7 +12,13 @@
  * start as `pending`, not `skipped`, and the driving node updates them).
  */
 
-import type { NodeType, WorkflowDefinition, WorkflowNode } from './types.js';
+import {
+  resolveWorkflowMaxParallel,
+  type NodeType,
+  type WorkflowDefinition,
+  type WorkflowNode,
+} from './types.js';
+import { resolveStepConfig, validateStepConfig, type ResolvedStepConfig } from './step-config.js';
 
 function asRecord(value: unknown): Record<string, unknown> {
   if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
@@ -187,6 +193,12 @@ export interface DryRunPlanNode {
   id: string;
   type: NodeType;
   name: string;
+  /**
+   * Resolved per-step config (#143) for agent/bot-turn nodes: the
+   * bot/role/provider/model/toolset/skills this step would run with.
+   * Present only when the node carries any of those fields.
+   */
+  step?: ResolvedStepConfig;
 }
 
 export interface DryRunLevel {
@@ -194,6 +206,13 @@ export interface DryRunLevel {
   level: number;
   /** Nodes in this level (they would run concurrently). */
   nodes: DryRunPlanNode[];
+  /** Raw level width (number of nodes in the level). */
+  width: number;
+  /**
+   * Concurrency the runner would actually use for this level: the
+   * width capped by the workflow's max_parallel (#145).
+   */
+  effectiveParallel: number;
 }
 
 /**
@@ -212,6 +231,8 @@ export interface DryRunPlan {
   subordinate: Record<string, string[]>;
   skipped: string[];
   budget?: { maxCostUsd: number };
+  /** Effective level-parallelism cap for this workflow (#145). */
+  maxParallel: number;
 }
 
 /**
@@ -220,12 +241,27 @@ export interface DryRunPlan {
  */
 export function buildExecutionPlan(def: WorkflowDefinition): DryRunPlan {
   validateWorkflowStructure(def);
+  for (const node of def.nodes) validateStepConfig(node);
+  if (def.maxParallel !== undefined || def.max_parallel !== undefined) {
+    const raw = def.maxParallel ?? def.max_parallel;
+    if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 1) {
+      throw new Error('workflow maxParallel must be a positive integer');
+    }
+  }
+  const maxParallel = resolveWorkflowMaxParallel(def);
   const byId = new Map(def.nodes.map((n) => [n.id, n]));
   const levels = computeTopologicalLevels(def).map((ids, level) => ({
     level,
+    width: ids.length,
+    effectiveParallel: Math.min(ids.length, maxParallel),
     nodes: ids.map((id) => {
       const node = byId.get(id)!;
-      return { id: node.id, type: node.type, name: node.name };
+      const planNode: DryRunPlanNode = { id: node.id, type: node.type, name: node.name };
+      if (node.type === 'agent' || node.type === 'bot-turn') {
+        const step = resolveStepConfig(asRecord(node.config));
+        if (Object.keys(step).length > 0) planNode.step = step;
+      }
+      return planNode;
     }),
   }));
   const subordinate: Record<string, string[]> = {};
@@ -242,7 +278,22 @@ export function buildExecutionPlan(def: WorkflowDefinition): DryRunPlan {
     levels,
     subordinate,
     skipped,
+    maxParallel,
   };
   if (def.budget) plan.budget = { maxCostUsd: def.budget.maxCostUsd };
   return plan;
+}
+
+/**
+ * Public dry-run API (#151): validate a workflow definition and return
+ * its execution plan (levels, per-step agent config, subordinate
+ * loop/match nodes, unreachable nodes, budget, max_parallel) WITHOUT
+ * executing anything — no runner, store, agent runtime, tool or
+ * governance call is involved, and the definition does not need to be
+ * registered first. Hosts (API/CLI/UI) should call this function (or
+ * `WorkflowRunner.dryRun`, which additionally runs the runner's full
+ * node-config validation) for any user-facing dry-run surface.
+ */
+export function dryRun(def: WorkflowDefinition): DryRunPlan {
+  return buildExecutionPlan(def);
 }

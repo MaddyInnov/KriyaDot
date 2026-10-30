@@ -1,0 +1,13 @@
+KriyaDot external-driving cheat sheet (asset of the driving-kriyadot pack)
+=========================================================================
+
+Discover first : kriyadot bots list            | GET /api/bots
+One-shot ask   : kriyadot chat <bot> "<msg>"   | POST /api/chat (SSE)
+Named session  : kriyadot run --bot <bot> --message "<msg>" --daemon <name>
+Follow up      : kriyadot send <name> "<msg>"
+Approvals      : never self-approve; surface the card and wait for the human
+Pause state    : kriyadot status               | GET /api/system/pause-state
+Token          : read <dataDir>/.api-token at runtime; never copy it into files
+
+Full guidance: SKILL.md · Endpoint table: references/api-endpoints.md
+Reachability check: node scripts/smoke-check.mjs [baseUrl]

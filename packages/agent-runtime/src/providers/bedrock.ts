@@ -34,7 +34,23 @@ export interface BedrockOptions {
   fetchFn?: typeof fetch;
   /** Clock override for signing tests. */
   now?: () => Date;
+  /** Injectable backoff sleep (tests). */
+  sleepFn?: (ms: number) => Promise<void>;
 }
+
+/**
+ * Name of the forced tool used for native structured output (parity
+ * #108). Converse has no `response_format`; the driver's native
+ * mechanism is a forced tool call: when a call carries a
+ * responseFormat spec, the driver adds this toolSpec (its inputSchema
+ * IS the requested JSON Schema) and sets
+ * `toolConfig.toolChoice = { tool: { name: '__structured_output' } }`.
+ * The tool call's input is returned as the reply content (JSON), never
+ * surfaced as a runtime tool call. A structured call is a final-answer
+ * call: user tools are still declared, but the forced choice means the
+ * model answers with the structured tool instead of calling them.
+ */
+export const BEDROCK_STRUCTURED_OUTPUT_TOOL_NAME = '__structured_output';
 
 interface AwsCredentials {
   accessKeyId: string;
@@ -115,6 +131,16 @@ interface ConverseMessage {
   content: ConverseBlock[];
 }
 
+/** Shape guard for #34 replay: a raw Converse content block. */
+function isConverseBlock(v: unknown): v is ConverseBlock {
+  if (typeof v !== 'object' || v === null) return false;
+  const b = v as Record<string, unknown>;
+  if (typeof b.text === 'string') return true;
+  if (typeof b.toolUse === 'object' && b.toolUse !== null) return true;
+  if (typeof b.toolResult === 'object' && b.toolResult !== null) return true;
+  return false;
+}
+
 export function buildConverseRequest(
   messages: ChatMessage[],
   tools: ToolDefinition[],
@@ -134,6 +160,17 @@ export function buildConverseRequest(
     } else if (m.role === 'user') {
       if (text) push('user', { text });
     } else if (m.role === 'assistant') {
+      // #34 replay: when this stored assistant message carries THIS
+      // driver's native items (Converse content blocks, captured by
+      // parseConverseResponse), replay them verbatim instead of
+      // reconstructing blocks from flattened text/tool calls — the
+      // reconstruction loses provider-side structure. Foreign-shaped
+      // native items (another provider's) are ignored, never crossed.
+      const native = (m as ChatMessage & { nativeItems?: unknown[] }).nativeItems;
+      if (Array.isArray(native) && native.length > 0 && native.every(isConverseBlock)) {
+        for (const block of native) push('assistant', block);
+        continue;
+      }
       if (text) push('assistant', { text });
       for (const call of getMessageToolCalls(m) ?? []) {
         push('assistant', {
@@ -165,15 +202,6 @@ export function buildConverseRequest(
   if (converse.length > 0 && converse[0]!.role === 'assistant') {
     converse.unshift({ role: 'user', content: [{ text: '(continued)' }] });
   }
-  if (opts.responseFormat) {
-    // Converse has no response_format: enforce via a system contract
-    // (the runtime additionally validates + retries, like Anthropic).
-    const contract =
-      opts.responseFormat.type === 'json_schema'
-        ? `Respond with a single JSON object conforming to this JSON Schema: ${JSON.stringify(opts.responseFormat.schema)}. Output ONLY the JSON object — no prose, no code fences.`
-        : 'Respond with a single valid JSON object. Output ONLY the JSON object — no prose, no code fences.';
-    system.push({ text: contract });
-  }
   const request: Record<string, unknown> = { messages: converse };
   if (system.length > 0) request.system = system;
   const inference: Record<string, number> = {};
@@ -181,25 +209,52 @@ export function buildConverseRequest(
   if (opts.topP !== undefined) inference.topP = opts.topP;
   if (opts.maxTokens !== undefined) inference.maxTokens = opts.maxTokens;
   if (Object.keys(inference).length > 0) request.inferenceConfig = inference;
-  if (tools.length > 0) {
-    request.toolConfig = {
-      tools: tools.map((t) => ({
-        toolSpec: {
-          name: t.name,
-          description: t.description,
-          inputSchema: { json: t.parameters },
+  const toolSpecs: Array<Record<string, unknown>> = tools.map((t) => ({
+    toolSpec: {
+      name: t.name,
+      description: t.description,
+      inputSchema: { json: t.parameters },
+    },
+  }));
+  if (opts.responseFormat) {
+    // Native structured output via a forced tool call (see
+    // BEDROCK_STRUCTURED_OUTPUT_TOOL_NAME above) — no prompt-append
+    // contract on this driver anymore.
+    toolSpecs.push({
+      toolSpec: {
+        name: BEDROCK_STRUCTURED_OUTPUT_TOOL_NAME,
+        description:
+          'Return the final answer as structured data conforming to the input schema. ' +
+          'Call this tool exactly once with the complete answer as its input.',
+        inputSchema: {
+          json:
+            opts.responseFormat.type === 'json_schema'
+              ? opts.responseFormat.schema
+              : { type: 'object', additionalProperties: true },
         },
-      })),
-      toolChoice: { auto: {} },
+      },
+    });
+  }
+  if (toolSpecs.length > 0) {
+    request.toolConfig = {
+      tools: toolSpecs,
+      toolChoice: opts.responseFormat
+        ? { tool: { name: BEDROCK_STRUCTURED_OUTPUT_TOOL_NAME } }
+        : { auto: {} },
     };
   }
   return request;
 }
 
-export function parseConverseResponse(data: Record<string, unknown>): {
+export function parseConverseResponse(
+  data: Record<string, unknown>,
+  opts: { structured?: boolean } = {},
+): {
   content: string;
   toolCalls: ToolCall[];
   usage: { promptTokens: number; completionTokens: number; totalTokens: number };
+  /** #34 capture: the raw Converse content blocks, verbatim. */
+  nativeItems: unknown[];
 } {
   const output = data.output as { message?: { content?: ConverseBlock[] } } | undefined;
   const blocks = output?.message?.content ?? [];
@@ -208,17 +263,26 @@ export function parseConverseResponse(data: Record<string, unknown>): {
   for (const block of blocks) {
     if ('text' in block && typeof block.text === 'string') content += block.text;
     if ('toolUse' in block) {
-      toolCalls.push({
-        id: block.toolUse.toolUseId,
-        name: block.toolUse.name,
-        args: block.toolUse.input ?? {},
-      });
+      if (opts.structured && block.toolUse.name === BEDROCK_STRUCTURED_OUTPUT_TOOL_NAME) {
+        // Native structured output: the forced tool's input IS the reply.
+        content += JSON.stringify(block.toolUse.input ?? {});
+      } else {
+        toolCalls.push({
+          id: block.toolUse.toolUseId,
+          name: block.toolUse.name,
+          args: block.toolUse.input ?? {},
+        });
+      }
     }
   }
   const usage = (data.usage ?? {}) as { inputTokens?: number; outputTokens?: number; totalTokens?: number };
   return {
     content,
     toolCalls,
+    // #34 capture: raw Converse blocks ride back verbatim so the
+    // runtime can persist them as the assistant message's nativeItems
+    // and buildConverseRequest can replay them on resume.
+    nativeItems: blocks as unknown[],
     usage: {
       promptTokens: usage.inputTokens ?? 0,
       completionTokens: usage.outputTokens ?? 0,
@@ -227,12 +291,27 @@ export function parseConverseResponse(data: Record<string, unknown>): {
   };
 }
 
+const BEDROCK_MAX_RETRIES_DEFAULT = 3;
+const BEDROCK_BASE_BACKOFF_MS = 500;
+
+function bedrockSleepDefault(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isBedrockRetryable(status: number, bodyText: string): boolean {
+  // Throttling (429 / ThrottlingException) and 5xx are retryable;
+  // Bedrock occasionally reports throttling as a 400 validation-style
+  // error whose body names ThrottlingException — honor that too.
+  return status === 429 || status >= 500 || /ThrottlingException/i.test(bodyText);
+}
+
 export class BedrockProvider implements LLMProvider {
   readonly providerId = 'bedrock';
   private readonly region: string;
   private readonly credentials?: AwsCredentials;
   private readonly fetchFn: typeof fetch;
   private readonly now: () => Date;
+  private readonly sleepFn: (ms: number) => Promise<void>;
 
   constructor(opts: BedrockOptions = {}) {
     this.region =
@@ -249,24 +328,27 @@ export class BedrockProvider implements LLMProvider {
         : undefined;
     this.fetchFn = opts.fetchFn ?? fetch;
     this.now = opts.now ?? (() => new Date());
+    this.sleepFn = opts.sleepFn ?? bedrockSleepDefault;
   }
 
+  /**
+   * Chat via Converse with per-profile retry/timeout controls (parity
+   * #11): `opts.maxRetries` (default 3) retries throttling/5xx and
+   * network errors with exponential backoff; `opts.timeoutMs` bounds
+   * the whole call via an AbortSignal combined with the caller's
+   * signal. Each attempt is re-signed (SigV4 timestamps go stale).
+   * Aborts are never retried.
+   */
   async chat(
     messages: ChatMessage[],
     tools: ToolDefinition[],
-    opts: {
-      model: string;
-      signal?: AbortSignal;
-      onToken?: (t: string) => void;
-      temperature?: number;
-      topP?: number;
-      maxTokens?: number;
-      responseFormat?: StructuredOutputSpec;
-    },
+    opts: Parameters<LLMProvider['chat']>[2],
   ): Promise<{
     content: string;
     toolCalls: ToolCall[];
     usage: { promptTokens: number; completionTokens: number; totalTokens: number };
+    /** #34: raw Converse blocks captured for session persistence/replay. */
+    nativeItems: unknown[];
   }> {
     if (!this.credentials) {
       throw new Error(
@@ -282,27 +364,58 @@ export class BedrockProvider implements LLMProvider {
       }),
     );
     const modelPath = `/model/${encodeURIComponent(opts.model)}/converse`;
-    const signed = signBedrockRequest({
-      region: this.region,
-      credentials: this.credentials,
-      path: modelPath,
-      body,
-      now: this.now(),
-    });
-    const res = await this.fetchFn(signed.url, {
-      method: 'POST',
-      headers: signed.headers,
-      body: signed.body,
-      signal: opts.signal,
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`Bedrock Converse failed (${res.status}): ${text.slice(0, 300)}`);
+    let signal = opts.signal;
+    if (opts.timeoutMs && opts.timeoutMs > 0) {
+      const timeoutSignal = AbortSignal.timeout(opts.timeoutMs);
+      signal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
     }
-    const data = (await res.json()) as Record<string, unknown>;
-    const parsed = parseConverseResponse(data);
-    if (parsed.content && opts.onToken) opts.onToken(parsed.content);
-    return parsed;
+    const maxRetries = Math.max(0, Math.floor(opts.maxRetries ?? BEDROCK_MAX_RETRIES_DEFAULT));
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const signed = signBedrockRequest({
+        region: this.region,
+        credentials: this.credentials,
+        path: modelPath,
+        body,
+        now: this.now(),
+      });
+      let res: Response;
+      try {
+        res = await this.fetchFn(signed.url, {
+          method: 'POST',
+          headers: signed.headers,
+          body: signed.body,
+          signal,
+        });
+      } catch (err) {
+        if (signal?.aborted || (err instanceof Error && err.name === 'AbortError')) throw err;
+        if (attempt >= maxRetries) throw err;
+        const lastError = err instanceof Error ? err : new Error(String(err));
+        try {
+          opts.onRetry?.(attempt + 1, lastError);
+        } catch {
+          // Retry notification must never break the retry loop.
+        }
+        await this.sleepFn(BEDROCK_BASE_BACKOFF_MS * 2 ** attempt);
+        continue;
+      }
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        const err = new Error(`Bedrock Converse failed (${res.status}): ${text.slice(0, 300)}`);
+        if (!isBedrockRetryable(res.status, text) || attempt >= maxRetries) throw err;
+        try {
+          opts.onRetry?.(attempt + 1, err);
+        } catch {
+          // Retry notification must never break the retry loop.
+        }
+        await this.sleepFn(BEDROCK_BASE_BACKOFF_MS * 2 ** attempt);
+        continue;
+      }
+      const data = (await res.json()) as Record<string, unknown>;
+      const parsed = parseConverseResponse(data, { structured: Boolean(opts.responseFormat) });
+      if (parsed.content && opts.onToken) opts.onToken(parsed.content);
+      return parsed;
+    }
+    throw new Error('Bedrock Converse failed after retries');
   }
 
   async listModels(): Promise<ModelInfo[]> {

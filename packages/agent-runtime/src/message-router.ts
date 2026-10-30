@@ -255,3 +255,71 @@ export function routeMessageWithWeights(
 export function routeMessage(text: string, bots: RoutableBot[]): MessageRoute {
   return routeMessageWithWeights(text, bots, DEFAULT_ROUTER_WEIGHTS);
 }
+
+// ---------------------------------------------------------------------------
+// Model-assisted routing (closure #141/#28): the 'routing' purpose
+// profile finally has a consumer. Deterministic routing stays the
+// default and the fallback; only AMBIGUOUS deterministic decisions
+// (confidence below threshold) ask the evaluate seam, and the model's
+// choice is accepted only at/above the probability threshold —
+// otherwise the router abstains back to the deterministic result.
+// ---------------------------------------------------------------------------
+
+import type { LLMProvider } from './types.js';
+import { evaluateQuestion } from './evaluate.js';
+import type { ModelProfiles, PurposeModelProfile } from './model-profiles.js';
+
+export interface ModelAssistedRoute extends MessageRoute {
+  /** 'deterministic' | 'evaluate' (model seam decided) | 'abstained' (model unsure → deterministic kept) */
+  via: 'deterministic' | 'evaluate' | 'abstained';
+}
+
+export async function routeMessageWithModel(
+  text: string,
+  bots: RoutableBot[],
+  provider: LLMProvider,
+  opts: {
+    profiles?: ModelProfiles;
+    profile?: PurposeModelProfile;
+    weights?: RouterWeights;
+    /** Deterministic confidence below which the model seam is consulted. Default 0.6. */
+    ambiguityThreshold?: number;
+    /** Evaluate probability at/above which the model choice wins. Default 0.6. */
+    acceptThreshold?: number;
+    signal?: AbortSignal;
+  } = {},
+): Promise<ModelAssistedRoute> {
+  const det = routeMessageWithWeights(text, bots, opts.weights ?? DEFAULT_ROUTER_WEIGHTS);
+  if (bots.length === 0) return { ...det, via: 'deterministic' };
+  if (det.confidence >= (opts.ambiguityThreshold ?? 0.6)) return { ...det, via: 'deterministic' };
+  // Ambiguous: ask the evaluate seam, resolved via the ROUTING purpose
+  // profile (#141). Candidate set = the deterministic top scorers.
+  const scored = scoreBotsForRouting(text, bots, opts.weights ?? DEFAULT_ROUTER_WEIGHTS)
+    .filter((b) => b.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 4);
+  const candidates = scored.length >= 2 ? scored.map((b) => b.botId) : bots.slice(0, 4).map((b) => b.id);
+  if (candidates.length < 2) return { ...det, via: 'deterministic' };
+  const nameOf = (id: string): string => bots.find((b) => b.id === id)?.name ?? id;
+  const ans = await evaluateQuestion(
+    provider,
+    {
+      kind: 'choice',
+      question:
+        `Which bot should handle this message? Message: ${text.slice(0, 500)}\n` +
+        candidates.map((id) => `- ${id}: ${bots.find((b) => b.id === id)?.description ?? nameOf(id)}`).join('\n'),
+      choices: candidates,
+    },
+    { profiles: opts.profiles, profile: opts.profile, signal: opts.signal, purpose: 'routing' },
+  ).catch(() => null);
+  if (!ans || typeof ans.value !== 'string') return { ...det, via: 'abstained' };
+  if (ans.probability < (opts.acceptThreshold ?? 0.6)) {
+    return { ...det, via: 'abstained' };
+  }
+  return {
+    botId: ans.value,
+    confidence: ans.probability,
+    reason: `routing model chose "${nameOf(ans.value)}" (p=${ans.probability.toFixed(2)}): ${ans.reason ?? 'ambiguous deterministic route'}`,
+    via: 'evaluate',
+  };
+}

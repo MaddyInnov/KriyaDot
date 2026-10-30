@@ -1,6 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
+/**
+ * Provider catalog + credential resolution.
+ *
+ * Credential precedence for resolveApiKey() (Octomind parity #12), highest
+ * first — a value found at an earlier step is NEVER overridden by a later
+ * one, and `.env` values in particular never override real environment
+ * variables:
+ *
+ *   1. the real process environment (`process.env[<ENV_KEY>]`)
+ *   2. the config `.env` file — `.env` sitting next to providers.local.json
+ *      (override the path with KRIYADOT_CONFIG_ENV_FILE)
+ *   3. the project `.env` file — `.env` in the workspace / working
+ *      directory (override the path with KRIYADOT_PROJECT_ENV_FILE)
+ *   4. `providers.local.json` (0600, written by the Providers settings
+ *      page) — the legacy file-storage fallback.
+ *
+ * The vault/file-storage stance is deliberate and unchanged: `.env`
+ * support is additive. Keys are never logged. Subscription bridge presets
+ * bypass this chain entirely — their tokens are consent-gated and read
+ * from the CLI's own credential file at request time (cli-bridge.ts).
+ *
+ * Keyless presets (catalog `keyless: true` — OVHcloud anonymous, LLM7
+ * anonymous, AI Horde) need no key at all; resolveApiKey may return
+ * undefined for them and createProvider must not treat that as an error.
+ */
 
 import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadBridgeToken } from './cli-bridge.js';
 
@@ -23,7 +49,27 @@ export interface ProviderPreset {
   id: string;
   name: string;
   /** Wire protocol driver to use. */
-  api: 'openai-compatible' | 'anthropic' | 'ollama' | 'llamacpp' | 'bedrock' | 'vertex';
+  api:
+    | 'openai-compatible'
+    | 'anthropic'
+    | 'ollama'
+    | 'llamacpp'
+    | 'bedrock'
+    | 'vertex'
+    | 'cohere'
+    | 'aihorde';
+  /**
+   * Keyless lane (free-LLM stack): the provider works with NO API key —
+   * no Authorization header / key is sent (e.g. OVHcloud AI Endpoints
+   * anonymous, LLM7 anonymous, AI Horde's official anonymous key).
+   * Keyless presets are never a paid default and are always labelled
+   * with `limitsNote` so the UI can be honest about shared limits.
+   */
+  keyless?: boolean;
+  /** Best-effort keyless lane: limits are undocumented/unverified (LLM7 anonymous). */
+  bestEffort?: boolean;
+  /** Human-honest limits copy for keyless / BYOK lanes, shown in the UI. */
+  limitsNote?: string;
   /** Base URL of the chat-completions (or messages) API. Empty for BYO presets until the user configures it. */
   baseUrl: string;
   /** Env var holding the user's API key. */
@@ -188,9 +234,72 @@ function readLocalOverrides(): Record<string, unknown> {
   }
 }
 
+// ---- .env chain (Octomind parity #12) --------------------------------------
+
 /**
- * Resolve the API key for a provider: env var first, then providers.local.json
- * (keyed by envKey, e.g. { "GROQ_API_KEY": "..." }). Bridge presets
+ * Minimal dependency-free `.env` parser. Supports `KEY=value`,
+ * `export KEY=value`, `# comments`, blank lines, and single/double
+ * quoted values (double quotes process `\n` / `\t` / `\"` / `\\`).
+ * Malformed lines are skipped, never thrown. Later duplicate keys win
+ * within one file (standard dotenv behaviour); ACROSS the chain, the
+ * earlier file wins because resolveApiKey consults them in order.
+ */
+export function parseDotEnv(content: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const body = line.startsWith('export ') ? line.slice('export '.length).trimStart() : line;
+    const eq = body.indexOf('=');
+    if (eq <= 0) continue;
+    const key = body.slice(0, eq).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    let value = body.slice(eq + 1).trim();
+    if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+      value = value
+        .slice(1, -1)
+        .replace(/\\n/g, '\n')
+        .replace(/\\t/g, '\t')
+        .replace(/\\"/g, '"')
+        .replace(/\\\\/g, '\\');
+    } else if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+      value = value.slice(1, -1);
+    } else {
+      // Unquoted: a trailing " # comment" is stripped.
+      const hash = value.indexOf(' #');
+      if (hash >= 0) value = value.slice(0, hash).trimEnd();
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+/** Config `.env`: next to providers.local.json (same config directory). */
+export function configEnvFilePath(): string {
+  if (process.env.KRIYADOT_CONFIG_ENV_FILE) return process.env.KRIYADOT_CONFIG_ENV_FILE;
+  return join(dirname(providersLocalFilePath()), '.env');
+}
+
+/** Project `.env`: the workspace `.env` (working directory by default). */
+export function projectEnvFilePath(): string {
+  if (process.env.KRIYADOT_PROJECT_ENV_FILE) return process.env.KRIYADOT_PROJECT_ENV_FILE;
+  return join(process.cwd(), '.env');
+}
+
+function readDotEnvFile(path: string): Record<string, string> {
+  try {
+    if (!existsSync(path)) return {};
+    return parseDotEnv(readFileSync(path, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Resolve the API key for a provider. Precedence (see module header):
+ * real env → config `.env` → project `.env` → providers.local.json
+ * (keyed by envKey, e.g. { "GROQ_API_KEY": "..." }). `.env` values NEVER
+ * override real environment variables. Bridge presets
  * (claude-subscription / codex-subscription / opencode-subscription) resolve consent-gated from the
  * user's own CLI login instead — never env, never disk. Never logs the key.
  */
@@ -205,6 +314,10 @@ export function resolveApiKey(providerId: string): string | undefined {
   }
   const fromEnv = process.env[preset.envKey];
   if (fromEnv && fromEnv.length > 0) return fromEnv;
+  const fromConfigEnv = readDotEnvFile(configEnvFilePath())[preset.envKey];
+  if (fromConfigEnv && fromConfigEnv.length > 0) return fromConfigEnv;
+  const fromProjectEnv = readDotEnvFile(projectEnvFilePath())[preset.envKey];
+  if (fromProjectEnv && fromProjectEnv.length > 0) return fromProjectEnv;
   const local = readLocalOverrides();
   const fromFile = local[preset.envKey];
   return typeof fromFile === 'string' && fromFile.length > 0 ? fromFile : undefined;
@@ -243,6 +356,12 @@ export function isFreeModel(providerId: string, modelId: string): boolean {
   const preset = resolvePreset(providerId);
   // Local providers (Ollama): on-machine inference, $0 per token — always free.
   if (preset?.local) return true;
+  // NOTE: keyless lanes (OVHcloud anonymous / LLM7 / AI Horde) are $0
+  // too, but they are deliberately NOT folded into isFreeModel: routing's
+  // free pool and the FREE_MODELS_ONLY guard keep their established
+  // semantics (catalog free:true + suffix rules). Keyless lanes carry
+  // their own `keyless: true` metadata + the keyless-stack descriptor
+  // (providers/keyless-stack.ts) for the first-run chain instead.
   if (preset?.models.some((m) => m.id === modelId && m.free === true)) return true;
   return modelId.endsWith(':free') || modelId.endsWith('-free');
 }

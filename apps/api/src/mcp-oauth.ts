@@ -299,6 +299,8 @@ export function registerMcpOAuthRoutes(router: express.Router, deps: McpOAuthRou
       serverId,
       serverUrl,
       store,
+      // #50: CIMD client id from the server config, when present.
+      cimdClientId: (mcpServers[serverId] as { cimdClientId?: string } | undefined)?.cimdClientId,
       resolveClient: (sid, metadata) => resolveMcpOAuthClient(config.dataDir, sid, metadata, redirectUri),
     });
 

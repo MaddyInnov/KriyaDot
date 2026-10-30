@@ -16,8 +16,10 @@ import { WorkflowsView } from './WorkflowsView.js';
 import { ActivityView } from './ActivityView.js';
 import { MemoryView } from './MemoryView.js';
 import { ModelsView } from './ModelsView.js';
+import { JobsView } from './JobsView.js';
+import { JobManager } from '../jobs.js';
 
-type View = 'chat' | 'bots' | 'workflows' | 'activity' | 'memory' | 'models';
+type View = 'chat' | 'bots' | 'workflows' | 'activity' | 'memory' | 'models' | 'jobs';
 
 interface Props {
   api: KriyaDotApi;
@@ -31,6 +33,7 @@ const VIEW_TITLES: Record<View, string> = {
   activity: 'Activity',
   memory: 'Memory',
   models: 'Models',
+  jobs: 'Jobs',
 };
 
 export function App({ api, config }: Props): React.ReactElement {
@@ -44,6 +47,8 @@ export function App({ api, config }: Props): React.ReactElement {
   const [connectionError, setConnectionError] = useState('');
   /** Per-bot transcripts, so switching views doesn't lose chat history. */
   const [transcripts, setTranscripts] = useState<Record<string, ChatMessage[]>>({});
+  /** Shared background-job registry (#187): ChatView registers turns, JobsView manages them. */
+  const [jobManager] = useState(() => new JobManager());
 
   useEffect(() => {
     let alive = true;
@@ -139,6 +144,9 @@ export function App({ api, config }: Props): React.ReactElement {
         case 'memory':
           if (bot) setView('memory');
           break;
+        case 'jobs':
+          setView('jobs');
+          break;
         case 'model-list':
           setView('models');
           break;
@@ -202,8 +210,10 @@ export function App({ api, config }: Props): React.ReactElement {
           setMessages={setBotMessages}
           onCommand={handleChatCommand}
           onTheme={applyTheme}
+          jobs={jobManager}
         />
       )}
+      {view === 'jobs' && <JobsView jobs={jobManager} palette={palette} />}
       {view === 'chat' && !bot && (
         <Box paddingX={1}><Text color={palette.dim}>No bot selected. Press Esc to open the bot picker.</Text></Box>
       )}

@@ -23,8 +23,10 @@
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { TurnValidatorSpec } from './types.js';
+import type { LLMProvider, TurnValidatorSpec } from './types.js';
 import { runProjectChecks, type VerifyExecFn } from './tools/verify.js';
+import { evaluateQuestion } from './evaluate.js';
+import type { ModelProfiles, PurposeModelProfile } from './model-profiles.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -228,6 +230,10 @@ export function parseValidatorSpecs(raw: unknown): TurnValidatorSpec[] {
         builtin: 'verify-changes',
         timeoutMs: typeof e.timeoutMs === 'number' ? e.timeoutMs : undefined,
       });
+    } else if (typeof e.criterion === 'string' && e.criterion.trim()) {
+      // #28: semantic criterion — judged via the evaluate seam at
+      // end-of-turn (runEvaluateValidator), not a shell command.
+      specs.push({ name, criterion: e.criterion });
     } else if (e.command !== undefined) {
       const before = specs.length;
       pushCommand(name, e.command);
@@ -237,4 +243,76 @@ export function parseValidatorSpecs(raw: unknown): TurnValidatorSpec[] {
     }
   }
   return specs;
+}
+
+// ---------------------------------------------------------------------------
+// Evaluate-backed semantic validator (closure #28): a validator whose
+// check is a natural-language criterion judged through the calibrated
+// evaluate seam, instead of a shell command. The runtime's command
+// validators stay deterministic; this is the opt-in semantic sibling —
+// wire it alongside runTurnValidators for criteria like "the reply
+// actually answers the question that was asked".
+// ---------------------------------------------------------------------------
+
+export interface EvaluateValidatorSpec {
+  name: string;
+  /** Natural-language criterion the final output must satisfy. */
+  criterion: string;
+  /**
+   * Probability at/above which the judge's verdict is acted on.
+   * Below it the judge is treated as unsure and the validator passes
+   * (abstention — a validator must never deadlock a turn on a coin
+   * flip). Default 0.6, matching the routing seam.
+   */
+  threshold?: number;
+}
+
+/**
+ * Judge `output` against `spec.criterion` via evaluateQuestion.
+ * Verdict rules (probability-thresholded):
+ *   - judge says YES with p >= threshold → passed
+ *   - judge says NO  with p >= threshold → FAILED (output carries the
+ *     judge's reason; validatorFailureMessage injects it as the
+ *     corrective instruction, same as a command validator)
+ *   - judge unsure (p < threshold) or unavailable → passed, with the
+ *     abstention noted in the output (fail-safe, gate philosophy).
+ * Never throws.
+ */
+export async function runEvaluateValidator(
+  provider: LLMProvider,
+  spec: EvaluateValidatorSpec,
+  input: { request: string; output: string },
+  opts: { profiles?: ModelProfiles; profile?: PurposeModelProfile; signal?: AbortSignal } = {},
+): Promise<ValidatorRunResult> {
+  const started = Date.now();
+  const threshold = spec.threshold ?? 0.6;
+  const ans = await evaluateQuestion(
+    provider,
+    {
+      kind: 'noul',
+      question:
+        `Does this agent output satisfy the criterion "${spec.criterion}"? ` +
+        `User request: ${input.request.slice(0, 600)} Output: ${input.output.slice(0, 1200)}`,
+    },
+    { profiles: opts.profiles, profile: opts.profile, signal: opts.signal },
+  );
+  const base = { name: spec.name, durationMs: Date.now() - started };
+  if (!ans) {
+    return { ...base, passed: true, output: 'evaluate judge unavailable — validator abstained (passed)' };
+  }
+  if (ans.probability < threshold) {
+    return {
+      ...base,
+      passed: true,
+      output: `evaluate judge unsure (p=${ans.probability.toFixed(2)} < ${threshold}) — validator abstained (passed)`,
+    };
+  }
+  if (ans.value === true) {
+    return { ...base, passed: true, output: `criterion satisfied (p=${ans.probability.toFixed(2)})${ans.reason ? `: ${ans.reason}` : ''}` };
+  }
+  return {
+    ...base,
+    passed: false,
+    output: `criterion NOT satisfied (p=${ans.probability.toFixed(2)}): ${ans.reason ?? 'the evaluate judge rejected the output'} — criterion: ${spec.criterion}`,
+  };
 }

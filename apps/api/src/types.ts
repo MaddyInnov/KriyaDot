@@ -94,6 +94,16 @@ export interface ProviderInfo {
    * ever required. The UI shows a "Local" badge instead of a key field.
    */
   local?: boolean;
+  /**
+   * Keyless lane (catalog `keyless: true` — OVHcloud anonymous, LLM7
+   * anonymous, AI Horde): works with no API key at all. The UI labels
+   * these honestly as shared/best-effort lanes using `limitsNote`.
+   */
+  keyless?: boolean;
+  /** Keyless but best-effort: limits undocumented/unverified (LLM7). */
+  bestEffort?: boolean;
+  /** Human-honest limits copy for keyless / BYOK lanes, shown in the UI. */
+  limitsNote?: string;
 }
 
 export interface RunWorkflowBody {

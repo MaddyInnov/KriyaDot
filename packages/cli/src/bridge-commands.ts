@@ -14,14 +14,10 @@
 //   kriyadot bridge chat <peerId> <botId> <msg…>  one turn on the peer
 //   kriyadot bridge unlink <peerId>               unlink a peer
 //
-// HOST WIRING (commands.ts) — parent applies:
-//   import { runBridgeCommand } from './bridge-commands.js';
-//   …in runCommand's switch:
-//   case 'bridge':
-//     return await runBridgeCommand(p, deps);
-//   …and in args.ts validateCommand, allow 'bridge' (it currently rejects
-//   unknown non-grouped commands). Alternatively collect handlers in a Map
-//   via registerBridgeCommands(registry) and dispatch from it.
+// HOST WIRING (#104, done): commands.ts dispatches `case 'bridge'` to
+// runBridgeCommand, args.ts validateCommand allows the subcommand set,
+// and help.ts + completion.ts cover the surface. registerBridgeCommands
+// remains for hosts that dispatch from a registry map instead.
 
 import { flagString } from './args.js';
 import type { ParsedArgs } from './args.js';

@@ -320,3 +320,81 @@ export function routeModel(input: RouteModelInput): RouteModelResult {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Evaluate-assisted routing (closure #28): routeModel above is purely
+// deterministic. When a caller has several plausible candidate routes
+// and no deterministic reason to prefer one, this seam asks the
+// calibrated evaluateQuestion (choice kind, resolved through the
+// 'routing' purpose profile) and accepts its pick ONLY at/above the
+// probability threshold; below it — or when the judge is unavailable —
+// the deterministic routeModel result stands (abstention). This is
+// the routing.ts counterpart of message-router.ts's seam, for callers
+// that route MODELS rather than bots.
+// ---------------------------------------------------------------------------
+
+import type { LLMProvider } from './types.js';
+import { evaluateQuestion } from './evaluate.js';
+import type { ModelProfiles, PurposeModelProfile } from './model-profiles.js';
+
+export interface EvaluateRouteOutcome {
+  result: RouteModelResult;
+  /** 'deterministic' (no judge consulted/needed) | 'evaluate' (judge pick accepted) | 'abstained' (judge unsure → deterministic kept). */
+  via: 'deterministic' | 'evaluate' | 'abstained';
+  /** The judge's calibrated probability, when it answered. */
+  probability?: number;
+}
+
+export async function routeModelWithEvaluate(
+  provider: LLMProvider,
+  input: RouteModelInput,
+  opts: {
+    /** Candidate routes the judge may choose between (deduped by provider/model). */
+    candidates: RouteModelResult[];
+    /** Probability at/above which the judge's pick wins. Default 0.6. */
+    acceptThreshold?: number;
+    profiles?: ModelProfiles;
+    profile?: PurposeModelProfile;
+    signal?: AbortSignal;
+  },
+): Promise<EvaluateRouteOutcome> {
+  const deterministic = routeModel(input);
+  const seen = new Set<string>();
+  const candidates = opts.candidates.filter((c) => {
+    const key = `${c.providerId}/${c.modelId}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  if (candidates.length < 2) return { result: deterministic, via: 'deterministic' };
+  // A candidate list that already contains only the deterministic pick
+  // needs no judge.
+  if (candidates.every((c) => c.providerId === deterministic.providerId && c.modelId === deterministic.modelId)) {
+    return { result: deterministic, via: 'deterministic' };
+  }
+  const labels = candidates.map((c) => `${c.providerId}/${c.modelId}`);
+  const ans = await evaluateQuestion(
+    provider,
+    {
+      kind: 'choice',
+      question:
+        `Which model is the best fit for a "${input.taskType}" task` +
+        (input.message ? ` described as: ${input.message.slice(0, 400)}` : '') +
+        `? Candidates: ${candidates.map((c, i) => `${labels[i]} (${c.reason})`).join('; ')}`,
+      choices: labels,
+    },
+    { profiles: opts.profiles, profile: opts.profile, signal: opts.signal, purpose: 'routing' },
+  );
+  if (!ans || typeof ans.value !== 'string') return { result: deterministic, via: 'deterministic' };
+  const threshold = opts.acceptThreshold ?? 0.6;
+  if (ans.probability < threshold) {
+    return { result: deterministic, via: 'abstained', probability: ans.probability };
+  }
+  const picked = candidates[labels.indexOf(ans.value)];
+  if (!picked) return { result: deterministic, via: 'abstained', probability: ans.probability };
+  return {
+    result: { ...picked, reason: `${picked.reason} [evaluate seam chose it with p=${ans.probability.toFixed(2)}${ans.reason ? `: ${ans.reason}` : ''}]` },
+    via: 'evaluate',
+    probability: ans.probability,
+  };
+}

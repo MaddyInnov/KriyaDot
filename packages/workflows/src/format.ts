@@ -48,6 +48,14 @@
  *
  * Round-trip guarantee: for any definition using the shapes above,
  * `parseWorkflowFile(serializeWorkflow(def))` deep-equals `def`.
+ *
+ * Extensions (#143/#145): agent/bot-turn node configs may carry
+ * per-step `role` / `provider` / `model` / `toolset` (alias `tools`) /
+ * `skills` (validated here, honored by the runner — see
+ * src/step-config.ts), and a workflow may carry `maxParallel` (the
+ * `max_parallel` spelling is accepted and normalized). A TOML
+ * serialization of the same format lives in src/toml-format.ts
+ * (`serializeWorkflowToml` / `parseWorkflowToml`).
  */
 
 import {
@@ -58,6 +66,7 @@ import {
   type WorkflowNode,
 } from './types.js';
 import { subordinateIdsOf, validateWorkflowStructure } from './plan.js';
+import { validateStepConfig } from './step-config.js';
 
 /** Value of the top-level `format` field of a KriyaDot workflow file. */
 export const WORKFLOW_FILE_FORMAT = 'kriyadot.workflow';
@@ -184,12 +193,36 @@ function parseDefinition(raw: unknown): WorkflowDefinition {
     }
     budget = { maxCostUsd };
   }
+  // Level-parallelism cap (#145): canonical `maxParallel`, with the
+  // `max_parallel` spelling accepted and normalized to it.
+  let maxParallel: number | undefined;
+  for (const key of ['maxParallel', 'max_parallel'] as const) {
+    const raw = rec[key];
+    if (raw === undefined) continue;
+    if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 1) {
+      fail(`workflow ${id}: ${key} must be a positive integer`);
+    }
+    if (maxParallel !== undefined && maxParallel !== raw) {
+      fail(`workflow ${id}: maxParallel and max_parallel disagree (${maxParallel} vs ${raw})`);
+    }
+    maxParallel = raw;
+  }
+  // Per-step agent config (#143): reject malformed role/model/toolset/
+  // skills at parse time so a bad file fails before registration.
+  for (const node of nodes) {
+    try {
+      validateStepConfig(node);
+    } catch (err) {
+      fail(err instanceof Error ? err.message : String(err));
+    }
+  }
   // Built in the canonical field order (id, name, description, budget,
   // nodes, edges) so serialize(parse(serialize(def))) is byte-stable.
   // (nodes/edges are assigned immediately below, before any use.)
   const def = { id, name } as WorkflowDefinition;
   if (description !== undefined) def.description = description;
   if (budget !== undefined) def.budget = budget;
+  if (maxParallel !== undefined) def.maxParallel = maxParallel;
   def.nodes = nodes;
   def.edges = edges;
   // Structural checks: duplicate ids, dangling edges, branch labels,

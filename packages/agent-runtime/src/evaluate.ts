@@ -52,6 +52,59 @@ export interface EvaluateOptions {
   /** Host purpose-profile table. */
   profiles?: ModelProfiles;
   signal?: AbortSignal;
+  /**
+   * Purpose whose profile drives this call (Octomind closure #141):
+   * 'evaluate' by default; routing passes 'routing' so the routing
+   * purpose profile resolves the router's decision model.
+   */
+  purpose?: import('./model-profiles.js').ModelPurpose;
+}
+
+/**
+ * The full per-purpose knob set (#8/#11) as provider chat options:
+ * temperature / topP / maxTokens / reasoningEffort plus the profile's
+ * retry/timeout controls (#11). Only defined knobs are emitted, so a
+ * profile that sets nothing changes nothing. `defaults` fill knobs the
+ * profile leaves unset (e.g. the supervisor gate's temperature 0).
+ */
+export function purposeChatOptions(
+  profile: PurposeModelProfile | undefined,
+  defaults: {
+    temperature?: number;
+    topP?: number;
+    maxTokens?: number;
+    reasoningEffort?: 'low' | 'medium' | 'high';
+  } = {},
+): {
+  temperature?: number;
+  topP?: number;
+  maxTokens?: number;
+  reasoningEffort?: 'low' | 'medium' | 'high';
+  maxRetries?: number;
+  timeoutMs?: number;
+} {
+  const out: ReturnType<typeof purposeChatOptions> = {};
+  const temperature = profile?.temperature ?? defaults.temperature;
+  if (temperature !== undefined) out.temperature = temperature;
+  const topP = profile?.topP ?? defaults.topP;
+  if (topP !== undefined) out.topP = topP;
+  const maxTokens = profile?.maxTokens ?? defaults.maxTokens;
+  if (maxTokens !== undefined) out.maxTokens = maxTokens;
+  const reasoningEffort = profile?.reasoningEffort ?? defaults.reasoningEffort;
+  if (reasoningEffort !== undefined) out.reasoningEffort = reasoningEffort;
+  if (profile?.maxRetries !== undefined) out.maxRetries = profile.maxRetries;
+  if (profile?.timeoutMs !== undefined) out.timeoutMs = profile.timeoutMs;
+  return out;
+}
+
+/** Resolve the FULL profile behind an evaluate-style call (exported for aux drivers). */
+export function resolveEvaluateProfile(opts: EvaluateOptions = {}): PurposeModelProfile | undefined {
+  if (opts.profile) return opts.profile;
+  const purpose = opts.purpose ?? 'evaluate';
+  return (
+    resolvePurposeProfile(purpose, { profiles: opts.profiles }) ??
+    (purpose !== 'supervisor' ? resolvePurposeProfile('supervisor', { profiles: opts.profiles }) : undefined)
+  );
 }
 
 /**
@@ -63,10 +116,7 @@ export function resolveEvaluateModel(
   provider: LLMProvider,
   opts: EvaluateOptions = {},
 ): string | undefined {
-  const profile =
-    opts.profile ??
-    resolvePurposeProfile('evaluate', { profiles: opts.profiles }) ??
-    resolvePurposeProfile('supervisor', { profiles: opts.profiles });
+  const profile = resolveEvaluateProfile(opts);
   const fromProfile = profileModelForProvider(profile, provider.providerId);
   if (fromProfile) return fromProfile;
   if (profile?.modelId && !profile.providerId) return profile.modelId;
@@ -143,7 +193,9 @@ export async function evaluateQuestion(
     const res = await provider.chat([{ role: 'user', content: buildPrompt(question) }], [], {
       model,
       signal: opts.signal,
-      temperature: 0,
+      // #8/#11: forward the full evaluate-profile knob set (temperature
+      // defaults to 0 only when the profile does not set one).
+      ...purposeChatOptions(resolveEvaluateProfile(opts), { temperature: 0 }),
     });
     text = res.content ?? '';
   } catch {

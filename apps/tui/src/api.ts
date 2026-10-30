@@ -92,6 +92,7 @@ export type ChatEvent =
   | { type: 'error'; message: string }
   | { type: 'interrupted'; reason: string }
   | { type: 'notice'; kind: string; message: string }
+  | { type: 'thinking'; content: string }
   | { type: 'queued_turn_start'; queueId: string; message: string }
   | { type: 'unknown'; raw: unknown };
 
@@ -146,6 +147,15 @@ export function parseChatEvent(data: string): ChatEvent {
         type: 'notice',
         kind: typeof ev.kind === 'string' ? ev.kind : 'info',
         message: typeof ev.message === 'string' ? ev.message : '',
+      };
+    case 'thinking':
+    case 'reasoning':
+      // Reasoning/thinking stream (#186): some providers emit these as
+      // separate deltas; content may arrive as `content` or `delta`.
+      return {
+        type: 'thinking',
+        content:
+          typeof ev.content === 'string' ? ev.content : typeof ev.delta === 'string' ? ev.delta : '',
       };
     case 'queued_turn_start':
       return {

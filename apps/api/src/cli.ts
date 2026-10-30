@@ -20,11 +20,12 @@ import {
   AcpServer,
   AgentRuntime,
   SessionStore,
-  createEmbedderFromEnv,
   parseModelProfiles,
   resolveBotWorkspaceDir,
+  selectDefaultEmbedder,
+  validateReplyAgainstSpec,
 } from '@mvp/agent-runtime';
-import type { BotConfig, StreamEvent, StructuredOutputSpec, TokenUsage } from '@mvp/agent-runtime';
+import type { BotConfig, StreamEvent, StructuredOutputSpec, TokenUsage, ToolDefinition } from '@mvp/agent-runtime';
 import { DEFAULT_POLICY, GovernanceGateway } from '@mvp/governance';
 import { loadConfig } from './config.js';
 import { GovernanceAdapter } from './governance-adapter.js';
@@ -49,7 +50,7 @@ export const CHAT_USAGE = [
   '  --provider <id>   Override the provider (default: the bot\'s)',
   '  --model <id>      Override the model (default: the bot\'s)',
   '  --json            Print a single JSON object: { content, usage, sessionId }',
-  '  --schema <json>   Enforce structured output: a JSON Schema object (or {"type":"json_object"})',
+  '  --schema <json>   Enforce structured output: a JSON Schema object (or {"type":"json_object"}); a reply that still violates it exits with code 2',
   '  --pretty          Human output: content + usage line (default)',
   '  --help            Show this help',
   '',
@@ -389,6 +390,9 @@ async function defaultBuildRuntime(): Promise<ChatCliRuntime> {
   });
   const governanceAdapter = new GovernanceAdapter(governance);
 
+  // Neural-by-default embedder selection (#13): local endpoint when
+  // reachable, bundled ONNX when configured, trigram offline fallback.
+  const embedderSelection = await selectDefaultEmbedder();
   const {
     registry,
     close: closeMcp,
@@ -398,6 +402,7 @@ async function defaultBuildRuntime(): Promise<ChatCliRuntime> {
     skillsDir: path.join(seedDir, 'skills'),
     mcpServers: seed.mcpServers,
     approvalBroker: governance,
+    embedder: embedderSelection.embedder,
   });
 
 
@@ -418,7 +423,7 @@ async function defaultBuildRuntime(): Promise<ChatCliRuntime> {
     toolRegistry: registry,
     sessionStoreOptions: { summarizer: createSummarizer(undefined, modelProfiles), adaptiveCompaction: true, backgroundCompaction: true },
     modelProfiles,
-    embedder: createEmbedderFromEnv(),
+    embedder: embedderSelection.embedder,
     workspaceDirForBot: (bot) =>
       resolveBotWorkspaceDir({
         botWorkspace: bot.workspace,
@@ -437,6 +442,7 @@ async function defaultBuildRuntime(): Promise<ChatCliRuntime> {
     getBotConfig: (id) => botsById.get(id),
     workspaceDir: config.workspaceDir,
     audit: (action, fields) => governance.audit(action, fields),
+    modelProfiles,
   });
 
   return {
@@ -544,6 +550,21 @@ export async function runChatCli(argv: string[], deps: ChatCliDeps = {}): Promis
           }
         },
       });
+      // Structured-output verification (#108): with --schema, the
+      // runtime enforced the spec at the provider (native structured
+      // output where supported) and ran its own JSON-validity retry;
+      // the CLI still verifies the FINAL reply so scripts get a
+      // machine-checkable signal: violations → stderr + exit code 2.
+      if (args.responseFormat) {
+        const problems = validateReplyAgainstSpec(content, args.responseFormat);
+        printResult(args, content, usage, sessionId);
+        if (problems.length > 0) {
+          console.error(`[chat] reply violates --schema (${problems.length} problem${problems.length === 1 ? '' : 's'}):`);
+          for (const p of problems) console.error(`  - ${p}`);
+          return 2;
+        }
+        return 0;
+      }
       printResult(args, content, usage, sessionId);
       return 0;
     } finally {
@@ -606,6 +627,10 @@ export interface AcpCliRuntime {
   runtime: AgentRuntime;
   bridge: { server?: AcpServer };
   createSessionId: () => string;
+  /** Host MCP injection (#99): the registry the runtime resolves from. */
+  toolRegistry?: Map<string, ToolDefinition>;
+  /** Persisted-session existence check for session/load (#98/#99). */
+  sessionExists?: (sessionId: string) => boolean;
   close: () => Promise<void>;
 }
 
@@ -635,12 +660,15 @@ async function defaultBuildAcpRuntime(bot: BotConfig): Promise<AcpCliRuntime> {
   const bridge: { server?: AcpServer } = {};
   const governanceGateway = new AcpGovernanceGateway(bridge);
 
+  // Neural-by-default embedder selection (#13), as in the chat builder.
+  const embedderSelection = await selectDefaultEmbedder();
   const { registry, close: closeMcp } = await buildToolRegistry({
     workspaceDir: config.workspaceDir,
     dataDir: config.dataDir,
     skillsDir: path.join(seedDir, 'skills'),
     mcpServers: seed.mcpServers,
     approvalBroker: governance,
+    embedder: embedderSelection.embedder,
   });
 
 
@@ -661,7 +689,7 @@ async function defaultBuildAcpRuntime(bot: BotConfig): Promise<AcpCliRuntime> {
     toolRegistry: registry,
     sessionStoreOptions: { summarizer: createSummarizer(undefined, modelProfiles), adaptiveCompaction: true, backgroundCompaction: true },
     modelProfiles,
-    embedder: createEmbedderFromEnv(),
+    embedder: embedderSelection.embedder,
     workspaceDirForBot: (b) =>
       resolveBotWorkspaceDir({
         botWorkspace: b.workspace,
@@ -674,6 +702,11 @@ async function defaultBuildAcpRuntime(bot: BotConfig): Promise<AcpCliRuntime> {
     runtime,
     bridge,
     createSessionId: () => sessions.createSession(bot.id),
+    // #99: session/new mcpServers connect into this same registry, and
+    // session/load resolves persisted sessions through the runtime's
+    // own store.
+    toolRegistry: registry,
+    sessionExists: (sessionId) => runtime.sessionStore.getSession(sessionId) !== undefined,
     close: async () => {
       await closeMcp();
       try {
@@ -726,6 +759,8 @@ export async function runAcpCli(argv: string[], deps: AcpCliDeps = {}): Promise<
     input,
     output,
     createSessionId: built.createSessionId,
+    ...(built.toolRegistry ? { toolRegistry: built.toolRegistry } : {}),
+    ...(built.sessionExists ? { sessionExists: built.sessionExists } : {}),
     log: (m) => console.error(m),
   });
   built.bridge.server = server;

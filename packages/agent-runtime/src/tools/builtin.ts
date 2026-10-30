@@ -1,22 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { execFile } from 'node:child_process';
 import { lookup as dnsLookup, type LookupAddress } from 'node:dns';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve, sep } from 'node:path';
-import { promisify } from 'node:util';
 import type { ToolContext, ToolDefinition } from '../types.js';
 import type { ButtonsWidgetPayload, WidgetAnswer, WidgetHost } from '../widgets.js';
 import { validateWidgetPayload } from '../widgets.js';
 import { executeInPersistentSandbox, executeSandboxedCommand, sandboxBackend } from './sandbox.js';
+import { formatHashedLines } from './line-hash.js';
+import { semanticMisuseHint } from '../tool-hints.js';
 import { resolveWorkspaceDir, type WorkspaceSource } from '../workspaces.js';
 // Shared catastrophic-shell detection (M1): the governance hard floor's
 // rm flag-cluster expansion, reused here so the tool-level denylist and the
 // CLI kill-switch catch `rm -rfv /etc`, `rm -rf --one-file-system /`, etc.
 import { catastrophicRmTarget } from '@mvp/governance';
 import { confineRealpath } from '../confine.js';
-
-const execFileAsync = promisify(execFile);
 
 const MAX_OUTPUT_BYTES = 8 * 1024; // 8KB truncation for command output
 const MAX_FETCH_BYTES = 200 * 1024; // 200KB cap for web_fetch
@@ -71,16 +69,26 @@ function confine(workspaceDir: string, p: string): string {
 function readFileTool(workspaceDir: WorkspaceSource): ToolDefinition {
   return {
     name: 'read_file',
-    description: 'Read a UTF-8 text file inside the workspace. Path is relative to the workspace root.',
+    description:
+      'Read a UTF-8 text file inside the workspace. Path is relative to the workspace root. ' +
+      'Set withHashes=true to get every line prefixed with a stable hash identifier ' +
+      '(`123#a3f9c2: content`) — quote those hashes in edit range mode for stale-safe edits.',
     parameters: {
       type: 'object',
-      properties: { path: { type: 'string', description: 'Workspace-relative file path' } },
+      properties: {
+        path: { type: 'string', description: 'Workspace-relative file path' },
+        withHashes: {
+          type: 'boolean',
+          description: 'Return lines as `lineNo#hash: content` with stable per-line content hashes (#184)',
+        },
+      },
       required: ['path'],
       additionalProperties: false,
     },
     handler: async (args, ctx) => {
       const file = confine(resolveWorkspaceDir(workspaceDir, ctx), String(args.path));
-      return readFileSync(file, 'utf8');
+      const content = readFileSync(file, 'utf8');
+      return args.withHashes === true ? formatHashedLines(content) : content;
     },
   };
 }
@@ -114,10 +122,11 @@ function runCommandTool(workspaceDir: WorkspaceSource): ToolDefinition {
     mutating: true,
     description:
       'Run a shell command (sh -c). Destructive patterns are refused. ' +
-      'Executes inside an E2B cloud sandbox when E2B_API_KEY is set, else a local Docker container ' +
-      '(isolated: no workspace files, no network by default); ' +
-      'falls back to host execution with the workspace as cwd only when no sandbox backend is available ' +
-      '(result carries sandboxed:false). ' +
+      'Execution is confined by default (#117): E2B cloud sandbox when E2B_API_KEY is set, else a local ' +
+      'Docker container, else the OS kernel sandbox (Landlock on Linux / Seatbelt on macOS) with the ' +
+      'workspace as the writable root. Unsandboxed host execution happens ONLY on an explicit opt-out ' +
+      '(SANDBOX_ALLOW_HOST=1 / SANDBOX_BACKEND=host) or as an availability fallback, and is flagged in ' +
+      'the result (sandboxed:false + warning). ' +
       'Stdout/stderr are truncated to 8KB.',
     parameters: {
       type: 'object',
@@ -137,6 +146,12 @@ function runCommandTool(workspaceDir: WorkspaceSource): ToolDefinition {
         typeof args.timeoutMs === 'number' && args.timeoutMs > 0
           ? Math.min(args.timeoutMs, 120_000)
           : DEFAULT_COMMAND_TIMEOUT_MS;
+      // Semantic misuse hint (#58): a shell command that clearly maps
+      // to a dedicated tool gets that guidance appended to its result.
+      const hint = semanticMisuseHint({ toolName: 'run_command', args: { command } });
+      const withHint = <T extends Record<string, unknown>>(r: T): T =>
+        hint ? { ...r, hint } : r;
+      const wsDir = resolveWorkspaceDir(workspaceDir, ctx);
       // Persistent Dot environment: run inside the Dot's own long-lived E2B
       // sandbox instead of a fresh ephemeral one. Falls back to ephemeral on
       // connect failure (the sandbox may have expired).
@@ -147,74 +162,38 @@ function runCommandTool(workspaceDir: WorkspaceSource): ToolDefinition {
             timeoutMs,
             maxOutputBytes: MAX_OUTPUT_BYTES * 4,
           });
-          return {
+          return withHint({
             exitCode: result.exitCode,
             timedOut: result.timedOut ?? false,
             stdout: truncate(result.stdout, MAX_OUTPUT_BYTES),
             stderr: truncate(result.stderr, MAX_OUTPUT_BYTES),
             sandboxed: true,
             backend: 'e2b-persistent',
-          };
+          });
         } catch (err) {
           // Persistent sandbox gone (expired/killed) — fall through to
           // ephemeral rather than failing the turn.
           console.warn(`[run_command] persistent sandbox ${persistentId} unreachable, using ephemeral: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
-      // Phase 3: prefer the sandboxed backend (E2B cloud, else Docker).
-      // Host execution remains only as a last resort so the tool keeps
-      // working on machines with neither; the result is flagged.
-      if (sandboxBackend() !== 'none') {
-        const result = await executeSandboxedCommand(command, {
-          timeoutMs,
-          maxOutputBytes: MAX_OUTPUT_BYTES * 4,
-        });
-        return {
-          exitCode: result.exitCode,
-          timedOut: result.timedOut ?? false,
-          stdout: truncate(result.stdout, MAX_OUTPUT_BYTES),
-          stderr: truncate(result.stderr, MAX_OUTPUT_BYTES),
-          sandboxed: true,
-          backend: sandboxBackend(),
-        };
-      }
-      try {
-        const { stdout, stderr } = await execFileAsync('sh', ['-c', command], {
-          cwd: resolveWorkspaceDir(workspaceDir, ctx),
-          timeout: timeoutMs,
-          maxBuffer: MAX_OUTPUT_BYTES * 4,
-          windowsHide: true,
-        });
-        return {
-          exitCode: 0,
-          stdout: truncate(stdout, MAX_OUTPUT_BYTES),
-          stderr: truncate(stderr, MAX_OUTPUT_BYTES),
-          sandboxed: false,
-        };
-      } catch (err) {
-        const e = err as {
-          stdout?: string;
-          stderr?: string;
-          code?: number | string;
-          killed?: boolean;
-          message: string;
-        };
-        if (e.killed) {
-          return {
-            exitCode: 124,
-            timedOut: true,
-            stdout: truncate(e.stdout ?? '', MAX_OUTPUT_BYTES),
-            stderr: truncate(e.stderr ?? '', MAX_OUTPUT_BYTES),
-            sandboxed: false,
-          };
-        }
-        return {
-          exitCode: typeof e.code === 'number' ? e.code : 1,
-          stdout: truncate(e.stdout ?? '', MAX_OUTPUT_BYTES),
-          stderr: truncate(e.stderr ?? e.message ?? '', MAX_OUTPUT_BYTES),
-          sandboxed: false,
-        };
-      }
+      // #117: confinement by default — container → kernel (workspace is
+      // the kernel writable root) → host only via the explicit opt-out
+      // or the availability fallback inside executeSandboxedCommand,
+      // which stamps sandboxed:false + warning on host results.
+      const result = await executeSandboxedCommand(command, {
+        timeoutMs,
+        maxOutputBytes: MAX_OUTPUT_BYTES * 4,
+        workspaceDir: wsDir,
+      });
+      return withHint({
+        exitCode: result.exitCode,
+        timedOut: result.timedOut ?? false,
+        stdout: truncate(result.stdout, MAX_OUTPUT_BYTES),
+        stderr: truncate(result.stderr, MAX_OUTPUT_BYTES),
+        sandboxed: result.sandboxed ?? result.backend !== 'host',
+        backend: result.backend ?? sandboxBackend(),
+        ...(result.warning ? { warning: result.warning } : {}),
+      });
     },
   };
 }

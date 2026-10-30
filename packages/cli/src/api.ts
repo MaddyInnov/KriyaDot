@@ -86,6 +86,7 @@ export type ChatEvent =
   | { type: 'error'; message: string }
   | { type: 'interrupted'; reason: string }
   | { type: 'notice'; kind: string; message: string }
+  | { type: 'elicitation'; id: string; message: string; requestedSchema: Record<string, unknown> }
   | { type: 'unknown'; raw: unknown };
 
 export class ApiError extends Error {
@@ -137,6 +138,16 @@ export function parseChatEvent(data: string): ChatEvent {
         kind: typeof ev.kind === 'string' ? ev.kind : 'info',
         message: typeof ev.message === 'string' ? ev.message : '',
       };
+    case 'elicitation':
+      return {
+        type: 'elicitation',
+        id: String(ev.id ?? ''),
+        message: typeof ev.message === 'string' ? ev.message : '',
+        requestedSchema:
+          typeof ev.requestedSchema === 'object' && ev.requestedSchema !== null
+            ? (ev.requestedSchema as Record<string, unknown>)
+            : {},
+      };
     default:
       return { type: 'unknown', raw };
   }
@@ -149,6 +160,15 @@ export interface ChatRequest {
   model?: string;
   providerId?: string;
   autoApprove?: boolean;
+  /** Structured-output spec (#108): mirrors the runtime's StructuredOutputSpec; the API chat route parses it as `responseFormat`. */
+  responseFormat?: {
+    type: 'json_object' | 'json_schema';
+    name?: string;
+    schema?: Record<string, unknown>;
+    strict?: boolean;
+  };
+  /** Dotted `-c` overrides (#110) forwarded for the runtime to apply per-run. */
+  configOverrides?: Record<string, unknown>;
 }
 
 export interface ChatCallbacks {
@@ -342,6 +362,8 @@ export class KriyaDotApi {
             ...(req.model ? { model: req.model } : {}),
             ...(req.providerId ? { providerId: req.providerId } : {}),
             ...(req.autoApprove ? { autoApprove: true } : {}),
+            ...(req.responseFormat ? { responseFormat: req.responseFormat } : {}),
+            ...(req.configOverrides ? { configOverrides: req.configOverrides } : {}),
           }),
           signal: controller.signal,
         });

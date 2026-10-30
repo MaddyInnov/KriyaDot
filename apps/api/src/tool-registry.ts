@@ -21,9 +21,10 @@ import {
   createSkillAuthoringTools,
   createSkillTools,
   createVerifyTools,
+  filterToolsByRequiredEnv,
   makeWorkspaceResolver,
 } from '@mvp/agent-runtime';
-import type { BotConfig, SchemaDriftApprovalBroker, ToolDefinition } from '@mvp/agent-runtime';
+import type { BotConfig, SchemaDriftApprovalBroker, SyncEmbedder, ToolDefinition } from '@mvp/agent-runtime';
 import type { McpServerConfig } from './seed.js';
 import {
   createMcpOAuthTokenStore,
@@ -77,6 +78,13 @@ export async function buildToolRegistry(opts: {
    * per tool-call; bots without a workspace use `workspaceDir`.
    */
   getBotConfig?: (botId: string) => BotConfig | undefined;
+  /**
+   * Embedder for the semantic code-search tool (#60). The host passes
+   * the platform embedder (selectDefaultEmbedder — neural when a local
+   * endpoint is reachable, trigram otherwise). Absent → the tool keeps
+   * its built-in trigram default.
+   */
+  embedder?: SyncEmbedder;
 }): Promise<BuiltRegistry> {
   const registry = new Map<string, ToolDefinition>();
   // Per-bot workspace resolver: falls back to the global workspaceDir when
@@ -94,7 +102,7 @@ export async function buildToolRegistry(opts: {
   // Phase 2: coding tools (patch/edit/glob/grep/LSP), per-bot memory tools,
   // and read_skill (progressive skill disclosure). All are ordinary registry
   // tools, so deny-by-default governance applies to each of them.
-  for (const tool of createCodingTools({ workspaceDir: resolveWorkspace })) {
+  for (const tool of createCodingTools({ workspaceDir: resolveWorkspace, embedder: opts.embedder })) {
     registry.set(tool.name, tool);
   }
   // PR integration: git tools (status/diff auto-allowed; commit/branch/push
@@ -178,6 +186,9 @@ export async function buildToolRegistry(opts: {
             serverId: serverName,
             serverUrl: serverConfig.url,
             store: oauthStore,
+            // #50: CIMD client id (https metadata URL) when the server
+            // config carries one.
+            cimdClientId: serverConfig.cimdClientId,
             resolveClient: async (sid, metadata) => {
               const peeked = peekMcpOAuthClientInfo(opts.dataDir, sid);
               if (peeked) return peeked;
@@ -225,6 +236,19 @@ export async function buildToolRegistry(opts: {
       }
     }
   }
+  }
+
+  // Environment-gated tools (#123): a built-in whose declared
+  // requiredEnv is unmet in this process is removed from the registry
+  // (it could only fail at call time); every skip is logged with its
+  // reason — never silent. MCP tools join later via connectMcp() and
+  // are governed by their server configs instead.
+  {
+    const { skipped } = filterToolsByRequiredEnv([...registry.values()], process.env);
+    for (const s of skipped) {
+      registry.delete(s.name);
+      console.warn(`[tools] ${s.reason}`);
+    }
   }
 
   return {

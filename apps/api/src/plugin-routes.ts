@@ -44,6 +44,7 @@ import {
 } from '@mvp/plugins';
 import type { HookBus, HookEventName, ToolDefinition } from '@mvp/agent-runtime';
 import { registerMessageProvider } from './messaging.js';
+import * as hooksConfig from './hooks-config.js';
 
 interface ApiError {
   error: string;
@@ -314,6 +315,28 @@ export function registerPluginHooks(manager: PluginManager, bus: HookBus): Array
  * delivery is pull-based: the host polls provider.poll() (see the poll
  * model documented in @mvp/plugins runtime.ts).
  */
+/**
+ * Script-hook host wiring (#67): register `hooks: [{kind:'script', ...}]`
+ * entries from bot/workspace config onto the host HookBus. Call at bot
+ * setup for each configured bot; returns all unsubscribers + errors.
+ */
+export function registerScriptHooksFromConfigs(
+  bus: HookBus,
+  configs: Array<{ id?: string; hooks?: unknown }>,
+): { unsubs: Array<() => void>; errors: string[]; registered: number } {
+  const { installBotScriptHooks } = hooksConfig;
+  const unsubs: Array<() => void> = [];
+  const errors: string[] = [];
+  let registered = 0;
+  for (const cfg of configs) {
+    const r = installBotScriptHooks(bus, cfg);
+    unsubs.push(...r.unsubs);
+    errors.push(...r.errors);
+    registered += r.registered;
+  }
+  return { unsubs, errors, registered };
+}
+
 export function registerPluginChannels(manager: PluginManager): string[] {
   const ids: string[] = [];
   for (const provider of manager.channelProviders()) {

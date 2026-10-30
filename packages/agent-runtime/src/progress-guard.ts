@@ -192,3 +192,83 @@ export function classifyTurnError(err: unknown, opts?: { aborted?: boolean }): T
   if (/no progress/i.test(msg)) return 'no_progress';
   return 'model_error';
 }
+
+// ---------------------------------------------------------------------------
+// Per-tool error tracking (closure #188): repeated errors change behaviour.
+// ---------------------------------------------------------------------------
+
+/** Coarse error class for a tool result (stable across message wording). */
+export function classifyToolError(result: unknown): string | null {
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) return null;
+  const err = (result as { error?: unknown }).error;
+  if (typeof err !== 'string' || !err) return null;
+  if (/not found|enoent|no such/i.test(err)) return 'not-found';
+  if (/permission|denied|forbidden|eacces/i.test(err)) return 'permission';
+  if (/timed? ?out|deadline/i.test(err)) return 'timeout';
+  if (/invalid|required|argument|schema/i.test(err)) return 'invalid-args';
+  if (/rate|quota|429/i.test(err)) return 'rate-limit';
+  return 'error';
+}
+
+export interface ToolErrorDirective {
+  toolName: string;
+  errorClass: string;
+  failures: number;
+  /** Instruction the runtime injects for the model. */
+  instruction: string;
+  /** True when the tool should be dropped for the rest of the session. */
+  dropTool: boolean;
+}
+
+/**
+ * Tracks CONSECUTIVE failures per (tool, error class) per session. At
+ * `threshold` (default 3) failures the runtime injects a "try an
+ * alternative" instruction; with `dropAfterThreshold` (default true)
+ * the tool is also dropped for the rest of the session.
+ */
+export class ToolErrorTracker {
+  private readonly counts = new Map<string, number>();
+  private readonly dropped = new Set<string>();
+  constructor(
+    private readonly opts: { threshold?: number; dropAfterThreshold?: boolean } = {},
+  ) {}
+  get threshold(): number { return this.opts.threshold ?? 3; }
+  private key(tool: string, cls: string): string { return `${tool}::${cls}`; }
+
+  /** Observe one executed call. Returns a directive when the threshold is hit (once per tool+class). */
+  observe(toolName: string, result: unknown): ToolErrorDirective | null {
+    const cls = classifyToolError(result);
+    if (!cls) {
+      // Success resets this tool's consecutive counters.
+      for (const k of [...this.counts.keys()]) {
+        if (k.startsWith(`${toolName}::`)) this.counts.delete(k);
+      }
+      return null;
+    }
+    const k = this.key(toolName, cls);
+    const n = (this.counts.get(k) ?? 0) + 1;
+    this.counts.set(k, n);
+    if (n !== this.threshold) return null;
+    const dropTool = this.opts.dropAfterThreshold ?? true;
+    if (dropTool) this.dropped.add(toolName);
+    return {
+      toolName,
+      errorClass: cls,
+      failures: n,
+      dropTool,
+      instruction:
+        `[tool reliability] Tool "${toolName}" keeps failing with ${cls} errors (${n} times in a row). ` +
+        'Stop calling it the same way: diagnose the cause, fix the arguments, or use an alternative tool/approach.' +
+        (dropTool ? ` "${toolName}" has been disabled for the rest of this session.` : ''),
+    };
+  }
+
+  isDropped(toolName: string): boolean { return this.dropped.has(toolName); }
+  failureCount(toolName: string, errorClass?: string): number {
+    if (errorClass) return this.counts.get(this.key(toolName, errorClass)) ?? 0;
+    let total = 0;
+    for (const [k, v] of this.counts) if (k.startsWith(`${toolName}::`)) total += v;
+    return total;
+  }
+  reset(): void { this.counts.clear(); this.dropped.clear(); }
+}

@@ -8,11 +8,13 @@ import {
   isLoopbackUrl,
   saveConfigFile,
   configPath,
+  configDir,
   tokenSource,
   getNamedSession,
   loadNamedSessions,
   saveNamedSession,
   deleteNamedSession,
+  mostRecentNamedSession,
 } from './config.js';
 import type { CliConfig, NamedSession } from './config.js';
 import { ApiError, KriyaDotApi } from './api.js';
@@ -32,6 +34,32 @@ import {
   zshCompletionScript,
 } from './completion.js';
 import type { DynamicNames } from './completion.js';
+import { runTapCommand } from './tap-commands.js';
+import { runBridgeCommand } from './bridge-commands.js';
+import { runLearningCommand } from './learning-commands.js';
+import { runWorkflowCommand } from './workflow-commands.js';
+import {
+  enqueueInboxMessage,
+  getDaemon,
+  isDaemonAlive,
+  listDaemons,
+  runDaemonLoop,
+  unregisterDaemon,
+} from './daemon.js';
+import { buildRepairMessage, parseSchemaFlag, validateReplyAgainstSpec, SchemaFlagError } from './json-schema.js';
+import type { StructuredOutputSpec } from './json-schema.js';
+import { defaultConfigTemplate, validateConfigObject } from './config-files.js';
+import { createCliLogger, isLogLevel, LOG_LEVELS, resolveLogLevel } from './log.js';
+import type { CliLogger } from './log.js';
+
+/**
+ * The CLI's own diagnostic logger (#181): level from the config file's
+ * logLevel, overridden by KRIYADOT_LOG_LEVEL. Gates diagnostics (session
+ * notes, daemon logs) — never chat output on stdout.
+ */
+function cliLogger(deps: CommandDeps): CliLogger {
+  return createCliLogger((s) => deps.stderr.write(s), resolveLogLevel({ configLevel: deps.cfg.logLevel }));
+}
 
 export interface CommandDeps {
   cfg: CliConfig;
@@ -93,6 +121,10 @@ interface ChatRunOpts {
   providerId?: string;
   autoApprove: boolean;
   format: OutputFormat;
+  /** Structured output (#108): forwarded as responseFormat + validated locally with one repair retry. */
+  schema?: StructuredOutputSpec;
+  /** Dotted `-c` overrides (#110) forwarded per-run. */
+  configOverrides?: Record<string, unknown>;
 }
 
 /**
@@ -104,6 +136,18 @@ export function jsonlLine(ev: ChatEvent): string {
   return JSON.stringify(ev);
 }
 
+/** Parse the --schema flag (chat/run); a bad value is a usage error. */
+function resolveSchemaFlag(p: ParsedArgs): StructuredOutputSpec | undefined {
+  const raw = flagString(p.flags, 'schema');
+  if (!raw) return undefined;
+  try {
+    return parseSchemaFlag(raw);
+  } catch (e) {
+    if (e instanceof SchemaFlagError) throw new UsageError(e.message);
+    throw e;
+  }
+}
+
 /** One-shot turn shared by `chat`, `run`, `bots run` and `send`. */
 async function oneShotTurn(deps: CommandDeps, o: ChatRunOpts): Promise<number> {
   const json = o.format === 'json';
@@ -112,28 +156,58 @@ async function oneShotTurn(deps: CommandDeps, o: ChatRunOpts): Promise<number> {
     err(deps, `[headless] denied approval for "${toolName}" (re-run with --auto-approve to allow)\n`);
     return false;
   };
-  const result = await runStreamingTurn(
-    { api: deps.api, out: (s) => deps.stdout.write(s), err: (s) => deps.stderr.write(s) },
-    {
-      botId: o.bot.id,
-      message: o.message,
-      sessionId: o.sessionId,
-      ...(o.model ? { model: o.model } : {}),
-      ...(o.providerId ? { providerId: o.providerId } : {}),
-      autoApprove: o.autoApprove,
-      ...(jsonl
-        ? {
-            onEvent: (ev: ChatEvent) => {
-              out(deps, `${jsonlLine(ev)}\n`);
-            },
-          }
-        : {}),
-    },
+  const turnIo = { api: deps.api, out: (s: string) => deps.stdout.write(s), err: (s: string) => deps.stderr.write(s) };
+  const turnOpts = {
+    botId: o.bot.id,
+    sessionId: o.sessionId,
+    ...(o.model ? { model: o.model } : {}),
+    ...(o.providerId ? { providerId: o.providerId } : {}),
+    autoApprove: o.autoApprove,
+    ...(o.schema ? { responseFormat: o.schema } : {}),
+    ...(o.configOverrides ? { configOverrides: o.configOverrides } : {}),
+    ...(jsonl
+      ? {
+          onEvent: (ev: ChatEvent) => {
+            out(deps, `${jsonlLine(ev)}\n`);
+          },
+        }
+      : {}),
+  };
+  // With --schema the reply is validated before anything is printed, so
+  // tokens are buffered instead of streamed; the (possibly repaired)
+  // final content is what reaches stdout.
+  let result = await runStreamingTurn(
+    turnIo,
+    { ...turnOpts, message: o.message },
     askApproval,
     (t) => {
-      if (!json && !jsonl) deps.stdout.write(t);
+      if (!json && !jsonl && !o.schema) deps.stdout.write(t);
     },
   );
+  if (o.schema && !result.failed && !jsonl) {
+    let errors = validateReplyAgainstSpec(result.content, o.schema);
+    if (errors.length > 0) {
+      err(deps, `[schema] reply failed validation (${errors.length} problem(s)); asking for one repair\n`);
+      const repaired = await runStreamingTurn(
+        turnIo,
+        { ...turnOpts, message: buildRepairMessage(o.schema, errors) },
+        askApproval,
+        () => undefined,
+      );
+      if (!repaired.failed) {
+        result = repaired;
+        errors = validateReplyAgainstSpec(result.content, o.schema);
+      }
+    }
+    if (errors.length > 0) {
+      err(deps, `[schema] reply still invalid after one repair retry:\n${errors.map((e) => `  - ${e}`).join('\n')}\n`);
+      if (json) {
+        printJson(deps, { ok: false, bot: o.bot.id, sessionId: o.sessionId, error: 'schema validation failed', schemaErrors: errors, content: result.content });
+      }
+      return EXIT_ERROR;
+    }
+    if (!json) deps.stdout.write(result.content);
+  }
   if (jsonl) {
     // stdout is the pure event stream; diagnostics stay on stderr.
     if (result.failed) err(deps, `[error] ${result.error ?? 'turn failed'}\n`);
@@ -247,11 +321,36 @@ function resolveSessionFlags(
   return { sessionId: fallbackSessionId };
 }
 
+/**
+ * Most-recent session resolution for `--continue` (#32): prefer the
+ * SERVER's most recent thread for the bot (its id + server-side title),
+ * falling back to the local named-session store when the server is
+ * unreachable or has no thread. Returns null when neither knows one.
+ */
+export async function resolveMostRecentSession(
+  deps: CommandDeps,
+  botId: string,
+): Promise<{ sessionId: string; label: string; source: 'server' | 'local' } | null> {
+  try {
+    const threads = await deps.api.listThreads({ botId });
+    if (threads.length > 0) {
+      const sorted = [...threads].sort((a, b) => String(b.lastMessageTs ?? '').localeCompare(String(a.lastMessageTs ?? '')));
+      const t = sorted[0]!;
+      return { sessionId: t.id, label: t.title ?? t.id, source: 'server' };
+    }
+  } catch {
+    // server unreachable — fall through to the local store
+  }
+  const local = mostRecentNamedSession();
+  if (local && local.botId === botId) return { sessionId: local.sessionId, label: local.name, source: 'local' };
+  return null;
+}
+
 /** Persist a daemon record and announce it on stderr (stdout stays clean). */
 function recordDaemonSession(deps: CommandDeps, name: string, sessionId: string, botId: string): void {
   const record: NamedSession = { name, sessionId, botId, updatedAt: Date.now() };
   saveNamedSession(record);
-  err(deps, `[session] "${name}" → ${sessionId} (bot ${botId}) — continue with: kriyadot send ${name} "…"\n`);
+  cliLogger(deps).info(`[session] "${name}" → ${sessionId} (bot ${botId}) — continue with: kriyadot send ${name} "…"`);
 }
 
 async function doChat(deps0: CommandDeps, p: ParsedArgs, ov: ConfigOverrides): Promise<number> {
@@ -276,8 +375,15 @@ async function doChat(deps0: CommandDeps, p: ParsedArgs, ov: ConfigOverrides): P
 
   if (message === null) {
     if (!deps.isTTY) throw new Error('No message given and stdin is not a pipe. Usage: kriyadot chat <bot> [message]');
-    // Interactive REPL. --daemon names the REPL session too.
-    const sess = resolveSessionFlags(deps, p, bot, randomUUID());
+    // Interactive REPL. --daemon names the REPL session too; --continue
+    // resumes the most recent session (#32).
+    let sess = resolveSessionFlags(deps, p, bot, randomUUID());
+    if (flagBool(p.flags, 'continue')) {
+      const recent = await resolveMostRecentSession(deps, bot.id);
+      if (!recent) throw new Error('No recent session to continue for this bot.');
+      err(deps, `[session] continuing ${recent.source} session "${recent.label}" (${recent.sessionId})\n`);
+      sess = { sessionId: recent.sessionId };
+    }
     if (sess.daemonName) recordDaemonSession(deps, sess.daemonName, sess.sessionId, bot.id);
     return runRepl(
       {
@@ -292,7 +398,13 @@ async function doChat(deps0: CommandDeps, p: ParsedArgs, ov: ConfigOverrides): P
     );
   }
 
-  const sess = resolveSessionFlags(deps, p, bot, randomUUID());
+  let sess = resolveSessionFlags(deps, p, bot, randomUUID());
+  if (flagBool(p.flags, 'continue')) {
+    const recent = await resolveMostRecentSession(deps, bot.id);
+    if (!recent) throw new Error('No recent session to continue for this bot.');
+    err(deps, `[session] continuing ${recent.source} session "${recent.label}" (${recent.sessionId})\n`);
+    sess = { sessionId: recent.sessionId };
+  }
   if (sess.daemonName) recordDaemonSession(deps, sess.daemonName, sess.sessionId, bot.id);
   return oneShotTurn(deps, {
     bot,
@@ -302,6 +414,8 @@ async function doChat(deps0: CommandDeps, p: ParsedArgs, ov: ConfigOverrides): P
     ...(provider ? { providerId: provider } : {}),
     autoApprove: flagBool(p.flags, 'auto-approve') || flagBool(p.flags, 'autoapprove'),
     format,
+    ...(resolveSchemaFlag(p) ? { schema: resolveSchemaFlag(p)! } : {}),
+    ...(ov.nested ? { configOverrides: ov.nested } : {}),
   });
 }
 
@@ -311,7 +425,13 @@ async function doRun(deps0: CommandDeps, p: ParsedArgs, ov: ConfigOverrides): Pr
   const bot = await resolveBot(deps, botRef);
   const message = await resolveMessage(deps, p, p.positional);
   if (message === null) throw new Error('No message given. Pass --message or pipe stdin.');
-  const sess = resolveSessionFlags(deps, p, bot, randomUUID());
+  let sess = resolveSessionFlags(deps, p, bot, randomUUID());
+  if (flagBool(p.flags, 'continue')) {
+    const recent = await resolveMostRecentSession(deps, bot.id);
+    if (!recent) throw new Error('No recent session to continue for this bot.');
+    err(deps, `[session] continuing ${recent.source} session "${recent.label}" (${recent.sessionId})\n`);
+    sess = { sessionId: recent.sessionId };
+  }
   if (sess.daemonName) recordDaemonSession(deps, sess.daemonName, sess.sessionId, bot.id);
   const model = ov.model ?? flagString(p.flags, 'model');
   const provider = ov.provider ?? flagString(p.flags, 'provider');
@@ -323,6 +443,8 @@ async function doRun(deps0: CommandDeps, p: ParsedArgs, ov: ConfigOverrides): Pr
     ...(provider ? { providerId: provider } : {}),
     autoApprove: flagBool(p.flags, 'auto-approve') || flagBool(p.flags, 'autoapprove'),
     format: ov.format ?? p.global.format,
+    ...(resolveSchemaFlag(p) ? { schema: resolveSchemaFlag(p)! } : {}),
+    ...(ov.nested ? { configOverrides: ov.nested } : {}),
   });
 }
 
@@ -331,7 +453,13 @@ async function doRun(deps0: CommandDeps, p: ParsedArgs, ov: ConfigOverrides): Pr
  * session recorded by `run --daemon <name>`, continuing that conversation.
  */
 async function doSend(deps: CommandDeps, p: ParsedArgs): Promise<number> {
-  const name = p.subcommand;
+  // `send --continue "…"` (#32): the most recent named session, no name needed.
+  let name = p.subcommand;
+  if (flagBool(p.flags, 'continue') && !getNamedSession(name)) {
+    const recent = mostRecentNamedSession();
+    if (!recent) throw new Error('No named sessions to continue. Start one with: kriyadot run --bot <id> --daemon <name> --message "…"');
+    name = recent.name;
+  }
   const named = getNamedSession(name);
   if (!named) {
     throw new Error(
@@ -341,6 +469,34 @@ async function doSend(deps: CommandDeps, p: ParsedArgs): Promise<number> {
   const bot = await resolveBot(deps, named.botId);
   const message = await resolveMessage(deps, p, p.positional);
   if (message === null) throw new Error(`Usage: kriyadot send ${name} "message"`);
+  // Live-daemon delivery (#102): when a daemon process holds this session,
+  // inject instead of starting a new turn — API inject endpoint first
+  // (steer into the live session), local inbox as the fallback channel.
+  const daemon = getDaemon(configDir(), name);
+  if (isDaemonAlive(daemon) || flagBool(p.flags, 'inject')) {
+    try {
+      const res = await deps.api.request<{ ok: boolean; delivery?: string }>(
+        `/daemon/sessions/${encodeURIComponent(name)}/inject`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: message }),
+        },
+      );
+      out(deps, `Injected into live daemon "${name}" (${res.delivery ?? 'queued'}).\n`);
+      saveNamedSession({ ...named, updatedAt: Date.now() });
+      return 0;
+    } catch (e) {
+      if (isDaemonAlive(daemon)) {
+        enqueueInboxMessage(configDir(), name, message);
+        out(deps, `Queued in the local inbox of live daemon "${name}" (API inject unavailable: ${e instanceof Error ? e.message : String(e)}).\n`);
+        saveNamedSession({ ...named, updatedAt: Date.now() });
+        return 0;
+      }
+      if (flagBool(p.flags, 'inject')) throw e;
+      // not live after all — fall through to the classic new-turn send
+    }
+  }
   const code = await oneShotTurn(deps, {
     bot,
     message,
@@ -354,11 +510,11 @@ async function doSend(deps: CommandDeps, p: ParsedArgs): Promise<number> {
   return code;
 }
 
-/** `kriyadot sessions [list]` / `kriyadot sessions delete <name>`. */
+/** `kriyadot sessions [list]` / `delete <name>` / `rename <name> <title>`. */
 async function doSessions(deps: CommandDeps, p: ParsedArgs): Promise<number> {
   if (p.subcommand === 'delete') {
     const name = p.positional[0];
-    if (!deleteNamedSession(name)) throw new Error(`No named session "${name}".`);
+    if (!name || !deleteNamedSession(name)) throw new Error(`No named session "${name}".`);
     if (p.global.format === 'json') {
       printJson(deps, { ok: true, deleted: name });
       return 0;
@@ -366,20 +522,136 @@ async function doSessions(deps: CommandDeps, p: ParsedArgs): Promise<number> {
     out(deps, `Deleted named session "${name}"\n`);
     return 0;
   }
-  const sessions = loadNamedSessions();
-  if (p.global.format === 'json') {
-    printJson(deps, sessions);
+  if (p.subcommand === 'rename') {
+    // Local title write (#32): the API exposes server-side thread titles
+    // for reading but has no title-write endpoint for plain sessions, so
+    // the rename is stored locally and server titles win on read.
+    const [name, ...titleWords] = p.positional;
+    const title = titleWords.join(' ').trim();
+    const existing = name ? getNamedSession(name) : null;
+    if (!existing || !title) throw new Error('Usage: kriyadot sessions rename <name> <title>');
+    saveNamedSession({ ...existing, title, updatedAt: Date.now() });
+    out(deps, `Renamed "${name}" → "${title}" (local title; server thread titles take precedence when present)\n`);
     return 0;
   }
-  if (sessions.length === 0) {
+  const sessions = loadNamedSessions();
+  // Server-side titles (#32): when the server is reachable, a thread's
+  // title is the session's shared name — merge it over the local record.
+  let serverTitles = new Map<string, string>();
+  try {
+    const threads = await deps.api.listThreads({});
+    serverTitles = new Map(threads.filter((t) => t.title).map((t) => [t.id, t.title as string]));
+  } catch {
+    // offline: local names only
+  }
+  const merged = sessions.map((s) => {
+    const title = serverTitles.get(s.sessionId) ?? s.title;
+    return title ? { ...s, title } : s;
+  });
+  if (p.global.format === 'json') {
+    printJson(deps, merged);
+    return 0;
+  }
+  if (merged.length === 0) {
     out(deps, 'No named sessions. Start one with: kriyadot run --bot <id> --daemon <name> --message "…"\n');
     return 0;
   }
-  for (const s of sessions) {
+  for (const s of merged) {
     const when = s.updatedAt ? new Date(s.updatedAt).toISOString() : '—';
-    out(deps, `${s.name}\tbot:${s.botId}\t${s.sessionId}\t${when}\n`);
+    out(deps, `${s.name}\tbot:${s.botId}\t${s.sessionId}\t${when}${s.title ? `\t"${s.title}"` : ''}\n`);
   }
   return 0;
+}
+
+/**
+ * `kriyadot daemon start|list|stop <name>` (#102/#109): start runs the
+ * foreground daemon loop (holds the session, heartbeats, drains the
+ * inject inbox); list shows the local registry with liveness; stop
+ * signals the recorded pid and unregisters.
+ */
+async function doDaemon(deps: CommandDeps, p: ParsedArgs): Promise<number> {
+  const dir = configDir();
+  if (p.subcommand === 'list' || p.subcommand === '') {
+    const daemons = listDaemons(dir);
+    if (p.global.format === 'json') {
+      printJson(deps, daemons.map((d) => ({ ...d, alive: isDaemonAlive(d) })));
+      return 0;
+    }
+    if (daemons.length === 0) {
+      out(deps, 'No daemons registered. Start one with: kriyadot daemon start <name> --bot <id>\n');
+      return 0;
+    }
+    for (const d of daemons) {
+      out(deps, `${d.name}\tpid:${d.pid}\t${isDaemonAlive(d) ? 'alive' : 'stale'}\tbot:${d.botId}\t${d.sessionId}\n`);
+    }
+    return 0;
+  }
+  if (p.subcommand === 'stop') {
+    const name = p.positional[0];
+    if (!name) throw new Error('Usage: kriyadot daemon stop <name>');
+    const rec = getDaemon(dir, name);
+    if (!rec) throw new Error(`No daemon named "${name}".`);
+    try {
+      process.kill(rec.pid, 'SIGTERM');
+    } catch {
+      // already gone — unregistering is still the right cleanup
+    }
+    unregisterDaemon(dir, name);
+    try {
+      await deps.api.request(`/daemon/sessions/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    } catch {
+      // API may not have the registration; local cleanup already done
+    }
+    out(deps, `Stopped daemon "${name}" (pid ${rec.pid}).\n`);
+    return 0;
+  }
+  if (p.subcommand === 'start') {
+    const name = p.positional[0];
+    if (!name) throw new Error('Usage: kriyadot daemon start <name> --bot <id>');
+    const existing = getDaemon(dir, name);
+    if (existing && isDaemonAlive(existing)) {
+      throw new Error(`Daemon "${name}" is already running (pid ${existing.pid}).`);
+    }
+    const named = getNamedSession(name);
+    const botRef = flagString(p.flags, 'bot') ?? named?.botId;
+    if (!botRef) throw new Error(`Usage: kriyadot daemon start ${name} --bot <id> (or record the session first with run --daemon)`);
+    const bot = await resolveBot(deps, botRef);
+    const sessionId = named && named.botId === bot.id ? named.sessionId : randomUUID();
+    saveNamedSession({ name, sessionId, botId: bot.id, updatedAt: Date.now() });
+    const pollRaw = flagString(p.flags, 'poll-ms');
+    const pollMs = pollRaw !== undefined ? Number(pollRaw) : undefined;
+    await runDaemonLoop({
+      dir,
+      record: { name, sessionId, botId: bot.id, pid: process.pid, startedAt: Date.now(), heartbeatAt: Date.now() },
+      log: (m) => cliLogger(deps).info(m),
+      ...(pollMs !== undefined && Number.isFinite(pollMs) && pollMs > 0 ? { pollMs } : {}),
+      apiRegister: async () => {
+        await deps.api.request('/daemon/sessions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, sessionId, pid: process.pid }),
+        });
+      },
+      apiHeartbeat: async () => {
+        await deps.api.request(`/daemon/sessions/${encodeURIComponent(name)}/heartbeat`, { method: 'POST' });
+      },
+      apiUnregister: async () => {
+        await deps.api.request(`/daemon/sessions/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      },
+      runTurn: async (message) => {
+        const result = await runStreamingTurn(
+          { api: deps.api, out: (s) => deps.stdout.write(s), err: (s) => deps.stderr.write(s) },
+          { botId: bot.id, message, sessionId, autoApprove: false },
+          async () => false,
+          (t) => deps.stdout.write(t),
+        );
+        if (result.failed) err(deps, `[daemon] turn failed: ${result.error ?? 'unknown'}\n`);
+        saveNamedSession({ name, sessionId, botId: bot.id, updatedAt: Date.now() });
+      },
+    });
+    return 0;
+  }
+  throw new Error('Usage: kriyadot daemon <start|list|stop>.');
 }
 
 /**
@@ -728,6 +1000,7 @@ async function doConfig(deps: CommandDeps, p: ParsedArgs): Promise<number> {
   if (p.subcommand === '' || p.subcommand === undefined) {
     out(deps, `apiUrl  ${cfg.apiUrl}\n`);
     out(deps, `token   ${masked}\n`);
+    out(deps, `logLevel  ${resolveLogLevel({ configLevel: cfg.logLevel })}\n`);
     out(deps, `file    ${configPath()}\n`);
     return 0;
   }
@@ -735,17 +1008,57 @@ async function doConfig(deps: CommandDeps, p: ParsedArgs): Promise<number> {
     out(deps, `${configPath()}\n`);
     return 0;
   }
+  if (p.subcommand === 'init') {
+    // #111: write the commented default config (JSONC). Refuses to
+    // clobber an existing file without --force.
+    const { existsSync, writeFileSync, mkdirSync } = await import('node:fs');
+    if (existsSync(configPath()) && !flagBool(p.flags, 'force')) {
+      throw new Error(`Config already exists at ${configPath()} — pass --force to overwrite it.`);
+    }
+    mkdirSync(configDir(), { recursive: true });
+    writeFileSync(configPath(), defaultConfigTemplate(), { mode: 0o600 });
+    out(deps, `Wrote default config to ${configPath()} (edit it, then run: kriyadot config validate)\n`);
+    return 0;
+  }
+  if (p.subcommand === 'validate') {
+    // #111: validate the on-disk config (drop-ins merged, migrations
+    // applied by the loader) — unknown keys are warnings, bad types are
+    // errors. Exit 1 when invalid so scripts can gate on it.
+    const { existsSync, readFileSync } = await import('node:fs');
+    if (!existsSync(configPath())) {
+      out(deps, `No config file at ${configPath()} — defaults apply. Run "kriyadot config init" to create one.\n`);
+      return 0;
+    }
+    let parsed: unknown;
+    try {
+      const { parseConfigText } = await import('./config-files.js');
+      parsed = parseConfigText(readFileSync(configPath(), 'utf8'), 'json');
+    } catch (e) {
+      err(deps, `config INVALID: ${e instanceof Error ? e.message : String(e)}\n`);
+      return EXIT_ERROR;
+    }
+    const v = validateConfigObject(parsed);
+    if (p.global.format === 'json') {
+      printJson(deps, v);
+      return v.valid ? 0 : EXIT_ERROR;
+    }
+    for (const w of v.warnings) err(deps, `warning: ${w}\n`);
+    for (const e of v.errors) err(deps, `error: ${e}\n`);
+    out(deps, v.valid ? `Config is valid${v.warnings.length ? ` (${v.warnings.length} warning(s))` : ''}: ${configPath()}\n` : `Config is INVALID: ${configPath()}\n`);
+    return v.valid ? 0 : EXIT_ERROR;
+  }
   if (p.subcommand === 'get') {
     const key = p.positional[0]?.toLowerCase();
     if (key === 'api' || key === 'apiurl') out(deps, `${cfg.apiUrl}\n`);
     else if (key === 'token') out(deps, cfg.token ? `${masked}\n` : '(not set)\n');
-    else throw new Error('Usage: kriyadot config get <api|token>');
+    else if (key === 'loglevel') out(deps, `${resolveLogLevel({ configLevel: cfg.logLevel })}\n`);
+    else throw new Error('Usage: kriyadot config get <api|token|logLevel>');
     return 0;
   }
   if (p.subcommand === 'set') {
     const key = p.positional[0]?.toLowerCase();
     const value = p.positional[1];
-    if (!key || value === undefined) throw new Error('Usage: kriyadot config set <api|token> <value>');
+    if (!key || value === undefined) throw new Error('Usage: kriyadot config set <api|token|logLevel> <value>');
     if (key === 'api' || key === 'apiurl') {
       const next = { ...cfg, apiUrl: normalizeApiUrl(value) };
       saveConfigFile(next);
@@ -760,9 +1073,19 @@ async function doConfig(deps: CommandDeps, p: ParsedArgs): Promise<number> {
       out(deps, 'token saved.\n');
       return 0;
     }
-    throw new Error('Usage: kriyadot config set <api|token> <value>');
+    if (key === 'loglevel') {
+      // #181: persisted level for the CLI's own diagnostics.
+      const level = value.trim().toLowerCase();
+      if (!isLogLevel(level)) throw new Error(`logLevel must be one of ${LOG_LEVELS.join(', ')}, got "${value}"`);
+      const next = { ...cfg, logLevel: level };
+      saveConfigFile(next);
+      deps.cfg = next;
+      out(deps, `logLevel → ${level} (KRIYADOT_LOG_LEVEL overrides per process)\n`);
+      return 0;
+    }
+    throw new Error('Usage: kriyadot config set <api|token|logLevel> <value>');
   }
-  throw new Error('Usage: kriyadot config [get|set|path]');
+  throw new Error('Usage: kriyadot config [get|set|path|validate|init]');
 }
 
 /** Dispatch a parsed invocation. Returns the process exit code. */
@@ -815,6 +1138,16 @@ export async function runCommand(p: ParsedArgs, deps: CommandDeps): Promise<numb
         return await doRoutines(deps, p);
       case 'team':
         return await doTeam(deps, p);
+      case 'tap':
+        return await runTapCommand(p, deps);
+      case 'bridge':
+        return await runBridgeCommand(p, deps);
+      case 'learning':
+        return await runLearningCommand(p, deps);
+      case 'workflows':
+        return await runWorkflowCommand(p, deps);
+      case 'daemon':
+        return await doDaemon(deps, p);
       case 'serve':
         return await doServe(deps, p);
       case 'models':

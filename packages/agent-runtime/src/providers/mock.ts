@@ -13,6 +13,12 @@ export interface MockStep {
   content?: string;
   toolCalls?: ToolCall[];
   usage?: TokenUsage;
+  /**
+   * Provider-native output items (#34): returned verbatim on the chat
+   * result so tests can exercise the capture → persist → replay path
+   * exactly as a real driver behaves.
+   */
+  nativeItems?: unknown[];
 }
 
 const DEFAULT_USAGE: TokenUsage = { promptTokens: 10, completionTokens: 5, totalTokens: 15 };
@@ -37,7 +43,7 @@ export class MockProvider implements LLMProvider {
     messages: ChatMessage[],
     _tools: ToolDefinition[],
     opts: { model: string; onToken?: (t: string) => void; signal?: AbortSignal },
-  ): Promise<{ content: string; toolCalls: ToolCall[]; usage: TokenUsage }> {
+  ): Promise<{ content: string; toolCalls: ToolCall[]; usage: TokenUsage; nativeItems: unknown[] }> {
     this.calls.push({ messages, model: opts.model });
     const step = this.steps[Math.min(this.cursor, this.steps.length - 1)];
     this.cursor += 1;
@@ -51,6 +57,10 @@ export class MockProvider implements LLMProvider {
       content,
       toolCalls: step.toolCalls ?? [],
       usage: step.usage ?? { ...DEFAULT_USAGE },
+      // #34: captured native items ride the result verbatim; incoming
+      // messages (with any stored nativeItems) are recorded in
+      // `calls` untouched — the replay half of the round-trip.
+      nativeItems: step.nativeItems ?? [],
     };
   }
 

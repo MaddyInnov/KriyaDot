@@ -1,0 +1,29 @@
+{
+  // KriyaDot as an external ACP agent in JetBrains IDEs
+  // (IntelliJ IDEA / WebStorm / PyCharm etc. with ACP support,
+  // 2025.3 and later).
+  //
+  // JetBrains IDEs read external ACP agents from an `acp.json` file:
+  //   Linux:   ~/.jetbrains/acp.json
+  //   macOS:   ~/Library/Application Support/JetBrains/acp.json
+  //   Windows: %APPDATA%\JetBrains\acp.json
+  // (or open Settings → Tools → AI Assistant → Agents and use the
+  // ACP configuration link, which opens/creates the same file).
+  //
+  // The "agent_servers" shape matches Zed's. Use an ABSOLUTE path for
+  // "command" if mvp-server is not on your PATH — e.g.
+  // "/home/you/kriyadot/dist/mvp-server" for the standalone binary
+  // built by scripts/build-server-binary.sh.
+  //
+  // Change the bot with the --bot arg: any bot id from seed/bots.json
+  // (helper is the server default when --bot is omitted; coder is the
+  // coding bot and the right default for editor use). After saving,
+  // pick "KriyaDot" from the AI chat agent selector.
+  "agent_servers": {
+    "KriyaDot": {
+      "command": "mvp-server",
+      "args": ["acp", "--bot", "coder"],
+      "env": {}
+    }
+  }
+}

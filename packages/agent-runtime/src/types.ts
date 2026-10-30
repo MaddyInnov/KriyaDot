@@ -11,11 +11,48 @@ export type { WidgetAnswer, WidgetHost, WidgetPayload };
 import type { CredentialProposer } from './credential-proposals.js';
 export type { CredentialProposer };
 
+/**
+ * A native media attachment on a user message (Octomind parity #38):
+ * the raw bytes ride the message so vision-capable provider drivers can
+ * serialize them as native content parts (OpenAI `image_url`/`video_url`,
+ * Anthropic base64 image blocks) instead of the model only ever seeing
+ * OCR text or a "preview not available" note. Drivers whose wire format
+ * has no part for a media kind degrade to the text content alone.
+ * Persisted verbatim by the session store (media_items column).
+ */
+export interface MessageMedia {
+  kind: 'image' | 'video';
+  /** MIME type, e.g. 'image/png', 'video/mp4'. */
+  mediaType: string;
+  /** Base64-encoded bytes (no data-URI prefix). */
+  dataBase64: string;
+}
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   toolCallId?: string;
   toolName?: string;
+  /** Native media attachments (#38). Only meaningful on user messages. */
+  media?: MessageMedia[];
+  /**
+   * Provider-native output items (Octomind parity #34): the raw output
+   * items a provider driver produced for this message — e.g. OpenAI
+   * Responses reasoning items, Anthropic thinking blocks, or tool-use
+   * blocks in the provider's own shape — preserved verbatim so a resumed
+   * session can replay them to the provider instead of reconstructing
+   * (and losing) them from the flattened text content.
+   *
+   * Driver contract: a driver that receives native items from its
+   * provider attaches them, unmodified, to the assistant message it
+   * returns (the runtime persists them via SessionStore). On resume the
+   * driver reads `nativeItems` back off the stored assistant messages
+   * (SessionStore returns them verbatim) and replays them to the
+   * provider in place of / alongside the text content, in stored order.
+   * Items are opaque to everything except the originating driver:
+   * never summarize, transform, or cross providers with them.
+   */
+  nativeItems?: unknown[];
 }
 
 export interface ToolCall {
@@ -28,6 +65,15 @@ export interface TokenUsage {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  /**
+   * Prompt-cache buckets (closure #137): tokens read from / written to
+   * the provider's prompt cache, when the driver reports them
+   * (Anthropic cache_read/cache_creation, OpenAI cached_tokens). Absent
+   * means the provider reported none. usage.ts's CacheAwareTokenUsage is
+   * the same shape; costOfUsage prices these buckets when present.
+   */
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
 }
 
 export type StreamEvent =
@@ -213,14 +259,17 @@ export interface ToolContext {
    */
   conversationId?: string;
   /**
-   * Guardrails-as-code (Octomind parity): names of tools already executed
-   * in this session (oldest first), maintained by the runtime. The
-   * governance adapter forwards it so policy rules with a
-   * `requiresHistory` condition can match ("allow X only after Y ran").
-   * Absent → history conditions never match (fail-closed for conditional
-   * allows, and conditional denies simply don't fire).
+   * Guardrails-as-code (Octomind parity): tools already executed in
+   * this session (oldest first), maintained by the runtime as RICH
+   * entries ({ name, argDigest, argSummary } — see history-entry.ts) so
+   * argument-qualified `requiresHistory` conditions can match; legacy
+   * name-only strings remain acceptable. The governance adapter
+   * forwards it so policy rules with a `requiresHistory` condition can
+   * match ("allow X only after Y ran"). Absent → history conditions
+   * never match (fail-closed for conditional allows, and conditional
+   * denies simply don't fire).
    */
-  sessionToolHistory?: string[];
+  sessionToolHistory?: (string | import('./history-entry.js').SessionToolHistoryEntry)[];
   /**
    * Interactive widgets (OpenMausBot parity P1 #15). Set by the runtime
    * when the host passed a WidgetCoordinator: tools can raise widgets
@@ -295,6 +344,14 @@ export interface BotPolicyRule {
  */
 export interface BotPolicy {
   rules: BotPolicyRule[];
+  /**
+   * Opt-in policy snapshot mode (#70): when true, the session's
+   * effective policy is captured immutably at its first tool call and
+   * used for the whole session (mid-session policy edits apply from
+   * the next session). Default/absent = live evaluation (KriyaDot's
+   * deliberate default — see governance policy-snapshot.ts).
+   */
+  policySnapshot?: boolean;
 }
 
 /**
@@ -379,6 +436,12 @@ export interface TurnValidatorSpec {
   name: string;
   command?: string[];
   builtin?: 'verify-changes';
+  /**
+   * Semantic criterion (closure #28): when set (and no command/builtin),
+   * the validator is judged through the calibrated evaluate seam
+   * (runEvaluateValidator) instead of a shell command.
+   */
+  criterion?: string;
   /** Per-validator timeout; default 120s. */
   timeoutMs?: number;
 }
@@ -392,7 +455,13 @@ export interface TurnValidatorSpec {
  */
 export interface LayerStageSpec {
   name: string;
-  kind: 'prepare' | 'review';
+  /**
+   * Stage kind (#41 depth): 'prepare' shapes the request before the
+   * main loop; 'execute' runs in the prepare phase with tool intent;
+   * 'review' may revise the draft answer; 'verify' runs in the review
+   * phase as a checker. (Originally only prepare/review existed.)
+   */
+  kind: 'prepare' | 'review' | 'execute' | 'verify';
   /** Stage system prompt (its job description). */
   prompt: string;
   /** Purpose profile or explicit model for this stage; default: turn model. */
@@ -400,6 +469,12 @@ export interface LayerStageSpec {
   providerId?: string;
   /** What the stage receives: the user message, the draft answer, or both. */
   inputMode?: 'user' | 'draft' | 'user+draft';
+  /** How the stage output is applied: note (system note), replace (draft), append. Default by kind. */
+  outputMode?: 'note' | 'replace' | 'append';
+  /** Persona/role label prepended to the stage prompt by the runtime. */
+  role?: string;
+  /** Purpose profile name whose model resolves this stage when `model` is unset. */
+  profile?: string;
 }
 
 /**
@@ -449,6 +524,14 @@ export interface BotConfig {
   backupModel?: string;
   /** Per-model inference options (reasoning effort, fast mode, etc.). */
   modelOptions?: ModelOptions;
+  /**
+   * Prompt-cache warming (#137): on cache-capable providers (Anthropic),
+   * a background CacheWarmer keeps this bot's system-prompt cache warm so
+   * turns start with cache-read pricing. `true` = default 5-minute
+   * interval; `{ intervalMs }` = custom (>= 60s). Absent/false = off.
+   * The host (apps/api) instantiates warmers from this field at startup.
+   */
+  cacheWarm?: boolean | { intervalMs?: number };
   skills: string[];
   tools: string[];
   mcpServers: string[];
@@ -605,6 +688,13 @@ export interface BotConfig {
    */
   autoActivateSkills?: boolean;
   /**
+   * Memory scope (closure #74): learned-memory atoms are stamped with
+   * this project id / role set at distillation time, and recall filters
+   * to atoms in scope (project + role-filtered retrieval). Unset → the
+   * bot's memory is unscoped (every atom visible), as before.
+   */
+  memoryScope?: { projectId?: string; roles?: string[] };
+  /**
    * Hindsight (Octomind parity): when true, a cheap-model retrospective
    * runs after tool-using turns and stores one lesson atom in memory.
    * Default false.
@@ -681,7 +771,18 @@ export interface LLMProvider {
        */
       onCliToolEvent?: (e: CliToolStreamEvent) => void;
     },
-  ): Promise<{ content: string; toolCalls: ToolCall[]; usage: TokenUsage }>;
+  ): Promise<{
+    content: string;
+    toolCalls: ToolCall[];
+    usage: TokenUsage;
+    /**
+     * Provider-native output items (#34): the driver's raw output items
+     * for this reply, preserved verbatim. The runtime copies them onto
+     * the persisted assistant message so a resumed session replays them
+     * to the originating provider instead of the flattened text.
+     */
+    nativeItems?: unknown[];
+  }>;
   listModels(): Promise<ModelInfo[]>;
 }
 
@@ -709,7 +810,9 @@ export interface ModelInfo {
  * Internal extension: the runtime tracks which tool calls an assistant message
  * produced so history can be re-serialized for providers (OpenAI tool_calls,
  * Anthropic tool_use blocks). The public ChatMessage contract is unchanged;
- * SessionStore persists this in a dedicated column.
+ * SessionStore persists this in a dedicated column. Provider-native output
+ * items (#34) ride on ChatMessage.nativeItems itself and are likewise
+ * persisted by SessionStore in a dedicated column.
  */
 export type RichMessage = ChatMessage & { toolCalls?: ToolCall[] };
 
@@ -726,9 +829,17 @@ export function emptyUsage(): TokenUsage {
 }
 
 export function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
-  return {
+  const out: TokenUsage = {
     promptTokens: a.promptTokens + b.promptTokens,
     completionTokens: a.completionTokens + b.completionTokens,
     totalTokens: a.totalTokens + b.totalTokens,
   };
+  // Cache buckets (#137) survive aggregation when either side has them.
+  if (a.cacheReadTokens !== undefined || b.cacheReadTokens !== undefined) {
+    out.cacheReadTokens = (a.cacheReadTokens ?? 0) + (b.cacheReadTokens ?? 0);
+  }
+  if (a.cacheWriteTokens !== undefined || b.cacheWriteTokens !== undefined) {
+    out.cacheWriteTokens = (a.cacheWriteTokens ?? 0) + (b.cacheWriteTokens ?? 0);
+  }
+  return out;
 }

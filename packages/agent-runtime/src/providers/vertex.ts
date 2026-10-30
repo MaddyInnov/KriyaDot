@@ -148,6 +148,12 @@ export class VertexProvider implements LLMProvider {
       throw new Error('Vertex AI is not configured: set GOOGLE_CLOUD_PROJECT (or VERTEX_PROJECT).');
     }
     const inner = await this.inner();
+    // #34: the result is returned verbatim from the inner
+    // OpenAI-compatible driver, so any nativeItems it attaches flow
+    // through untouched, and stored nativeItems on `messages` are
+    // handed to it as-is. (The inner driver is the fenced
+    // openai-compatible.ts — its own capture state is reported in the
+    // closure report.)
     return inner.chat(messages, tools, opts);
   }
 

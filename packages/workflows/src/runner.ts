@@ -12,7 +12,7 @@ import type { GovernanceGateway } from '@mvp/governance';
 import { WorkflowStore } from './store.js';
 import { renderTemplate, type TemplateContext } from './template.js';
 import { evaluateCode, evaluateCondition, type CodeSandboxContext } from './code-sandbox.js';
-import { extractCostUsd } from './cost.js';
+import { extractCostUsd, priceUsageUsd, type UsagePricer } from './cost.js';
 import {
   buildExecutionPlan,
   computeReachableNodeIds,
@@ -21,16 +21,67 @@ import {
   type DryRunPlan,
 } from './plan.js';
 import {
+  applyStepConfigToBot,
+  resolveStepConfig,
+  validateStepConfig,
+  type ResolvedStepConfig,
+} from './step-config.js';
+import {
+  formatRunEventsJsonl,
+  runEventsFromRun,
+  type WorkflowRunEvent,
+} from './run-events.js';
+import {
   isNodeType,
+  resolveWorkflowMaxParallel,
   type NodeState,
   type NodeStatus,
   type RunStatus,
   type WorkflowDefinition,
   type WorkflowNode,
   type WorkflowRun,
+  type WorkflowTokenUsage,
 } from './types.js';
 
 export type { DryRunPlan, DryRunLevel, DryRunPlanNode } from './plan.js';
+
+/**
+ * Request handed to an injected node executor (#150) for agent /
+ * bot-turn nodes. The host (API) can pass a real executor that runs
+ * the turn its own way (e.g. a different runtime, a recorded fixture,
+ * a metered gateway) and returns the text plus token usage; the
+ * runner prices the usage itself via its price table / `usagePricer`.
+ */
+export interface AgentNodeExecutionRequest {
+  runId: string;
+  workflowId: string;
+  node: WorkflowNode;
+  /** Resolved per-step config (#143) for this node. */
+  step: ResolvedStepConfig;
+  /** The registered bot (unmodified). */
+  bot: BotConfig;
+  /** Effective bot for this step: role/model/toolset/skills applied. */
+  effectiveBot: BotConfig;
+  message: string;
+  sessionId: string;
+}
+
+/** Result an injected node executor returns for an agent/bot-turn node. */
+export interface AgentNodeExecutionResult {
+  text: string;
+  /** Token usage of the turn; priced by the runner when present. */
+  usage?: WorkflowTokenUsage;
+  /** Explicit USD cost; wins over pricing `usage` when present. */
+  costUsd?: number;
+  providerId?: string;
+  modelId?: string;
+}
+
+export type WorkflowNodeExecutor = (
+  req: AgentNodeExecutionRequest,
+) => Promise<AgentNodeExecutionResult>;
+
+export type RunEventCallback = (event: WorkflowRunEvent) => void;
 
 export interface WorkflowRunnerOptions {
   dbPath: string;
@@ -45,6 +96,26 @@ export interface WorkflowRunnerOptions {
    * with one timed step per node. Metadata-tier fields only.
    */
   telemetry?: TelemetryCollector;
+  /**
+   * Injectable executor for agent/bot-turn nodes (#150). When set it
+   * replaces `agentRuntime.runTurn` for those nodes; its returned
+   * token usage is priced by the runner. When unset, the runner uses
+   * `agentRuntime.runTurn` and prices the usage IT returns (previously
+   * that usage was discarded and agent nodes always cost $0).
+   */
+  nodeExecutor?: WorkflowNodeExecutor;
+  /**
+   * Injectable price table (#150): converts (provider, model, usage)
+   * to USD. Defaults to the agent-runtime price table
+   * (`costOfUsage` / `priceUsageUsd` in src/cost.ts).
+   */
+  usagePricer?: UsagePricer;
+  /**
+   * JSONL observability sink (#152): receives every run event
+   * (run_started / step_completed / run_finished) as it happens.
+   * Equivalent to calling `runner.onRunEvent(cb)` after construction.
+   */
+  onRunEvent?: RunEventCallback;
 }
 
 export type RunUpdateCallback = (run: WorkflowRun) => void;
@@ -74,6 +145,20 @@ interface SubExecutionContext {
   item?: unknown;
   index?: number;
   iteration?: number;
+}
+
+/**
+ * Internal node-execution result: the node's output plus the priced
+ * usage side-channel (#150). Agent nodes keep a plain-string output
+ * for template compatibility, so their usage/cost cannot ride on the
+ * output — they ride here instead.
+ */
+interface NodeExecutionResult {
+  output: unknown;
+  usage?: WorkflowTokenUsage;
+  costUsd?: number;
+  provider?: string;
+  model?: string;
 }
 
 /** Dot-path lookup (`a.b.0.c`) into a JSON-like value; undefined on miss. */
@@ -133,6 +218,14 @@ export class WorkflowRunner {
    */
   private readonly runCosts = new Map<string, number>();
 
+  /** Injected agent/bot-turn executor (#150); see WorkflowRunnerOptions. */
+  private readonly nodeExecutor?: WorkflowNodeExecutor;
+  /** Injected usage pricer (#150); defaults to the agent-runtime table. */
+  private readonly usagePricer?: UsagePricer;
+  /** JSONL run-event listeners (#152) + per-run in-memory event log. */
+  private readonly runEventListeners = new Set<RunEventCallback>();
+  private readonly runEvents = new Map<string, WorkflowRunEvent[]>();
+
   constructor(opts: WorkflowRunnerOptions) {
     this.store = new WorkflowStore(opts.dbPath);
     this.agentRuntime = opts.agentRuntime;
@@ -140,6 +233,71 @@ export class WorkflowRunner {
     this.tools = opts.tools;
     this.bots = opts.bots;
     this.telemetry = opts.telemetry;
+    this.nodeExecutor = opts.nodeExecutor;
+    this.usagePricer = opts.usagePricer;
+    if (opts.onRunEvent) this.runEventListeners.add(opts.onRunEvent);
+  }
+
+  // -- run events (#152) ------------------------------------------------------
+
+  /**
+   * Subscribe to JSONL-observability run events (run_started /
+   * step_completed with costUsd / run_finished with totals). Returns
+   * an unsubscribe function.
+   */
+  onRunEvent(cb: RunEventCallback): () => void {
+    this.runEventListeners.add(cb);
+    return () => {
+      this.runEventListeners.delete(cb);
+    };
+  }
+
+  /** Events emitted so far for a run (live-collected, in order). */
+  getRunEvents(runId: string): WorkflowRunEvent[] {
+    const live = this.runEvents.get(runId);
+    if (live && live.length > 0) return [...live];
+    const run = this.store.getRun(runId);
+    return run ? runEventsFromRun(run) : [];
+  }
+
+  /**
+   * JSONL export for a run: one JSON object per line (run_started,
+   * step_completed…, run_finished). Uses live-collected events when
+   * available, else reconstructs them from the stored run snapshot.
+   */
+  exportRunEventsJsonl(runId: string): string {
+    return formatRunEventsJsonl(this.getRunEvents(runId));
+  }
+
+  private emitRunEvent(event: WorkflowRunEvent): void {
+    const list = this.runEvents.get(event.runId) ?? [];
+    list.push(event);
+    this.runEvents.set(event.runId, list);
+    for (const cb of this.runEventListeners) {
+      try {
+        cb(event);
+      } catch (err) {
+        console.error('onRunEvent listener threw:', err);
+      }
+    }
+  }
+
+  /** Price token usage with the injected pricer or the default table. */
+  private priceUsage(
+    providerId: string | undefined,
+    modelId: string | undefined,
+    usage: WorkflowTokenUsage | undefined,
+  ): number {
+    if (!usage || !providerId || !modelId) return 0;
+    if (this.usagePricer) {
+      const priced = this.usagePricer(providerId, modelId, usage);
+      if (typeof priced === 'number') return Number.isFinite(priced) && priced >= 0 ? priced : 0;
+      if (priced && typeof priced.total === 'number') {
+        return Number.isFinite(priced.total) && priced.total >= 0 ? priced.total : 0;
+      }
+      return 0;
+    }
+    return priceUsageUsd(providerId, modelId, usage);
   }
 
   close(): void {
@@ -198,6 +356,19 @@ export class WorkflowRunner {
       const max = def.budget.maxCostUsd;
       if (typeof max !== 'number' || !Number.isFinite(max) || max < 0) {
         throw new Error('workflow budget.maxCostUsd must be a non-negative number');
+      }
+    }
+    if (def.maxParallel !== undefined || def.max_parallel !== undefined) {
+      const raw = def.maxParallel ?? def.max_parallel;
+      if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 1) {
+        throw new Error('workflow maxParallel must be a positive integer');
+      }
+      if (
+        def.maxParallel !== undefined &&
+        def.max_parallel !== undefined &&
+        def.maxParallel !== def.max_parallel
+      ) {
+        throw new Error('workflow maxParallel and max_parallel disagree');
       }
     }
     const ids = new Set<string>();
@@ -298,6 +469,9 @@ export class WorkflowRunner {
    */
   private validateNodeConfig(node: WorkflowNode): void {
     const config = asRecord(node.config);
+    // Per-step agent config (#143): role/provider/model/toolset/skills
+    // must be well-typed when present on agent/bot-turn nodes.
+    validateStepConfig(node);
     if (node.type === 'if') {
       const condition = config['condition'];
       if (typeof condition !== 'string' || condition.trim().length === 0) {
@@ -541,6 +715,18 @@ export class WorkflowRunner {
       const run = this.getRunOrThrow(runId);
       const def = this.getWorkflow(run.workflowId);
       const levels = this.topologicalLevels(def);
+      // JSONL observability (#152): one run_started per run execution.
+      const alreadyStarted = (this.runEvents.get(runId) ?? []).some(
+        (e) => e.type === 'run_started',
+      );
+      if (!alreadyStarted) {
+        this.emitRunEvent({
+          type: 'run_started',
+          ts: Date.now(),
+          runId,
+          workflowId: def.id,
+        });
+      }
 
       for (let levelIndex = 0; levelIndex < levels.length; levelIndex++) {
         const current = this.getRunOrThrow(runId);
@@ -553,6 +739,17 @@ export class WorkflowRunner {
           const s = current.nodeStates[nodeId]?.status;
           if (s === 'pending' && !this.hasActiveIncomingEdge(def, current, nodeId)) {
             this.updateNodeState(runId, nodeId, { status: 'skipped' });
+            this.emitRunEvent({
+              type: 'step_completed',
+              ts: Date.now(),
+              runId,
+              workflowId: def.id,
+              nodeId,
+              nodeType: def.nodes.find((n) => n.id === nodeId)?.type,
+              status: 'skipped',
+              costUsd: 0,
+              totalCostUsd: this.runCosts.get(runId) ?? 0,
+            });
           }
         }
         // Crash-resume: never re-execute steps that already completed (or
@@ -562,13 +759,26 @@ export class WorkflowRunner {
           return s !== 'succeeded' && s !== 'skipped';
         });
         if (pending.length > 0) {
-          await Promise.all(pending.map((nodeId) => this.executeNode(runId, nodeId)));
+          // max_parallel cap (#145): at most `cap` nodes of this level
+          // execute concurrently (worker-pool, results via node states).
+          const cap = resolveWorkflowMaxParallel(def);
+          let cursor = 0;
+          const worker = async (): Promise<void> => {
+            for (;;) {
+              const idx = cursor++;
+              if (idx >= pending.length) return;
+              await this.executeNode(runId, pending[idx]!);
+            }
+          };
+          await Promise.all(
+            Array.from({ length: Math.min(cap, pending.length) }, () => worker()),
+          );
         }
 
         const after = this.getRunOrThrow(runId);
         const states = levels[levelIndex].map((nodeId) => after.nodeStates[nodeId]?.status);
         if (states.some((s) => s === 'failed')) {
-          this.setRunStatus(runId, 'failed');
+          this.finishRun(runId, def, 'failed');
           return;
         }
         if (states.some((s) => s === 'paused')) {
@@ -577,7 +787,7 @@ export class WorkflowRunner {
           return;
         }
       }
-      this.setRunStatus(runId, 'succeeded');
+      this.finishRun(runId, def, 'succeeded');
     } finally {
       // Telemetry: close the run record on terminal status only. A run
       // paused for approval keeps its record open across the wait; the
@@ -616,8 +826,9 @@ export class WorkflowRunner {
       attempts: priorAttempts + 1,
     });
     let lastCostUsd = 0;
+    let lastResult: NodeExecutionResult | undefined;
     try {
-      const output = await this.runNodeWithPolicy(runId, node, undefined, {
+      const result = await this.runNodeWithPolicy(runId, node, undefined, {
         onAttempt: (attempt) => {
           if (attempt > 1) {
             this.updateNodeState(runId, nodeId, {
@@ -627,10 +838,12 @@ export class WorkflowRunner {
           }
         },
       });
-      // Budget: sum the cost signal on the output; exceeding the
-      // workflow's cap fails this node (and therefore the run) with a
-      // budget error, and later levels never start.
-      const costUsd = extractCostUsd(output);
+      lastResult = result;
+      const output = result.output;
+      // Budget: sum the cost of this node — an explicit cost signal on
+      // the output, or the priced token usage of an agent/bot-turn
+      // step (#150) — and fail on exceeding the workflow's cap.
+      const costUsd = result.costUsd ?? extractCostUsd(output);
       lastCostUsd = costUsd;
       if (costUsd > 0) {
         const total = (this.runCosts.get(runId) ?? 0) + costUsd;
@@ -648,8 +861,25 @@ export class WorkflowRunner {
         endedAt: Date.now(),
       };
       if (costUsd > 0) patch.costUsd = costUsd;
+      if (result.usage) patch.usage = result.usage;
+      if (result.provider) patch.provider = result.provider;
+      if (result.model) patch.model = result.model;
       this.updateNodeState(runId, nodeId, patch);
       this.checkpoint(runId);
+      this.emitRunEvent({
+        type: 'step_completed',
+        ts: Date.now(),
+        runId,
+        workflowId: def.id,
+        nodeId,
+        nodeType: node.type,
+        status: 'succeeded',
+        costUsd,
+        ...(result.usage ? { usage: result.usage } : {}),
+        ...(result.provider ? { provider: result.provider } : {}),
+        ...(result.model ? { model: result.model } : {}),
+        totalCostUsd: this.runCosts.get(runId) ?? costUsd,
+      });
       nodeStep?.end({ ok: true });
       // A node that paused for approval resumes the run once its decision lands.
       const current = this.getRunOrThrow(runId);
@@ -664,8 +894,25 @@ export class WorkflowRunner {
       };
       // Keep the cost of a node that tripped the budget on its state.
       if (lastCostUsd > 0) patch.costUsd = lastCostUsd;
+      if (lastResult?.usage) patch.usage = lastResult.usage;
+      if (lastResult?.provider) patch.provider = lastResult.provider;
+      if (lastResult?.model) patch.model = lastResult.model;
       this.updateNodeState(runId, nodeId, patch);
       this.checkpoint(runId);
+      this.emitRunEvent({
+        type: 'step_completed',
+        ts: Date.now(),
+        runId,
+        workflowId: def.id,
+        nodeId,
+        nodeType: node.type,
+        status: 'failed',
+        costUsd: lastCostUsd,
+        ...(lastResult?.usage ? { usage: lastResult.usage } : {}),
+        ...(lastResult?.provider ? { provider: lastResult.provider } : {}),
+        ...(lastResult?.model ? { model: lastResult.model } : {}),
+        totalCostUsd: this.runCosts.get(runId) ?? lastCostUsd,
+      });
     }
   }
 
@@ -682,7 +929,7 @@ export class WorkflowRunner {
     node: WorkflowNode,
     override?: SubExecutionContext,
     hooks?: { onAttempt?: (attempt: number) => void },
-  ): Promise<unknown> {
+  ): Promise<NodeExecutionResult> {
     const maxAttempts = node.retry?.maxAttempts ?? 1;
     const backoffMs = node.retry?.backoffMs ?? 0;
     let lastError: unknown;
@@ -702,7 +949,7 @@ export class WorkflowRunner {
     runId: string,
     node: WorkflowNode,
     override?: SubExecutionContext,
-  ): Promise<unknown> {
+  ): Promise<NodeExecutionResult> {
     const work = this.runNodeLogic(runId, node, override);
     const timeoutMs = node.timeoutMs;
     if (timeoutMs === undefined) return work;
@@ -725,13 +972,13 @@ export class WorkflowRunner {
     runId: string,
     node: WorkflowNode,
     override?: SubExecutionContext,
-  ): Promise<unknown> {
+  ): Promise<NodeExecutionResult> {
     const run = this.getRunOrThrow(runId);
     const ctx = this.buildTemplateContext(run, override);
 
     switch (node.type) {
       case 'trigger':
-        return run.input;
+        return { output: run.input };
 
       case 'agent': {
         const config = asRecord(node.config);
@@ -743,16 +990,16 @@ export class WorkflowRunner {
         const bot = this.bots.get(botId)!;
         const rendered = renderTemplate(config['prompt'] ?? '', ctx);
         const message = typeof rendered === 'string' ? rendered : JSON.stringify(rendered);
-        let text = '';
-        await this.agentRuntime.runTurn({
-          bot,
-          message,
-          sessionId: `workflow:${runId}:${node.id}`,
-          onEvent: (event: StreamEvent) => {
-            if (event.type === 'token') text += event.content;
-          },
-        });
-        return text;
+        const turn = await this.runAgentTurn(runId, node, bot, message, `workflow:${runId}:${node.id}`);
+        // Output stays the plain assistant text (templates address it
+        // as {{nodes.<id>.output}}); usage/cost ride the side channel.
+        return {
+          output: turn.text,
+          usage: turn.usage,
+          costUsd: turn.costUsd,
+          provider: turn.provider,
+          model: turn.model,
+        };
       }
 
       case 'tool': {
@@ -777,7 +1024,7 @@ export class WorkflowRunner {
           const approved = await this.pauseOnApproval(runId, node.id, evaluation.approvalId);
           if (!approved) throw new Error('denied by user');
         }
-        return await tool.handler(args, toolCtx);
+        return { output: await tool.handler(args, toolCtx) };
       }
 
       case 'http': {
@@ -808,7 +1055,7 @@ export class WorkflowRunner {
         } catch {
           body = text;
         }
-        return { status: response.status, body };
+        return { output: { status: response.status, body } };
       }
 
       case 'delay': {
@@ -818,7 +1065,7 @@ export class WorkflowRunner {
           throw new Error(`delay node ${node.id}: config.seconds must be a non-negative number`);
         }
         await sleep(seconds * 1000);
-        return { waitedSeconds: seconds };
+        return { output: { waitedSeconds: seconds } };
       }
 
       case 'approval': {
@@ -832,7 +1079,7 @@ export class WorkflowRunner {
         );
         const approved = await this.pauseOnApproval(runId, node.id, approvalId);
         if (!approved) throw new Error('denied by user');
-        return { approved: true };
+        return { output: { approved: true } };
       }
 
       case 'if': {
@@ -844,7 +1091,7 @@ export class WorkflowRunner {
         const rendered = renderTemplate(rawCondition, ctx);
         const sandboxCtx = this.buildCodeSandboxContext(run, override);
         const condition = await this.evaluateConditionValue(node.id, rendered, sandboxCtx);
-        return { condition };
+        return { output: { condition } };
       }
 
       case 'set': {
@@ -857,7 +1104,7 @@ export class WorkflowRunner {
         for (const [field, template] of Object.entries(assignments)) {
           output[field] = renderTemplate(template, ctx);
         }
-        return output;
+        return { output };
       }
 
       case 'code': {
@@ -869,7 +1116,9 @@ export class WorkflowRunner {
         const timeoutMs =
           typeof config['timeoutMs'] === 'number' ? config['timeoutMs'] : undefined;
         try {
-          return await evaluateCode(code, this.buildCodeSandboxContext(run, override), timeoutMs);
+          return {
+            output: await evaluateCode(code, this.buildCodeSandboxContext(run, override), timeoutMs),
+          };
         } catch (err) {
           throw new Error(
             `code node ${node.id} failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -898,16 +1147,19 @@ export class WorkflowRunner {
           typeof renderedSession === 'string' && renderedSession.length > 0
             ? renderedSession
             : `workflow:${runId}:${node.id}`;
-        let text = '';
-        await this.agentRuntime.runTurn({
-          bot,
-          message,
-          sessionId,
-          onEvent: (event: StreamEvent) => {
-            if (event.type === 'token') text += event.content;
-          },
-        });
-        return { text, sessionId };
+        const turn = await this.runAgentTurn(runId, node, bot, message, sessionId);
+        // Output carries usage + costUsd (#150) alongside the historic
+        // { text, sessionId } shape.
+        const output: Record<string, unknown> = { text: turn.text, sessionId };
+        if (turn.usage) output['usage'] = turn.usage;
+        if (turn.costUsd > 0) output['costUsd'] = turn.costUsd;
+        return {
+          output,
+          usage: turn.usage,
+          costUsd: turn.costUsd,
+          provider: turn.provider,
+          model: turn.model,
+        };
       }
 
       case 'loop': {
@@ -948,24 +1200,26 @@ export class WorkflowRunner {
         let lastBodyOutput: unknown;
         let lastEvaluatorOutput: unknown;
         for (let iteration = 1; iteration <= maxIterations; iteration++) {
-          const bodyOutput = await this.executeSubNode(runId, def, bodyNodeId, {
+          const bodyResult = await this.executeSubNode(runId, def, bodyNodeId, {
             nodes: { ...outputs },
             iteration,
             item: override?.item,
             index: override?.index,
           });
+          const bodyOutput = bodyResult.output;
           outputs[bodyNodeId] = bodyOutput;
           lastBodyOutput = bodyOutput;
-          totalCostUsd += extractCostUsd(bodyOutput);
-          const evaluatorOutput = await this.executeSubNode(runId, def, evaluatorNodeId, {
+          totalCostUsd += bodyResult.costUsd ?? extractCostUsd(bodyOutput);
+          const evaluatorResult = await this.executeSubNode(runId, def, evaluatorNodeId, {
             nodes: { ...outputs },
             iteration,
             item: override?.item,
             index: override?.index,
           });
+          const evaluatorOutput = evaluatorResult.output;
           outputs[evaluatorNodeId] = evaluatorOutput;
           lastEvaluatorOutput = evaluatorOutput;
-          totalCostUsd += extractCostUsd(evaluatorOutput);
+          totalCostUsd += evaluatorResult.costUsd ?? extractCostUsd(evaluatorOutput);
           const accepted = this.loopAccepted(evaluatorOutput, acceptPath);
           history.push({ iteration, bodyOutput, evaluatorOutput, accepted });
           if (accepted) {
@@ -979,7 +1233,7 @@ export class WorkflowRunner {
               history,
             };
             if (totalCostUsd > 0) out['costUsd'] = totalCostUsd;
-            return out;
+            return { output: out, costUsd: totalCostUsd };
           }
         }
         // Exhausted: body/evaluator themselves ran fine — record their
@@ -1031,14 +1285,14 @@ export class WorkflowRunner {
           for (;;) {
             const index = cursor++;
             if (index >= items.length) return;
-            const out = await this.executeSubNode(runId, def, bodyNodeId, {
+            const sub = await this.executeSubNode(runId, def, bodyNodeId, {
               nodes: { ...outputs },
               item: items[index],
               index,
               iteration: override?.iteration,
             });
-            results[index] = out;
-            costs[index] = extractCostUsd(out);
+            results[index] = sub.output;
+            costs[index] = sub.costUsd ?? extractCostUsd(sub.output);
           }
         };
         const workerCount = Math.min(maxParallel, items.length);
@@ -1051,12 +1305,87 @@ export class WorkflowRunner {
         }
         const out: Record<string, unknown> = { results, count: items.length };
         if (totalCostUsd > 0) out['costUsd'] = totalCostUsd;
-        return out;
+        return { output: out, costUsd: totalCostUsd };
       }
 
       default:
         throw new Error(`unsupported node type: ${(node as WorkflowNode).type}`);
     }
+  }
+
+  /**
+   * Run one agent/bot-turn step (#143 + #150): resolve the per-step
+   * config, build the effective bot, execute via the injected
+   * `nodeExecutor` when present else `agentRuntime.runTurn`, and price
+   * the returned token usage with the runner's price table / injected
+   * pricer. An executor-supplied explicit `costUsd` wins over pricing.
+   */
+  private async runAgentTurn(
+    runId: string,
+    node: WorkflowNode,
+    bot: BotConfig,
+    message: string,
+    sessionId: string,
+  ): Promise<{
+    text: string;
+    usage?: WorkflowTokenUsage;
+    costUsd: number;
+    provider?: string;
+    model?: string;
+  }> {
+    const run = this.getRunOrThrow(runId);
+    const step = resolveStepConfig(asRecord(node.config));
+    const effectiveBot = applyStepConfigToBot(bot, step);
+    const provider = effectiveBot.provider;
+    const model = effectiveBot.model;
+
+    if (this.nodeExecutor) {
+      const res = await this.nodeExecutor({
+        runId,
+        workflowId: run.workflowId,
+        node,
+        step,
+        bot,
+        effectiveBot,
+        message,
+        sessionId,
+      });
+      const usage = res.usage;
+      const costUsd =
+        typeof res.costUsd === 'number' && Number.isFinite(res.costUsd) && res.costUsd >= 0
+          ? res.costUsd
+          : this.priceUsage(res.providerId ?? provider, res.modelId ?? model, usage);
+      return {
+        text: res.text,
+        usage,
+        costUsd,
+        provider: res.providerId ?? provider,
+        model: res.modelId ?? model,
+      };
+    }
+
+    let text = '';
+    let doneUsage: WorkflowTokenUsage | undefined;
+    const returned = await this.agentRuntime.runTurn({
+      bot: effectiveBot,
+      message,
+      sessionId,
+      onEvent: (event: StreamEvent) => {
+        if (event.type === 'token') text += event.content;
+        if (event.type === 'done') doneUsage = event.usage;
+      },
+    });
+    const usage: WorkflowTokenUsage | undefined =
+      returned && typeof returned === 'object' && typeof returned.promptTokens === 'number'
+        ? returned
+        : doneUsage;
+    return {
+      text,
+      usage,
+      costUsd: this.priceUsage(provider, model, usage),
+      provider,
+      model,
+    };
   }
 
   /** Acceptance rule for a loop evaluator output (see LoopNodeConfig). */
@@ -1077,7 +1406,7 @@ export class WorkflowRunner {
     def: WorkflowDefinition,
     targetId: string,
     ctx: SubExecutionContext,
-  ): Promise<unknown> {
+  ): Promise<NodeExecutionResult> {
     const target = def.nodes.find((n) => n.id === targetId);
     if (!target) throw new Error(`unknown subordinate node ${targetId} in workflow ${def.id}`);
     return this.runNodeWithPolicy(runId, target, ctx);
@@ -1253,6 +1582,33 @@ export class WorkflowRunner {
     const cached = this.runCache.get(runId);
     if (cached) cached.nodeStates[nodeId] = next;
     this.emitUpdate(runId);
+  }
+
+  /** Set a terminal run status and emit the run_finished event (#152). */
+  private finishRun(runId: string, def: WorkflowDefinition, status: 'succeeded' | 'failed'): void {
+    this.setRunStatus(runId, status);
+    const run = this.getRunOrThrow(runId);
+    const steps: { nodeId: string; costUsd: number; status: string }[] = [];
+    let summed = 0;
+    for (const [nodeId, state] of Object.entries(run.nodeStates)) {
+      if (state.status === 'pending' || state.status === 'running' || state.status === 'paused') {
+        continue;
+      }
+      const costUsd = typeof state.costUsd === 'number' ? state.costUsd : 0;
+      // Steps completed live in this process already emitted their
+      // step_completed events; the breakdown here is for aggregation.
+      steps.push({ nodeId, costUsd, status: state.status });
+      summed += costUsd;
+    }
+    this.emitRunEvent({
+      type: 'run_finished',
+      ts: Date.now(),
+      runId,
+      workflowId: def.id,
+      status,
+      totalCostUsd: this.runCosts.get(runId) ?? summed,
+      steps,
+    });
   }
 
   private setRunStatus(runId: string, status: RunStatus): void {

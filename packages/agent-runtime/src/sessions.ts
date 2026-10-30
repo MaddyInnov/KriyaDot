@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { ChatMessage, RichMessage, ToolCall } from './types.js';
+import { createHash } from 'node:crypto';
+import {
+  scoreAttention,
+  DEFAULT_ATTENTION_PIN_THRESHOLD,
+  type MessageCategory,
+} from './attention.js';
+export type { MessageCategory } from './attention.js';
 
 // vitest (Vite 5.4.21) cannot statically resolve the `node:sqlite` specifier,
 // so load it at runtime via the builtin-module API instead of a top-level import.
@@ -45,6 +52,8 @@ interface MessageRow {
   tool_name: string | null;
   tool_call_id: string | null;
   tool_calls: string | null;
+  native_items: string | null;
+  media_items: string | null;
 }
 
 function newId(): string {
@@ -60,6 +69,8 @@ export interface IdentifiedMessage {
   toolName?: string;
   toolCallId?: string;
   toolCalls?: ToolCall[];
+  /** Provider-native output items (#34), returned verbatim as stored. */
+  nativeItems?: unknown[];
   /**
    * Reply-thread membership (Slack-style threads). Null/undefined for main
    * chat messages. threadId is the opaque thread id (`thr_…`); threadRootId
@@ -153,16 +164,38 @@ export interface SessionStoreOptions {
    */
   compactThreshold?: number;
   /**
-   * Adaptive compression (Octomind parity): instead of a fixed message
-   * count, the fold depth is COMPUTED from measured growth — the
-   * verbatim tail is sized by estimated tokens against
-   * `contextBudgetTokens`, so a session of short messages keeps more
-   * verbatim history than a session of huge tool outputs. Default off
-   * (fixed-count behavior unchanged).
+   * Adaptive compression (Octomind parity #128): instead of a fixed
+   * message count, the fold depth is COMPUTED from the measured context
+   * growth RATE (estimated tokens per turn over the recent window, see
+   * {@link measureGrowthRate}) AND the measured size: the verbatim tail
+   * token budget is scaled by the rate (fast-growing sessions fold
+   * deeper, slow-growing sessions keep more), and an automatic fold is
+   * gated on amortization — it is skipped/deferred when the estimated
+   * summarizer cost is >= the tokens the fold would save (see
+   * {@link estimateAmortization}); an explicit compactNow() is forced
+   * and bypasses the gate. Default off (fixed-count behavior unchanged,
+   * apart from the retention/attention survival rules below, which
+   * apply in both modes).
    */
   adaptiveCompaction?: boolean;
   /** Token budget for the adaptive tail + summary (default 60_000). */
   contextBudgetTokens?: number;
+  /**
+   * Per-category knowledge-retention budgets (#132): fractions (need not
+   * sum to 1; they are normalized) of the retained-block budget granted
+   * to each message category when a fold chooses which folded blocks
+   * survive verbatim. Partial overrides merge over
+   * {@link DEFAULT_RETENTION_BUDGETS}.
+   */
+  retentionBudgets?: Partial<Record<MessageCategory, number>>;
+  /**
+   * Attention score at/above which a folded block may be pinned into
+   * the retained set (#133). Default
+   * {@link DEFAULT_ATTENTION_PIN_THRESHOLD} (0.5).
+   */
+  attentionPinThreshold?: number;
+  /** Max blocks pinned verbatim per fold (default 20). */
+  maxRetainedBlocks?: number;
   /**
    * Background folds (Octomind parity): when a fold is due and a prior
    * summary exists, getMessages returns the current view immediately
@@ -182,6 +215,116 @@ export interface CompactionArchiveEntry {
   messageCount: number;
   summary: string;
   createdAt: string;
+  /**
+   * SHA-256 (hex) of the stored messages_json, written at archive time
+   * (#134). Absent on pre-#134 rows until backfilled — verification is
+   * verify-when-present (see readArchive / verifyArchive).
+   */
+  contentHash?: string;
+}
+
+/** Result of {@link SessionStore.readArchive}. */
+export interface ReadArchiveResult {
+  entry: CompactionArchiveEntry;
+  messages: RichMessage[];
+  /**
+   * Set when the archive failed integrity verification (#134): a hash
+   * mismatch or unparseable stored JSON. When set, `messages` is empty
+   * — corrupted content is reported, never parsed best-effort and
+   * silently served.
+   */
+  integrityFailure?: string;
+}
+
+/** Explicit plan state carried across compaction folds (#87). */
+export interface SessionPlanState {
+  sessionId: string;
+  /** The plan artifact, verbatim (string form; objects are JSON text). */
+  plan: string;
+  updatedAt: string;
+}
+
+/**
+ * Per-category retention budgets (#132): share of the retained-block
+ * budget each category may claim during a fold. Decisions dominate,
+ * tool results get the smallest share (they are the most re-derivable).
+ */
+export const DEFAULT_RETENTION_BUDGETS: Record<MessageCategory, number> = {
+  decisions: 0.4,
+  'file-content': 0.25,
+  'user-turns': 0.15,
+  'tool-results': 0.1,
+  other: 0.1,
+};
+
+/** Measured context growth (#128). */
+export interface GrowthRate {
+  /** Mean estimated tokens per turn (message) over the whole history. */
+  tokensPerTurn: number;
+  /** Mean estimated tokens per turn over the recent window. */
+  recentTokensPerTurn: number;
+  totalTokens: number;
+  turns: number;
+}
+
+const RECENT_GROWTH_WINDOW = 20;
+/** Reference growth rate the adaptive tail budget is calibrated to. */
+export const GROWTH_REFERENCE_TOKENS_PER_TURN = 250;
+
+/**
+ * Measure the context growth rate from per-message token estimates:
+ * overall tokens/turn plus a recent-window rate (the signal the
+ * adaptive fold depth reacts to — a session that suddenly starts
+ * emitting huge tool outputs folds deeper than its history suggests).
+ */
+export function measureGrowthRate(tokenCounts: number[]): GrowthRate {
+  const totalTokens = tokenCounts.reduce((s, n) => s + n, 0);
+  const turns = tokenCounts.length;
+  const recent = tokenCounts.slice(-RECENT_GROWTH_WINDOW);
+  const recentTokens = recent.reduce((s, n) => s + n, 0);
+  return {
+    tokensPerTurn: turns > 0 ? totalTokens / turns : 0,
+    recentTokensPerTurn: recent.length > 0 ? recentTokens / recent.length : 0,
+    totalTokens,
+    turns,
+  };
+}
+
+export interface AmortizationEstimate {
+  /** Estimated tokens the fold removes from the live context. */
+  tokensSaved: number;
+  /** Estimated summarizer cost in token equivalents. */
+  summarizerCost: number;
+  /** True when the fold pays for itself (cost < saved). */
+  amortizes: boolean;
+}
+
+/** Fixed per-call overhead (token equivalents) charged to a fold. */
+export const SUMMARIZER_CALL_OVERHEAD_TOKENS = 64;
+
+/** Estimated summary size for a fold of `compactTokens` tokens. */
+export function estimateSummaryTokens(compactTokens: number): number {
+  if (compactTokens <= 0) return 0;
+  return Math.min(800, Math.max(32, Math.ceil(compactTokens * 0.2)));
+}
+
+/**
+ * Amortization gate (#128): a fold pays for itself only when the
+ * summarizer's estimated cost (summary output + fixed call overhead)
+ * is below the tokens the fold saves (folded tokens minus the summary
+ * that replaces them). Tiny folds fail this and are deferred until
+ * more context has accumulated — or forced via compactNow().
+ */
+export function estimateAmortization(compactTokens: number): AmortizationEstimate {
+  const summaryTokens = estimateSummaryTokens(compactTokens);
+  const tokensSaved = Math.max(0, compactTokens - summaryTokens);
+  const summarizerCost = summaryTokens + SUMMARIZER_CALL_OVERHEAD_TOKENS;
+  return { tokensSaved, summarizerCost, amortizes: summarizerCost < tokensSaved };
+}
+
+/** SHA-256 (hex) of an archived block's stored JSON (#134). */
+export function hashArchiveContent(messagesJson: string): string {
+  return createHash('sha256').update(messagesJson, 'utf8').digest('hex');
 }
 
 /** Rough token estimate (≈4 chars/token) for one stored message row. */
@@ -209,7 +352,45 @@ function mapRow(row: MessageRow): RichMessage {
       // corrupted column: drop it rather than failing the whole history
     }
   }
+  if (row.native_items) {
+    try {
+      const items = JSON.parse(row.native_items) as unknown;
+      // Provider-native items (#34) are returned verbatim, never reshaped.
+      if (Array.isArray(items)) msg.nativeItems = items;
+    } catch {
+      // corrupted column: drop it rather than failing the whole history
+    }
+  }
+  if (row.media_items) {
+    try {
+      const media = JSON.parse(row.media_items) as unknown;
+      // Native media attachments (#38) round-trip verbatim so a resumed
+      // session replays the same image/video parts to the provider.
+      if (Array.isArray(media)) msg.media = media as ChatMessage['media'];
+    } catch {
+      // corrupted column: drop it rather than failing the whole history
+    }
+  }
   return msg;
+}
+
+/**
+ * Driver contract for provider-native items (#34), session-layer half:
+ * drivers attach the provider's raw output items to the assistant
+ * ChatMessage as `nativeItems` before the message is appended; the store
+ * persists them verbatim (appendMessage) and returns them verbatim on
+ * every read path (getMessages / listThreadMessages). On resume a driver
+ * replays the stored `nativeItems` of each assistant message to its
+ * provider in stored order. This helper collects them in history order
+ * for a driver (or a test) that wants the flat replay list.
+ */
+export function collectNativeItems(messages: ChatMessage[]): unknown[] {
+  const out: unknown[] = [];
+  for (const m of messages) {
+    const items = (m as RichMessage).nativeItems;
+    if (Array.isArray(items)) out.push(...items);
+  }
+  return out;
 }
 
 /**
@@ -238,6 +419,9 @@ export class SessionStore {
   private readonly adaptiveCompaction: boolean;
   private readonly contextBudgetTokens: number;
   private readonly backgroundCompaction: boolean;
+  private readonly retentionBudgets: Record<MessageCategory, number>;
+  private readonly attentionPinThreshold: number;
+  private readonly maxRetainedBlocks: number;
   /** sessionId → { summary, upToId }: already-compacted watermark cache. */
   private readonly compactionCache = new Map<string, { summary: string; upToId: number }>();
   /** Sessions with a background fold currently in flight. */
@@ -254,6 +438,12 @@ export class SessionStore {
     this.adaptiveCompaction = opts.adaptiveCompaction === true;
     this.contextBudgetTokens = parsePositiveInt(opts.contextBudgetTokens) ?? 60_000;
     this.backgroundCompaction = opts.backgroundCompaction === true;
+    this.retentionBudgets = { ...DEFAULT_RETENTION_BUDGETS, ...(opts.retentionBudgets ?? {}) };
+    this.attentionPinThreshold =
+      typeof opts.attentionPinThreshold === 'number' && Number.isFinite(opts.attentionPinThreshold)
+        ? Math.min(1, Math.max(0, opts.attentionPinThreshold))
+        : DEFAULT_ATTENTION_PIN_THRESHOLD;
+    this.maxRetainedBlocks = parsePositiveInt(opts.maxRetainedBlocks) ?? 20;
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY,
@@ -300,7 +490,34 @@ export class SessionStore {
         worktree_path TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS session_plan_state (
+        session_id TEXT PRIMARY KEY,
+        plan TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
     `);
+    // #34 migration: provider-native output items column (nullable; old
+    // rows simply carry no native items).
+    try {
+      this.db.exec('ALTER TABLE messages ADD COLUMN native_items TEXT');
+    } catch {
+      // Column already exists.
+    }
+    // #38 migration: native media attachments column (nullable; old rows
+    // simply carry no media).
+    try {
+      this.db.exec('ALTER TABLE messages ADD COLUMN media_items TEXT');
+    } catch {
+      // Column already exists.
+    }
+    // #134 migration: archive content hash (nullable; pre-#134 rows are
+    // verify-when-present and can be backfilled — see
+    // backfillArchiveHashes).
+    try {
+      this.db.exec('ALTER TABLE compaction_archive ADD COLUMN content_hash TEXT');
+    } catch {
+      // Column already exists.
+    }
     // Full-text search (OpenMausBot parity): FTS5 index over message
     // content, maintained incrementally by triggers so search stays fresh
     // on every insert/delete (branch copies, rewinds, new messages).
@@ -458,9 +675,15 @@ export class SessionStore {
   appendMessage(sessionId: string, msg: ChatMessage): void {
     const rich = msg as RichMessage;
     const toolCalls: ToolCall[] | undefined = rich.toolCalls;
+    // Provider-native output items (#34): persisted verbatim (JSON) so a
+    // resumed session replays exactly what the provider produced.
+    const nativeItems: unknown[] | undefined = rich.nativeItems;
+    // Native media attachments (#38): persisted verbatim (JSON) so a
+    // resumed session replays the same image/video parts.
+    const media = msg.media;
     this.db
       .prepare(
-        'INSERT INTO messages (session_id, role, content, tool_name, tool_call_id, tool_calls, ts) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO messages (session_id, role, content, tool_name, tool_call_id, tool_calls, native_items, media_items, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         sessionId,
@@ -469,8 +692,55 @@ export class SessionStore {
         msg.toolName ?? null,
         msg.toolCallId ?? null,
         toolCalls && toolCalls.length > 0 ? JSON.stringify(toolCalls) : null,
+        nativeItems && nativeItems.length > 0 ? JSON.stringify(nativeItems) : null,
+        media && media.length > 0 ? JSON.stringify(media) : null,
         new Date().toISOString(),
       );
+  }
+
+  // ------------------------------------------------------------------
+  // Explicit plan state (#87): a protected artifact stored ALONGSIDE the
+  // session (never as a message), so compaction can never summarize it
+  // away. getMessages re-injects it verbatim after every fold.
+  // ------------------------------------------------------------------
+
+  /** Set/replace a session's plan state. Objects are stored as JSON. */
+  setPlanState(sessionId: string, plan: string | Record<string, unknown>): void {
+    const text = typeof plan === 'string' ? plan : JSON.stringify(plan);
+    this.db
+      .prepare(
+        `INSERT INTO session_plan_state (session_id, plan, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(session_id) DO UPDATE SET plan = excluded.plan, updated_at = excluded.updated_at`,
+      )
+      .run(sessionId, text, new Date().toISOString());
+  }
+
+  /** A session's plan state, or undefined when none was set. */
+  getPlanState(sessionId: string): SessionPlanState | undefined {
+    const row = this.db
+      .prepare('SELECT plan, updated_at AS updatedAt FROM session_plan_state WHERE session_id = ?')
+      .get(sessionId) as { plan: string; updatedAt: string } | undefined;
+    if (!row) return undefined;
+    return { sessionId, plan: row.plan, updatedAt: row.updatedAt };
+  }
+
+  /** Clear a session's plan state. Returns true when one existed. */
+  clearPlanState(sessionId: string): boolean {
+    const res = this.db.prepare('DELETE FROM session_plan_state WHERE session_id = ?').run(sessionId);
+    return res.changes > 0;
+  }
+
+  /** The protected plan-state message injected into post-fold context. */
+  private planStateMessage(sessionId: string): ChatMessage | undefined {
+    const state = this.getPlanState(sessionId);
+    if (!state) return undefined;
+    return {
+      role: 'system',
+      content:
+        `[session plan state — protected artifact, carried verbatim across compaction; ` +
+        `do not treat as summarized]\n${state.plan}`,
+    };
   }
 
   private readCompaction(sessionId: string): { summary: string; upToId: number } | undefined {
@@ -495,33 +765,104 @@ export class SessionStore {
   private allRows(sessionId: string): MessageRow[] {
     return this.db
       .prepare(
-        'SELECT id, role, content, tool_name, tool_call_id, tool_calls FROM messages WHERE session_id = ? ORDER BY id ASC',
+        'SELECT id, role, content, tool_name, tool_call_id, tool_calls, native_items, media_items FROM messages WHERE session_id = ? ORDER BY id ASC',
       )
       .all(sessionId) as unknown as MessageRow[];
   }
 
   /**
-   * Decide the verbatim tail and the range to fold, or null when no
-   * fold is due. Fixed mode: fold when total > keepN + threshold.
-   * Adaptive mode: the tail is sized by estimated tokens against the
-   * context budget (at least 20 messages, at most keepN), and a fold is
-   * due when the context exceeds the budget (with a minimum chunk) or
-   * the count backstop trips.
+   * Choose which folded blocks survive a fold verbatim (#132 + #133):
+   * candidates are the rows about to fold, scored by the attention
+   * subsystem; blocks below the pin threshold never survive. Survivors
+   * are allocated per category by the retention budgets — each category
+   * first claims its normalized share of the block budget with its
+   * highest-attention blocks, then unused quota spills over to the
+   * remaining candidates in global attention order. Returns survivors
+   * in original (chronological) order.
+   */
+  private selectRetained(
+    compactRange: MessageRow[],
+    allRows: MessageRow[],
+  ): MessageRow[] {
+    const budget = this.maxRetainedBlocks;
+    if (budget <= 0 || compactRange.length === 0) return [];
+    // Global indices for the recency signal: position in the full history.
+    const offset = allRows.indexOf(compactRange[0]!);
+    const scored = compactRange.map((row, i) => {
+      const msg = mapRow(row);
+      const score = scoreAttention(msg, { index: offset + i, total: allRows.length });
+      return { row, score: score.score, category: score.category };
+    }).filter((s) => s.score >= this.attentionPinThreshold);
+    if (scored.length === 0) return [];
+
+    const categories = Object.keys(this.retentionBudgets) as MessageCategory[];
+    const totalWeight = categories.reduce((s, c) => s + Math.max(0, this.retentionBudgets[c]), 0);
+    const picked = new Set<number>();
+    const byAttention = (a: (typeof scored)[number], b: (typeof scored)[number]) =>
+      b.score - a.score || b.row.id - a.row.id;
+    // Phase 1: per-category quota claims.
+    for (const category of categories) {
+      const weight = Math.max(0, this.retentionBudgets[category]);
+      const quota = totalWeight > 0 ? Math.floor((weight / totalWeight) * budget) : 0;
+      if (quota <= 0) continue;
+      const inCategory = scored
+        .filter((s) => s.category === category && !picked.has(s.row.id))
+        .sort(byAttention);
+      for (const s of inCategory.slice(0, quota)) picked.add(s.row.id);
+    }
+    // Phase 2: spill — unused quota goes to the best remaining blocks.
+    if (picked.size < budget) {
+      for (const s of [...scored].sort(byAttention)) {
+        if (picked.size >= budget) break;
+        picked.add(s.row.id);
+      }
+    }
+    return compactRange.filter((r) => picked.has(r.id));
+  }
+
+  /**
+   * Decide the verbatim tail, the range to fold, and the folded blocks
+   * that survive verbatim, or null when no fold is due.
+   *
+   * Fixed mode: fold when total > keepN + threshold.
+   * Adaptive mode (#128): the growth RATE is measured from the rows
+   * (recent tokens/turn), the tail token budget is scaled by that rate
+   * AND bounded by size (70% of the context budget), and the fold is
+   * due when the measured size exceeds the budget (with a minimum
+   * chunk) or the count backstop trips. Automatic folds in adaptive
+   * mode are amortization-gated; `force` (compactNow) bypasses the
+   * gate. In both modes, high-attention blocks in the fold range are
+   * retained verbatim per the retention budgets (#132/#133).
    */
   private planCompaction(
     rows: MessageRow[],
     keepN: number,
-  ): { compactRange: MessageRow[]; kept: MessageRow[] } | null {
+    opts: { force?: boolean } = {},
+  ): { compactRange: MessageRow[]; kept: MessageRow[]; retained: MessageRow[] } | null {
     if (!this.adaptiveCompaction) {
       if (rows.length <= keepN + this.compactThreshold) return null;
-      return { compactRange: rows.slice(0, rows.length - keepN), kept: rows.slice(-keepN) };
+      const compactRange = rows.slice(0, rows.length - keepN);
+      return {
+        compactRange,
+        kept: rows.slice(-keepN),
+        retained: this.selectRetained(compactRange, rows),
+      };
     }
-    const totalTokens = rows.reduce((sum, r) => sum + estimateRowTokens(r), 0);
+    const tokenCounts = rows.map(estimateRowTokens);
+    const totalTokens = tokenCounts.reduce((sum, n) => sum + n, 0);
+    const growth = measureGrowthRate(tokenCounts);
+    // Rate-derived tail budget: fast growth folds deeper (scale down to
+    // 0.5x), slow growth keeps more verbatim (scale up to 1.5x).
+    const rate = growth.recentTokensPerTurn;
+    const rateScale =
+      rate > 0
+        ? Math.min(1.5, Math.max(0.5, GROWTH_REFERENCE_TOKENS_PER_TURN / rate))
+        : 1;
+    const tailBudget = Math.floor(this.contextBudgetTokens * 0.7 * rateScale);
     let keep = 0;
     let tailTokens = 0;
-    const tailBudget = Math.floor(this.contextBudgetTokens * 0.7);
     for (let i = rows.length - 1; i >= 0; i--) {
-      tailTokens += estimateRowTokens(rows[i]!);
+      tailTokens += tokenCounts[i]!;
       keep += 1;
       // Floor of 8 verbatim messages (the most recent exchanges are
       // never folded); beyond it the token budget rules.
@@ -533,7 +874,25 @@ export class SessionStore {
     const countBackstop = rows.length > keepN + this.compactThreshold;
     if (foldCount <= 0) return null;
     if (!countBackstop && !(totalTokens > this.contextBudgetTokens && foldCount >= 10)) return null;
-    return { compactRange: rows.slice(0, foldCount), kept: rows.slice(foldCount) };
+    const compactRange = rows.slice(0, foldCount);
+    // Amortization gate (#128): defer a fold that costs more than it
+    // saves. Forced folds (compactNow) and the count backstop at twice
+    // the threshold (history is unboundedly large) bypass the gate.
+    if (!opts.force && !countBackstop) {
+      const compactTokens = tokenCounts.slice(0, foldCount).reduce((s, n) => s + n, 0);
+      if (!estimateAmortization(compactTokens).amortizes) return null;
+    } else if (!opts.force && countBackstop) {
+      const hardBackstop = rows.length > keepN + this.compactThreshold * 2;
+      if (!hardBackstop) {
+        const compactTokens = tokenCounts.slice(0, foldCount).reduce((s, n) => s + n, 0);
+        if (!estimateAmortization(compactTokens).amortizes) return null;
+      }
+    }
+    return {
+      compactRange,
+      kept: rows.slice(foldCount),
+      retained: this.selectRetained(compactRange, rows),
+    };
   }
 
   /** Archive a raw range losslessly BEFORE it folds into the summary. */
@@ -541,12 +900,18 @@ export class SessionStore {
     const fromId = range[0]!.id;
     const toId = range[range.length - 1]!.id;
     const id = `arc-${sessionId.slice(0, 12)}-${fromId}-${toId}`;
+    const messagesJson = JSON.stringify(range.map(mapRow));
     this.db
       .prepare(
-        `INSERT OR IGNORE INTO compaction_archive (id, session_id, from_id, to_id, message_count, messages_json, summary, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT OR IGNORE INTO compaction_archive (id, session_id, from_id, to_id, message_count, messages_json, summary, created_at, content_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(id, sessionId, fromId, toId, range.length, JSON.stringify(range.map(mapRow)), summary, new Date().toISOString());
+      .run(
+        id, sessionId, fromId, toId, range.length, messagesJson, summary,
+        new Date().toISOString(),
+        // Hash governance (#134): hash the exact stored bytes at write time.
+        hashArchiveContent(messagesJson),
+      );
     return id;
   }
 
@@ -571,30 +936,98 @@ export class SessionStore {
     const rows = this.db
       .prepare(
         `SELECT id, session_id AS sessionId, from_id AS fromId, to_id AS toId, summary, created_at AS createdAt,
-                message_count AS messageCount
+                message_count AS messageCount, content_hash AS contentHash
          FROM compaction_archive WHERE session_id = ? ORDER BY from_id ASC`,
       )
-      .all(sessionId) as unknown as CompactionArchiveEntry[];
-    return rows;
+      .all(sessionId) as unknown as Array<CompactionArchiveEntry & { contentHash: string | null }>;
+    return rows.map(({ contentHash, ...rest }) => ({
+      ...rest,
+      ...(contentHash ? { contentHash } : {}),
+    }));
+  }
+
+  /**
+   * Verify one archive's stored content against its hash (#134).
+   * `verified: false` with `reason: 'no-hash'` is the migration state
+   * for pre-#134 rows (verify-when-present), NOT an integrity failure;
+   * `integrityFailure: true` means a present hash did not match (or the
+   * stored JSON is unparseable) — the content must not be trusted.
+   */
+  verifyArchive(archiveId: string):
+    | { verified: true }
+    | { verified: false; reason: 'not-found' | 'no-hash' | 'hash-mismatch' | 'unparseable'; integrityFailure: boolean } {
+    const row = this.db
+      .prepare('SELECT messages_json AS messagesJson, content_hash AS contentHash FROM compaction_archive WHERE id = ?')
+      .get(archiveId) as { messagesJson: string; contentHash: string | null } | undefined;
+    if (!row) return { verified: false, reason: 'not-found', integrityFailure: false };
+    if (!row.contentHash) return { verified: false, reason: 'no-hash', integrityFailure: false };
+    if (hashArchiveContent(row.messagesJson) !== row.contentHash) {
+      return { verified: false, reason: 'hash-mismatch', integrityFailure: true };
+    }
+    try {
+      JSON.parse(row.messagesJson);
+    } catch {
+      return { verified: false, reason: 'unparseable', integrityFailure: true };
+    }
+    return { verified: true };
+  }
+
+  /**
+   * Backfill hashes for pre-#134 archive rows (content_hash IS NULL),
+   * optionally scoped to one session. Returns the number of rows
+   * backfilled. After backfill those rows verify like any other.
+   */
+  backfillArchiveHashes(sessionId?: string): number {
+    const rows = this.db
+      .prepare(
+        `SELECT id, messages_json AS messagesJson FROM compaction_archive
+         WHERE content_hash IS NULL${sessionId ? ' AND session_id = ?' : ''}`,
+      )
+      .all(...(sessionId ? [sessionId] : [])) as Array<{ id: string; messagesJson: string }>;
+    const update = this.db.prepare('UPDATE compaction_archive SET content_hash = ? WHERE id = ?');
+    for (const r of rows) update.run(hashArchiveContent(r.messagesJson), r.id);
+    return rows.length;
   }
 
   /** Derefence one archive: the original messages, verbatim. */
-  readArchive(archiveId: string): { entry: CompactionArchiveEntry; messages: RichMessage[] } | undefined {
+  readArchive(archiveId: string): ReadArchiveResult | undefined {
     const row = this.db
       .prepare(
-        `SELECT id, session_id AS sessionId, from_id AS fromId, to_id AS toId, summary, created_at AS createdAt, messages_json AS messagesJson
+        `SELECT id, session_id AS sessionId, from_id AS fromId, to_id AS toId, summary, created_at AS createdAt, messages_json AS messagesJson, content_hash AS contentHash, message_count AS messageCount
          FROM compaction_archive WHERE id = ?`,
       )
-      .get(archiveId) as (CompactionArchiveEntry & { messagesJson: string }) | undefined;
+      .get(archiveId) as
+      | (CompactionArchiveEntry & { messagesJson: string; contentHash: string | null })
+      | undefined;
     if (!row) return undefined;
-    let messages: RichMessage[] = [];
+    const { messagesJson, contentHash, ...entryFields } = row;
+    const entry: CompactionArchiveEntry = {
+      ...entryFields,
+      ...(contentHash ? { contentHash } : {}),
+    };
+    // Hash governance (#134): verify-when-present BEFORE parsing. A
+    // mismatch is an integrity failure — report it and serve nothing,
+    // never a best-effort parse of corrupted content.
+    if (contentHash && hashArchiveContent(messagesJson) !== contentHash) {
+      return {
+        entry,
+        messages: [],
+        integrityFailure:
+          `archive ${archiveId} failed hash verification (stored content does not match its content_hash)`,
+      };
+    }
+    let messages: RichMessage[];
     try {
-      messages = JSON.parse(row.messagesJson) as RichMessage[];
+      messages = JSON.parse(messagesJson) as RichMessage[];
     } catch {
-      messages = [];
+      return {
+        entry,
+        messages: [],
+        integrityFailure: `archive ${archiveId} contains unparseable stored JSON`,
+      };
     }
     return {
-      entry: { ...row, messageCount: messages.length },
+      entry: { ...entry, messageCount: messages.length },
       messages,
     };
   }
@@ -643,7 +1076,8 @@ export class SessionStore {
     if (!this.summarizer) return false;
     const rows = this.allRows(sessionId);
     const keepN = Math.max(this.historyLimit, COMPACTION_KEEP_FLOOR);
-    const plan = this.planCompaction(rows, keepN);
+    // Forced (#128): an explicit compact bypasses the amortization gate.
+    const plan = this.planCompaction(rows, keepN, { force: true });
     if (!plan) return false;
     const before = (this.compactionCache.get(sessionId) ?? this.readCompaction(sessionId))?.upToId ?? -1;
     const after = await this.foldRange(sessionId, plan.compactRange);
@@ -701,13 +1135,27 @@ export class SessionStore {
         this.startBackgroundFold(sessionId, rows, keepN);
         const kept = rows.filter((r) => r.id > cached.upToId).slice(-keepN);
         const compactedCount = rows.length - kept.length;
-        return [this.compactionHeader(sessionId, cached.summary, compactedCount, kept.length), ...kept.map(mapRow)];
+        const retained = this.selectRetained(rows.filter((r) => r.id <= cached.upToId), rows);
+        const planMsg = this.planStateMessage(sessionId);
+        return [
+          this.compactionHeader(sessionId, cached.summary, compactedCount, kept.length),
+          ...(planMsg ? [planMsg] : []),
+          ...retained.map(mapRow),
+          ...kept.map(mapRow),
+        ];
       }
     }
 
     const { summary } = await this.foldRange(sessionId, plan.compactRange);
+    // Post-fold assembly (#87 + #132/#133): the protected plan state is
+    // re-injected verbatim right after the summary header, followed by
+    // the high-attention blocks retained from the folded range, then
+    // the verbatim tail.
+    const planMsg = this.planStateMessage(sessionId);
     return [
       this.compactionHeader(sessionId, summary, plan.compactRange.length, plan.kept.length),
+      ...(planMsg ? [planMsg] : []),
+      ...plan.retained.map(mapRow),
       ...plan.kept.map(mapRow),
     ];
   }
@@ -720,25 +1168,21 @@ export class SessionStore {
   listThreadMessages(sessionId: string): IdentifiedMessage[] {
     const rows = this.db
       .prepare(
-        'SELECT id, role, content, tool_name, tool_call_id, tool_calls, ts FROM messages WHERE session_id = ? ORDER BY id ASC',
+        'SELECT id, role, content, tool_name, tool_call_id, tool_calls, native_items, media_items, ts FROM messages WHERE session_id = ? ORDER BY id ASC',
       )
       .all(sessionId) as unknown as Array<MessageRow & { ts: string }>;
     return rows.map((row) => {
+      const rich = mapRow(row);
       const msg: IdentifiedMessage = {
         id: row.id,
-        role: row.role as ChatMessage['role'],
+        role: rich.role,
         content: row.content,
         ts: row.ts,
       };
       if (row.tool_name) msg.toolName = row.tool_name;
       if (row.tool_call_id) msg.toolCallId = row.tool_call_id;
-      if (row.tool_calls) {
-        try {
-          msg.toolCalls = JSON.parse(row.tool_calls) as ToolCall[];
-        } catch {
-          // corrupted column: drop it rather than failing the whole history
-        }
-      }
+      if (rich.toolCalls) msg.toolCalls = rich.toolCalls;
+      if (rich.nativeItems) msg.nativeItems = rich.nativeItems;
       return msg;
     });
   }
@@ -778,8 +1222,8 @@ export class SessionStore {
     });
     const copied = this.db
       .prepare(
-        `INSERT INTO messages (session_id, role, content, tool_name, tool_call_id, tool_calls, ts)
-         SELECT ?, role, content, tool_name, tool_call_id, tool_calls, ts
+        `INSERT INTO messages (session_id, role, content, tool_name, tool_call_id, tool_calls, native_items, media_items, ts)
+         SELECT ?, role, content, tool_name, tool_call_id, tool_calls, native_items, media_items, ts
          FROM messages WHERE session_id = ? AND id <= ? ORDER BY id ASC`,
       )
       .run(newSessionId, sessionId, fromMessageId);
@@ -799,8 +1243,8 @@ export class SessionStore {
     const newId = this.createSession(session.botId, { ownerPersonId: session.ownerPersonId });
     this.db
       .prepare(
-        `INSERT INTO messages (session_id, role, content, tool_name, tool_call_id, tool_calls, ts)
-         SELECT ?, role, content, tool_name, tool_call_id, tool_calls, ts
+        `INSERT INTO messages (session_id, role, content, tool_name, tool_call_id, tool_calls, native_items, media_items, ts)
+         SELECT ?, role, content, tool_name, tool_call_id, tool_calls, native_items, media_items, ts
          FROM messages WHERE session_id = ? ORDER BY id ASC`,
       )
       .run(newId, sessionId);
@@ -809,6 +1253,13 @@ export class SessionStore {
       .prepare(
         `INSERT INTO compactions (session_id, summary, up_to_id, updated_at)
          SELECT ?, summary, up_to_id, updated_at FROM compactions WHERE session_id = ?`,
+      )
+      .run(newId, sessionId);
+    // Copy the protected plan state (#87) so the duplicate keeps its plan.
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO session_plan_state (session_id, plan, updated_at)
+         SELECT ?, plan, updated_at FROM session_plan_state WHERE session_id = ?`,
       )
       .run(newId, sessionId);
     return newId;
@@ -824,6 +1275,7 @@ export class SessionStore {
     if (!session) return false;
     this.db.prepare('DELETE FROM messages WHERE session_id = ?').run(sessionId);
     this.db.prepare('DELETE FROM compactions WHERE session_id = ?').run(sessionId);
+    this.db.prepare('DELETE FROM session_plan_state WHERE session_id = ?').run(sessionId);
     this.db.prepare('DELETE FROM session_worktrees WHERE session_id = ?').run(sessionId);
     const res = this.db.prepare('DELETE FROM sessions WHERE id = ?').run(sessionId);
     return res.changes > 0;

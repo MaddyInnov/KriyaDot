@@ -22,12 +22,14 @@ import {
 } from '@mvp/agent-runtime';
 import type {
   BotConfig,
+  ModelProfiles,
   StreamEvent,
   SubagentSpawnFn,
   TokenUsage,
   ToolDefinition,
 } from '@mvp/agent-runtime';
 import type { GovernanceAdapter } from './governance-adapter.js';
+import { createSummarizer } from './summarizer.js';
 
 import { openDb } from '@mvp/agent-runtime';
 import type { DatabaseSync } from 'node:sqlite';
@@ -51,6 +53,15 @@ export interface DelegateWiringOpts {
     fields: { actor?: string; sessionId?: string; toolName?: string; decision?: string; detail?: unknown },
   ) => void;
   defaultProviderId?: string;
+  /**
+   * The host's purpose-based model-profile table (Octomind parity —
+   * delegate modelProfiles closure). The child runtime receives the SAME
+   * table the server runtime was built with, plus a child summarizer built
+   * from it, so delegated children resolve aux purposes (compression,
+   * reviewer, …) through profiles instead of env-only fallback, and child
+   * sessions get adaptive compaction like parent sessions.
+   */
+  modelProfiles?: ModelProfiles;
 }
 
 /** Ensure the minted child session id has a row in the sessions table. */
@@ -100,12 +111,23 @@ export function registerDelegateTools(opts: DelegateWiringOpts): void {
     const childSessionId = input.sessionId ?? `sub_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
     ensureSessionRow(dbPath, childSessionId, bot.id);
 
-    const childRuntime = new AgentRuntime({
+    const childRuntime: AgentRuntime = new AgentRuntime({
       dbPath,
       skillsDir: opts.skillsDir,
       governance: opts.governanceAdapter,
       toolRegistry: childRegistry,
       defaultProviderId: opts.defaultProviderId ?? 'groq',
+      // Delegate modelProfiles closure: the child gets its own runtime
+      // instance OF the host's profile table (per-turn overrides still win
+      // inside the child) and the same session-store options as the server
+      // runtime — a profile-driven summarizer + adaptive/background folds —
+      // instead of silently dropping both.
+      modelProfiles: opts.modelProfiles,
+      sessionStoreOptions: {
+        summarizer: createSummarizer(undefined, opts.modelProfiles),
+        adaptiveCompaction: true,
+        backgroundCompaction: true,
+      },
       // Octomind parity wiring (same as the server runtime): per-bot
       // workspaces for project instructions/policy/tools + the shared
       // platform embedder for discovery.
@@ -116,6 +138,12 @@ export function registerDelegateTools(opts: DelegateWiringOpts): void {
           dataDir: opts.dataDir,
         }),
       embedder: createEmbedderFromEnv(),
+      // #59: children get read_spilled_result bound to their own spill
+      // store too (the closure runs per turn, after childRuntime exists).
+      extraToolsForBot: (botId): ToolDefinition[] => {
+        const b = opts.getBotConfig(botId);
+        return b ? childRuntime.createSpillTools(b) : [];
+      },
     });
 
     // Collect the child's final text from the token stream. (runTurn returns

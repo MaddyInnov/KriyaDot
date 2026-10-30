@@ -14,9 +14,15 @@ import { shapeDeepSeekRequest } from './deepseek.js';
 import { parseOpenAIRateLimitHeaders, recordRateLimit } from './rate-limit.js';
 import { shapeReasoning } from '../reasoning-profiles.js';
 
+/** Native multimodal content parts (Octomind parity #38). */
+type OpenAIContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } }
+  | { type: 'video_url'; video_url: { url: string } };
+
 interface OpenAIMessage {
   role: string;
-  content: string | null;
+  content: string | null | OpenAIContentPart[];
   tool_call_id?: string;
   tool_calls?: Array<{
     id: string;
@@ -62,6 +68,20 @@ function toOpenAIMessages(messages: ChatMessage[]): OpenAIMessage[] {
             }
           : {}),
       });
+    } else if (m.role === 'user' && m.media && m.media.length > 0) {
+      // #38: native multimodal turn — text part first, then one part per
+      // attachment as a data URI (image_url / video_url), the wire shape
+      // OpenAI-compatible vision endpoints accept.
+      const parts: OpenAIContentPart[] = [{ type: 'text', text: m.content }];
+      for (const media of m.media) {
+        const url = `data:${media.mediaType};base64,${media.dataBase64}`;
+        parts.push(
+          media.kind === 'video'
+            ? { type: 'video_url', video_url: { url } }
+            : { type: 'image_url', image_url: { url } },
+        );
+      }
+      out.push({ role: 'user', content: parts });
     } else {
       out.push({ role: m.role, content: m.content });
     }
@@ -86,6 +106,13 @@ export interface OpenAICompatibleOptions {
   apiKey: string;
   extraHeaders?: Record<string, string>;
   defaultModel?: string;
+  /** Injectable fetch (tests). Default: the global fetch, resolved lazily per call. */
+  fetchFn?: typeof fetch;
+  /**
+   * Keyless lanes (free-LLM stack: LLM7 anonymous): send NO Authorization
+   * header at all. The apiKey value is ignored for auth in this mode.
+   */
+  omitAuthHeader?: boolean;
 }
 
 /**
@@ -98,6 +125,8 @@ export class OpenAICompatibleProvider implements LLMProvider {
   private readonly apiKey: string;
   private readonly extraHeaders: Record<string, string>;
   private readonly defaultModel?: string;
+  private readonly fetchFn: typeof fetch;
+  private readonly omitAuthHeader: boolean;
 
   constructor(opts: OpenAICompatibleOptions) {
     this.providerId = opts.providerId;
@@ -105,6 +134,15 @@ export class OpenAICompatibleProvider implements LLMProvider {
     this.apiKey = opts.apiKey;
     this.extraHeaders = opts.extraHeaders ?? {};
     this.defaultModel = opts.defaultModel;
+    // Lazy indirection so tests that stub the global fetch AFTER
+    // construction still intercept requests.
+    this.fetchFn =
+      opts.fetchFn ?? (((...args: Parameters<typeof fetch>) => fetch(...args)) as typeof fetch);
+    this.omitAuthHeader = opts.omitAuthHeader ?? false;
+  }
+
+  private authHeaders(): Record<string, string> {
+    return this.omitAuthHeader ? {} : { Authorization: `Bearer ${this.apiKey}` };
   }
 
   private async fetchWithRetry(
@@ -120,7 +158,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
       }
       let res: Response;
       try {
-        res = await fetch(url, init);
+        res = await this.fetchFn(url, init);
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
         if (attempt < maxRetries) {
@@ -236,7 +274,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.apiKey}`,
+        ...this.authHeaders(),
         ...this.extraHeaders,
       },
       body: JSON.stringify(body),
@@ -272,7 +310,12 @@ export class OpenAICompatibleProvider implements LLMProvider {
             delta?: { content?: string | null; tool_calls?: SSEToolCallDelta[] };
             finish_reason?: string | null;
           }>;
-          usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+          usage?: {
+            prompt_tokens?: number;
+            completion_tokens?: number;
+            total_tokens?: number;
+            prompt_tokens_details?: { cached_tokens?: number };
+          };
         };
         try {
           chunk = JSON.parse(data) as typeof chunk;
@@ -296,6 +339,11 @@ export class OpenAICompatibleProvider implements LLMProvider {
             promptTokens: chunk.usage.prompt_tokens ?? 0,
             completionTokens: chunk.usage.completion_tokens ?? 0,
             totalTokens: chunk.usage.total_tokens ?? 0,
+            // Prompt-cache reads (#137): OpenAI reports them under
+            // prompt_tokens_details.cached_tokens.
+            ...(chunk.usage.prompt_tokens_details?.cached_tokens !== undefined
+              ? { cacheReadTokens: chunk.usage.prompt_tokens_details.cached_tokens }
+              : {}),
           };
         }
       }
@@ -328,8 +376,8 @@ export class OpenAICompatibleProvider implements LLMProvider {
       }));
     }
     try {
-      const res = await fetch(`${this.baseUrl}/models`, {
-        headers: { Authorization: `Bearer ${this.apiKey}`, ...this.extraHeaders },
+      const res = await this.fetchFn(`${this.baseUrl}/models`, {
+        headers: { ...this.authHeaders(), ...this.extraHeaders },
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = (await res.json()) as { data?: Array<{ id: string; context_length?: number }> };

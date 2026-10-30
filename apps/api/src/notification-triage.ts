@@ -28,7 +28,14 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
-import { createProvider, routeModel, type LLMProvider } from '@mvp/agent-runtime';
+import {
+  createProvider,
+  resolveTriageProfile,
+  routeModel,
+  triageDecision,
+  type LLMProvider,
+  type ModelProfiles,
+} from '@mvp/agent-runtime';
 import { openDb } from '@mvp/agent-runtime';
 import type { PushService } from './push.js';
 import type { BriefingItem } from './briefing.js';
@@ -305,9 +312,28 @@ export function parseNotificationTriage(text: string): { urgent: boolean } | nul
 export function createRoutingNotificationTriage(deps: {
   providerFactory?: (providerId: string) => LLMProvider;
   route?: () => { providerId: string; modelId: string };
+  /** Purpose-profile table (#141): the triage seam resolves through it. */
+  profiles?: ModelProfiles;
 } = {}): NotificationTriageFn {
   const factory = deps.providerFactory ?? ((id: string) => createProvider(id));
   return async (n) => {
+    // #141 decision seam FIRST: the calibrated evaluate seam answers
+    // through the 'triage' purpose profile; a usable verdict settles
+    // triage without the ad-hoc prompt below. Null (no resolvable
+    // model / unusable answer) falls back to the prompt path.
+    try {
+      const profile = resolveTriageProfile({ profiles: deps.profiles });
+      const seamRoute =
+        deps.route?.() ?? routeModel({ taskType: 'simple-qa', providerHint: undefined });
+      const seam = await triageDecision(
+        factory(profile?.providerId ?? seamRoute.providerId),
+        `Does this phone notification need the user's immediate attention? App: ${n.appName ?? n.appPackage}. Title: ${n.title}`,
+        { profiles: deps.profiles, signal: AbortSignal.timeout(30_000) },
+      );
+      if (seam) return { urgent: seam.urgent };
+    } catch {
+      // The seam must never break triage — fall through to the prompt.
+    }
     try {
       const route = deps.route?.() ?? routeModel({ taskType: 'simple-qa', providerHint: undefined });
       const provider = factory(route.providerId);

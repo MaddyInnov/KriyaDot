@@ -17,6 +17,7 @@ const KNOWN = new Set([
   'clear',
   'help',
   'quit',
+  'jobs',
 ]);
 
 /**
@@ -50,6 +51,7 @@ export const HELP_ENTRIES: HelpEntry[] = [
   { command: '/workflows', usage: '/workflows', description: 'Show workflows and recent runs' },
   { command: '/memory', usage: '/memory', description: 'Show this bot’s memory summary' },
   { command: '/activity', usage: '/activity', description: 'Show recent activity (audit log)' },
+  { command: '/jobs', usage: '/jobs', description: 'Background job manager (list running jobs, cancel)' },
   { command: '/theme', usage: '/theme <name>', description: 'Switch TUI theme (light/dark/midnight/porcelain/ocean)' },
   { command: '/clear', usage: '/clear', description: 'Clear the chat transcript' },
   { command: '/help', usage: '/help', description: 'Show this help' },

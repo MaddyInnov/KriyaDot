@@ -21,7 +21,7 @@
 
 import { createHash } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
-import { mkdir, readdir, readFile, stat, writeFile, rm, chmod } from 'node:fs/promises';
+import { mkdir, readdir, readFile, stat, statfs, writeFile, rm, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
@@ -323,6 +323,14 @@ export interface LocalLlmDeps {
   arch?: string;
   /** Base auto-restart backoff in ms (default 2000). Lower in tests. */
   restartBaseDelayMs?: number;
+  /**
+   * Long-running exec for the Ollama sidecar pull (model pulls take
+   * minutes, far beyond defaultExec's 15 s cap). Default: an execFile
+   * wrapper with a 30-minute timeout.
+   */
+  execLong?: ExecFn;
+  /** Free-disk probe for the sidecar (tests). Default: fs statfs. */
+  freeSpaceFn?: (path: string) => Promise<number | null>;
 }
 
 export interface ModelEntry extends CuratedModel {
@@ -424,6 +432,8 @@ export class LocalLlmManager {
   private readonly logLines: string[] = [];
   private gpuCache: GpuInfo | null = null;
   private stopping = false;
+  /** Sidecar-only injectables (execLong / freeSpaceFn), kept off `deps`. */
+  private readonly sidecarDeps: Pick<LocalLlmDeps, 'execLong' | 'freeSpaceFn'>;
 
   constructor(dataDir: string, deps: LocalLlmDeps = {}) {
     this.dataDir = dataDir;
@@ -435,6 +445,7 @@ export class LocalLlmManager {
       arch: deps.arch,
       restartBaseDelayMs: deps.restartBaseDelayMs,
     };
+    this.sidecarDeps = { execLong: deps.execLong, freeSpaceFn: deps.freeSpaceFn };
   }
 
   private get platform(): string {
@@ -827,6 +838,187 @@ export class LocalLlmManager {
   paths(): { root: string; bin: string; models: string } {
     return { root: this.rootDir, bin: this.binDir, models: this.modelsDir };
   }
+
+  // -------------------------------------------------------------------------
+  // Ollama sidecar mode (free-LLM stack — Lightning Studio case)
+  //
+  // On a Lightning Studio the guaranteed first-run brain is an Ollama
+  // sidecar next to the KriyaDot server, NOT this manager's llama.cpp
+  // server. The sidecar rules, from the free-LLM research (§5):
+  //  - pre-pull EXACTLY ONE small model (default qwen3:4b, Ollama naming,
+  //    ~2.5 GB Q4_K_M) — the Studio's free Drive is only 10 GB TOTAL,
+  //    shared with the KriyaDot server and the Ollama binary, so a
+  //    second model is a disk accident waiting to happen;
+  //  - check free space (model size + safety margin) BEFORE pulling;
+  //  - all process execution goes through the manager's injectable
+  //    exec runners (deps.exec / deps.execLong) so tests use fakes and
+  //    never pull a real model.
+  // -------------------------------------------------------------------------
+
+  /** The one configured sidecar model (env KRIYADOT_SIDECAR_MODEL). */
+  sidecarModel(): string {
+    return (process.env.KRIYADOT_SIDECAR_MODEL ?? '').trim() || SIDECAR_DEFAULT_MODEL;
+  }
+
+  private async sidecarFreeDiskBytes(): Promise<number | null> {
+    if (this.sidecarDeps.freeSpaceFn) return this.sidecarDeps.freeSpaceFn(this.dataDir);
+    try {
+      const s = await statfs(this.dataDir);
+      return s.bavail * s.bsize;
+    } catch {
+      return null;
+    }
+  }
+
+  private get execLong(): ExecFn {
+    return this.sidecarDeps.execLong ?? defaultExecLong;
+  }
+
+  /** Status of the Ollama sidecar: binary present? model pulled? disk? */
+  async sidecarStatus(model: string = this.sidecarModel()): Promise<SidecarStatus> {
+    const host = ollamaSidecarHost();
+    let binaryPresent = false;
+    let version: string | undefined;
+    try {
+      const { stdout } = await this.deps.exec('ollama', ['--version']);
+      binaryPresent = true;
+      version = stdout.split('\n').map((l) => l.trim()).filter(Boolean)[0];
+    } catch {
+      binaryPresent = false;
+    }
+    const models: string[] = [];
+    if (binaryPresent) {
+      try {
+        const { stdout } = await this.deps.exec('ollama', ['list']);
+        for (const line of stdout.split('\n').slice(1)) {
+          const name = line.trim().split(/\s+/)[0];
+          if (name) models.push(name);
+        }
+      } catch {
+        // Binary present but daemon unreachable: model list unknown.
+      }
+    }
+    const modelPulled = models.some((m) => m === model || m.startsWith(`${model}`));
+    const freeDiskBytes = await this.sidecarFreeDiskBytes();
+    const requiredBytes = SIDECAR_MODEL_SIZE_BYTES + SIDECAR_DISK_MARGIN_BYTES;
+    return {
+      mode: 'ollama-sidecar',
+      providerId: 'ollama',
+      host,
+      baseUrl: `${host}/v1`,
+      binaryPresent,
+      version,
+      model,
+      modelPulled,
+      models,
+      freeDiskBytes,
+      requiredBytes,
+      diskSufficient: modelPulled
+        ? true
+        : freeDiskBytes === null
+          ? null
+          : freeDiskBytes >= requiredBytes,
+      ready: binaryPresent && modelPulled,
+    };
+  }
+
+  /**
+   * Ensure the sidecar is ready: pull EXACTLY the one configured model
+   * when it is missing and disk space suffices. Never pulls a second
+   * model and never downloads the Ollama binary itself.
+   */
+  async ensureSidecarModel(
+    model: string = this.sidecarModel(),
+  ): Promise<{ status: SidecarStatus; pulled: boolean }> {
+    const before = await this.sidecarStatus(model);
+    if (!before.binaryPresent) {
+      throw new Error(
+        'Ollama sidecar: the `ollama` binary is not installed on this machine/Studio. ' +
+          'Install Ollama (https://ollama.com/download) — KriyaDot never downloads it implicitly.',
+      );
+    }
+    if (before.modelPulled) return { status: before, pulled: false };
+    if (before.freeDiskBytes !== null && before.freeDiskBytes < before.requiredBytes) {
+      throw new Error(
+        `Ollama sidecar: not enough free disk to pull ${model}. ` +
+          `Need ~${(before.requiredBytes / 1e9).toFixed(1)} GB (model + margin), have ${(before.freeDiskBytes / 1e9).toFixed(1)} GB. ` +
+          'Note the Studio Drive constraint: 10 GB total, shared with the server — exactly one small model fits safely.',
+      );
+    }
+    this.log(`sidecar: pulling the one configured model ${model}`);
+    await this.execLong('ollama', ['pull', model]);
+    const after = await this.sidecarStatus(model);
+    if (!after.modelPulled) {
+      throw new Error(`Ollama sidecar: \`ollama pull ${model}\` finished but the model is not listed.`);
+    }
+    return { status: after, pulled: true };
+  }
+
+  /**
+   * Descriptor exposing the sidecar as the standard local provider: the
+   * host constructs the normal `ollama` provider (createProvider /
+   * OllamaProvider) against this base URL and selects `model`.
+   */
+  sidecarProviderDescriptor(model: string = this.sidecarModel()): {
+    providerId: 'ollama';
+    baseUrl: string;
+    model: string;
+    local: true;
+    keyless: true;
+  } {
+    const host = ollamaSidecarHost();
+    return { providerId: 'ollama', baseUrl: `${host}/v1`, model, local: true, keyless: true };
+  }
+}
+
+/** Default sidecar model: exactly one small model (Qwen3-4B class). */
+export const SIDECAR_DEFAULT_MODEL = 'qwen3:4b';
+/** Approximate on-disk size of the default sidecar model (Q4_K_M ≈ 2.5 GB). */
+export const SIDECAR_MODEL_SIZE_BYTES = 2_500_000_000;
+/** Free-space safety margin required before a sidecar pull. */
+export const SIDECAR_DISK_MARGIN_BYTES = 1_000_000_000;
+
+/** Ollama sidecar host: OLLAMA_HOST env, default http://localhost:11434. */
+export function ollamaSidecarHost(): string {
+  const raw = (process.env.OLLAMA_HOST ?? '').trim();
+  return (raw.length > 0 ? raw : 'http://localhost:11434').replace(/\/+$/, '');
+}
+
+/** Long-timeout execFile wrapper for sidecar pulls (30 min cap). */
+export function defaultExecLong(cmd: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolvePromise, reject) => {
+    nodeExecFile(
+      cmd,
+      args,
+      { timeout: 30 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) reject(err);
+        else resolvePromise({ stdout: String(stdout), stderr: String(stderr) });
+      },
+    );
+  });
+}
+
+export interface SidecarStatus {
+  mode: 'ollama-sidecar';
+  /** The standard local provider this sidecar is exposed as. */
+  providerId: 'ollama';
+  host: string;
+  /** OpenAI-compatible base URL of the sidecar. */
+  baseUrl: string;
+  binaryPresent: boolean;
+  version?: string;
+  /** The one configured sidecar model. */
+  model: string;
+  modelPulled: boolean;
+  /** All models `ollama list` reports (diagnostics). */
+  models: string[];
+  freeDiskBytes: number | null;
+  /** Model size + safety margin a pull would require. */
+  requiredBytes: number;
+  /** Null when free space could not be probed. */
+  diskSufficient: boolean | null;
+  ready: boolean;
 }
 
 /** Re-resolve a model's on-disk path (used by routes). */

@@ -1,5 +1,44 @@
 {
   "providers": {
+    "ai21": {
+      "api": "openai-compatible",
+      "baseUrl": "https://api.ai21.com/studio/v1",
+      "envKey": "AI21_API_KEY",
+      "id": "ai21",
+      "models": [
+        {
+          "default": true,
+          "id": "jamba-1.5-large",
+          "name": "Jamba 1.5 Large",
+          "contextLength": 256000
+        },
+        {
+          "id": "jamba-1.5-mini",
+          "name": "Jamba 1.5 Mini",
+          "contextLength": 256000
+        }
+      ],
+      "name": "AI21 Labs",
+      "notes": "AI21's OpenAI-compatible chat completions API. Use your own AI21 API key (AI21_API_KEY) \u2014 never a shared or pooled key."
+    },
+    "aihorde": {
+      "api": "aihorde",
+      "baseUrl": "https://aihorde.net/api/v2",
+      "envKey": "AIHORDE_API_KEY",
+      "id": "aihorde",
+      "keyless": true,
+      "limitsNote": "Anonymous lane: official anonymous key, lowest queue priority, max 512 tokens, plain chat only (no tool calls).",
+      "models": [
+        {
+          "default": true,
+          "id": "koboldcpp",
+          "name": "AI Horde (community workers)",
+          "contextLength": 8192
+        }
+      ],
+      "name": "AI Horde (keyless, chat only)",
+      "notes": "Volunteer-run community inference. Works with the official anonymous key 0000000000 when AIHORDE_API_KEY is unset. Slow (queued) deep fallback for plain chat only."
+    },
     "anthropic": {
       "api": "anthropic",
       "baseUrl": "https://api.anthropic.com/v1",
@@ -149,6 +188,58 @@
       "notes": "Uses YOUR Codex CLI login (~/.codex/auth.json) \u2014 no API key needed. Shown only when the CLI is detected; requires your explicit Connect consent. Token is read at request time and never stored or logged.",
       "liveModels": true
     },
+    "cohere": {
+      "api": "cohere",
+      "baseUrl": "https://api.cohere.com/v2",
+      "envKey": "COHERE_API_KEY",
+      "id": "cohere",
+      "models": [
+        {
+          "default": true,
+          "id": "command-a-03-2025",
+          "name": "Command A",
+          "contextLength": 256000
+        },
+        {
+          "id": "command-r7b-12-2024",
+          "name": "Command R7B",
+          "contextLength": 128000
+        },
+        {
+          "id": "command-r-plus-08-2024",
+          "name": "Command R+",
+          "contextLength": 128000
+        }
+      ],
+      "name": "Cohere",
+      "notes": "Cohere's native v2 chat API (NOT OpenAI-shaped) via the dedicated Cohere driver. Use your own Cohere API key (COHERE_API_KEY) \u2014 never a shared or pooled key."
+    },
+    "deepinfra": {
+      "api": "openai-compatible",
+      "baseUrl": "https://api.deepinfra.com/v1/openai",
+      "envKey": "DEEPINFRA_API_KEY",
+      "id": "deepinfra",
+      "models": [
+        {
+          "default": true,
+          "id": "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+          "name": "Llama 3.1 70B Instruct Turbo",
+          "contextLength": 131072
+        },
+        {
+          "id": "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+          "name": "Llama 3.1 8B Instruct Turbo",
+          "contextLength": 131072
+        },
+        {
+          "id": "deepseek-ai/DeepSeek-V3",
+          "name": "DeepSeek V3",
+          "contextLength": 131072
+        }
+      ],
+      "name": "DeepInfra",
+      "notes": "DeepInfra's OpenAI-compatible API. Use your own DeepInfra API key (DEEPINFRA_API_KEY) \u2014 never a shared or pooled key."
+    },
     "deepseek": {
       "api": "openai-compatible",
       "baseUrl": "https://api.deepseek.com",
@@ -220,6 +311,48 @@
       ],
       "name": "Groq"
     },
+    "hyperbolic": {
+      "api": "openai-compatible",
+      "baseUrl": "https://api.hyperbolic.xyz/v1",
+      "envKey": "HYPERBOLIC_API_KEY",
+      "id": "hyperbolic",
+      "models": [
+        {
+          "default": true,
+          "id": "meta-llama/Meta-Llama-3.3-70B-Instruct",
+          "name": "Llama 3.3 70B Instruct",
+          "contextLength": 131072
+        },
+        {
+          "id": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+          "name": "Llama 3.1 8B Instruct",
+          "contextLength": 131072
+        }
+      ],
+      "name": "Hyperbolic",
+      "notes": "Hyperbolic's OpenAI-compatible API. Use your own Hyperbolic API key (HYPERBOLIC_API_KEY) \u2014 never a shared or pooled key."
+    },
+    "lambda": {
+      "api": "openai-compatible",
+      "baseUrl": "https://api.lambda.ai/v1",
+      "envKey": "LAMBDA_API_KEY",
+      "id": "lambda",
+      "models": [
+        {
+          "default": true,
+          "id": "llama3.1-70b-instruct-fp8",
+          "name": "Llama 3.1 70B Instruct FP8",
+          "contextLength": 131072
+        },
+        {
+          "id": "llama3.1-8b-instruct-fp8",
+          "name": "Llama 3.1 8B Instruct FP8",
+          "contextLength": 131072
+        }
+      ],
+      "name": "Lambda Inference",
+      "notes": "Lambda's OpenAI-compatible inference API. Use your own Lambda API key (LAMBDA_API_KEY) \u2014 never a shared or pooled key."
+    },
     "llamacpp": {
       "api": "llamacpp",
       "baseUrl": "http://127.0.0.1:11435",
@@ -231,6 +364,30 @@
       "name": "Local LLM (llama.cpp)",
       "notes": "Managed local models via stock llama.cpp \u2014 zero-config binary download, GPU auto-detect, served on 127.0.0.1 only. No API key, ever. Manage it in Settings \u2192 Local LLM. Set KRIYADOT_LLAMACPP_PORT to change the server port.",
       "replyTimeoutMs": 300000
+    },
+    "llm7-anonymous": {
+      "api": "openai-compatible",
+      "baseUrl": "https://api.llm7.io/v1",
+      "envKey": "LLM7_API_KEY",
+      "id": "llm7-anonymous",
+      "keyless": true,
+      "bestEffort": true,
+      "limitsNote": "~60 requests/hour per IP (unverified, best-effort)",
+      "models": [
+        {
+          "default": true,
+          "id": "default",
+          "name": "LLM7 default (anonymous)",
+          "contextLength": 32768
+        },
+        {
+          "id": "fast",
+          "name": "LLM7 fast (anonymous)",
+          "contextLength": 32768
+        }
+      ],
+      "name": "LLM7.io (anonymous, best-effort)",
+      "notes": "Keyless community gateway \u2014 NO API key is sent. Anonymous limits are undocumented and shared per IP; treat as best-effort only, never the sole default. Prompts leave this device."
     },
     "lmstudio": {
       "api": "openai-compatible",
@@ -342,6 +499,53 @@
         }
       ],
       "name": "Moonshot AI"
+    },
+    "nebius": {
+      "api": "openai-compatible",
+      "baseUrl": "https://api.studio.nebius.com/v1",
+      "envKey": "NEBIUS_API_KEY",
+      "id": "nebius",
+      "models": [
+        {
+          "default": true,
+          "id": "meta-llama/Meta-Llama-3.1-70B-Instruct",
+          "name": "Llama 3.1 70B Instruct",
+          "contextLength": 131072
+        },
+        {
+          "id": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+          "name": "Llama 3.1 8B Instruct",
+          "contextLength": 131072
+        },
+        {
+          "id": "Qwen/Qwen2.5-Coder-32B-Instruct",
+          "name": "Qwen 2.5 Coder 32B Instruct",
+          "contextLength": 131072
+        }
+      ],
+      "name": "Nebius AI Studio",
+      "notes": "Nebius AI Studio's OpenAI-compatible API. Use your own Nebius API key (NEBIUS_API_KEY) \u2014 never a shared or pooled key."
+    },
+    "novita": {
+      "api": "openai-compatible",
+      "baseUrl": "https://api.novita.ai/v3/openai",
+      "envKey": "NOVITA_API_KEY",
+      "id": "novita",
+      "models": [
+        {
+          "default": true,
+          "id": "meta-llama/llama-3.3-70b-instruct",
+          "name": "Llama 3.3 70B Instruct",
+          "contextLength": 131072
+        },
+        {
+          "id": "deepseek/deepseek-v3-0324",
+          "name": "DeepSeek V3 0324",
+          "contextLength": 131072
+        }
+      ],
+      "name": "Novita AI",
+      "notes": "Novita's OpenAI-compatible API. Use your own Novita API key (NOVITA_API_KEY) \u2014 never a shared or pooled key."
     },
     "ollama": {
       "api": "ollama",
@@ -493,6 +697,98 @@
       "liveModels": true,
       "models": [],
       "name": "OpenRouter"
+    },
+    "ovh-anonymous": {
+      "api": "openai-compatible",
+      "baseUrl": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+      "envKey": "OVH_API_KEY",
+      "id": "ovh-anonymous",
+      "keyless": true,
+      "limitsNote": "Anonymous lane: 2 requests/min per model (shared) \u2014 modest limits",
+      "models": [
+        {
+          "default": true,
+          "id": "gpt-oss-120b",
+          "name": "GPT-OSS 120B (OVH anonymous)",
+          "contextLength": 131072
+        },
+        {
+          "id": "Qwen3-32B",
+          "name": "Qwen3 32B (OVH anonymous)",
+          "contextLength": 131072
+        },
+        {
+          "id": "Meta-Llama-3_3-70B-Instruct",
+          "name": "Llama 3.3 70B Instruct (OVH anonymous)",
+          "contextLength": 131072
+        }
+      ],
+      "name": "OVHcloud AI Endpoints (anonymous)",
+      "notes": "Keyless lane of OVHcloud AI Endpoints (officially documented anonymous tier) \u2014 NO API key is sent. The driver rotates across models on 429 because the cap is per model. Prompts leave this device."
+    },
+    "perplexity": {
+      "api": "openai-compatible",
+      "baseUrl": "https://api.perplexity.ai",
+      "envKey": "PERPLEXITY_API_KEY",
+      "id": "perplexity",
+      "models": [
+        {
+          "default": true,
+          "id": "sonar",
+          "name": "Sonar",
+          "contextLength": 127072
+        },
+        {
+          "id": "sonar-pro",
+          "name": "Sonar Pro",
+          "contextLength": 200000
+        },
+        {
+          "id": "sonar-reasoning-pro",
+          "name": "Sonar Reasoning Pro",
+          "contextLength": 128000
+        }
+      ],
+      "name": "Perplexity",
+      "notes": "Perplexity's OpenAI-compatible chat completions API (preset is sufficient \u2014 its wire shape matches the shared driver; no provider-specific driver needed). Use your own Perplexity API key (PERPLEXITY_API_KEY) \u2014 never a shared or pooled key."
+    },
+    "pollinations": {
+      "api": "openai-compatible",
+      "baseUrl": "https://gen.pollinations.ai/v1",
+      "byo": true,
+      "envKey": "POLLINATIONS_API_KEY",
+      "id": "pollinations",
+      "models": [
+        {
+          "default": true,
+          "id": "openai",
+          "name": "Pollinations OpenAI (BYOK)",
+          "contextLength": 128000
+        }
+      ],
+      "name": "Pollinations (bring your own key)",
+      "notes": "Bring-your-own-key ONLY: Pollinations no longer offers a keyless generation tier (their docs require a key; generation without one returns 401). Set your OWN POLLINATIONS_API_KEY. Never a default, and KriyaDot never embeds a shared key."
+    },
+    "sambanova": {
+      "api": "openai-compatible",
+      "baseUrl": "https://api.sambanova.ai/v1",
+      "envKey": "SAMBANOVA_API_KEY",
+      "id": "sambanova",
+      "models": [
+        {
+          "default": true,
+          "id": "Meta-Llama-3.3-70B-Instruct",
+          "name": "Llama 3.3 70B Instruct",
+          "contextLength": 131072
+        },
+        {
+          "id": "Meta-Llama-3.1-8B-Instruct",
+          "name": "Llama 3.1 8B Instruct",
+          "contextLength": 131072
+        }
+      ],
+      "name": "SambaNova",
+      "notes": "SambaNova Cloud's OpenAI-compatible API. Use your own SambaNova API key (SAMBANOVA_API_KEY) \u2014 never a shared or pooled key."
     },
     "together": {
       "api": "openai-compatible",

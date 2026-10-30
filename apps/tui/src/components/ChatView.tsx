@@ -8,10 +8,13 @@ import type { BotSummary, ChatEvent, KriyaDotApi } from '../api.js';
 import { isKnownCommand, parseSlashCommand } from '../commands.js';
 import type { TuiPalette, ThemeName } from '../themes.js';
 import { isThemeName, THEME_NAMES } from '../themes.js';
+import { MarkdownText } from './MarkdownText.js';
+import { Spinner } from './Spinner.js';
+import type { JobManager } from '../jobs.js';
 
 export interface ChatMessage {
   id: number;
-  role: 'user' | 'assistant' | 'system' | 'tool';
+  role: 'user' | 'assistant' | 'system' | 'tool' | 'thinking';
   text: string;
   denied?: boolean;
 }
@@ -34,6 +37,7 @@ export interface ChatCommand {
     | 'model-list'
     | 'model-set'
     | 'theme'
+    | 'jobs'
     | 'unknown';
   args?: string;
   raw?: string;
@@ -48,6 +52,8 @@ interface Props {
   setMessages: (updater: (prev: ChatMessage[]) => ChatMessage[]) => void;
   onCommand: (cmd: ChatCommand) => void;
   onTheme: (name: ThemeName) => void;
+  /** Shared background-job registry (#187): each chat turn registers here so the Jobs panel can list/cancel it. */
+  jobs?: JobManager;
 }
 
 let nextId = 1;
@@ -63,11 +69,13 @@ function summarizeArgs(args: unknown): string {
   }
 }
 
-export function ChatView({ api, bot, palette, sessionId, messages, setMessages, onCommand, onTheme }: Props): React.ReactElement {
+export function ChatView({ api, bot, palette, sessionId, messages, setMessages, onCommand, onTheme, jobs }: Props): React.ReactElement {
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [assistantBuffer, setAssistantBuffer] = useState('');
+  const [runningTools, setRunningTools] = useState(0);
+  const jobIdRef = useRef<string | null>(null);
   const turnRef = useRef<AbortController | null>(null);
   const assistantMsgId = useRef<number | null>(null);
   const streamingRef = useRef(false);
@@ -102,11 +110,26 @@ export function ChatView({ api, bot, palette, sessionId, messages, setMessages, 
           if (assistantMsgId.current == null) startAssistantMessage();
           setAssistantBuffer((b) => b + ev.content);
           break;
+        case 'thinking':
+          // Reasoning stream (#186): accumulated into one collapsed
+          // 'thinking' message per burst, rendered italic + truncated.
+          if (ev.content) {
+            setMessages((m) => {
+              const last = m[m.length - 1];
+              if (last && last.role === 'thinking') {
+                return [...m.slice(0, -1), { ...last, text: last.text + ev.content }];
+              }
+              return [...m, { id: nextMessageId(), role: 'thinking' as const, text: ev.content }];
+            });
+          }
+          break;
         case 'tool_call':
           flushAssistantBuffer();
+          setRunningTools((n) => n + 1);
           append('tool', `⚙ ${ev.call.name}${ev.approvalRequired ? ' (approval requested)' : ''} …`);
           break;
         case 'tool_result':
+          setRunningTools((n) => Math.max(0, n - 1));
           append('tool', ev.denied ? `✕ ${ev.call.name} denied` : `✓ ${ev.call.name} done`, ev.denied);
           break;
         case 'approval_required': {
@@ -158,6 +181,11 @@ export function ChatView({ api, bot, palette, sessionId, messages, setMessages, 
       streamingRef.current = true;
       assistantMsgId.current = null;
       setAssistantBuffer('');
+      // Register the turn as a background job (#187): the Jobs panel can
+      // cancel it, which aborts this turn's controller.
+      if (jobs) {
+        jobIdRef.current = jobs.start(`Chat: ${text.slice(0, 48)}`, () => turnRef.current?.abort());
+      }
       void api
         .sendChat(
           { botId: bot.id, message: text, sessionId },
@@ -168,12 +196,16 @@ export function ChatView({ api, bot, palette, sessionId, messages, setMessages, 
               streamingRef.current = false;
               setPendingApproval(null);
               assistantMsgId.current = null;
+              if (jobs && jobIdRef.current) jobs.finish(jobIdRef.current, 'done');
+              jobIdRef.current = null;
             },
             onError: (err) => {
               append('system', `⚠ Connection error: ${err.message}`);
               setStreaming(false);
               streamingRef.current = false;
               assistantMsgId.current = null;
+              if (jobs && jobIdRef.current) jobs.finish(jobIdRef.current, 'failed', err.message);
+              jobIdRef.current = null;
             },
           },
         )
@@ -186,7 +218,7 @@ export function ChatView({ api, bot, palette, sessionId, messages, setMessages, 
           streamingRef.current = false;
         });
     },
-    [api, append, bot.id, handleEvent, sessionId],
+    [api, append, bot.id, handleEvent, sessionId, jobs],
   );
 
   const decideApproval = useCallback(
@@ -216,6 +248,7 @@ export function ChatView({ api, bot, palette, sessionId, messages, setMessages, 
         case 'clear':
         case 'quit':
         case 'help':
+        case 'jobs':
         case 'model':
           if (name === 'model') {
             if (!args) onCommand({ kind: 'model-list' });
@@ -278,9 +311,17 @@ export function ChatView({ api, bot, palette, sessionId, messages, setMessages, 
               </Text>
             )}
             {m.role === 'assistant' && (
-              <Text>
+              <Box>
                 <Text color={palette.green} bold>{bot.name} › </Text>
-                <Text color={palette.text}>{m.text}</Text>
+                <MarkdownText text={m.text} palette={palette} />
+              </Box>
+            )}
+            {m.role === 'thinking' && (
+              // Collapsed thinking display (#186): italic dim summary —
+              // first line + size — never the full reasoning dump.
+              <Text color={palette.dim} italic>
+                💭 thinking · {m.text.length} chars · {m.text.split('\n')[0]!.slice(0, 100)}
+                {m.text.length > 100 ? '…' : ''}
               </Text>
             )}
             {m.role === 'tool' && <Text color={m.denied ? palette.red : palette.dim}>{m.text}</Text>}
@@ -293,6 +334,11 @@ export function ChatView({ api, bot, palette, sessionId, messages, setMessages, 
             <Text color={palette.text}>{assistantBuffer}</Text>
             <Text color={palette.dim}> ▍</Text>
           </Text>
+        )}
+        {streaming && runningTools > 0 && (
+          <Box marginTop={1}>
+            <Spinner color={palette.amber} label={`running ${runningTools} tool${runningTools > 1 ? 's' : ''}…`} />
+          </Box>
         )}
       </Box>
 
@@ -307,7 +353,7 @@ export function ChatView({ api, bot, palette, sessionId, messages, setMessages, 
       )}
 
       <Box borderStyle="single" borderColor={palette.border} paddingX={1}>
-        <Text color={palette.dim}>{streaming ? '…' : '› '}</Text>
+        {streaming ? <Spinner color={palette.dim} /> : <Text color={palette.dim}>{'› '}</Text>}
         <TextInput
           value={input}
           onChange={setInput}

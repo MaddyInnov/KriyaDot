@@ -140,7 +140,9 @@ export function validateCommand(p: ParsedArgs): string | null {
       }
       return null;
     case 'send':
-      if (!p.subcommand) return usage('kriyadot send <name> "message" — name a session from "kriyadot sessions".');
+      if (!p.subcommand && !flagBool(p.flags, 'continue')) {
+        return usage('kriyadot send <name> "message" — name a session from "kriyadot sessions" (or --continue for the most recent).');
+      }
       return null;
     case 'sessions':
       if (p.subcommand === '' || p.subcommand === 'list') return null;
@@ -148,7 +150,31 @@ export function validateCommand(p: ParsedArgs): string | null {
         if (p.positional.length === 0) return usage('kriyadot sessions delete <name>.');
         return null;
       }
-      return usage('kriyadot sessions [list|delete <name>].');
+      if (p.subcommand === 'rename') {
+        if (p.positional.length < 2) return usage('kriyadot sessions rename <name> <title>.');
+        return null;
+      }
+      return usage('kriyadot sessions [list|delete <name>|rename <name> <title>].');
+    case 'bridge':
+      if (['', 'invite', 'link', 'list', 'peers', 'experts', 'chat', 'unlink'].includes(p.subcommand)) return null;
+      return usage('kriyadot bridge <invite|link|list|peers|experts|chat|unlink>.');
+    case 'learning':
+      if (['', 'list', 'show', 'delete', 'clear', 'evolution'].includes(p.subcommand)) return null;
+      return usage('kriyadot learning <list|show|delete|clear|evolution>.');
+    case 'workflows':
+      if (['', 'list'].includes(p.subcommand)) return null;
+      if (p.subcommand === 'dry-run') {
+        if (p.positional.length === 0) return usage('kriyadot workflows dry-run <id>.');
+        return null;
+      }
+      if (p.subcommand === 'run') {
+        if (p.positional.length === 0) return usage('kriyadot workflows run <name|id>.');
+        return null;
+      }
+      return usage('kriyadot workflows <list|dry-run <id>|run <name|id>>.');
+    case 'daemon':
+      if (['', 'start', 'list', 'stop'].includes(p.subcommand)) return null;
+      return usage('kriyadot daemon <start|list|stop>.');
     case 'completion':
       if (p.subcommand === '' || p.subcommand === 'bash' || p.subcommand === 'zsh') return null;
       return usage('kriyadot completion [bash|zsh].');
@@ -168,6 +194,21 @@ export function validateCommand(p: ParsedArgs): string | null {
     case 'team':
       if (p.subcommand === 'apply' || p.subcommand === 'export') return null;
       return usage('kriyadot team <apply|export>.');
+    case 'tap':
+      if (p.subcommand === '') return null;
+      if (p.subcommand === 'init') {
+        if (p.positional.length === 0) return usage('kriyadot tap init <dir> --kind <bot|workflow|capability|skill|tap>.');
+        return null;
+      }
+      if (p.subcommand === 'install') {
+        if (p.positional.length === 0) return usage('kriyadot tap install <ref>.');
+        return null;
+      }
+      if (p.subcommand === 'validate') {
+        if (p.positional.length === 0) return usage('kriyadot tap validate <dir>.');
+        return null;
+      }
+      return usage('kriyadot tap <init|install|validate>.');
     case 'serve':
       return null;
     case 'models':
@@ -184,8 +225,8 @@ export function validateCommand(p: ParsedArgs): string | null {
       if (p.subcommand === '') return null;
       return usage(`kriyadot ${p.command}.`);
     case 'config':
-      if (['', 'get', 'set', 'path'].includes(p.subcommand)) return null;
-      return usage('kriyadot config [get|set|path].');
+      if (['', 'get', 'set', 'path', 'validate', 'init'].includes(p.subcommand)) return null;
+      return usage('kriyadot config [get|set|path|validate|init].');
     case 'help':
     case '':
       return null;

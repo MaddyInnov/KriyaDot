@@ -149,6 +149,62 @@ export interface MatchNodeConfig {
   maxParallel?: number;
 }
 
+/** Default cap on nodes executing concurrently within one level (#145). */
+export const DEFAULT_MAX_PARALLEL = 8;
+
+/**
+ * Config for an `agent` node (#143): per-step role/model/toolset/skills.
+ * Every field except `botId`/`prompt` is optional; when present the
+ * runner builds an *effective* bot for this step only (the registered
+ * bot is never mutated):
+ * - `role`     — role/persona label for this step; applied to the
+ *                effective bot's system prompt.
+ * - `provider` — provider override (else the bot's provider).
+ * - `model`    — model override (else the bot's model). Also used to
+ *                price the step's token usage (#150).
+ * - `toolset`  — tool names enabled for this step (alias: `tools`);
+ *                replaces the bot's tool list for this step.
+ * - `skills`   — skill names enabled for this step; replaces the bot's
+ *                skill list for this step.
+ */
+export interface AgentNodeConfig {
+  botId: string;
+  prompt?: string;
+  role?: string;
+  provider?: string;
+  model?: string;
+  toolset?: string[] | string;
+  /** Alias for `toolset`. */
+  tools?: string[] | string;
+  skills?: string[] | string;
+}
+
+/** Config for a `bot-turn` node: AgentNodeConfig plus thread continuity. */
+export interface BotTurnNodeConfig extends AgentNodeConfig {
+  /** Optional existing conversation/session id to continue. */
+  sessionId?: string;
+}
+
+/** Token usage of one step, structurally identical to agent-runtime's. */
+export interface WorkflowTokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
+/**
+ * Resolve a workflow's level-parallelism cap (#145): `maxParallel`
+ * (canonical) or the `max_parallel` spelling accepted by the file
+ * formats, falling back to DEFAULT_MAX_PARALLEL (8).
+ */
+export function resolveWorkflowMaxParallel(
+  def: Pick<WorkflowDefinition, 'maxParallel'> & { max_parallel?: unknown },
+): number {
+  const raw = def.maxParallel ?? def.max_parallel;
+  if (typeof raw === 'number' && Number.isInteger(raw) && raw >= 1) return raw;
+  return DEFAULT_MAX_PARALLEL;
+}
+
 export interface WorkflowDefinition {
   id: string;
   name: string;
@@ -161,8 +217,19 @@ export interface WorkflowDefinition {
    * outputs (see src/cost.ts: top-level `costUsd`, or `costCents` /
    * `cost_cents`, or the same fields nested under `usage`) and fails the
    * run with a budget error as soon as the total exceeds `maxCostUsd`.
+   * Agent/bot-turn usage is priced from the agent-runtime price table
+   * (#150), so the cap covers LLM spend too.
    */
   budget?: WorkflowBudget;
+  /**
+   * Cap on how many nodes of one topological level may execute
+   * concurrently (#145). Positive integer, default
+   * DEFAULT_MAX_PARALLEL (8). The file formats also accept the
+   * `max_parallel` spelling and normalize it to this field.
+   */
+  maxParallel?: number;
+  /** Snake-case alias accepted on input; normalized to `maxParallel`. */
+  max_parallel?: number;
 }
 
 export type NodeStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'paused' | 'skipped';
@@ -188,6 +255,17 @@ export interface NodeState {
    * cost signal. Summed by the runner for workflow budget enforcement.
    */
   costUsd?: number;
+  /**
+   * Token usage reported for this node (#150), when the executor
+   * returned it (agent/bot-turn nodes, or an injected node executor).
+   * In-memory / event-stream data: the SQLite store persists `costUsd`,
+   * not the raw usage.
+   */
+  usage?: WorkflowTokenUsage;
+  /** Provider that served an agent/bot-turn node (#143/#150). */
+  provider?: string;
+  /** Model that served an agent/bot-turn node (#143/#150). */
+  model?: string;
 }
 
 export interface WorkflowRun {

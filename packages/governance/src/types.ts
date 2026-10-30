@@ -28,9 +28,55 @@ export interface PolicyRule {
    * matching `toolPattern` (case-insensitive RegExp) have already run
    * in this session. Needs EvalContext.sessionToolHistory; without it
    * the rule never matches (fail-closed).
+   *
+   * Argument-qualified conditions (#66): `argDigest` requires the
+   * recorded history entries to carry exactly that argument digest
+   * (see `computeArgDigest` in history.ts), and `argPattern` is a
+   * case-sensitive RegExp matched against the entries' `argSummary`.
+   * Entries that carry no digest/summary (legacy name-only string
+   * entries) NEVER satisfy an argument-qualified condition
+   * (fail-closed), but keep satisfying name-only conditions.
    */
-  requiresHistory?: { toolPattern: string; minCount?: number };
+  requiresHistory?: {
+    toolPattern: string;
+    minCount?: number;
+    /** Exact argument digest a history entry must carry. */
+    argDigest?: string;
+    /** RegExp matched against a history entry's `argSummary`. */
+    argPattern?: string;
+  };
+  /**
+   * Domain-bound capability (#122): when present, this rule is an
+   * egress allowlist. The gateway extracts the target host from the
+   * tool arguments (see `extractTargetHost` in domains.ts); a call
+   * whose host is outside `domains` — or whose host cannot be
+   * determined — is DENIED outright (it does not fall through to a
+   * later, more permissive rule). A call whose host is inside the set
+   * matches the rule normally (its `effect` applies).
+   */
+  domains?: string[];
 }
+
+/**
+ * One recorded session-history entry (#66).
+ *
+ * Legacy entries are plain tool-name strings. Rich entries carry the
+ * tool name plus an argument digest (`argDigest`, a SHA-256 hex string
+ * over the canonical JSON of the call arguments — see history.ts) and
+ * an optional human/matcher-readable `argSummary` (a compact,
+ * secret-redaction-unaware string the runtime builds from the args,
+ * e.g. "command=git status"). Governance never sees raw arguments in
+ * history: the digest is the exact-match contract and the summary is
+ * the pattern-match contract.
+ */
+export interface SessionHistoryEntry {
+  name: string;
+  argDigest?: string;
+  argSummary?: string;
+}
+
+/** Session tool history: legacy name-only strings and/or rich entries. */
+export type SessionToolHistory = Array<string | SessionHistoryEntry>;
 
 /** A deny-by-default policy: `defaultEffect` applies when no rule matches. */
 export interface Policy {
@@ -113,13 +159,16 @@ export interface EvalContext {
    */
   neverExpire?: boolean;
   /**
-   * Guardrails as code (Octomind parity): names of tools that have
-   * already executed in this session (in order). Policy rules with
-   * `requiresHistory` conditions match against this list. Supplied by
-   * the runtime's tool context; absent for out-of-session evaluations
-   * (simulations), where history-conditioned rules never match.
+   * Guardrails as code (Octomind parity): tools that have already
+   * executed in this session (in order) — legacy name-only strings or
+   * rich {@link SessionHistoryEntry} objects carrying an argument
+   * digest/summary for argument-qualified `requiresHistory` conditions
+   * (#66). Policy rules with `requiresHistory` conditions match against
+   * this list. Supplied by the runtime's tool context; absent for
+   * out-of-session evaluations (simulations), where history-conditioned
+   * rules never match.
    */
-  sessionToolHistory?: string[];
+  sessionToolHistory?: SessionToolHistory;
 }
 
 /** Result of evaluating a proposed tool call against the policy. */
@@ -146,5 +195,9 @@ export interface SimulationResult {
   hardFloor?: { tier: 'catastrophic' | 'destructive'; reason: string; patternId: string };
   /** True when the run_command hard denylist fired. */
   denylist?: boolean;
+  /** #122: true when a domain-bound rule denied the call (host outside its allowlist or undeterminable). */
+  domainDenied?: boolean;
+  /** #122: the target host extracted from the tool arguments, when one was found. */
+  targetHost?: string;
   simulated: true;
 }

@@ -24,6 +24,7 @@ import type { Duplex } from 'node:stream';
 import type { DatabaseSync } from 'node:sqlite';
 
 import { openDb } from '@mvp/agent-runtime';
+import { LivenessTracker, ReplayBuffer, shouldDropOutbound } from './ws-hub-util.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -343,8 +344,31 @@ export type CompanionPush =
   | { type: 'activity'; summary: string }
   | { type: 'ping'; ts: number }
   | { type: 'pong'; ts: number }
-  | { type: 'hello'; ok: true; deviceId: string; snapshot?: unknown }
+  | { type: 'hello'; ok: true; deviceId: string; snapshot?: unknown; resumeToken?: string; seq?: number; resumed?: boolean }
+  | { type: 'resume'; ok: true; replayed: number; truncated: boolean; seq: number }
+  | { type: 'command_result'; command: string; ok: boolean; result?: unknown; detail?: string }
+  | { type: 'elicitation'; id: string; message: string; requestedSchema: Record<string, unknown> }
   | { type: 'error'; detail: string };
+
+/**
+ * Request-linked costs on status pushes (#94): when the runtime
+ * provides usage for the run, the push carries cost fields; when it
+ * does not, the fields are present as null (never silently absent, so
+ * clients can render "cost unknown" honestly).
+ */
+export function runStatusPush(
+  run: Record<string, unknown>,
+  usage?: { costUsd?: number | null; totalTokens?: number | null } | null,
+): CompanionPush {
+  return {
+    type: 'run-status',
+    run: {
+      ...run,
+      costUsd: usage?.costUsd ?? null,
+      totalTokens: usage?.totalTokens ?? null,
+    },
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Minimal RFC 6455 WebSocket framing (mirrors phone.ts — same proven code)
@@ -357,6 +381,8 @@ export interface CompanionSocket {
   close(code?: number): void;
   onMessage(cb: (text: string) => void): void;
   onClose(cb: () => void): void;
+  /** Unsent bytes buffered by the transport (backpressure, #95). */
+  bufferedAmount?: number;
 }
 
 class WireSocket implements CompanionSocket {
@@ -378,6 +404,10 @@ class WireSocket implements CompanionSocket {
   }
   onClose(cb: () => void): void {
     this.closeCb = cb;
+  }
+
+  get bufferedAmount(): number {
+    return (this.socket as { writableLength?: number }).writableLength ?? 0;
   }
 
   sendText(text: string): void {
@@ -511,19 +541,70 @@ export interface CompanionHubOptions {
   snapshot?: () => unknown;
   /** Application heartbeat interval ms (0 disables; mainly for tests). */
   heartbeatMs?: number;
+  /** Dead-client eviction (#95): silence window + reap interval (0 reap interval disables). */
+  silenceMs?: number;
+  reapIntervalMs?: number;
+  /** Outbound backpressure cap in buffered bytes (#95). */
+  backpressureCapBytes?: number;
+  /** Session commands over WS (#96): prompt/cancel/model/slash frames route here. */
+  onSessionCommand?: (cmd: { type: 'prompt' | 'cancel' | 'model' | 'slash'; sessionId?: string; text?: string; model?: string }, device: CompanionDevice) => Promise<unknown> | unknown;
+  /** Elicitation answers from clients (#51): the WS elicitation bridge's frame resolver. */
+  elicitationResolve?: (frame: Record<string, unknown>) => boolean;
+  /** Clock override (tests). */
+  now?: () => number;
+}
+
+/** Low-priority frame types are droppable under backpressure (#95). */
+function isLowPriority(event: CompanionPush): boolean {
+  return event.type === 'ping' || event.type === 'activity';
 }
 
 interface PushConn {
   socket: CompanionSocket;
   device: CompanionDevice;
   remoteAddr: string;
+  /** Liveness/replay identity (#94/#95). */
+  connId: string;
+  replay: ReplayBuffer;
 }
 
 const HEARTBEAT_MS = 30_000;
 
+let companionConnSeq = 0;
+
 export class CompanionHub {
   private readonly conns = new Set<PushConn>();
   private heartbeat: ReturnType<typeof setInterval> | null = null;
+  private reaper: ReturnType<typeof setInterval> | null = null;
+  private livenessInstance: LivenessTracker | null = null;
+  private get liveness(): LivenessTracker {
+    if (!this.livenessInstance) this.livenessInstance = new LivenessTracker(this.opts.silenceMs ?? 90_000);
+    return this.livenessInstance;
+  }
+  /** Resume buffers survive disconnects (bounded, #94). */
+  private readonly replayBuffers = new Map<string, ReplayBuffer>();
+
+  private now(): number { return this.opts.now ? this.opts.now() : Date.now(); }
+
+  /** Evict connections silent beyond the window. Returns the eviction count (also run on a timer). */
+  reapStale(): number {
+    const dead = this.liveness.reap(this.now());
+    let n = 0;
+    for (const conn of [...this.conns]) {
+      if (!dead.includes(conn.connId)) continue;
+      n += 1;
+      try { conn.socket.close(4001); } catch { /* ignore */ }
+      this.conns.delete(conn);
+    }
+    return n;
+  }
+
+  private ensureReaper(): void {
+    if (this.reaper || this.opts.reapIntervalMs === 0) return;
+    const timer = setInterval(() => { this.reapStale(); }, this.opts.reapIntervalMs ?? 30_000);
+    (timer as unknown as { unref?: () => void }).unref?.();
+    this.reaper = timer;
+  }
 
   constructor(
     private readonly store: CompanionStore,
@@ -540,40 +621,41 @@ export class CompanionHub {
     return false;
   }
 
-  /** Push an event to every connected phone. Never throws. */
-  broadcast(event: CompanionPush): void {
+  /**
+   * Deliver one event to one connection: assigns the session sequence
+   * number, records the frame in the replay buffer, and drops
+   * low-priority frames for sockets over the backpressure cap (#94/#95).
+   * Returns true when the frame was handed to the socket.
+   */
+  private deliver(c: PushConn, event: CompanionPush): boolean {
+    if (isLowPriority(event) && shouldDropOutbound(c.socket, 'low', this.opts.backpressureCapBytes)) return false;
     let text: string;
     try {
-      text = JSON.stringify({ ...event, v: COMPANION_PROTOCOL_VERSION });
+      const seq = c.replay.lastSeq + 1;
+      text = JSON.stringify({ ...event, v: COMPANION_PROTOCOL_VERSION, seq });
+      c.replay.record(text, this.now());
     } catch {
-      return;
+      return false;
     }
-    for (const c of this.conns) {
-      try {
-        c.socket.sendText(text);
-      } catch {
-        // ignore
-      }
+    try {
+      c.socket.sendText(text);
+      return true;
+    } catch {
+      return false;
     }
+  }
+
+  /** Push an event to every connected phone. Never throws. */
+  broadcast(event: CompanionPush): void {
+    for (const c of this.conns) this.deliver(c, event);
   }
 
   /** Push an event to one device's connections. Returns true if delivered. */
   pushToDevice(deviceId: string, event: CompanionPush): boolean {
-    let text: string;
-    try {
-      text = JSON.stringify({ ...event, v: COMPANION_PROTOCOL_VERSION });
-    } catch {
-      return false;
-    }
     let delivered = false;
     for (const c of this.conns) {
       if (c.device.id !== deviceId) continue;
-      try {
-        c.socket.sendText(text);
-        delivered = true;
-      } catch {
-        // ignore
-      }
+      if (this.deliver(c, event)) delivered = true;
     }
     return delivered;
   }
@@ -593,11 +675,15 @@ export class CompanionHub {
     return dropped;
   }
 
-  /** Stop the heartbeat timer (tests / shutdown). */
+  /** Stop the heartbeat + reaper timers (tests / shutdown). */
   close(): void {
     if (this.heartbeat) {
       clearInterval(this.heartbeat);
       this.heartbeat = null;
+    }
+    if (this.reaper) {
+      clearInterval(this.reaper);
+      this.reaper = null;
     }
   }
 
@@ -641,10 +727,16 @@ export class CompanionHub {
 
   /** Accept an already-authenticated text-message socket (used by tests with an in-process mock). */
   acceptSocket(sock: CompanionSocket, remoteAddrStr: string, device: CompanionDevice): void {
-    const conn: PushConn = { socket: sock, device, remoteAddr: remoteAddrStr };
+    const connId = `conn_${++companionConnSeq}`;
+    // Each connection starts with a fresh replay buffer; a hello that
+    // presents a known resumeToken swaps in the surviving buffer (#94).
+    let replay = new ReplayBuffer(100);
+    const conn: PushConn = { socket: sock, device, remoteAddr: remoteAddrStr, connId, replay };
     this.conns.add(conn);
+    this.liveness.track(connId, this.now());
     this.store.touchDevice(device.id);
     this.ensureHeartbeat();
+    this.ensureReaper();
     this.audit('companion.ws_connected', {
       actor: 'api',
       toolName: 'companion',
@@ -652,15 +744,39 @@ export class CompanionHub {
     });
 
     let helloed = false;
-    const send = (event: CompanionPush): void => {
-      try {
-        sock.sendText(JSON.stringify({ ...event, v: COMPANION_PROTOCOL_VERSION }));
-      } catch {
-        // ignore
+    const send = (event: CompanionPush): void => { this.deliver(conn, event); };
+    const snapshotOf = (): unknown => {
+      try { return this.opts.snapshot?.(); } catch { return undefined; }
+    };
+    const doHello = (raw: Record<string, unknown>): void => {
+      helloed = true;
+      const presented = typeof raw.resumeToken === 'string' ? raw.resumeToken : '';
+      const lastSeq = typeof raw.lastSeq === 'number' && Number.isFinite(raw.lastSeq) ? raw.lastSeq : 0;
+      const surviving = presented ? this.replayBuffers.get(presented) : undefined;
+      const resumed = surviving ? surviving.resume(presented, lastSeq, this.now()) : null;
+      if (surviving && resumed) {
+        conn.replay = surviving;
+        replay = surviving;
+        send({ type: 'hello', ok: true, deviceId: device.id, snapshot: snapshotOf(), resumeToken: presented, seq: surviving.lastSeq, resumed: true });
+        // Replay the missed frames verbatim (they carry their original seq).
+        for (const ev of resumed.events) {
+          try { sock.sendText(ev.text); } catch { /* ignore */ }
+        }
+        send({ type: 'resume', ok: true, replayed: resumed.events.length, truncated: resumed.truncated, seq: surviving.lastSeq });
+        return;
       }
+      // Fresh session: issue a resume token for the next reconnect.
+      const token = replay.issue(this.now());
+      this.replayBuffers.set(token, replay);
+      if (this.replayBuffers.size > 50) {
+        const oldest = this.replayBuffers.keys().next().value as string;
+        this.replayBuffers.delete(oldest);
+      }
+      send({ type: 'hello', ok: true, deviceId: device.id, snapshot: snapshotOf(), resumeToken: token, seq: 0 });
     };
 
     sock.onMessage((text) => {
+      this.liveness.touch(connId, this.now());
       let raw: unknown;
       try {
         raw = JSON.parse(text);
@@ -672,35 +788,45 @@ export class CompanionHub {
         send({ type: 'error', detail: 'not_an_object' });
         return;
       }
-      const t = (raw as Record<string, unknown>).t;
+      const msg = raw as Record<string, unknown>;
+      const t = msg.t;
       if (!helloed) {
         if (t !== 'hello') {
           send({ type: 'error', detail: 'hello_required' });
           return;
         }
-        helloed = true;
-        let snapshot: unknown;
-        try {
-          snapshot = this.opts.snapshot?.();
-        } catch {
-          snapshot = undefined;
-        }
-        send({ type: 'hello', ok: true, deviceId: device.id, snapshot });
+        doHello(msg);
         return;
       }
-      if (t === 'hello') {
-        let snapshot: unknown;
-        try {
-          snapshot = this.opts.snapshot?.();
-        } catch {
-          snapshot = undefined;
-        }
-        send({ type: 'hello', ok: true, deviceId: device.id, snapshot });
-        return;
-      }
+      if (t === 'hello') { doHello(msg); return; }
       if (t === 'ping') {
-        const ts = (raw as Record<string, unknown>).ts;
-        send({ type: 'pong', ts: typeof ts === 'number' && Number.isFinite(ts) ? ts : Date.now() });
+        this.liveness.pong(connId, this.now());
+        send({ type: 'pong', ts: typeof msg.ts === 'number' && Number.isFinite(msg.ts) ? msg.ts : Date.now() });
+        return;
+      }
+      if (t === 'pong') { this.liveness.pong(connId, this.now()); return; }
+      if (t === 'elicitation_response') {
+        const ok = this.opts.elicitationResolve ? this.opts.elicitationResolve(msg) : false;
+        if (!ok) send({ type: 'error', detail: 'elicitation_not_pending' });
+        return;
+      }
+      // Session commands over WS (#96): prompt / cancel / model / slash
+      // route to the same dispatch the HTTP/SSE path uses (host-wired).
+      if (t === 'prompt' || t === 'cancel' || t === 'model' || t === 'slash') {
+        if (!this.opts.onSessionCommand) {
+          send({ type: 'error', detail: 'session_commands_unavailable' });
+          return;
+        }
+        const cmd = {
+          type: t as 'prompt' | 'cancel' | 'model' | 'slash',
+          ...(typeof msg.sessionId === 'string' ? { sessionId: msg.sessionId } : {}),
+          ...(typeof msg.text === 'string' ? { text: msg.text } : {}),
+          ...(typeof msg.model === 'string' ? { model: msg.model } : {}),
+        };
+        void Promise.resolve(this.opts.onSessionCommand(cmd, device)).then(
+          (result) => send({ type: 'command_result', command: t, ok: true, result }),
+          (err: unknown) => send({ type: 'command_result', command: t, ok: false, detail: err instanceof Error ? err.message : String(err) }),
+        );
         return;
       }
       send({ type: 'error', detail: 'unknown_type' });
@@ -708,6 +834,7 @@ export class CompanionHub {
 
     sock.onClose(() => {
       this.conns.delete(conn);
+      this.liveness.forget(connId);
       this.audit('companion.ws_disconnected', {
         actor: 'api',
         toolName: 'companion',

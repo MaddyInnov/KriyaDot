@@ -749,3 +749,37 @@ export function extractToolCostCents(result: unknown): number | undefined {
   }
   return undefined;
 }
+
+// ---------------------------------------------------------------------------
+// Supervisor statistics surface (closure #180): the Activity surface
+// reads SupervisorStats snapshots through this summarizer (kept pure so
+// spans.ts stays free of supervisor imports).
+// ---------------------------------------------------------------------------
+
+export interface SupervisorStatsSnapshot {
+  gatesFired: number;
+  gateAccepts: number;
+  gateRejections: number;
+  gateSkipped: number;
+  steers: number;
+  authorizerAllowed: number;
+  authorizerDenied: number;
+  authorizerSkipped: number;
+  plansCreated: number;
+  condensations: number;
+  planSketches: number;
+}
+
+export function summarizeSupervisorStats(stats: SupervisorStatsSnapshot): {
+  gateAcceptRate: number | null;
+  authorizerDenyRate: number | null;
+  total: SupervisorStatsSnapshot;
+} {
+  const decided = stats.gateAccepts + stats.gateRejections;
+  const authDecided = stats.authorizerAllowed + stats.authorizerDenied;
+  return {
+    gateAcceptRate: decided > 0 ? stats.gateAccepts / decided : null,
+    authorizerDenyRate: authDecided > 0 ? stats.authorizerDenied / authDecided : null,
+    total: stats,
+  };
+}

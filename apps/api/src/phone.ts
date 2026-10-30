@@ -21,6 +21,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { consumeWsTicket } from './loopback-auth.js';
 
 import { openDb } from '@mvp/agent-runtime';
+import { LivenessTracker, shouldDropOutbound } from './ws-hub-util.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -434,6 +435,8 @@ export interface PhoneSocket {
   close(code?: number): void;
   onMessage(cb: (text: string) => void): void;
   onClose(cb: () => void): void;
+  /** Unsent bytes buffered by the transport (backpressure, #95). */
+  bufferedAmount?: number;
 }
 
 class NetPhoneSocket implements PhoneSocket {
@@ -457,6 +460,10 @@ class NetPhoneSocket implements PhoneSocket {
   }
   onClose(cb: () => void): void {
     this.closeCb = cb;
+  }
+
+  get bufferedAmount(): number {
+    return (this.socket as { writableLength?: number }).writableLength ?? 0;
   }
 
   sendText(text: string): void {
@@ -594,11 +601,13 @@ interface PhoneConn {
   session: PhoneSession;
   frames: number;
   inputs: number;
+  lastSeenAt: number;
 }
 
 interface ViewerConn {
   socket: PhoneSocket;
   watching: string | null;
+  lastSeenAt: number;
 }
 
 export interface PhoneActionResult {
@@ -619,6 +628,27 @@ interface PendingAction {
 export class PhoneSessionHub {
   private readonly phones = new Map<string, PhoneConn>(); // deviceId → connection
   private readonly viewers = new Set<ViewerConn>();
+  private readonly liveness = new LivenessTracker(90_000);
+  private reaper: ReturnType<typeof setInterval> | null = null;
+
+  /** Evict phone/viewer connections silent beyond the window (#95). Returns evictions. */
+  reapStale(now: number = Date.now()): number {
+    let n = 0;
+    for (const [deviceId, conn] of [...this.phones]) {
+      if (now - conn.lastSeenAt > 90_000) { try { conn.socket.close(4001); } catch { /* ignore */ } this.phones.delete(deviceId); n += 1; }
+    }
+    for (const vw of [...this.viewers]) {
+      if (now - vw.lastSeenAt > 90_000) { try { vw.socket.close(4001); } catch { /* ignore */ } this.viewers.delete(vw); n += 1; }
+    }
+    return n;
+  }
+
+  private ensureReaper(): void {
+    if (this.reaper) return;
+    const t = setInterval(() => { this.reapStale(); }, 30_000);
+    (t as unknown as { unref?: () => void }).unref?.();
+    this.reaper = t;
+  }
   private readonly latestFrames = new Map<string, { jpg: string; w: number; h: number; ts: number }>();
   /** W14: in-flight server→phone actions awaiting an action_result ack. */
   private readonly pendingActions = new Map<string, PendingAction>();
@@ -754,6 +784,7 @@ export class PhoneSessionHub {
 
   /** Accept an already-established text-message socket (used by tests with an in-process mock). */
   acceptSocket(sock: PhoneSocket, remoteAddr: string): void {
+    this.ensureReaper();
     let role: 'phone' | 'viewer' | null = null;
     let phoneConn: PhoneConn | null = null;
     let viewerConn: ViewerConn | null = null;
@@ -797,6 +828,8 @@ export class PhoneSessionHub {
     };
 
     sock.onMessage((text) => {
+      if (phoneConn) phoneConn.lastSeenAt = Date.now();
+      if (viewerConn) viewerConn.lastSeenAt = Date.now();
       let raw: unknown;
       try {
         raw = JSON.parse(text);
@@ -832,7 +865,7 @@ export class PhoneSessionHub {
           }
           const session = this.store.startSession(msg.deviceId, 'ws');
           this.store.touchDevice(msg.deviceId);
-          phoneConn = { socket: sock, deviceId: msg.deviceId, session, frames: 0, inputs: 0 };
+          phoneConn = { socket: sock, deviceId: msg.deviceId, session, frames: 0, inputs: 0, lastSeenAt: Date.now() };
           this.phones.set(msg.deviceId, phoneConn);
           role = 'phone';
           authed = true;
@@ -855,7 +888,7 @@ export class PhoneSessionHub {
             sock.close(4401);
             return;
           }
-          viewerConn = { socket: sock, watching: msg.deviceId };
+          viewerConn = { socket: sock, watching: msg.deviceId, lastSeenAt: Date.now() };
           this.viewers.add(viewerConn);
           role = 'viewer';
           authed = true;
@@ -912,6 +945,7 @@ export class PhoneSessionHub {
           const relay = JSON.stringify({ t: 'frame', jpg: msg.jpg, w: msg.w, h: msg.h, ts: msg.ts });
           for (const vw of this.viewers) {
             if (vw.watching === phoneConn.deviceId) {
+              if (shouldDropOutbound(vw.socket, 'low')) continue; // slow viewer drops frames, others unaffected (#95)
               try {
                 vw.socket.sendText(relay);
               } catch {

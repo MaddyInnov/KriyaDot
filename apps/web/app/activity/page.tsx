@@ -17,6 +17,9 @@ import { HealthPanel } from '../../components/activity/health-panel';
 import { RoutingPanel } from '../../components/activity/routing-panel';
 import { RecoveryPanel } from '../../components/activity/recovery-panel';
 import { RunsPanel } from '../../components/activity/runs-panel';
+import { HumanAccountingPanel } from '../../components/activity/human-accounting-panel';
+import { SessionAnalyzePanel } from '../../components/activity/session-analyze-panel';
+import { UnifiedStatusPanel } from '../../components/activity/unified-status-panel';
 
 const TABS = [
   { id: 'briefing', label: 'Briefing', pro: false },
@@ -24,6 +27,9 @@ const TABS = [
   { id: 'notifications', label: 'Notifications', pro: false },
   { id: 'approvals', label: 'Approvals', pro: false },
   { id: 'runs', label: 'Runs', pro: false },
+  { id: 'status', label: 'Status', pro: false },
+  { id: 'analyze', label: 'Analyze', pro: false },
+  { id: 'human', label: 'Human time', pro: false },
   { id: 'spaces', label: 'Spaces', pro: false },
   { id: 'summary', label: 'Summary', pro: false },
   { id: 'rules', label: 'Rules', pro: false },
@@ -68,6 +74,9 @@ export default function ActivityPage() {
         {activeTab === "notifications" && <NotificationPanel />}
         {activeTab === "approvals" && <ApprovalsPanel hideHeader />}
         {activeTab === "runs" && <RunsPanel />}
+        {activeTab === "status" && <UnifiedStatusPanel />}
+        {activeTab === "analyze" && <SessionAnalyzePanel />}
+        {activeTab === "human" && <HumanAccountingPanel />}
         {activeTab === "spaces" && <SpacePanel />}
         {activeTab === "summary" && <OmniPanel />}
         {activeTab === "rules" && <RulesPanel />}

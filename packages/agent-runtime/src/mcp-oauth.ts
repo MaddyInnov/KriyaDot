@@ -581,6 +581,194 @@ export async function registerOAuthClient(
 }
 
 // ---------------------------------------------------------------------------
+// Client ID Metadata Documents — CIMD (Octomind parity #50)
+// ---------------------------------------------------------------------------
+//
+// With CIMD the client_id IS an https URL. Dereferencing it yields a JSON
+// metadata document describing the client (redirect_uris, grant_types,
+// token_endpoint_auth_method, ...). The authorization server fetches the
+// same document during the flow, so the fetched document — validated
+// against the URL it was fetched from — is the client's identity. This
+// sits alongside the existing paths (pre-registered client info and
+// RFC 7591 dynamic registration); nothing about those changes.
+//
+// Validation rules (fail closed — a bad document is a hard error, never a
+// silent fall back to another identity):
+// - the URL must be https (http is allowed only for localhost dev servers);
+// - the document must be a JSON object;
+// - `client_id` in the document must EXACTLY equal the URL it came from;
+// - `redirect_uris` must be a non-empty array of absolute URIs, and the
+//   redirect URI the flow will use must be one of them;
+// - `grant_types`, when present, must include "authorization_code"
+//   (absent → the spec default, ["authorization_code"]);
+// - `response_types`, when present, must include "code"
+//   (absent → the spec default, ["code"]);
+// - `token_endpoint_auth_method` defaults to "none"; any method that
+//   would require a client secret is rejected, because a public metadata
+//   document cannot carry one.
+
+/** A validated Client ID Metadata Document. */
+export interface ClientIdMetadataDocument {
+  /** The client_id — identical to the https URL the document was fetched from. */
+  client_id: string;
+  client_name?: string;
+  redirect_uris: string[];
+  grant_types: string[];
+  response_types: string[];
+  token_endpoint_auth_method: string;
+  scope?: string;
+  client_uri?: string;
+  logo_uri?: string;
+}
+
+/** True when a client_id is a CIMD URL (https, or http on localhost) rather than an opaque id. */
+export function isCimdClientId(clientId: string): boolean {
+  if (typeof clientId !== 'string') return false;
+  let url: URL;
+  try {
+    url = new URL(clientId);
+  } catch {
+    return false;
+  }
+  if (url.protocol === 'https:') return true;
+  if (url.protocol === 'http:' && (url.hostname === 'localhost' || url.hostname === '127.0.0.1')) return true;
+  return false;
+}
+
+function stringArrayField(b: Record<string, unknown>, key: string): string[] | undefined {
+  const v = b[key];
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v) || !v.every((s) => typeof s === 'string')) {
+    throw new Error(`CIMD document field "${key}" must be an array of strings`);
+  }
+  return v as string[];
+}
+
+/**
+ * Parse + validate a Client ID Metadata Document fetched from
+ * `expectedClientIdUrl`. Throws (fail closed) on malformed documents and
+ * on any mismatch with the URL it was fetched from.
+ */
+export function parseClientIdMetadataDocument(
+  body: unknown,
+  expectedClientIdUrl: string,
+): ClientIdMetadataDocument {
+  if (!isCimdClientId(expectedClientIdUrl)) {
+    throw new Error(`CIMD client_id must be an https URL, got "${expectedClientIdUrl}"`);
+  }
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw new Error('CIMD document is not a JSON object');
+  }
+  const b = body as Record<string, unknown>;
+  if (b.client_id !== expectedClientIdUrl) {
+    throw new Error(
+      `CIMD client_id mismatch: document says ${JSON.stringify(b.client_id)}, expected "${expectedClientIdUrl}"`,
+    );
+  }
+  const redirectUris = stringArrayField(b, 'redirect_uris');
+  if (!redirectUris || redirectUris.length === 0) {
+    throw new Error('CIMD document must declare a non-empty "redirect_uris" array');
+  }
+  for (const uri of redirectUris) {
+    try {
+      new URL(uri);
+    } catch {
+      throw new Error(`CIMD redirect_uri "${uri}" is not an absolute URI`);
+    }
+  }
+  const grantTypes = stringArrayField(b, 'grant_types') ?? ['authorization_code'];
+  if (!grantTypes.includes('authorization_code')) {
+    throw new Error('CIMD document "grant_types" must include "authorization_code"');
+  }
+  const responseTypes = stringArrayField(b, 'response_types') ?? ['code'];
+  if (!responseTypes.includes('code')) {
+    throw new Error('CIMD document "response_types" must include "code"');
+  }
+  const authMethod = b.token_endpoint_auth_method ?? 'none';
+  if (typeof authMethod !== 'string' || !authMethod) {
+    throw new Error('CIMD document "token_endpoint_auth_method" must be a non-empty string');
+  }
+  if (authMethod !== 'none') {
+    // A secret-bearing method cannot work: the identity document is
+    // public by design, so there is no secret to authenticate with.
+    throw new Error(
+      `CIMD document requests token_endpoint_auth_method "${authMethod}", which requires a client secret; ` +
+        'CIMD clients must use "none" (public client + PKCE).',
+    );
+  }
+  const doc: ClientIdMetadataDocument = {
+    client_id: expectedClientIdUrl,
+    redirect_uris: redirectUris,
+    grant_types: grantTypes,
+    response_types: responseTypes,
+    token_endpoint_auth_method: authMethod,
+  };
+  if (typeof b.client_name === 'string') doc.client_name = b.client_name;
+  if (typeof b.scope === 'string') doc.scope = b.scope;
+  if (typeof b.client_uri === 'string') doc.client_uri = b.client_uri;
+  if (typeof b.logo_uri === 'string') doc.logo_uri = b.logo_uri;
+  return doc;
+}
+
+/**
+ * Fetch + validate the metadata document for a CIMD client_id URL.
+ * `fetchFn` is injectable — tests run fully offline.
+ */
+export async function fetchClientIdMetadataDocument(
+  clientIdUrl: string,
+  fetchFn: FetchFn = fetch,
+): Promise<ClientIdMetadataDocument> {
+  if (!isCimdClientId(clientIdUrl)) {
+    throw new Error(`CIMD client_id must be an https URL, got "${clientIdUrl}"`);
+  }
+  const res = await fetchFn(clientIdUrl, { headers: { accept: 'application/json' } });
+  if (!res.ok) {
+    throw new Error(`CIMD document fetch failed (HTTP ${res.status}) for ${clientIdUrl}`);
+  }
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    throw new Error(`CIMD document at ${clientIdUrl} is not valid JSON`);
+  }
+  return parseClientIdMetadataDocument(body, clientIdUrl);
+}
+
+/**
+ * Resolve a CIMD client identity for one flow: fetch + validate the
+ * document, and check that `redirectUri` (the one the flow will use) is
+ * declared in it. Returns the McpOAuthClientInfo the existing token
+ * endpoints consume — clientId is the URL, and there is never a secret.
+ */
+export async function resolveCimdClient(
+  clientIdUrl: string,
+  opts: { redirectUri?: string; fetchFn?: FetchFn },
+): Promise<{ client: McpOAuthClientInfo; metadata: ClientIdMetadataDocument }> {
+  const metadata = await fetchClientIdMetadataDocument(clientIdUrl, opts.fetchFn ?? fetch);
+  if (opts.redirectUri !== undefined && !metadata.redirect_uris.includes(opts.redirectUri)) {
+    throw new Error(
+      `CIMD redirect_uri mismatch: "${opts.redirectUri}" is not declared in the metadata document at ${clientIdUrl} ` +
+        `(declared: ${metadata.redirect_uris.join(', ')})`,
+    );
+  }
+  return { client: { clientId: metadata.client_id }, metadata };
+}
+
+/**
+ * Build a `resolveClient`-shaped resolver (see McpOAuthClientOptions)
+ * backed by CIMD, for hosts that want CIMD without McpOAuthClient's
+ * built-in support. Fetches the document on every resolution — the AS
+ * sees the same freshness, and the document is small.
+ */
+export function createCimdClientResolver(
+  clientIdUrl: string,
+  redirectUri: string,
+  fetchFn: FetchFn = fetch,
+): (serverId: string, metadata: AuthorizationServerMetadata) => Promise<McpOAuthClientInfo> {
+  return async () => (await resolveCimdClient(clientIdUrl, { redirectUri, fetchFn })).client;
+}
+
+// ---------------------------------------------------------------------------
 // Token store (host-implemented with encrypted storage)
 // ---------------------------------------------------------------------------
 
@@ -632,6 +820,14 @@ export interface McpOAuthClientOptions {
    * back to dynamic registration when the metadata advertises it.
    */
   resolveClient: (serverId: string, metadata: AuthorizationServerMetadata) => Promise<McpOAuthClientInfo>;
+  /**
+   * CIMD client identity (Octomind parity #50): an https URL used as the
+   * client_id. When set, client resolution fetches + validates the
+   * Client ID Metadata Document at that URL (via fetchFn) instead of
+   * calling resolveClient — the document IS the identity. The redirect
+   * URI of each flow is checked against the document when known.
+   */
+  cimdClientId?: string;
   fetchFn?: FetchFn;
   /** Override for the "start OAuth" URL surfaced in McpOAuthRequiredError. */
   startUrl?: string;
@@ -647,6 +843,28 @@ export class McpOAuthClient {
 
   private get fetchFn(): FetchFn {
     return this.opts.fetchFn ?? fetch;
+  }
+
+  /**
+   * Resolve the OAuth client identity for this server. CIMD wins when
+   * configured (cimdClientId): the metadata document at the client_id
+   * URL is fetched + validated and used as the identity, and
+   * `redirectUri` (when the flow knows it) must be declared there.
+   * Otherwise the host's resolveClient (pre-registered / DCR) is used,
+   * exactly as before.
+   */
+  private async resolveClientIdentity(
+    metadata: AuthorizationServerMetadata,
+    redirectUri?: string,
+  ): Promise<McpOAuthClientInfo> {
+    if (this.opts.cimdClientId) {
+      const { client } = await resolveCimdClient(this.opts.cimdClientId, {
+        redirectUri,
+        fetchFn: this.fetchFn,
+      });
+      return client;
+    }
+    return this.opts.resolveClient(this.opts.serverId, metadata);
   }
 
   get startUrl(): string {
@@ -681,7 +899,7 @@ export class McpOAuthClient {
       throw new McpOAuthRequiredError(this.opts.serverId, this.startUrl);
     }
     const metadata = await this.metadata();
-    const client = await this.opts.resolveClient(this.opts.serverId, metadata);
+    const client = await this.resolveClientIdentity(metadata);
     try {
       const refreshed = await refreshAccessToken(
         {
@@ -714,7 +932,7 @@ export class McpOAuthClient {
     scope?: string;
   }): Promise<string> {
     const metadata = await this.metadata();
-    const client = await this.opts.resolveClient(this.opts.serverId, metadata);
+    const client = await this.resolveClientIdentity(metadata, args.redirectUri);
     return buildMcpAuthUrl({
       authorizationEndpoint: metadata.authorization_endpoint,
       clientId: client.clientId,
@@ -748,7 +966,7 @@ export class McpOAuthClient {
       throw new McpOAuthRequiredError(this.opts.serverId, this.startUrl);
     }
     const metadata = await this.metadata();
-    const client = await this.opts.resolveClient(this.opts.serverId, metadata);
+    const client = await this.resolveClientIdentity(metadata);
     try {
       const refreshed = await refreshAccessToken(
         {
@@ -777,7 +995,7 @@ export class McpOAuthClient {
     redirectUri: string;
   }): Promise<McpOAuthTokens> {
     const metadata = await this.metadata();
-    const client = await this.opts.resolveClient(this.opts.serverId, metadata);
+    const client = await this.resolveClientIdentity(metadata, args.redirectUri);
     const tokens = await exchangeCodeForTokens(
       {
         tokenEndpoint: metadata.token_endpoint,

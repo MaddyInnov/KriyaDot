@@ -65,7 +65,14 @@ import {
 import type { GovernanceGateway } from './governance.js';
 import { tagUntrustedToolOutput } from './runtime.js';
 import type { ToolCall, ToolContext, ToolDefinition } from './types.js';
-import { describeScope, requiredScopeForTool, type McpScopeStore } from './mcp-scopes.js';
+import type { McpToolAnnotations } from './mcp.js';
+import {
+  describeScope,
+  isToolAllowedByFilter,
+  requiredScopeForTool,
+  type McpScopeStore,
+  type McpServerToolFilter,
+} from './mcp-scopes.js';
 import type { TelemetryResourceProvider } from './telemetry.js';
 
 /** Minimal tool description the MCP server needs (a subset of ToolDefinition). */
@@ -74,6 +81,34 @@ export interface PlatformToolDef {
   description: string;
   /** JSON Schema (object) for the tool arguments. */
   parameters: Record<string, unknown>;
+  /**
+   * True when the tool mutates state (same flag as ToolDefinition).
+   * Drives the MCP annotations emitted on tools/list (#57a).
+   */
+  mutating?: boolean;
+  /** Explicit idempotence knowledge, when the tool author knows it (#57a). */
+  idempotent?: boolean;
+  /** Full annotation override; wins over the derived hints when set. */
+  annotations?: McpToolAnnotations;
+}
+
+/**
+ * Derive MCP tool annotations (#57a) from the internal mutating metadata:
+ * readOnlyHint = not mutating, destructiveHint = mutating, idempotentHint
+ * from explicit knowledge — falling back to `true` for read-only tools
+ * (a tool that cannot mutate is safe to retry). An explicit
+ * `def.annotations` replaces the derived set wholesale.
+ */
+export function annotationsForTool(def: PlatformToolDef): McpToolAnnotations {
+  if (def.annotations) return def.annotations;
+  const mutating = def.mutating === true;
+  const annotations: McpToolAnnotations = {
+    readOnlyHint: !mutating,
+    destructiveHint: mutating,
+  };
+  if (def.idempotent !== undefined) annotations.idempotentHint = def.idempotent;
+  else if (!mutating) annotations.idempotentHint = true;
+  return annotations;
 }
 
 /**
@@ -91,7 +126,12 @@ export function toolProviderFromDefinitions(defs: Iterable<ToolDefinition>): Too
   const list = [...defs];
   return {
     listTools: () =>
-      list.map((d) => ({ name: d.name, description: d.description, parameters: d.parameters })),
+      list.map((d) => ({
+        name: d.name,
+        description: d.description,
+        parameters: d.parameters,
+        ...(d.mutating !== undefined ? { mutating: d.mutating } : {}),
+      })),
     callTool: async (name, args) => {
       const def = list.find((d) => d.name === name);
       if (!def) throw new Error(`Unknown tool: "${name}"`);
@@ -129,6 +169,12 @@ export interface PlatformMcpServerOptions {
    * Unset → no scope enforcement (all tools behave as before).
    */
   scopes?: McpScopeStore;
+  /**
+   * Per-server tool filter with wildcards (Octomind parity #55): when
+   * set, tools the filter does not expose are omitted from tools/list
+   * and refused on tools/call (as if unknown). Unset → full surface.
+   */
+  toolFilter?: McpServerToolFilter;
   /**
    * Runtime telemetry ("eyes for your AI"). When set, the server exposes
    * telemetry as READ-ONLY MCP resources under `kriyadot://telemetry/*`
@@ -181,7 +227,7 @@ function jsonResult(payload: unknown, isError = false): CallToolResult {
   return textResult(JSON.stringify(payload, null, 2), isError);
 }
 
-function coerceInputSchema(parameters: Record<string, unknown> | undefined): Tool['inputSchema'] {
+export function coerceInputSchema(parameters: Record<string, unknown> | undefined): Tool['inputSchema'] {
   if (
     parameters &&
     typeof parameters === 'object' &&
@@ -205,6 +251,7 @@ export class PlatformMcpServer {
   private readonly serverInfo: { name: string; version: string };
   private readonly approvalTtlMs: number;
   private readonly scopeStore?: McpScopeStore;
+  private readonly toolFilter?: McpServerToolFilter;
   private readonly telemetry?: TelemetryResourceProvider;
   private readonly servers = new Set<Server>();
 
@@ -222,6 +269,7 @@ export class PlatformMcpServer {
     this.serverInfo = opts.serverInfo ?? { name: 'mvp-platform-mcp', version: '0.1.0' };
     this.approvalTtlMs = opts.approvalTtlMs ?? DEFAULT_APPROVAL_TTL_MS;
     this.scopeStore = opts.scopes;
+    this.toolFilter = opts.toolFilter;
     this.telemetry = opts.telemetry;
   }
 
@@ -256,6 +304,8 @@ export class PlatformMcpServer {
   private chatToolDef(): PlatformToolDef {
     return {
       name: CHAT_TOOL_NAME,
+      // A bot turn can mutate the world through the bot's own tools.
+      mutating: true,
       description:
         this.chat?.description ??
         'Run one turn with the platform bot and return its reply. Subject to the same governance approval policy as every other tool.',
@@ -272,11 +322,15 @@ export class PlatformMcpServer {
 
   private async listMcpTools(): Promise<Tool[]> {
     const all = await this.listToolDefs();
-    return all.map((d) => ({
-      name: d.name,
-      description: d.description,
-      inputSchema: coerceInputSchema(d.parameters),
-    }));
+    return all
+      .filter((d) => isToolAllowedByFilter(this.toolFilter, d.name))
+      .map((d) => ({
+        name: d.name,
+        description: d.description,
+        inputSchema: coerceInputSchema(d.parameters),
+        // #57a: annotations derived from the internal mutating metadata.
+        annotations: annotationsForTool(d),
+      }));
   }
 
   private toolKnown(name: string, defs: PlatformToolDef[]): boolean {
@@ -311,6 +365,12 @@ export class PlatformMcpServer {
 
   private async handleCallTool(name: string, args: unknown): Promise<CallToolResult> {
     const defs = await this.tools.listTools();
+    if (!isToolAllowedByFilter(this.toolFilter, name)) {
+      return jsonResult(
+        { status: 'error', code: 'tool_filtered', message: `Tool "${name}" is filtered out for this server.` },
+        true,
+      );
+    }
     if (!this.toolKnown(name, defs)) {
       return jsonResult(
         { status: 'error', code: 'unknown_tool', message: `Unknown tool: "${name}"` },
@@ -343,6 +403,27 @@ export class PlatformMcpServer {
           },
           true,
         );
+      }
+      // Domain-bound egress (#122): when the tool's egress is bound to a
+      // domain allowlist, the call's destination must be on it
+      // (fail-closed when the destination cannot be determined).
+      if (required === 'egress') {
+        const egress = this.scopeStore.checkEgress(name, call.args);
+        if (!egress.granted) {
+          this.audit({ type: 'mcp.tool.domain_denied', call, detail: { host: egress.host ?? null, reason: egress.reason ?? '' } });
+          return jsonResult(
+            {
+              status: 'denied',
+              code: 'domain_denied',
+              tool: name,
+              requiredScope: 'egress',
+              message:
+                `Tool "${name}" egress denied: ${egress.reason}. ` +
+                `Adjust the binding via PATCH /api/mcp/tools/${encodeURIComponent(name)}/scopes with { "domains": [...] }.`,
+            },
+            true,
+          );
+        }
       }
     }
 
@@ -656,4 +737,137 @@ export class PlatformMcpServer {
     }
     this.servers.clear();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Five builtin MCP servers (Octomind parity #52)
+// ---------------------------------------------------------------------------
+//
+// The platform's builtin surface used to be ONE server (`mvp-platform-mcp`)
+// exposing everything. The suite splits that same surface into five
+// logical servers by concern, each an independent PlatformMcpServer with
+// its own name, independently listable/connectable, all built by the same
+// factory (this section) over ONE shared ToolProvider:
+//
+//   core          — general platform tools (the default bucket)
+//   orchestration — delegation, teams, workflows, scheduling, MCP admin
+//   runtime       — memory, checkpoints, recall, verify, telemetry tools
+//                   (and the telemetry RESOURCES, which are runtime data)
+//   agent         — the `chat` bot-invocation tool + user-interaction and
+//                   web tools the agent persona drives
+//   local         — local machine surface: files, shell, git, computer
+//
+// Partitioning is by tool NAME (see builtinServerForTool) and is total:
+// every tool lands in exactly one server. Backward compatibility:
+// PlatformMcpServer itself is unchanged — the existing single-server
+// construction keeps working and exposes the full surface; the suite is
+// additive. `createBuiltinMcpServer(opts, 'core')` is the closest analog
+// of the old entry when a host wants just the core partition.
+
+export const BUILTIN_MCP_SERVER_IDS = ['core', 'orchestration', 'runtime', 'agent', 'local'] as const;
+
+export type BuiltinMcpServerId = (typeof BUILTIN_MCP_SERVER_IDS)[number];
+
+const ORCHESTRATION_TOOL_RE =
+  /^(delegate|delegate_|ask_bot|message_bot|coordinate_bots|create_bot|propose_|raise_escalation|retry_thread|run_workflow|workflow|schedule_|thread_schedule|mcp_manage|spawn_|subagent)/i;
+const RUNTIME_TOOL_RE =
+  /^(memory_|recall|recall_|checkpoint|verify|verify_|usage|telemetry|session_|health|hindsight|distill)/i;
+const LOCAL_TOOL_RE =
+  /^(run_command|shell|exec|git_|computer_|local:|read_file|write_file|edit_file|create_file|delete_file|remove_file|list_dir|list_files|glob|grep|apply_patch|patch_file|move_file|copy_file)/i;
+const AGENT_TOOL_RE =
+  /^(chat$|ask_user_question|request_credential|web_search|web_fetch|fetch|search_|browser_)/i;
+
+/** Which builtin server a tool name belongs to. Total + deterministic. */
+export function builtinServerForTool(toolName: string): BuiltinMcpServerId {
+  const name = toolName.trim();
+  if (ORCHESTRATION_TOOL_RE.test(name)) return 'orchestration';
+  if (RUNTIME_TOOL_RE.test(name)) return 'runtime';
+  if (LOCAL_TOOL_RE.test(name)) return 'local';
+  if (AGENT_TOOL_RE.test(name)) return 'agent';
+  return 'core';
+}
+
+/** Partition tool defs by builtin server id; every id key is present. */
+export function partitionToolDefs(
+  defs: readonly PlatformToolDef[],
+): Record<BuiltinMcpServerId, PlatformToolDef[]> {
+  const out: Record<BuiltinMcpServerId, PlatformToolDef[]> = {
+    core: [],
+    orchestration: [],
+    runtime: [],
+    agent: [],
+    local: [],
+  };
+  for (const def of defs) out[builtinServerForTool(def.name)].push(def);
+  return out;
+}
+
+/** A ToolProvider view exposing only one partition of a shared provider. */
+export function partitionedToolProvider(provider: ToolProvider, id: BuiltinMcpServerId): ToolProvider {
+  return {
+    listTools: async () => {
+      const all = await provider.listTools();
+      return all.filter((d) => builtinServerForTool(d.name) === id);
+    },
+    callTool: async (name, args) => {
+      if (builtinServerForTool(name) !== id) {
+        throw new Error(`Tool "${name}" is not served by the "${id}" builtin MCP server.`);
+      }
+      return provider.callTool(name, args);
+    },
+  };
+}
+
+/** The five-server suite: one PlatformMcpServer per builtin id. */
+export interface PlatformMcpServerSuite {
+  /** The serverSet: every builtin server by id. */
+  servers: Record<BuiltinMcpServerId, PlatformMcpServer>;
+  get(id: BuiltinMcpServerId): PlatformMcpServer;
+  ids(): BuiltinMcpServerId[];
+  /** Tool defs listed by one server (its partition only). */
+  listToolDefs(id: BuiltinMcpServerId): Promise<PlatformToolDef[]>;
+  closeAll(): Promise<void>;
+}
+
+/**
+ * Build the five-server suite from the same options the single server
+ * takes. Governance, bot/session identity, scopes and the tool filter are
+ * shared across all five; the `chat` tool lands on `agent` only, and
+ * telemetry resources on `runtime` only. Server names default to
+ * `<base>-<id>` (e.g. `mvp-platform-mcp-core`).
+ */
+export function createPlatformMcpServerSuite(opts: PlatformMcpServerOptions): PlatformMcpServerSuite {
+  const baseName = opts.serverInfo?.name ?? 'mvp-platform-mcp';
+  const baseVersion = opts.serverInfo?.version ?? '0.1.0';
+  const servers = {} as Record<BuiltinMcpServerId, PlatformMcpServer>;
+  for (const id of BUILTIN_MCP_SERVER_IDS) {
+    servers[id] = new PlatformMcpServer({
+      ...opts,
+      tools: partitionedToolProvider(opts.tools, id),
+      chat: id === 'agent' ? opts.chat : undefined,
+      telemetry: id === 'runtime' ? opts.telemetry : undefined,
+      serverInfo: { name: `${baseName}-${id}`, version: baseVersion },
+    });
+  }
+  return {
+    servers,
+    get: (id) => servers[id],
+    ids: () => [...BUILTIN_MCP_SERVER_IDS],
+    listToolDefs: (id) => servers[id].listToolDefs(),
+    closeAll: async () => {
+      await Promise.all(Object.values(servers).map((s) => s.close()));
+    },
+  };
+}
+
+/**
+ * Build ONE builtin server from the suite by id. Note the single-server
+ * PlatformMcpServer construction remains the backward-compatible default
+ * (full surface); this helper is for hosts that want one partition only.
+ */
+export function createBuiltinMcpServer(
+  opts: PlatformMcpServerOptions,
+  id: BuiltinMcpServerId,
+): PlatformMcpServer {
+  return createPlatformMcpServerSuite(opts).get(id);
 }

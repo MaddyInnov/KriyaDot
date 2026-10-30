@@ -3,11 +3,33 @@
 /**
  * Sandboxed command execution backend for `run_command`.
  *
- * Backend selection (first match wins):
+ * Backend selection (first match wins) — #117 closure, the kernel
+ * sandbox is now the DEFAULT confinement, not an opt-in fallback:
  *   1. E2B cloud sandbox, when `E2B_API_KEY` is set in the environment
  *      (free tier; API key is read from env only, never hardcoded).
  *   2. Local Docker, via `docker run` with resource limits and no network.
- *   3. Fail closed with a descriptive error when neither is available.
+ *   3. Kernel sandbox: Landlock on Linux / Seatbelt on macOS, with the
+ *      bot workspace dir (`SandboxCommandOptions.workspaceDir`) as the
+ *      writable root and cwd.
+ *   4. Host execution — ONLY on an explicit opt-out (see below), or as
+ *      the availability fallback in step 5.
+ *   5. When the kernel backend is unavailable (no compiler, kernel
+ *      without Landlock, …) the run falls back to host execution WITH
+ *      a loud warning surfaced in the result metadata (`sandboxed:
+ *      false` + `warning`), rather than breaking every existing
+ *      deployment — UNLESS strict mode is configured, in which case
+ *      it fails closed with a descriptive error.
+ *
+ * Explicit host opt-out (unsandboxed execution by configuration):
+ *   - `SANDBOX_ALLOW_HOST=1` (or `SANDBOX_HOST_FALLBACK=1`) in env, or
+ *   - `SANDBOX_BACKEND=host`, or
+ *   - `allowHostFallback: true` in the call options.
+ * Strict mode: `SANDBOX_STRICT=1` in env or `strict: true` in options.
+ * Kernel opt-out (legacy/escape hatch): `SANDBOX_KERNEL_FALLBACK=0`
+ * or `SANDBOX_DISABLE_KERNEL=1` removes the kernel from the chain
+ * (host then still requires the opt-out above, or strict mode fails
+ * closed). `SANDBOX_KERNEL_FALLBACK=1` remains accepted (now a no-op:
+ * the kernel is already in the default chain).
  *
  * Trust guarantees kept: deny-by-default approvals stay in the caller
  * (coordinator wiring), sandbox commands run with no network access unless
@@ -30,6 +52,24 @@ export interface SandboxCommandOptions {
   maxOutputBytes?: number;
   /** Allow network access inside the sandbox. Default false (no network). */
   network?: boolean;
+  /**
+   * Bot workspace directory (#117): the kernel backends' writable root
+   * and cwd, and the host fallback's cwd. Container backends ignore it
+   * (they run in their own isolated filesystem, unchanged).
+   */
+  workspaceDir?: string;
+  /**
+   * Explicit opt-out: permit unsandboxed host execution when no
+   * container/kernel backend is available. Also settable via env
+   * `SANDBOX_ALLOW_HOST=1` / `SANDBOX_BACKEND=host`.
+   */
+  allowHostFallback?: boolean;
+  /**
+   * Strict mode: fail closed (throw) instead of falling back to host
+   * execution when no sandbox backend is available. Also settable via
+   * env `SANDBOX_STRICT=1`.
+   */
+  strict?: boolean;
 }
 
 export interface SandboxCommandResult {
@@ -38,9 +78,42 @@ export interface SandboxCommandResult {
   exitCode: number;
   /** True when the command was killed because it exceeded timeoutMs. */
   timedOut?: boolean;
+  /** Backend that actually executed the command (when known). */
+  backend?: SandboxBackend;
+  /** False only for unsandboxed host execution. */
+  sandboxed?: boolean;
+  /**
+   * Loud warning surfaced when execution was NOT confined (host
+   * fallback). Callers should pass this through to result metadata.
+   */
+  warning?: string;
 }
 
-export type SandboxBackend = 'e2b' | 'docker' | 'landlock' | 'seatbelt' | 'none';
+export type SandboxBackend = 'e2b' | 'docker' | 'landlock' | 'seatbelt' | 'host' | 'none';
+
+/** Env knobs for the #117 resolution chain (exported for tests/hosts). */
+export function kernelSandboxDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.SANDBOX_DISABLE_KERNEL === '1' || env.SANDBOX_KERNEL_FALLBACK === '0';
+}
+
+export function hostFallbackOptedIn(
+  opts: SandboxCommandOptions = {},
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (opts.allowHostFallback === true) return true;
+  if (env.SANDBOX_ALLOW_HOST === '1' || env.SANDBOX_HOST_FALLBACK === '1') return true;
+  return (env.SANDBOX_BACKEND ?? '').trim().toLowerCase() === 'host';
+}
+
+export function sandboxStrictMode(
+  opts: SandboxCommandOptions = {},
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return opts.strict === true || env.SANDBOX_STRICT === '1';
+}
+
+export const HOST_FALLBACK_WARNING =
+  'WARNING: command executed UNSANDBOXED on the host — no container or kernel sandbox backend was available (or host execution was explicitly opted into). Set SANDBOX_STRICT=1 to fail closed instead.';
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 256 * 1024; // 256KB
@@ -111,27 +184,36 @@ function asCompletedResult(err: unknown): { exitCode: number; stdout: string; st
 }
 
 /**
- * Which sandbox backend is available right now.
- * E2B wins when `E2B_API_KEY` is present; otherwise Docker if the CLI
- * works. `SANDBOX_BACKEND` forces a backend (validated against
- * availability; an unavailable choice falls through to auto). With
- * `SANDBOX_KERNEL_FALLBACK=1`, kernel backends join the auto chain
- * after Docker: Landlock on Linux (once its helper is compiled) and
- * Seatbelt on macOS.
+ * Which sandbox backend the default resolution chain picks right now
+ * (synchronous probe — the Landlock leg requires the helper to be
+ * already compiled; `executeSandboxedCommand` compiles on first use).
+ *
+ * Order (#117): container (E2B → Docker) → kernel (Landlock/Seatbelt,
+ * DEFAULT, no opt-in flag needed) → host (explicit opt-out only) →
+ * 'none'. `SANDBOX_BACKEND` forces a backend (validated against
+ * availability; an unavailable choice falls through to auto), with
+ * two special values: 'host' (explicit unsandboxed opt-out) and
+ * 'none' (force no-backend; execute then applies the fallback rules).
  */
 export function sandboxBackend(): SandboxBackend {
   const forced = (process.env.SANDBOX_BACKEND ?? '').trim().toLowerCase();
+  if (forced === 'host') return 'host';
   if (forced === 'landlock' && landlockHelperReady()) return 'landlock';
   if (forced === 'seatbelt' && seatbeltAvailable()) return 'seatbelt';
+  if (forced === 'docker' && dockerAvailable()) return 'docker';
+  if (forced === 'e2b' && typeof process.env.E2B_API_KEY === 'string' && process.env.E2B_API_KEY.trim() !== '') {
+    return 'e2b';
+  }
   if (forced === 'none') return 'none';
   if (typeof process.env.E2B_API_KEY === 'string' && process.env.E2B_API_KEY.trim() !== '') {
     return 'e2b';
   }
   if (dockerAvailable()) return 'docker';
-  if ((process.env.SANDBOX_KERNEL_FALLBACK ?? '') === '1') {
+  if (!kernelSandboxDisabled()) {
     if (landlockHelperReady()) return 'landlock';
     if (seatbeltAvailable()) return 'seatbelt';
   }
+  if (hostFallbackOptedIn()) return 'host';
   return 'none';
 }
 
@@ -360,32 +442,116 @@ async function runInDocker(cmd: string, opts: SandboxCommandOptions): Promise<Sa
 }
 
 /**
- * Execute a shell command inside an isolated sandbox (E2B cloud or local Docker).
+ * Unsandboxed host execution — reachable ONLY via the explicit opt-out
+ * or the availability fallback (both decided in
+ * executeSandboxedCommand, which stamps the warning metadata). The
+ * command runs with the workspace dir as cwd. Never call this as a
+ * default: confinement is the default (#117).
+ */
+async function runOnHost(cmd: string, opts: SandboxCommandOptions): Promise<SandboxCommandResult> {
+  const timeoutMs = resolveTimeoutMs(opts.timeoutMs);
+  const maxBytes = resolveMaxOutputBytes(opts.maxOutputBytes);
+  const cwd = opts.workspaceDir ?? process.cwd();
+  return new Promise<SandboxCommandResult>((resolve, reject) => {
+    const child = spawn('sh', ['-c', cmd], { cwd, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    let outBytes = 0;
+    let errBytes = 0;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, timeoutMs);
+    timer.unref?.();
+    child.stdout?.on('data', (d: Buffer) => {
+      if (outBytes < maxBytes) {
+        out.push(d.subarray(0, maxBytes - outBytes));
+        outBytes += d.length;
+      }
+    });
+    child.stderr?.on('data', (d: Buffer) => {
+      if (errBytes < maxBytes) {
+        err.push(d.subarray(0, maxBytes - errBytes));
+        errBytes += d.length;
+      }
+    });
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      reject(new Error(`Host execution failed to start: ${e.message}`));
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({
+        stdout: Buffer.concat(out).toString('utf8'),
+        stderr: Buffer.concat(err).toString('utf8'),
+        exitCode: timedOut ? TIMEOUT_EXIT_CODE : (code ?? 1),
+        ...(timedOut ? { timedOut: true } : {}),
+        backend: 'host',
+        sandboxed: false,
+        warning: HOST_FALLBACK_WARNING,
+      });
+    });
+  });
+}
+
+function noBackendError(): Error {
+  return new Error(
+    'No sandbox backend available (strict mode): set E2B_API_KEY for the E2B cloud sandbox, ' +
+      'install Docker for the local sandbox, or run on a host with a kernel backend ' +
+      '(Landlock on Linux / Seatbelt on macOS). Host execution requires the explicit ' +
+      'opt-out SANDBOX_ALLOW_HOST=1.',
+  );
+}
+
+/**
+ * Execute a shell command with confinement by default (#117):
+ * container (E2B/Docker) → kernel (Landlock/Seatbelt, workspace as the
+ * writable root) → host ONLY on explicit opt-out, or — when the kernel
+ * backend is unavailable — as a fallback carrying a loud `warning` in
+ * the result metadata. Strict mode (`SANDBOX_STRICT=1` / `strict`)
+ * fails closed instead of falling back.
  * No network access inside the sandbox unless `opts.network` is true.
- * Throws (fail closed) when no backend is available.
  */
 export async function executeSandboxedCommand(
   cmd: string,
   opts: SandboxCommandOptions = {},
 ): Promise<SandboxCommandResult> {
   const backend = sandboxBackend();
-  if (backend === 'e2b') return runInE2B(cmd, opts);
-  if (backend === 'docker') return runInDocker(cmd, opts);
+  if (backend === 'e2b') {
+    const res = await runInE2B(cmd, opts);
+    return { ...res, backend: 'e2b', sandboxed: true };
+  }
+  if (backend === 'docker') {
+    const res = await runInDocker(cmd, opts);
+    return { ...res, backend: 'docker', sandboxed: true };
+  }
   if (backend === 'landlock') return runInLandlock(cmd, opts);
   if (backend === 'seatbelt') return runInSeatbelt(cmd, opts);
-  // First-use path: kernel fallback requested but the Landlock helper
-  // is not compiled yet — compile + probe now, then run confined
-  // rather than failing closed when the kernel can protect the run.
-  const forced = (process.env.SANDBOX_BACKEND ?? '').trim().toLowerCase();
-  if (forced === 'landlock' || (process.env.SANDBOX_KERNEL_FALLBACK ?? '') === '1') {
-    if (process.platform === 'linux') return runInLandlock(cmd, opts);
-    if (process.platform === 'darwin') return runInSeatbelt(cmd, opts);
+  if (backend === 'host') {
+    console.warn(`[sandbox] ${HOST_FALLBACK_WARNING}`);
+    return runOnHost(cmd, opts);
   }
-  throw new Error(
-    'No sandbox backend available: set E2B_API_KEY for the E2B cloud sandbox, ' +
-      'install Docker for the local sandbox, or enable a kernel backend ' +
-      '(SANDBOX_KERNEL_FALLBACK=1 for Landlock on Linux / Seatbelt on macOS).',
-  );
+  // backend === 'none'. First-use path: the synchronous probe cannot
+  // compile the Landlock helper, so try the kernel now (compile +
+  // probe) before deciding the fallback — the kernel is the default,
+  // no opt-in flag required.
+  const forced = (process.env.SANDBOX_BACKEND ?? '').trim().toLowerCase();
+  if (forced !== 'none' && !kernelSandboxDisabled()) {
+    try {
+      if (process.platform === 'linux') return await runInLandlock(cmd, opts);
+      if (process.platform === 'darwin') return await runInSeatbelt(cmd, opts);
+    } catch {
+      // Kernel genuinely unavailable on this host — fall through to
+      // the documented fallback below.
+    }
+  }
+  if (sandboxStrictMode(opts)) throw noBackendError();
+  // Availability fallback (NOT fail-closed by default — that would
+  // break every existing deployment on kernel-less hosts): run on the
+  // host with a loud warning in the result metadata + log.
+  console.warn(`[sandbox] ${HOST_FALLBACK_WARNING}`);
+  return runOnHost(cmd, opts);
 }
 
 /**

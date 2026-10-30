@@ -30,6 +30,13 @@ export interface HttpMcpServer {
    * then restart or wait for reconnect.
    */
   oauth?: boolean;
+  /**
+   * CIMD (closure #50): an https URL acting as the OAuth client_id —
+   * the authorization server fetches the client metadata document from
+   * it instead of a dynamic-registration round-trip. Passed through to
+   * McpOAuthClient when set.
+   */
+  cimdClientId?: string;
 }
 
 export type McpServerConfig = StdioMcpServer | HttpMcpServer;

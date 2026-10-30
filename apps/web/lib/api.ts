@@ -104,6 +104,18 @@ export interface BotPolicy {
   rules: BotPolicyRule[];
 }
 
+/** One stage of a bot's layer pipeline (mirrors agent-runtime LayerStageSpec + parity role/outputMode). */
+export interface LayerStageSpec {
+  name: string;
+  kind: 'prepare' | 'review' | string;
+  prompt?: string;
+  role?: string;
+  model?: string;
+  providerId?: string;
+  inputMode?: 'user' | 'draft' | 'user+draft' | string;
+  outputMode?: string;
+}
+
 export interface BotConfig {
   id: string;
   name: string;
@@ -111,6 +123,8 @@ export interface BotConfig {
   systemPrompt: string;
   provider: string;
   model: string;
+  /** Staged orchestration around the main turn (#41); absent = single-stage turns. */
+  layers?: LayerStageSpec[];
   /** Multiplayer layer (W7): owning person id; unset = the default user. */
   ownerId?: string;
   /** AI failover (W1): backup provider/model for hard usage-limit failures. */
@@ -413,6 +427,10 @@ export interface ProviderInfo {
   connected?: boolean;
   /** Local provider (Ollama): on-machine, no API key ever required. */
   local?: boolean;
+  /** Keyless-lane metadata (free-LLM stack): true when usable with NO api key. */
+  keyless?: boolean;
+  /** Honest limits note for a keyless/shared lane, from the provider catalog. */
+  limitsNote?: string;
 }
 
 export interface WorkflowNodeDef {

@@ -30,6 +30,8 @@ import { checkHardFloor } from '@mvp/governance';
 import { mergeBotPolicy } from '@mvp/governance/dist/bot-policy.js';
 import { loadWorkspacePolicy } from '@mvp/governance/dist/policy-file.js';
 import type { BotPolicy } from '@mvp/governance/dist/bot-policy.js';
+import { createPolicySnapshot } from '@mvp/governance/dist/policy-snapshot.js';
+import type { PolicySnapshot } from '@mvp/governance/dist/policy-snapshot.js';
 
 function toEvalContext(
   ctx: ToolContext,
@@ -40,7 +42,7 @@ function toEvalContext(
   actor: string;
   relayed?: boolean;
   addresseePersonId?: string;
-  sessionToolHistory?: string[];
+  sessionToolHistory?: (string | { name: string; argDigest?: string; argSummary?: string })[];
 } {
   // Guarded external messages: turns triggered by a relayed external
   // message (webhook / external origin) mint relayed approvals, which can
@@ -115,6 +117,15 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
   private readonly approvalObserver?: GovernanceAdapterOptions['approvalObserver'];
   /** Runtime-facing approval id → real gateway approval id. */
   private readonly idMap = new Map<string, string>();
+  /**
+   * Opt-in policy snapshots (#70): sessionId → immutable capture of the
+   * session's effective policy, taken at the session's FIRST evaluation
+   * when snapshot mode is enabled (bot `policy.policySnapshot: true` or
+   * the workspace policy file's `"policySnapshot": true`). KriyaDot's
+   * default stays live evaluation; a snapshot exists ONLY for opted-in
+   * sessions. Bounded like idMap — snapshots are per-session state.
+   */
+  private readonly sessionSnapshots = new Map<string, PolicySnapshot>();
 
   constructor(real: RealGovernanceGateway, opts: GovernanceAdapterOptions = {}) {
     this.real = real;
@@ -236,6 +247,53 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
     return merged;
   }
 
+  /** Whether snapshot mode (#70) is opted into for this bot/workspace. */
+  private snapshotEnabledFor(botId: string): boolean {
+    if (this.getBotConfig?.(botId)?.policy?.policySnapshot === true) return true;
+    const workspaceDir = this.workspaceDirForBot?.(botId);
+    if (workspaceDir) {
+      try {
+        if (loadWorkspacePolicy(workspaceDir).policySnapshot === true) return true;
+      } catch {
+        // A broken workspace policy file never enables snapshot mode.
+      }
+    }
+    return false;
+  }
+
+  /**
+   * The session's policy snapshot, capturing on first use. Returns
+   * undefined when snapshot mode is not enabled (the default) — the
+   * caller then evaluates live. The capture is audited once per session
+   * with its provenance hash.
+   */
+  private snapshotForSession(ctx: ToolContext, mergedPolicy: Policy | null): PolicySnapshot | undefined {
+    const existing = this.sessionSnapshots.get(ctx.sessionId);
+    if (existing) return existing;
+    if (!this.snapshotEnabledFor(ctx.botId)) return undefined;
+    const snapshot = createPolicySnapshot(mergedPolicy ?? this.globalPolicy, {
+      source: `bot:${ctx.botId}`,
+    });
+    this.sessionSnapshots.set(ctx.sessionId, snapshot);
+    if (this.sessionSnapshots.size > 500) {
+      const first = this.sessionSnapshots.keys().next();
+      if (!first.done) this.sessionSnapshots.delete(first.value);
+    }
+    this.audit({
+      type: 'policy',
+      botId: ctx.botId,
+      sessionId: ctx.sessionId,
+      detail: `policy snapshot captured for session (opt-in #70): ${snapshot.ruleCount} rules, sha256 ${snapshot.hash.slice(0, 12)}…`,
+      ts: new Date().toISOString(),
+    });
+    return snapshot;
+  }
+
+  /** Test/host introspection: the snapshot captured for a session, if any. */
+  policySnapshotForSession(sessionId: string): PolicySnapshot | undefined {
+    return this.sessionSnapshots.get(sessionId);
+  }
+
   async evaluate(call: ToolCall, ctx: ToolContext): Promise<GovernanceEvaluation> {
     // Hard floors FIRST — before learned preferences, policy, always-allow.
     // No mode can bypass these.
@@ -281,9 +339,17 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
     // policy (first match wins); the repo-local workspace policy merges
     // ahead of both. No extra rules → global policy only.
     const mergedPolicy = this.mergedPolicyFor(ctx.botId, ctx);
-    const res = mergedPolicy
-      ? await this.real.evaluateWithPolicy(call.name, call.args, this.evalContext(ctx), mergedPolicy)
-      : await this.real.evaluate(call.name, call.args, this.evalContext(ctx));
+    // Opt-in snapshot mode (#70): when enabled for this bot/workspace,
+    // the FIRST evaluation of a session captures the effective policy
+    // immutably and every later evaluation in the session uses the
+    // capture — mid-session policy edits then apply from the NEXT
+    // session. Default (flag off): live evaluation, unchanged.
+    const snapshot = this.snapshotForSession(ctx, mergedPolicy);
+    const res = snapshot
+      ? await this.real.evaluateWithSnapshot(call.name, call.args, this.evalContext(ctx), snapshot)
+      : mergedPolicy
+        ? await this.real.evaluateWithPolicy(call.name, call.args, this.evalContext(ctx), mergedPolicy)
+        : await this.real.evaluate(call.name, call.args, this.evalContext(ctx));
     if (res.effect === 'require-approval' && res.approvalId) {
       const runtimeId = randomUUID();
       this.idMap.set(runtimeId, res.approvalId);

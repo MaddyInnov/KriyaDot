@@ -96,6 +96,24 @@ import { applyStepEvent, type StepLineState } from '../components/chat/step-stat
 import { GaplessAudioQueue } from '../components/chat/audio-queue';
 import { GoalStatusCard } from '../components/chat/goal-card';
 import { BranchPicker, MessageSearchBox } from '../components/chat/message-search';
+import {
+  buildFragmentReply,
+  buildQuotedReply,
+  BUILTIN_CHAT_COMMANDS,
+  isBuiltinCommand,
+  parseSlashInvocation,
+  selectCopySegment,
+  type QuotableMessage,
+} from '../lib/octomind-web';
+import {
+  getSessionContext,
+  getUnifiedStatus,
+  isAbsent,
+  loadSessionAnalyze,
+  runChatCommand,
+} from '../lib/octomind-api';
+import { CommandResultCard } from '../components/chat/command-result-card';
+import { DiscoveryPanel } from '../components/chat/discovery-panel';
 import { useCodeSession } from '../components/code/useCodeSession';
 import { CodeSessionView } from '../components/code/CodeSessionView';
 import { CodingSessionStrip } from '../components/code/CodingSessionStrip';
@@ -144,6 +162,8 @@ type ChatBlock =
       interactive: boolean;
       answered?: WidgetAnswerState;
     }
+  /** Structured result of a built-in slash command (#114 et al.), rendered by CommandResultCard. */
+  | { kind: 'command-result'; id: string; title: string; payload: unknown; ts: number }
   | { kind: 'error'; id: string; text: string }
   | { kind: 'interrupted'; id: string; text: string }
   | { kind: 'notice'; id: string; text: string }
@@ -512,6 +532,38 @@ function ThreadBtn({
   );
 }
 
+/**
+ * "Reply" action (#35): quotes this message into the composer. Clicking
+ * Reply on several messages before sending quotes them all, in click
+ * order — the point-by-point multi-quote. Click again to un-quote.
+ */
+function ReplyBtn({
+  onReply,
+  quoted,
+  disabled,
+}: {
+  onReply: () => void;
+  quoted?: boolean;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      className="copy-btn"
+      title="Reply — quote this message into the composer (click more messages to quote them point-by-point)"
+      aria-label="Reply quoting this message"
+      aria-pressed={quoted}
+      disabled={disabled}
+      onClick={(e) => {
+        e.stopPropagation();
+        onReply();
+      }}
+    >
+      {quoted ? '✓ Quoted' : '↩ Reply'}
+    </button>
+  );
+}
+
 /** Suggestion chips for the empty state. */
 const SUGGESTIONS = [
   'Explain a concept simply',
@@ -568,6 +620,13 @@ function ChatPageInner() {
   const [slashMgrOpen, setSlashMgrOpen] = useState(false);
   const [slashDraft, setSlashDraft] = useState({ name: '', description: '', prompt: '' });
   const [slashError, setSlashError] = useState('');
+  // Reply quoting (#35): messages toggled into the composer, in click order.
+  const [quotedBlocks, setQuotedBlocks] = useState<Array<QuotableMessage & { blockId: string }>>([]);
+  // Fragment reply (#37): a text selection inside one assistant message.
+  const [pendingFragment, setPendingFragment] = useState<{ blockId: string; ref: string; role: string; fragment: string } | null>(null);
+  const [selectionAction, setSelectionAction] = useState<{ x: number; y: number; blockId: string; ref: string; role: string; text: string } | null>(null);
+  // Intent discovery (#166) panel visibility.
+  const [discoveryOpen, setDiscoveryOpen] = useState(false);
   // Conversations (chat sessions) per bot, persisted locally.
   const [convos, setConvos] = useState<Record<string, Conversation[]>>({});
   const [activeConvo, setActiveConvo] = useState<Record<string, string>>({});
@@ -1668,10 +1727,143 @@ function ChatPageInner() {
     }
   };
 
+  /** Push a structured command-result block into the transcript. */
+  const pushCommandResult = (title: string, payload: unknown) => {
+    setBlocks((prev) => [...prev, { kind: 'command-result', id: nextId(), title, payload, ts: Date.now() }]);
+  };
+
+  const pushNotice = (text: string) => {
+    setBlocks((prev) => [...prev, { kind: 'notice', id: nextId(), text }]);
+  };
+
+  /**
+   * Built-in slash commands (#114/#135/#161/#164/#172/#175-#178). These
+   * are handled by the API's command endpoint; where a pre-existing
+   * local endpoint already serves the same data (session context,
+   * share, unified status), it is the fallback — never a fabricated
+   * result. /context and /reply are NOT intercepted here: the chat API
+   * already handles them in-stream (session-craft.ts).
+   */
+  const runBuiltinCommand = async (name: string, args: string) => {
+    const bot = selectedBotRef.current;
+    const sessionId = bot ? (activeConvoRef.current[bot.id] ?? '') : '';
+    const payloadOf = (res: { data?: unknown; result?: unknown; payload?: unknown; reply?: string; text?: string } & Record<string, unknown>) =>
+      res.data ?? res.result ?? res.payload ?? (res.reply ? { reply: res.reply } : res);
+    // /copy is clipboard-first: prefer the API's segment text, fall back
+    // to the locally held transcript segments.
+    if (name === 'copy') {
+      let text = '';
+      let source = 'local transcript';
+      try {
+        const res = await runChatCommand({ sessionId, botId: bot?.id, command: 'copy', args });
+        const data = (res.data && typeof res.data === 'object' ? res.data : null) as { text?: string } | null;
+        if (data && typeof data.text === 'string' && data.text) { text = data.text; source = 'API'; }
+        else if (typeof res.text === 'string' && res.text) { text = res.text; source = 'API'; }
+        else if (typeof res.reply === 'string' && res.reply) { text = res.reply; source = 'API'; }
+      } catch { /* fall through to local segments */ }
+      if (!text) {
+        const msgs = blocksRef.current
+          .filter((b) => b.kind === 'user' || b.kind === 'assistant')
+          .map((b) => ({ role: b.kind as string, text: (b as { text: string }).text }));
+        text = selectCopySegment(msgs, args).text;
+      }
+      if (!text) { pushNotice('Nothing to copy for that segment yet.'); return; }
+      try {
+        await navigator.clipboard.writeText(text);
+        pushNotice(`⧉ Copied the "${selectCopySegment([], args).segment}" segment (${text.length} chars, from ${source}) to the clipboard.`);
+      } catch {
+        pushCommandResult('/copy — clipboard unavailable, here is the segment text', { text });
+      }
+      return;
+    }
+    if (name === 'share') {
+      if (!sessionId) { pushNotice('Start a conversation first — there is no session to share yet.'); return; }
+      try {
+        const res = await shareSession(sessionId);
+        const url = `${window.location.origin}${res.path}`;
+        try { await navigator.clipboard.writeText(url); } catch { /* link is in the card */ }
+        pushCommandResult('/share — public session link (copied)', { url, messages: res.messages, title: res.title });
+      } catch (err) {
+        pushNotice(`Share failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
+    if (name === 'analyze') {
+      if (!sessionId) { pushNotice('No active session to analyze.'); return; }
+      try {
+        const res = await loadSessionAnalyze(sessionId);
+        pushCommandResult('/analyze — local session viewer (nothing uploaded)', {
+          source: res.source,
+          ...(res.context ?? {}),
+          messagesLoaded: res.messages.length,
+          openFullViewerIn: 'Activity → Analyze',
+        });
+      } catch (err) {
+        pushNotice(`/analyze failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
+    // Generic path: the command endpoint, with honest fallbacks.
+    try {
+      const res = await runChatCommand({ sessionId, botId: bot?.id, command: name, args });
+      pushCommandResult(`/${name}`, payloadOf(res));
+    } catch (err) {
+      if (!isAbsent(err)) {
+        pushNotice(`/${name} failed: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+      // Endpoint absent: serve what pre-existing local endpoints can.
+      try {
+        if (name === 'info' || name === 'context') {
+          if (!sessionId) throw new Error('no active session');
+          pushCommandResult(`/${name} (from the local session-context endpoint)`, await getSessionContext(sessionId));
+          return;
+        }
+        if (name === 'status') {
+          pushCommandResult('/status', await getUnifiedStatus());
+          return;
+        }
+      } catch (fallbackErr) {
+        pushNotice(
+          `/${name} is not available yet: the chat-command endpoint has not landed on this API` +
+          `${isAbsent(fallbackErr) ? ' and neither has its fallback endpoint' : ` (${fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)})`}.`,
+        );
+        return;
+      }
+      pushNotice(`/${name} is not available yet: the session-command endpoint (POST /api/sessions/:id/commands) has not landed on this API.`);
+    }
+  };
+
   /** Text composer send. */
   const send = () => {
-    const text = input.trim();
-    if (!text && attachedFiles.length === 0) return;
+    const rawText = input.trim();
+    if (!rawText && attachedFiles.length === 0) return;
+    // Built-in commands run locally against the command endpoint — but
+    // not when the user defined a template with the same name, and not
+    // /reply or /context (already handled in-stream by the chat API).
+    const inv = parseSlashInvocation(rawText);
+    if (
+      inv &&
+      isBuiltinCommand(inv.name) &&
+      inv.name !== 'reply' &&
+      inv.name !== 'context' &&
+      !slashCommands[inv.name] &&
+      attachedFiles.length === 0
+    ) {
+      setInput('');
+      void runBuiltinCommand(inv.name, inv.args);
+      return;
+    }
+    // Compose quoted replies (#35 multi-quote / #37 fragment) into the
+    // outgoing message in the API /reply quote format.
+    let text = rawText;
+    if (pendingFragment) {
+      text = buildFragmentReply(pendingFragment, pendingFragment.fragment, rawText);
+      setPendingFragment(null);
+    } else if (quotedBlocks.length > 0) {
+      text = buildQuotedReply(quotedBlocks, rawText);
+      setQuotedBlocks([]);
+    }
     const fileIds = attachedFiles.map((f) => f.id);
     setInput('');
     setAttachedFiles([]);
@@ -1951,10 +2143,17 @@ function ChatPageInner() {
 
   // ---- slash commands ----
   const slashNames = Object.keys(slashCommands).sort();
+  // Palette catalog: built-in commands (#114 et al.) + user templates.
+  // User templates win the description display; built-ins fill the rest.
+  const slashCatalog: Record<string, { description: string; builtin?: boolean }> = {
+    ...Object.fromEntries(BUILTIN_CHAT_COMMANDS.map((c) => [c.name, { description: c.description, builtin: true }])),
+    ...Object.fromEntries(Object.entries(slashCommands).map(([n, c]) => [n, { description: c.description }])),
+  };
+  const paletteSlashNames = Object.keys(slashCatalog).sort();
   const slashQuery = input.startsWith('/') ? input.slice(1).split(/\s/)[0] ?? '' : null;
   const slashMatches =
     slashQuery !== null
-      ? slashNames.filter((n) => n.startsWith(slashQuery.toLowerCase()))
+      ? paletteSlashNames.filter((n) => n.startsWith(slashQuery.toLowerCase()))
       : [];
   const showSlashPop = slashQuery !== null && slashMatches.length > 0 && !sending;
 
@@ -2041,6 +2240,55 @@ function ChatPageInner() {
   const contextLength = modelOptions.find((m) => m.id === activeModelId)?.contextLength;
   // Chat polish derived state: find matches, @mention matches, palette.
   const textOfBlock = (b: ChatBlock): string => (b.kind === 'user' || b.kind === 'assistant' ? b.text : '');
+  // #35: 1-based position of each user/assistant block among messages —
+  // the ref the API's /reply resolves (`<n>` = 1-based position).
+  const ordinalByBlockId = new Map<string, number>();
+  {
+    let ord = 0;
+    for (const b of blocks) {
+      if (b.kind === 'user' || b.kind === 'assistant') {
+        ord += 1;
+        ordinalByBlockId.set(b.id, ord);
+      }
+    }
+  }
+  const toggleQuoteBlock = (b: ChatBlock) => {
+    if (b.kind !== 'user' && b.kind !== 'assistant') return;
+    const ref = String(ordinalByBlockId.get(b.id) ?? '');
+    setPendingFragment(null);
+    setQuotedBlocks((prev) =>
+      prev.some((q) => q.blockId === b.id)
+        ? prev.filter((q) => q.blockId !== b.id)
+        : [...prev, { blockId: b.id, ref, role: b.kind, text: b.text }],
+    );
+    inputRef.current?.focus();
+  };
+  /** #37: capture a text selection inside a message → floating action. */
+  const handleMessageSelection = () => {
+    const sel = window.getSelection();
+    const text = sel?.toString().trim() ?? '';
+    if (!sel || text.length < 2 || sel.rangeCount === 0) {
+      setSelectionAction(null);
+      return;
+    }
+    const node = sel.getRangeAt(0).commonAncestorContainer;
+    const el = (node instanceof Element ? node : node.parentElement)?.closest?.('[data-block-id]');
+    const blockId = el?.getAttribute('data-block-id') ?? '';
+    const block = blocksRef.current.find((b) => b.id === blockId);
+    if (!block || (block.kind !== 'assistant' && block.kind !== 'user') || !block.text.includes(text)) {
+      setSelectionAction(null);
+      return;
+    }
+    const rect = sel.getRangeAt(0).getBoundingClientRect();
+    setSelectionAction({
+      x: Math.max(8, rect.left + rect.width / 2 - 70),
+      y: Math.max(8, rect.top - 42),
+      blockId,
+      ref: String(ordinalByBlockId.get(blockId) ?? ''),
+      role: block.kind,
+      text,
+    });
+  };
   const findMatches = findOpen
     ? findInMessages(blocks.filter((b) => b.kind === 'user' || b.kind === 'assistant').map((b) => ({ id: b.id, text: textOfBlock(b) })), findQuery)
     : [];
@@ -2408,6 +2656,17 @@ function ChatPageInner() {
             <ShareSessionBtn sessionId={activeConvo[selectedBotId] ?? ''} disabled={sending} />
           )}
           {chatMode === 'chat' && (
+            <button
+              type="button"
+              className="copy-btn"
+              aria-expanded={discoveryOpen}
+              title="Find a specialist or capability by intent (semantic discovery)"
+              onClick={() => setDiscoveryOpen((v) => !v)}
+            >
+              🔎 Find by intent
+            </button>
+          )}
+          {chatMode === 'chat' && (
             <MessageSearchBox
               botId={selectedBotId}
               botName={(id) => bots.find((b) => b.id === id)?.name ?? id}
@@ -2488,6 +2747,18 @@ function ChatPageInner() {
           </div>
         ) : (
           <>
+            {discoveryOpen && (
+              <DiscoveryPanel
+                onPickBot={(botId) => {
+                  if (bots.some((b) => b.id === botId)) {
+                    setSelectedBotId(botId);
+                    setDiscoveryOpen(false);
+                  } else {
+                    pushNotice(`Bot "${botId}" was returned by discovery but is not in this instance's roster.`);
+                  }
+                }}
+              />
+            )}
             <CodingSessionStrip
               files={codeSession.files}
               active={codeSession.active}
@@ -2531,7 +2802,7 @@ function ChatPageInner() {
         <PinnedBanner pins={pins}
           onJump={(pin) => messagesRef.current?.querySelector(`[data-block-id="${CSS.escape(pin.messageId)}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })}
           onUnpin={(pin) => { void unpinChatMessage(pin.threadId, pin.messageId).catch(() => {}); setPins((prev) => prev.filter((x) => x.messageId !== pin.messageId)); }} />
-        <div className="chat-messages" ref={messagesRef}>
+        <div className="chat-messages" ref={messagesRef} onMouseUp={handleMessageSelection}>
           {selectedBot?.approvalMode === 'bypass' && (
             <div
               role="alert"
@@ -2599,6 +2870,7 @@ function ChatPageInner() {
                       </span>
                       <span className="msg-time">{fmtTime(b.ts)}</span>
                       <CopyBtn text={b.text} />
+                      <ReplyBtn onReply={() => toggleQuoteBlock(b)} quoted={quotedBlocks.some((q) => q.blockId === b.id)} disabled={sending} />
                       <button type="button" className="copy-btn" title="Pin message" aria-label="Pin message" onClick={() => pinBlock(b)}>📌</button>
                       <BranchBtn onBranch={() => branchFromBlock(b.id)} disabled={branching || sending} />
                       <ThreadBtn
@@ -2671,6 +2943,9 @@ function ChatPageInner() {
                       <span className="msg-author">{botLabel}</span>
                       <span className="msg-time">{fmtTime(b.ts)}</span>
                       {b.text.length > 0 && <CopyBtn text={b.text} />}
+                      {!b.streaming && b.text.length > 0 && (
+                        <ReplyBtn onReply={() => toggleQuoteBlock(b)} quoted={quotedBlocks.some((q) => q.blockId === b.id)} disabled={sending} />
+                      )}
                       {!b.streaming && <button type="button" className="copy-btn" title="Pin message" aria-label="Pin message" onClick={() => pinBlock(b)}>📌</button>}
                       {!b.streaming && (
                         <BranchBtn onBranch={() => branchFromBlock(b.id)} disabled={branching || sending} />
@@ -2729,6 +3004,12 @@ function ChatPageInner() {
                   </div>
                 );
               }
+              case 'command-result':
+                return (
+                  <div key={b.id} className="msg-row assistant">
+                    <CommandResultCard title={b.title} payload={b.payload} />
+                  </div>
+                );
               case 'goal':
                 return (
                   <div key={b.id} className="msg-row assistant">
@@ -2943,7 +3224,63 @@ function ChatPageInner() {
           })}
         </div>
 
+        {/* #37 floating selection action */}
+        {selectionAction && (
+          <button
+            type="button"
+            className="btn btn-primary btn-sm"
+            style={{ position: 'fixed', left: selectionAction.x, top: selectionAction.y, zIndex: 60, boxShadow: '0 4px 16px rgba(0,0,0,0.25)' }}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => {
+              setPendingFragment({
+                blockId: selectionAction.blockId,
+                ref: selectionAction.ref,
+                role: selectionAction.role,
+                fragment: selectionAction.text,
+              });
+              setQuotedBlocks([]);
+              setSelectionAction(null);
+              window.getSelection()?.removeAllRanges();
+              inputRef.current?.focus();
+            }}
+          >
+            ↩ Reply to selection
+          </button>
+        )}
         <div className="chat-input-wrap">
+          {(quotedBlocks.length > 0 || pendingFragment) && (
+            <div className="card" style={{ marginBottom: 8, padding: '8px 12px' }} aria-label="Quoted reply tray">
+              {pendingFragment ? (
+                <div className="row-between" style={{ gap: 8 }}>
+                  <span className="small">
+                    <strong>Replying to a selection</strong> from message #{pendingFragment.ref} ({pendingFragment.role}):{' '}
+                    <span className="muted">“{pendingFragment.fragment.slice(0, 120)}{pendingFragment.fragment.length > 120 ? '…' : ''}”</span>
+                    <br />
+                    <span className="muted">Only this fragment will be quoted, with the quotedFragment marker for the API.</span>
+                  </span>
+                  <button type="button" className="btn btn-sm" onClick={() => setPendingFragment(null)}>✕ Clear</button>
+                </div>
+              ) : (
+                <div>
+                  <div className="row-between" style={{ gap: 8 }}>
+                    <span className="small">
+                      <strong>Quoting {quotedBlocks.length} message{quotedBlocks.length === 1 ? '' : 's'}</strong>{' '}
+                      <span className="muted">— they will be quoted point-by-point, in this order, ahead of your reply. Click Reply on more messages to add them.</span>
+                    </span>
+                    <button type="button" className="btn btn-sm" onClick={() => setQuotedBlocks([])}>✕ Clear all</button>
+                  </div>
+                  {quotedBlocks.map((q) => (
+                    <div key={q.blockId} className="row-between" style={{ gap: 8, marginTop: 4 }}>
+                      <span className="small muted" style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        #{q.ref} ({q.role}): {q.text.slice(0, 100)}{q.text.length > 100 ? '…' : ''}
+                      </span>
+                      <button type="button" className="copy-btn" onClick={() => setQuotedBlocks((p) => p.filter((x) => x.blockId !== q.blockId))}>✕</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           {mentionState && mentionMatches.length > 0 && (
             <MentionMenu entries={mentionMatches} highlight={0}
               onPick={(entry) => {
@@ -2968,7 +3305,7 @@ function ChatPageInner() {
                   onMouseEnter={() => setSlashHl(i)}
                 >
                   <span className="cmd">/{name}</span>
-                  <span className="desc">{slashCommands[name]?.description || '—'}</span>
+                  <span className="desc">{slashCatalog[name]?.description || '—'}{slashCatalog[name]?.builtin && !slashCommands[name] ? ' · built-in' : ''}</span>
                 </button>
               ))}
             </div>

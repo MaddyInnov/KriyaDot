@@ -66,6 +66,13 @@ export const DEFAULT_POLICY: Policy = {
         'MCP servers are untrusted third parties; their tools need human approval unless the server is explicitly allowlisted',
     },
     {
+      id: 'local-tools-require-approval',
+      toolPattern: '^local:',
+      effect: 'require-approval',
+      reason:
+        'Local project tools are executables from the workspace (.kriyadot/tools/) that run on the host via execFile with no sandbox confinement; they require human approval unless a more specific policy rule explicitly allows them (see docs/local-tools-security.md)',
+    },
+    {
       id: 'approval-file-writes',
       toolPattern: '^(write_file|edit_file|create_file|delete_file|remove_file)$',
       actionClass: 'write',

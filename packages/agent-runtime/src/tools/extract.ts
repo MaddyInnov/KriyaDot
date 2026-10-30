@@ -44,7 +44,7 @@ export function createExtractTools(host: ExtractHost): ToolDefinition[] {
       const res = await host.provider.chat(
         [{ role:'system', content:'Extract values exactly per the schema. Reply with exactly one JSON value.' }, { role:'user', content: source }],
         [],
-        { model, responseFormat: { type:'json_schema', name:'extraction', schema, strict:false }, temperature: profile?.temperature },
+        { model, responseFormat: { type:'json_schema', name:'extraction', schema, strict:false }, temperature: profile?.temperature, topP: profile?.topP, maxTokens: profile?.maxTokens, reasoningEffort: profile?.reasoningEffort, maxRetries: profile?.maxRetries, timeoutMs: profile?.timeoutMs },
       );
       let parsed: unknown;
       try { parsed = JSON.parse(res.content.trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'')); } catch { return { error: 'extraction did not return valid JSON', raw: res.content.slice(0,500) }; }

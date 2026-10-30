@@ -39,6 +39,15 @@ export interface QueuedMessage {
   sessionId: string;
   botId: string;
   message: string;
+  /**
+   * Co-driving (#173): the writer who sent this message when several
+   * writers share one live session, and whether it was sent as a
+   * co-driver message (drained as that writer's own turn, attributed
+   * to them) rather than an anonymous queue entry. Absent on rows
+   * written before co-driving existed.
+   */
+  writerId?: string;
+  codrive?: boolean;
   provider?: string;
   model?: string;
   taskType?: 'code' | 'chat' | 'reasoning' | 'simple-qa';
@@ -54,6 +63,9 @@ export interface EnqueueInput {
   sessionId: string;
   botId: string;
   message: string;
+  /** Co-driving writer attribution (#173); see QueuedMessage. */
+  writerId?: string;
+  codrive?: boolean;
   provider?: string;
   model?: string;
   reasoningEffort?: 'low' | 'medium' | 'high';
@@ -79,6 +91,8 @@ interface QueueRow {
   sandbox_mode: string | null;
   status: string;
   created_at: number;
+  writer_id: string | null;
+  codrive: number | null;
 }
 
 function rowToQueued(r: QueueRow): QueuedMessage {
@@ -96,6 +110,8 @@ function rowToQueued(r: QueueRow): QueuedMessage {
     sandboxMode: (r.sandbox_mode as QueuedMessage['sandboxMode']) ?? undefined,
     status: r.status as QueuedMessageStatus,
     createdAt: r.created_at,
+    writerId: r.writer_id ?? undefined,
+    codrive: r.codrive === 1 || undefined,
   };
 }
 
@@ -121,10 +137,24 @@ export class ChatQueueStore {
         max_budget_usd REAL,
         sandbox_mode TEXT,
         status TEXT NOT NULL DEFAULT 'queued',
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        writer_id TEXT,
+        codrive INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_chat_queue_session ON chat_queue (session_id, status, created_at);
     `);
+    // Co-driving columns (#173) for databases created before they
+    // existed: additive migration, ignored when already present.
+    for (const ddl of [
+      `ALTER TABLE chat_queue ADD COLUMN writer_id TEXT`,
+      `ALTER TABLE chat_queue ADD COLUMN codrive INTEGER NOT NULL DEFAULT 0`,
+    ]) {
+      try {
+        this.db.exec(ddl);
+      } catch {
+        // Column already exists — nothing to migrate.
+      }
+    }
   }
 
   /** Enqueue a message. Returns the id and 1-based position in the session queue. */
@@ -143,8 +173,8 @@ export class ChatQueueStore {
     this.db
       .prepare(
         `INSERT INTO chat_queue
-         (id, session_id, bot_id, message, provider, model, task_type, auto_approve, plan_mode, max_budget_usd, sandbox_mode, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)`,
+         (id, session_id, bot_id, message, provider, model, task_type, auto_approve, plan_mode, max_budget_usd, sandbox_mode, status, created_at, writer_id, codrive)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`,
       )
       .run(
         id,
@@ -159,6 +189,8 @@ export class ChatQueueStore {
         input.maxBudgetUsd ?? null,
         input.sandboxMode ?? null,
         now,
+        input.writerId ?? null,
+        input.codrive ? 1 : 0,
       );
     const position = this.countForSession(input.sessionId);
     return { id, position };
@@ -202,6 +234,16 @@ export class ChatQueueStore {
       .prepare(`SELECT COUNT(*) AS n FROM chat_queue WHERE session_id = ? AND status = 'queued'`)
       .get(sessionId) as unknown as { n: number };
     return row.n;
+  }
+
+  /** Distinct co-driving writers with queued messages on a session (#173). */
+  writersForSession(sessionId: string): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT writer_id FROM chat_queue WHERE session_id = ? AND status = 'queued' AND writer_id IS NOT NULL ORDER BY writer_id ASC`,
+      )
+      .all(sessionId) as unknown as Array<{ writer_id: string }>;
+    return rows.map((r) => r.writer_id);
   }
 
   /** Reset stale 'started' rows to 'queued' (e.g. from a crashed turn) on boot. */

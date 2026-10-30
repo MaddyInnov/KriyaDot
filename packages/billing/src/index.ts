@@ -5,4 +5,5 @@ export * from './ledger.js';
 export * from './pricing.js';
 export * from './cost-breakdown.js';
 export * from './spend-caps.js';
+export * from './threshold-gate.js';
 export * from './purchase.js';
