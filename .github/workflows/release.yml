@@ -75,6 +75,7 @@ jobs:
       - name: Attach SHA256SUMS to the release
         shell: bash
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -150,6 +151,7 @@ jobs:
           work=$(mktemp -d)
           "$APPIMAGE" --appimage-extract >/dev/null
           mv squashfs-root "$work/appdir"
+          chmod -R a+rX "$work/appdir"  # appimagetool refuses AppDirs with owner-only (0700) entries from the extract
           rm -f "$work/appdir"/usr/lib/libwebkit2gtk-4.1.so* \
                 "$work/appdir"/usr/lib/libjavascriptcoregtk-4.1.so*
           wget -q -O "$work/ait.AppImage" https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
