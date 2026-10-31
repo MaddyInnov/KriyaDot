@@ -871,6 +871,22 @@ export class WidgetStore {
   }
 
   /**
+   * Transition ONE pending widget to 'expired' regardless of the
+   * wall-clock comparison (the caller — the coordinator's fail-closed
+   * waiter — has already decided this widget's wait is over). Same
+   * guards as expireStale: never-expire cards (expires_at NULL or
+   * flagged) never transition here. Returns true when it transitioned.
+   */
+  expireOne(id: string, now = Date.now()): boolean {
+    const res = this.db
+      .prepare(
+        "UPDATE widgets SET status = 'expired', answered_at = ? WHERE id = ? AND status = 'pending' AND expires_at IS NOT NULL AND COALESCE(never_expire, 0) = 0",
+      )
+      .run(now, id);
+    return res.changes > 0;
+  }
+
+  /**
    * Mark pending widgets past their expiry as 'expired'. Returns the ids
    * that transitioned (so the host can settle in-flight waiters).
    */
@@ -1016,8 +1032,16 @@ export class WidgetCoordinator {
           return;
         }
         // Fail closed: mark expired (only if still pending) and audit.
+        // The sweep is wall-clock based and can miss by a millisecond
+        // when this timer was capped at the widget's own expiry (timer
+        // granularity), so transition THIS widget deterministically
+        // before resolving — the store must agree with the expired
+        // outcome the waiter is about to report.
         const stillPending = current?.status === 'pending';
         const expiredIds = stillPending ? this.store.expireStale() : [];
+        if (stillPending && !expiredIds.includes(widgetId)) {
+          this.store.expireOne(widgetId);
+        }
         if (expiredIds.includes(widgetId) || stillPending) {
           try {
             this.audit?.('widget.expired', {
