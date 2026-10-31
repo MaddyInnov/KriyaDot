@@ -72,6 +72,15 @@ describe('buildWorkspaceList + filter', () => {
     expect(filterHistoryByWorkspace(h, null).map((e) => e.convoId)).toEqual(['s1']);
     expect(filterHistoryByWorkspace(h, undefined)).toHaveLength(4);
   });
+
+  it('labels allocated …/bots/<id>/workspace paths by the bot segment', () => {
+    const allocBots = [
+      { id: 'scout', name: 'Scout', workspace: '/data/bots/scout/workspace' },
+      { id: 'helper', name: 'Helper', workspace: '/data/bots/helper/workspace' },
+    ];
+    const ws = buildWorkspaceList(allocBots, []);
+    expect(ws.map((w) => w.label)).toEqual(['Default workspace', 'helper', 'scout']);
+  });
 });
 
 describe('searchHistory', () => {

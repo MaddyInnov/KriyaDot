@@ -43,7 +43,8 @@ export function createProvider(providerId: string, opts?: { apiKey?: string }): 
   // Scripted two-step turn: announce a file write, then confirm after the
   // approval-gated tool call completes. Clearly labeled "(mock)" in the UI.
   if (providerId === 'demo' && isDemoMockEnabled()) {
-    return new MockProvider([
+    return new MockProvider(
+      [
       {
         content: "I'll create that note for you right now.",
         toolCalls: [
@@ -61,8 +62,12 @@ export function createProvider(providerId: string, opts?: { apiKey?: string }): 
       {
         content:
           'Done — hello-from-video.txt is written to the workspace. Notice what just happened: the platform paused and asked for your approval before writing the file. That is deny-by-default governance in action — sensitive actions always wait for your OK, right here in the chat.',
-      },
-    ]);
+        },
+      ],
+      // Pace the demo stream like a real provider (~45ms/word) so
+      // screen recordings and screenshots show genuine streaming.
+      { tokenDelayMs: 45 },
+    );
   }
 
   // Agent-CLI inference backend: `agent/<cli-id>/<model>` (e.g.

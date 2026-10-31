@@ -30,13 +30,18 @@ const DEFAULT_USAGE: TokenUsage = { promptTokens: 10, completionTokens: 5, total
 export class MockProvider implements LLMProvider {
   readonly providerId = 'mock';
   private readonly steps: MockStep[];
+  private readonly tokenDelayMs: number;
   private cursor = 0;
   /** Every chat() invocation, in order — handy for assertions. */
   readonly calls: Array<{ messages: ChatMessage[]; model: string }> = [];
 
-  constructor(steps: MockStep[]) {
+  constructor(steps: MockStep[], opts?: { tokenDelayMs?: number }) {
     if (steps.length === 0) throw new Error('MockProvider needs at least one scripted step');
     this.steps = steps;
+    // Optional per-token pacing so demo/screenshot runs stream at a
+    // human-visible rate like a real provider. Default 0 = instant
+    // (every existing test keeps the synchronous behavior).
+    this.tokenDelayMs = opts?.tokenDelayMs ?? 0;
   }
 
   async chat(
@@ -51,6 +56,9 @@ export class MockProvider implements LLMProvider {
     if (opts.onToken && content) {
       for (const word of content.split(/(\s+)/)) {
         if (word) opts.onToken(word);
+        if (word && this.tokenDelayMs > 0) {
+          await new Promise((r) => setTimeout(r, this.tokenDelayMs));
+        }
       }
     }
     return {

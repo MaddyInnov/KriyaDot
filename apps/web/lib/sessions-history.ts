@@ -61,7 +61,13 @@ export function relativeTime(ts: number, now: number): string {
 
 function workspaceLabel(path: string): string {
   const parts = path.split(/[\\/]/).filter(Boolean);
-  return parts.length > 0 ? parts[parts.length - 1] : path;
+  if (parts.length === 0) return path;
+  const base = parts[parts.length - 1]!;
+  // Allocated per-bot workspaces end in a generic "workspace" segment
+  // (…/bots/<bot-id>/workspace) — the parent segment is the meaningful
+  // name; a bare "workspace" label would repeat identically per bot.
+  if (base === 'workspace' && parts.length > 1) return parts[parts.length - 2]!;
+  return base;
 }
 
 /**
