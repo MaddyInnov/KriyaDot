@@ -59,7 +59,12 @@ export function relativeTime(ts: number, now: number): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-function workspaceLabel(path: string): string {
+/**
+ * Human display name for a workspace path — the ONLY form UI surfaces may
+ * show (raw filesystem paths never render). Exported for the chat roster
+ * and the header bot picker.
+ */
+export function workspaceDisplayName(path: string): string {
   const parts = path.split(/[\\/]/).filter(Boolean);
   if (parts.length === 0) return path;
   const base = parts[parts.length - 1]!;
@@ -115,10 +120,10 @@ export function buildWorkspaceList(
   for (const e of history) counts.set(e.workspace, (counts.get(e.workspace) ?? 0) + 1);
   const named = new Map<string, string>();
   for (const b of bots) {
-    if (b.workspace && !named.has(b.workspace)) named.set(b.workspace, workspaceLabel(b.workspace));
+    if (b.workspace && !named.has(b.workspace)) named.set(b.workspace, workspaceDisplayName(b.workspace));
   }
   for (const key of counts.keys()) {
-    if (key && !named.has(key)) named.set(key, workspaceLabel(key));
+    if (key && !named.has(key)) named.set(key, workspaceDisplayName(key));
   }
   const out: WorkspaceEntry[] = [
     { id: null, label: DEFAULT_WORKSPACE_LABEL, sessionCount: counts.get(null) ?? 0 },

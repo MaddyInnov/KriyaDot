@@ -7,6 +7,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { CodeBlock } from '../code/CodeBlock';
 import { authedFetch, pinWorkspaceFile, renameWorkspaceFile } from '../../lib/api';
+import { workspaceDisplayName } from '../../lib/sessions-history';
 
 export interface FileNode {
   name: string;
@@ -173,7 +174,7 @@ export function FilesPanel() {
             <option value="">Shared workspace</option>
             {bots.map((b) => (
               <option key={b.id} value={b.id}>
-                {b.name}{b.workspace ? ` (${b.workspace})` : ' (shared)'}
+                {b.name}{b.workspace ? ` (${workspaceDisplayName(b.workspace)})` : ' (shared)'}
               </option>
             ))}
           </select>

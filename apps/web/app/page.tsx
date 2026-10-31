@@ -70,6 +70,7 @@ import type {
   UploadedFile,
 } from '../lib/api';
 import { COST_ESTIMATE_TOOLTIP, contextMeter, costOfUsage, formatTokens, formatUsd } from '../lib/usage';
+import { workspaceDisplayName } from '../lib/sessions-history';
 import { WidgetRenderer, validateWidget } from '../components/widgets';
 import type { Widget, WidgetAction, WidgetAnswerState } from '../components/widgets';
 import { CodeBlock, LineDiffView, UnifiedDiffView } from '../components/code/CodeBlock';
@@ -81,6 +82,8 @@ import { getWebSTTProvider } from '../lib/voice-http';
 import { VOICE_NOTE_PERSIST_LIMIT, type VoiceNote } from '../lib/voice-notes';
 import { CallPanel, VoiceNoteBubble, VoiceNoteRecorder } from '../components/voice';
 import { NoteAttachButton } from '../components/chat/note-attach-button';
+import { BotPicker } from '../components/chat/bot-picker';
+import { ModelControl } from '../components/chat/model-control';
 import { BotConversationSheet, BotNoticeRow, type BotNoticeData } from '../components/chat/bot-notice';
 import { PublishedPageCard, publishedPageFromToolResult } from '../components/chat/published-page-card';
 import { MessageReactions } from '../components/chat/message-reactions';
@@ -818,7 +821,28 @@ function ChatPageInner() {
   openThreadRef.current = openThread;
   // Sidebar (mobile drawer) + settings popover.
   const [sideOpen, setSideOpen] = useState(false);
+  // Roster Bots section: collapsed by default (chrome simplification,
+  // 2026-10-31) — bot picking lives in the header picker; the roster list
+  // is an on-demand disclosure. Persisted per user.
+  const [botsOpen, setBotsOpen] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('mvp:roster-bots-open') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const toggleBotsOpen = () => {
+    setBotsOpen((v) => {
+      try {
+        localStorage.setItem('mvp:roster-bots-open', v ? '0' : '1');
+      } catch { /* ignore */ }
+      return !v;
+    });
+  };
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Composer ⋯ overflow (chrome simplification): secondary composer
+  // actions live here instead of a permanent footer cluster.
+  const [composerOverflowOpen, setComposerOverflowOpen] = useState(false);
   // Chat vs live voice-call mode (the call panel lives inside the Chat
   // destination — the top-level nav stays exactly six destinations).
   const [chatMode, setChatMode] = useState<'chat' | 'call'>('chat');
@@ -2801,9 +2825,8 @@ function ChatPageInner() {
       <PlacesRail />
       <CommandPalette open={paletteOpen} items={paletteItems} onClose={() => setPaletteOpen(false)} onSelect={onPaletteSelect} />
       <aside className={`bot-roster${sideOpen ? ' open' : ''}`} aria-label="Conversations and bots">
-        <button className="btn btn-primary new-chat-btn" onClick={newConversation} disabled={!selectedBotId && !universalMode}>
-          {t('chat.newChat')}
-        </button>
+        {/* No New-chat button here: the app sidebar's "New Chat" is the one
+            and only new-chat control (chrome simplification, 2026-10-31). */}
         <button
           type="button"
           className={`bot-item universal-item${universalMode ? ' selected' : ''}`}
@@ -2933,8 +2956,18 @@ function ChatPageInner() {
             })()}
           </>
         )}
-        <h3>Bots</h3>
-        {bots.map((b) => (
+        <button
+          type="button"
+          className="roster-bots-toggle"
+          onClick={toggleBotsOpen}
+          aria-expanded={botsOpen}
+          title={botsOpen ? 'Hide the bots list' : 'Show the bots list'}
+        >
+          <h3>Bots</h3>
+          <span className="roster-bots-count">{bots.length}</span>
+          <span className="roster-bots-chevron" aria-hidden="true">{botsOpen ? '▾' : '▸'}</span>
+        </button>
+        {botsOpen && bots.map((b) => (
           <button
             key={b.id}
             className={`bot-item${!universalMode && b.id === selectedBotId ? ' selected' : ''}`}
@@ -2953,11 +2986,11 @@ function ChatPageInner() {
             <div className="bot-name">{b.name}</div>
             {b.description && <div className="bot-desc">{b.description}</div>}
             <div className="bot-ws small muted" title={b.workspace ? `Isolated workspace: ${b.workspace}` : 'Shared workspace'}>
-              {b.workspace ? `📁 ${b.workspace}` : '📁 shared'}
+              {b.workspace ? `📁 ${workspaceDisplayName(b.workspace)}` : '📁 Shared workspace'}
             </div>
           </button>
         ))}
-        {bots.length === 0 && <div className="small muted">Loading bots…</div>}
+        {botsOpen && bots.length === 0 && <div className="small muted">Loading bots…</div>}
         <CloudSessionsPanel />
       </aside>
       {sideOpen && <div className="side-scrim" onClick={() => setSideOpen(false)} aria-hidden="true" />}
@@ -2982,97 +3015,33 @@ function ChatPageInner() {
           >
             ☰
           </button>
-          {universalMode ? (
-            <div className="universal-header">
-              <span className="universal-title">✦ Universal</span>
-              <span className="small muted universal-anchor">
-                {universalSession
-                  ? `${universalSession.anchorBotName}${universalSession.chiefConfigured ? ' · Chief of Staff' : ''}`
-                  : 'Routing automatically'}
-              </span>
-              <span className="small muted universal-hint">Routing is automatic — @mention a bot to force it</span>
-            </div>
-          ) : (
-            <>
-          {selectedBot?.avatarUrl && <img src={selectedBot.avatarUrl} alt={selectedBot.name} width={30} height={30} style={{ borderRadius: '50%', objectFit: 'cover' }} />}
-          <div
-            className="model-picker"
-            role="group"
-            aria-label="Model picker"
-            title="Provider · model · sandbox — switch mid-conversation, applies to the next message"
-          >
-            <span className="mp-icon" aria-hidden="true">◈</span>
-            <select
-              className="mp-select"
-              value={providerId}
-              onChange={(e) => {
-                setProviderId(e.target.value);
-                setModelId('');
-              }}
-              aria-label="Provider"
-            >
-              {providers.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name}
-                  {p.configured ? '' : ' (no key)'}
-                </option>
-              ))}
-            </select>
-            <span className="mp-sep" aria-hidden="true">/</span>
-            <select
-              className="mp-select mp-model"
-              value={modelId}
-              onChange={(e) => setModelId(e.target.value)}
-              aria-label="Model"
-            >
-              <option value="">(bot default)</option>
-              {modelOptions.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.name}
-                </option>
-              ))}
-            </select>
-            <span className="mp-sep" aria-hidden="true">·</span>
-            <select
-              className="mp-select mp-sandbox"
-              value={sandboxMode}
-              onChange={(e) => setSandboxMode(e.target.value as SandboxMode)}
-              aria-label="Sandbox mode"
-              title="Sandbox: read-only blocks writes/exec · workspace-write is the default · danger-full-access lifts the cage (approvals still apply)"
-            >
-              <option value="workspace-write">🛡️ Workspace</option>
-              <option value="read-only">🔒 Read-only</option>
-              <option value="danger-full-access">⚠️ Full access</option>
-            </select>
-            <span className="mp-sep" aria-hidden="true">·</span>
-            <select
-              className="mp-select mp-effort"
-              value={reasoningEffort}
-              onChange={(e) => setReasoningEffort(e.target.value as ReasoningEffort)}
-              aria-label="Reasoning effort"
-              title="Reasoning effort: how hard the model thinks (low = fast, high = thorough). Applies to reasoning models."
-            >
-              <option value="low">🧠 Low</option>
-              <option value="medium">🧠 Med</option>
-              <option value="high">🧠 High</option>
-            </select>
-          </div>
-          <select
-            className="select steer-select"
-            value={queueMode}
-            onChange={(e) => setQueueMode(e.target.value as QueueMode)}
-            aria-label="Steering mode"
-            title="Steering: Interrupt aborts the running turn; Queue waits for the turn boundary (Claude Code style)"
-          >
-            <option value="interrupt">⚡ Interrupt</option>
-            <option value="queue">⏳ Queue</option>
-          </select>
+          {/* Interlocutor picker (chrome simplification, 2026-10-31): one
+              quiet button for Universal / the current bot; the provider /
+              model / sandbox / effort / steering selects that used to
+              crowd this header now live in the composer's ONE model
+              control (bottom-right) and its popover. */}
+          <BotPicker
+            bots={bots}
+            universalMode={universalMode}
+            selectedBot={selectedBot ?? null}
+            universalAnchor={
+              universalSession
+                ? `${universalSession.anchorBotName}${universalSession.chiefConfigured ? ' · Chief of Staff' : ''}`
+                : 'Routing automatically'
+            }
+            onPickUniversal={enableUniversal}
+            onPickBot={(b) => {
+              const wasUniversal = universalModeRef.current;
+              if (wasUniversal) setUniversalModePersist(false);
+              setSelectedBotId(b.id);
+              setSideOpen(false);
+              if (wasUniversal && b.id === botIdRef.current) reloadBotBlocks(b);
+            }}
+          />
           {queuedCount > 0 && (
             <span className="queued-badge" title={`${queuedCount} message(s) queued for the turn boundary`}>
               ⏳ {queuedCount} queued
             </span>
-          )}
-            </>
           )}
           {/* "Now" cards (W8a): what each busy bot is doing right now. */}
           <NowCards turns={nowTurns} />
@@ -3111,58 +3080,10 @@ function ChatPageInner() {
               </button>
             </div>
           )}
-          <div
-            className="mode-toggle"
-            role="group"
-            aria-label={t('chat.modeChatLabel')}
-            title="Chat vs live voice call"
-          >
-            <button
-              type="button"
-              className={`mode-opt${chatMode === 'chat' ? ' active' : ''}`}
-              onClick={() => setChatMode('chat')}
-              aria-pressed={chatMode === 'chat'}
-            >
-              {t('chat.modeChat')}
-            </button>
-            <button
-              type="button"
-              className={`mode-opt${chatMode === 'call' ? ' active' : ''}`}
-              onClick={() => setChatMode('call')}
-              aria-pressed={chatMode === 'call'}
-            >
-              {t('chat.modeCall')}
-            </button>
-          </div>
-          <LanguageSwitcher />
-          {chatMode === 'chat' && selectedBotId && (
-            <BranchPicker
-              threadId={activeConvo[selectedBotId] ?? ''}
-              onSwitch={(id) => void switchBranchVersion(id)}
-              disabled={sending || branching}
-            />
-          )}
-          {chatMode === 'chat' && selectedBotId && (
-            <ShareSessionBtn sessionId={activeConvo[selectedBotId] ?? ''} disabled={sending} />
-          )}
-          {chatMode === 'chat' && (
-            <button
-              type="button"
-              className="copy-btn"
-              aria-expanded={discoveryOpen}
-              title="Find a specialist or capability by intent (semantic discovery)"
-              onClick={() => setDiscoveryOpen((v) => !v)}
-            >
-              🔎 Find by intent
-            </button>
-          )}
-          {chatMode === 'chat' && (
-            <MessageSearchBox
-              botId={selectedBotId}
-              botName={(id) => bots.find((b) => b.id === id)?.name ?? id}
-              onJump={(r) => void jumpToSearchResult(r)}
-            />
-          )}
+          {/* Everything else that used to crowd this header (call mode,
+              language, branch, share, find-by-intent, message search,
+              run settings) now lives in the single ⋯ overflow panel at
+              the end of the header — chrome simplification, 2026-10-31. */}
           <div className="spacer" style={{ flex: 1 }} />
           {autoApprove && <span className="mode-badge auto">AUTO-APPROVE ON</span>}
           {planMode && <span className="mode-badge plan">PLAN MODE</span>}
@@ -3170,16 +3091,74 @@ function ChatPageInner() {
             <button
               className={`icon-btn${settingsOpen ? ' active' : ''}`}
               onClick={() => setSettingsOpen((v) => !v)}
-              aria-label="Run settings"
+              aria-label="More actions and settings"
               aria-expanded={settingsOpen}
-              title="Run settings: approvals, plan mode, budget, slash commands"
+              title="More: voice call, find, share, language, run settings"
             >
-              ⚙️
+              ⋯
             </button>
             {settingsOpen && (
               <>
                 <div className="pop-scrim" onClick={() => setSettingsOpen(false)} aria-hidden="true" />
-                <div className="settings-pop" role="dialog" aria-label="Run settings">
+                <div className="settings-pop settings-pop-wide" role="dialog" aria-label="More actions and settings">
+                  <div
+                    className="mode-toggle"
+                    role="group"
+                    aria-label={t('chat.modeChatLabel')}
+                    title="Chat vs live voice call"
+                  >
+                    <button
+                      type="button"
+                      className={`mode-opt${chatMode === 'chat' ? ' active' : ''}`}
+                      onClick={() => setChatMode('chat')}
+                      aria-pressed={chatMode === 'chat'}
+                    >
+                      {t('chat.modeChat')}
+                    </button>
+                    <button
+                      type="button"
+                      className={`mode-opt${chatMode === 'call' ? ' active' : ''}`}
+                      onClick={() => setChatMode('call')}
+                      aria-pressed={chatMode === 'call'}
+                    >
+                      {t('chat.modeCall')}
+                    </button>
+                  </div>
+                  {chatMode === 'chat' && (
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      aria-expanded={discoveryOpen}
+                      title="Find a specialist or capability by intent (semantic discovery)"
+                      onClick={() => {
+                        setSettingsOpen(false);
+                        setDiscoveryOpen((v) => !v);
+                      }}
+                    >
+                      🔎 Find by intent
+                    </button>
+                  )}
+                  {chatMode === 'chat' && (
+                    <MessageSearchBox
+                      botId={selectedBotId}
+                      botName={(id) => bots.find((b) => b.id === id)?.name ?? id}
+                      onJump={(r) => {
+                        setSettingsOpen(false);
+                        void jumpToSearchResult(r);
+                      }}
+                    />
+                  )}
+                  {chatMode === 'chat' && selectedBotId && (
+                    <div className="overflow-row">
+                      <BranchPicker
+                        threadId={activeConvo[selectedBotId] ?? ''}
+                        onSwitch={(id) => void switchBranchVersion(id)}
+                        disabled={sending || branching}
+                      />
+                      <ShareSessionBtn sessionId={activeConvo[selectedBotId] ?? ''} disabled={sending} />
+                    </div>
+                  )}
+                  <LanguageSwitcher />
                   <h4>Run settings</h4>
                   <ClayToggle
                     checked={autoApprove}
@@ -3849,14 +3828,9 @@ function ChatPageInner() {
             </div>
           )}
           <div className="chat-input">
-            {/* Feature interconnection (P2-E): attach a note/page so it lands
-                in the bot's context on every turn. */}
-            <NoteAttachButton
-              botId={selectedBotId}
-              botName={selectedBot?.name ?? 'bot'}
-              sessionId={selectedBotId ? (activeConvo[selectedBotId] ?? '') : ''}
-              disabled={!selectedBot}
-            />
+            {/* The permanent composer row is exactly: attach, input, mic,
+                send (chrome simplification, 2026-10-31). Note-attach and
+                dictation moved to the composer ⋯ overflow below. */}
             {/* File upload: attach files to the chat message. */}
             <input
               ref={fileInputRef}
@@ -3966,14 +3940,6 @@ function ChatPageInner() {
               onRecorded={(blob, durationMs) => void handleRecordedNote(blob, durationMs)}
               onError={(msg) => setBlocks((prev) => [...prev, { kind: 'error', id: nextId(), text: msg }])}
             />
-            <VoiceNoteRecorder
-              stt={getWebSTTProvider()}
-              disabled={!selectedBot || sending}
-              onVoiceNote={sendVoiceNote}
-              onError={(msg) =>
-                setBlocks((prev) => [...prev, { kind: 'error', id: nextId(), text: msg }])
-              }
-            />
             {sending ? (
               <button className="btn btn-stop" onClick={stopTurn} title={t('chat.stopTitle')}>
                 ⏹ {t('chat.stop')}
@@ -3984,99 +3950,149 @@ function ChatPageInner() {
               </button>
             )}
           </div>
+          {/* Slim composer footer (chrome simplification, 2026-10-31):
+              left = one ⋯ overflow holding every secondary composer
+              action; right = the ONE model control. The usage readouts
+              that used to sit here permanently are in the status bar
+              below (tokens / cache / context) and in the overflow. */}
           <div className="composer-footer">
-            <button type="button" className={`fusion-toggle${followBottom ? ' on' : ''}`} aria-pressed={followBottom}
-              onClick={() => setFollowBottom((v) => !v)} title="Follow bottom: keep the view pinned to the newest messages">
-              ⬇ Follow{followBottom ? ' on' : ''}
-            </button>
-            {universalMode && (
-              <PlacementPill
-                value={taskPlacement}
-                onChange={(v) => {
-                  setTaskPlacement(v);
-                  taskPlacementRef.current = v;
-                }}
-                syncConfigured={syncConfigured}
-                disabled={sending}
-              />
-            )}
-            <label className="small" title="Session model — the same provider/model state as the header picker">
-              Model{' '}
-              <select className="mp-select" value={modelId} aria-label="Model"
-                onChange={(e) => setModelId(e.target.value)}>
-                <option value="">(bot default)</option>
-                {modelOptions.map((m) => (<option key={m.id} value={m.id}>{m.name}</option>))}
-              </select>
-            </label>
-            <label className="small" title="Model for the NEXT turn only — after sending, the bot's model applies again">
-              Turn model{' '}
-              <select className="mp-select" value={turnModel} aria-label="Model for next turn"
-                onChange={(e) => { setTurnModel(e.target.value); turnModelRef.current = e.target.value; }}>
-                <option value="">(bot default)</option>
-                {modelOptions.map((m) => (<option key={m.id} value={m.id}>{m.name}</option>))}
-              </select>
-            </label>
-            <button type="button" className="fusion-toggle" title="Polish the draft with text assist"
-              onClick={() => { const cur = input; if (!cur.trim()) return; void polishComposerText(cur).then((r) => { if (r.ok) setInput(r.text); }).catch(() => {}); }}>
-              ✨ Polish
-            </button>
-            <TokenCostChip usage={botSessionUsage} costUsd={botSessionCost} />
-            <span className="mono" title="Rough estimate: ~4 characters per token">
-              ≈{formatTokens(estimateTokens(input))} tok
-            </span>
-            <span className="kbd-hint" title="Enter sends · Shift+Enter for a new line">
-              <kbd>↵</kbd> send · <kbd>⇧↵</kbd> newline
-            </span>
-            <button
-              type="button"
-              className={`fusion-toggle${fusionMode ? ' on' : ''}`}
-              title="Fusion mode: decompose the task, run workers in parallel, fuse the results"
-              aria-pressed={fusionMode}
-              onClick={() => setFusionMode((v) => !v)}
-            >
-              ⚡ Fusion{fusionMode ? ' on' : ''}
-            </button>
-            <button
-              type="button"
-              className={`fusion-toggle${voiceReply ? ' on' : ''}`}
-              title="Voice reply: hear the reply spoken sentence-by-sentence while it streams (streaming TTS)"
-              aria-pressed={voiceReply}
-              onClick={() => setVoiceReply((v) => !v)}
-            >
-              🔊 Voice reply{voiceReply ? ' on' : ''}
-            </button>
-            <button
-              type="button"
-              className="fusion-toggle"
-              title="Start a goal run with this bot: type the goal after /goal and send (e.g. /goal Research the top 3 competitors)"
-              onClick={() => {
-                setInput('/goal ');
-                inputRef.current?.focus();
-              }}
-            >
-              🎯 Goal
-            </button>
-            <a className="fusion-history-link" href="/fusion" title="Past fusion runs">
-              history
-            </a>
-            {botSessionUsage ? (
-              <span
-                className="mono"
-                title={`Session: ${botSessionUsage.promptTokens} in / ${botSessionUsage.completionTokens} out`}
+            <div className="composer-overflow">
+              <button
+                type="button"
+                className={`composer-overflow-btn${composerOverflowOpen ? ' active' : ''}`}
+                onClick={() => setComposerOverflowOpen((v) => !v)}
+                aria-expanded={composerOverflowOpen}
+                aria-label="More composer actions"
+                title="More: attach note, dictate, polish, fusion, voice reply, goal"
               >
-                Σ {formatTokens(botSessionUsage.totalTokens)}
-                {botSessionCost !== undefined && (
-                  <span title={COST_ESTIMATE_TOOLTIP}> · ≈{formatUsd(botSessionCost)}</span>
-                )}
-                {sessionMeter && (
-                  <span className={sessionMeter.warn ? 'amber' : undefined}>
-                    {' '}· ctx {Math.round(sessionMeter.pct)}%
-                  </span>
-                )}
-              </span>
-            ) : (
-              <span className="muted">No usage yet</span>
-            )}
+                ⋯
+              </button>
+              {composerOverflowOpen && (
+                <>
+                  <div className="pop-scrim" onClick={() => setComposerOverflowOpen(false)} aria-hidden="true" />
+                  <div className="composer-overflow-pop" role="dialog" aria-label="More composer actions">
+                    <div className="composer-overflow-row">
+                      {/* Feature interconnection (P2-E): attach a note/page
+                          so it lands in the bot's context on every turn. */}
+                      <NoteAttachButton
+                        botId={selectedBotId}
+                        botName={selectedBot?.name ?? 'bot'}
+                        sessionId={selectedBotId ? (activeConvo[selectedBotId] ?? '') : ''}
+                        disabled={!selectedBot}
+                      />
+                      <span className="small muted">Attach a note/page to context</span>
+                    </div>
+                    <div className="composer-overflow-row">
+                      <VoiceNoteRecorder
+                        stt={getWebSTTProvider()}
+                        disabled={!selectedBot || sending}
+                        onVoiceNote={sendVoiceNote}
+                        onError={(msg) =>
+                          setBlocks((prev) => [...prev, { kind: 'error', id: nextId(), text: msg }])
+                        }
+                      />
+                      <span className="small muted">Dictate a voice note</span>
+                    </div>
+                    <button type="button" className={`fusion-toggle${followBottom ? ' on' : ''}`} aria-pressed={followBottom}
+                      onClick={() => setFollowBottom((v) => !v)} title="Follow bottom: keep the view pinned to the newest messages">
+                      ⬇ Follow{followBottom ? ' on' : ''}
+                    </button>
+                    <button type="button" className="fusion-toggle" title="Polish the draft with text assist"
+                      onClick={() => { const cur = input; if (!cur.trim()) return; void polishComposerText(cur).then((r) => { if (r.ok) setInput(r.text); }).catch(() => {}); }}>
+                      ✨ Polish
+                    </button>
+                    <button
+                      type="button"
+                      className={`fusion-toggle${fusionMode ? ' on' : ''}`}
+                      title="Fusion mode: decompose the task, run workers in parallel, fuse the results"
+                      aria-pressed={fusionMode}
+                      onClick={() => setFusionMode((v) => !v)}
+                    >
+                      ⚡ Fusion{fusionMode ? ' on' : ''}
+                    </button>
+                    <button
+                      type="button"
+                      className={`fusion-toggle${voiceReply ? ' on' : ''}`}
+                      title="Voice reply: hear the reply spoken sentence-by-sentence while it streams (streaming TTS)"
+                      aria-pressed={voiceReply}
+                      onClick={() => setVoiceReply((v) => !v)}
+                    >
+                      🔊 Voice reply{voiceReply ? ' on' : ''}
+                    </button>
+                    <button
+                      type="button"
+                      className="fusion-toggle"
+                      title="Start a goal run with this bot: type the goal after /goal and send (e.g. /goal Research the top 3 competitors)"
+                      onClick={() => {
+                        setComposerOverflowOpen(false);
+                        setInput('/goal ');
+                        inputRef.current?.focus();
+                      }}
+                    >
+                      🎯 Goal
+                    </button>
+                    <a className="fusion-history-link" href="/fusion" title="Past fusion runs" onClick={() => setComposerOverflowOpen(false)}>
+                      Fusion history
+                    </a>
+                    <div className="composer-overflow-info">
+                      <TokenCostChip usage={botSessionUsage} costUsd={botSessionCost} />
+                      <span className="mono" title="Rough estimate: ~4 characters per token">
+                        draft ≈{formatTokens(estimateTokens(input))} tok
+                      </span>
+                      <span className="kbd-hint" title="Enter sends · Shift+Enter for a new line">
+                        <kbd>↵</kbd> send · <kbd>⇧↵</kbd> newline
+                      </span>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+            <div className="composer-footer-spacer" style={{ flex: 1 }} />
+            <ModelControl
+              providers={providers}
+              providerId={providerId}
+              modelId={modelId}
+              botDefaultLabel={
+                selectedBot?.model
+                  ? (providers
+                      .find((p) => p.id === (selectedBot.provider ?? providerId))
+                      ?.models.find((m) => m.id === selectedBot.model)?.name ?? selectedBot.model)
+                  : 'Bot default'
+              }
+              onSelectModel={(pid, mid) => {
+                setProviderId(pid);
+                setModelId(mid);
+              }}
+              onSelectBotDefault={() => {
+                setModelId('');
+                if (selectedBot?.provider) setProviderId(selectedBot.provider);
+              }}
+              turnModel={turnModel}
+              onTurnModelChange={(v) => {
+                setTurnModel(v);
+                turnModelRef.current = v;
+              }}
+              sandboxMode={sandboxMode}
+              onSandboxChange={(v) => setSandboxMode(v)}
+              reasoningEffort={reasoningEffort}
+              onEffortChange={(v) => setReasoningEffort(v)}
+              queueMode={queueMode}
+              onQueueModeChange={(v) => setQueueMode(v)}
+              placementNode={
+                universalMode ? (
+                  <PlacementPill
+                    value={taskPlacement}
+                    onChange={(v) => {
+                      setTaskPlacement(v);
+                      taskPlacementRef.current = v;
+                    }}
+                    syncConfigured={syncConfigured}
+                    disabled={sending}
+                  />
+                ) : undefined
+              }
+              disabled={!selectedBot}
+            />
           </div>
         </div>
         <ChatStatusBar

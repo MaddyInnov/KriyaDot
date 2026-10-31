@@ -231,6 +231,7 @@ html[data-theme='ocean'] {
 
 html,
 body {
+  height: 100%;
   margin: 0;
   padding: 0;
   color: var(--text);
@@ -285,7 +286,8 @@ textarea {
 .shell {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  height: 100vh;
+  height: 100dvh;
 }
 
 /* Frosted-glass topbar */
@@ -770,15 +772,22 @@ html[data-ux='pro'] .theme-opt:hover {
 
 .main {
   flex: 1;
+  min-height: 0;
+  overflow-y: auto;
   max-width: 1200px;
   width: 100%;
   margin: 0 auto;
   padding: 26px 22px 52px;
 }
 
-/* Chat takes the full width — no empty margins on wide screens. */
+/* Chat takes the full width — no empty margins on wide screens. It also
+ * takes the full height: the shell is exactly the viewport, so the chat
+ * screen bleeds to every edge of the remaining window (no card frame, no
+ * padding) and its composer + status bar pin to the true bottom. */
 .main:has(.chat-layout) {
   max-width: none;
+  padding: 0;
+  overflow: hidden;
 }
 
 /* Page entrance (Pro only) */
@@ -1246,15 +1255,12 @@ table.tbl tr:last-child td {
 .chat-layout {
   display: flex;
   gap: 0;
-  border: 1px solid var(--glass-border);
-  border-radius: 26px;
   overflow: hidden;
   background: var(--glass-bg);
   backdrop-filter: blur(20px) saturate(1.4);
   -webkit-backdrop-filter: blur(20px) saturate(1.4);
-  height: calc(100vh - 150px);
-  min-height: 480px;
-  box-shadow: var(--shadow-lg);
+  height: 100%;
+  min-height: 0;
 }
 
 .bot-roster {
@@ -1324,6 +1330,7 @@ html[data-ux='pro'] .bot-item:hover {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
 }
 
 /* Glass chat header */
@@ -1397,6 +1404,7 @@ html[data-ux='pro'] .bot-item:hover {
 
 .chat-messages {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 20px;
   display: flex;
@@ -2209,9 +2217,8 @@ html[data-ux='simple'] .bot-item:hover {
 
   .chat-layout {
     flex-direction: column;
-    height: calc(100dvh - 62px - 96px);
+    height: 100%;
     min-height: 0;
-    border-radius: 22px;
   }
 
   .bot-roster {
