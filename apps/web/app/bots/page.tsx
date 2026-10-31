@@ -19,6 +19,8 @@ import { BotPlacementPanel } from '../../components/panels/bot-placement-panel';
 import { GuideHint } from '../../components/guide/hint';
 import { LayersEditor } from '../../components/bots/layers-editor';
 import type { LayerStage } from '../../lib/octomind-api';
+import { useCollapsed } from '../../lib/use-collapsed';
+import { PaneCollapseButton, PaneStrip } from '../../components/collapse';
 
 const EFFECTS: BotPolicyEffect[] = ['allow', 'deny', 'require-approval'];
 
@@ -799,6 +801,9 @@ function BotsPageInner() {
   const [rosterError, setRosterError] = useState('');
   const [rosterReport, setRosterReport] = useState<RosterImportReport | null>(null);
   const importFileRef = useRef<HTMLInputElement>(null);
+  // Collapse pass: the roster rail collapses against the editor with the
+  // shared pattern (`kriyadot:collapse:bots-roster`).
+  const rosterCol = useCollapsed('bots-roster');
   const tabs = [
     { id: 'policy' as const, label: t('bots.tabPolicy') },
     { id: 'model' as const, label: t('bots.tabModel') },
@@ -955,8 +960,15 @@ function BotsPageInner() {
           </details>
         </>
       ) : (
-      <div className={`chat-layout${!showSetup && !selectedBot ? ' dc-list-focus' : ''}`}>
-        <aside className="bot-roster">
+      <div className={`chat-layout bots-layout${!showSetup && !selectedBot ? ' dc-list-focus' : ''}`}>
+        <aside className={`bot-roster${rosterCol.collapsed ? ' kd-collapsed' : ''}`}>
+          {rosterCol.collapsed && (
+            <PaneStrip label="Bots" side="left" onExpand={() => rosterCol.setCollapsed(false)} />
+          )}
+          <div className="roster-fill">
+          <div className="roster-head-row">
+            <PaneCollapseButton label="bots roster" side="left" onCollapse={() => rosterCol.setCollapsed(true)} />
+          </div>
           <h3>{t('bots.roster')}</h3>
           {bots.map((b) => (
             <button
@@ -1048,6 +1060,7 @@ function BotsPageInner() {
           {!selectedBot && !showSetup && (
             <p className="small muted" style={{ marginTop: 12 }}>{t('bots.selectPrompt')}</p>
           )}
+          </div>
         </aside>
         {(showSetup || selectedBot) && (
         <div className="chat-main">

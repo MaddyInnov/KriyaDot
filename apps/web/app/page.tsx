@@ -105,6 +105,8 @@ import { StepInspector } from '../components/chat/step-inspector';
 import { ChatStatusBar } from '../components/chat/chat-status-bar';
 import { FilePreviewPane } from '../components/chat/file-preview-pane';
 import { CloudSessionsPanel } from '../components/chat/cloud-sessions';
+import { useCollapsed, usePaneSize } from '../lib/use-collapsed';
+import { CollapseChevron, PaneResizeHandle, PaneStrip } from '../components/collapse';
 import { getSyncStatus, type TaskPlacement } from '../lib/frontdoor';
 import { THEMES, applyThemeChoice, getStoredThemeChoice } from '../lib/theme';
 import { FinishedSteps, NowCards, StepLine } from '../components/chat/step-line';
@@ -823,22 +825,21 @@ function ChatPageInner() {
   const [sideOpen, setSideOpen] = useState(false);
   // Roster Bots section: collapsed by default (chrome simplification,
   // 2026-10-31) — bot picking lives in the header picker; the roster list
-  // is an on-demand disclosure. Persisted per user.
-  const [botsOpen, setBotsOpen] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem('mvp:roster-bots-open') === '1';
-    } catch {
-      return false;
-    }
-  });
-  const toggleBotsOpen = () => {
-    setBotsOpen((v) => {
-      try {
-        localStorage.setItem('mvp:roster-bots-open', v ? '0' : '1');
-      } catch { /* ignore */ }
-      return !v;
-    });
-  };
+  // is an on-demand disclosure. Persisted per user via the shared
+  // collapse pattern (`kriyadot:collapse:chat-bots`).
+  const botsSection = useCollapsed('chat-bots', true);
+  const botsOpen = !botsSection.collapsed;
+  const toggleBotsOpen = botsSection.toggle;
+  // Collapse pass: the roster rail itself, the Conversations section, and
+  // the two chat side panes (step inspector / file preview) all use the
+  // shared persisted collapse; the side panes are also resizable
+  // (`kriyadot:size:chat-inspector` / `kriyadot:size:chat-preview`).
+  const rosterCol = useCollapsed('chat-roster');
+  const convosSection = useCollapsed('chat-convos');
+  const inspCol = useCollapsed('chat-inspector');
+  const inspSize = usePaneSize('chat-inspector');
+  const previewCol = useCollapsed('chat-preview');
+  const previewSize = usePaneSize('chat-preview');
   const [settingsOpen, setSettingsOpen] = useState(false);
   // Composer ⋯ overflow (chrome simplification): secondary composer
   // actions live here instead of a permanent footer cluster.
@@ -2824,7 +2825,25 @@ function ChatPageInner() {
     <div className="chat-layout">
       <PlacesRail />
       <CommandPalette open={paletteOpen} items={paletteItems} onClose={() => setPaletteOpen(false)} onSelect={onPaletteSelect} />
-      <aside className={`bot-roster${sideOpen ? ' open' : ''}`} aria-label="Conversations and bots">
+      <aside
+        className={`bot-roster${sideOpen ? ' open' : ''}${rosterCol.collapsed ? ' kd-collapsed' : ''}`}
+        aria-label="Conversations and bots"
+      >
+        {rosterCol.collapsed && (
+          <PaneStrip label="Conversations" side="left" onExpand={() => rosterCol.setCollapsed(false)} />
+        )}
+        <div className="roster-fill">
+        <div className="roster-head-row">
+          <button
+            type="button"
+            className="icon-btn kd-collapse-btn"
+            onClick={() => rosterCol.setCollapsed(true)}
+            aria-label="Collapse conversations sidebar"
+            title="Collapse conversations sidebar"
+          >
+            <span aria-hidden="true">«</span>
+          </button>
+        </div>
         {/* No New-chat button here: the app sidebar's "New Chat" is the one
             and only new-chat control (chrome simplification, 2026-10-31). */}
         <button
@@ -2839,7 +2858,20 @@ function ChatPageInner() {
         </button>
         {selectedBotId && (
           <>
-            <h3>Conversations</h3>
+            <button
+              type="button"
+              className="roster-bots-toggle"
+              onClick={convosSection.toggle}
+              aria-expanded={!convosSection.collapsed}
+              title={convosSection.collapsed ? 'Show conversations' : 'Hide conversations'}
+            >
+              <h3>Conversations</h3>
+              <span className="roster-bots-count">{(convos[selectedBotId] ?? []).length}</span>
+              <span className="roster-bots-chevron">
+                <CollapseChevron collapsed={convosSection.collapsed} />
+              </span>
+            </button>
+            {!convosSection.collapsed && (
             <div className="convo-list">
               {(convos[selectedBotId] ?? [])
                 .filter((c) => showHiddenConvos || !c.hidden)
@@ -2919,6 +2951,7 @@ function ChatPageInner() {
                 </button>
               )}
             </div>
+            )}
             {convoMenu && selectedBotId && (() => {
               const target = (convos[selectedBotId] ?? []).find((c) => c.id === convoMenu.convoId);
               if (!target) return null;
@@ -2965,7 +2998,9 @@ function ChatPageInner() {
         >
           <h3>Bots</h3>
           <span className="roster-bots-count">{bots.length}</span>
-          <span className="roster-bots-chevron" aria-hidden="true">{botsOpen ? '▾' : '▸'}</span>
+          <span className="roster-bots-chevron">
+            <CollapseChevron collapsed={!botsOpen} />
+          </span>
         </button>
         {botsOpen && bots.map((b) => (
           <button
@@ -2992,6 +3027,7 @@ function ChatPageInner() {
         ))}
         {botsOpen && bots.length === 0 && <div className="small muted">Loading bots…</div>}
         <CloudSessionsPanel />
+        </div>
       </aside>
       {sideOpen && <div className="side-scrim" onClick={() => setSideOpen(false)} aria-hidden="true" />}
       <div className="chat-width-handle" role="separator" aria-orientation="vertical" title="Drag to resize the chat column"
@@ -4107,21 +4143,74 @@ function ChatPageInner() {
         )}
       </div>
 
-      {/* Step inspector + produced-file preview panes (chat-layout side panes) */}
+      {/* Step inspector + produced-file preview panes (chat-layout side
+          panes). Collapse pass: both collapse to a slim re-open strip and
+          both are resizable from their left edge; the chat column flexes
+          to absorb either change. Width persists per pane and survives
+          collapse/expand (kriyadot:size:<pane>). */}
       {activeTrajSelection && (
-        <div className="chat-side-pane">
-          <StepInspector
-            event={activeTrajSelection.event}
-            span={activeTrajSelection.span}
-            run={activeTrajSelection.run}
-            sessionStart={activeTrajSelection.sessionStart}
-            onClose={() => setTrajSelection(null)}
-          />
+        <div
+          className={`chat-side-pane kd-resizable${inspCol.collapsed ? ' kd-collapsed' : ''}`}
+          style={
+            !inspCol.collapsed && inspSize.width
+              ? { width: inspSize.width, minWidth: inspSize.width }
+              : undefined
+          }
+        >
+          {!inspCol.collapsed && (
+            <PaneResizeHandle
+              label="Resize step inspector pane"
+              edge="left"
+              width={inspSize.width ?? 420}
+              min={280}
+              onResize={inspSize.setWidth}
+              onReset={inspSize.reset}
+            />
+          )}
+          <div className="kd-pane-fill">
+            <StepInspector
+              event={activeTrajSelection.event}
+              span={activeTrajSelection.span}
+              run={activeTrajSelection.run}
+              sessionStart={activeTrajSelection.sessionStart}
+              onClose={() => setTrajSelection(null)}
+              onCollapse={() => inspCol.setCollapsed(true)}
+            />
+          </div>
+          {inspCol.collapsed && (
+            <PaneStrip label="Step inspector" side="right" onExpand={() => inspCol.setCollapsed(false)} />
+          )}
         </div>
       )}
       {previewPath && (
-        <div className="chat-side-pane">
-          <FilePreviewPane path={previewPath} onClose={() => setPreviewPath(null)} />
+        <div
+          className={`chat-side-pane kd-resizable${previewCol.collapsed ? ' kd-collapsed' : ''}`}
+          style={
+            !previewCol.collapsed && previewSize.width
+              ? { width: previewSize.width, minWidth: previewSize.width }
+              : undefined
+          }
+        >
+          {!previewCol.collapsed && (
+            <PaneResizeHandle
+              label="Resize file preview pane"
+              edge="left"
+              width={previewSize.width ?? 420}
+              min={280}
+              onResize={previewSize.setWidth}
+              onReset={previewSize.reset}
+            />
+          )}
+          <div className="kd-pane-fill">
+            <FilePreviewPane
+              path={previewPath}
+              onClose={() => setPreviewPath(null)}
+              onCollapse={() => previewCol.setCollapsed(true)}
+            />
+          </div>
+          {previewCol.collapsed && (
+            <PaneStrip label="File preview" side="right" onExpand={() => previewCol.setCollapsed(false)} />
+          )}
         </div>
       )}
 

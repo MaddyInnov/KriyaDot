@@ -8,6 +8,8 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { CodeBlock } from '../code/CodeBlock';
 import { authedFetch, pinWorkspaceFile, renameWorkspaceFile } from '../../lib/api';
 import { workspaceDisplayName } from '../../lib/sessions-history';
+import { useCollapsed, usePaneSize } from '../../lib/use-collapsed';
+import { PaneCollapseButton, PaneResizeHandle, PaneStrip } from '../collapse';
 
 export interface FileNode {
   name: string;
@@ -86,6 +88,11 @@ export function FilesPanel() {
   // Bot workspace switcher: '' = shared global workspace, else a bot id.
   const [bots, setBots] = useState<Array<{ id: string; name: string; workspace?: string }>>([]);
   const [scope, setScope] = useState<string>('');
+  // Collapse pass: the tree pane collapses to a strip and the tree/viewer
+  // split is resizable (`kriyadot:collapse:files-tree` +
+  // `kriyadot:size:files-tree`); collapse remembers the width.
+  const treeCol = useCollapsed('files-tree');
+  const treeSize = usePaneSize('files-tree');
 
   const listUrl = scope ? `/api/bots/${encodeURIComponent(scope)}/files` : '/api/files';
   const contentUrl = (path: string) =>
@@ -159,8 +166,18 @@ export function FilesPanel() {
   const crumbs = useMemo(() => (selected ? selected.path.split('/') : []), [selected]);
 
   return (
-    <div className="files-layout">
-      <div className="files-tree glass">
+    <div
+      className={`files-layout kd-files${treeCol.collapsed ? ' kd-tree-collapsed' : ''}`}
+      style={
+        !treeCol.collapsed && treeSize.width
+          ? { gridTemplateColumns: `${treeSize.width}px 12px minmax(0, 1fr)` }
+          : undefined
+      }
+    >
+      <div className={`files-tree glass kd-resizable${treeCol.collapsed ? ' kd-collapsed' : ''}`}>
+        {treeCol.collapsed && (
+          <PaneStrip label="Files" side="left" onExpand={() => treeCol.setCollapsed(false)} />
+        )}
         <div className="files-tree-head">
           <span className="label">Workspace files</span>
           <select
@@ -178,6 +195,9 @@ export function FilesPanel() {
               </option>
             ))}
           </select>
+          <span style={{ float: 'right' }}>
+            <PaneCollapseButton label="file tree" side="left" onCollapse={() => treeCol.setCollapsed(true)} />
+          </span>
         </div>
         {error && <div className="error-text">{error}</div>}
         {!tree && !error && <div className="muted">Loading…</div>}
@@ -194,6 +214,16 @@ export function FilesPanel() {
             />
           ))}
       </div>
+      {!treeCol.collapsed && (
+        <PaneResizeHandle
+          label="Resize file tree"
+          edge="right"
+          width={treeSize.width ?? 300}
+          min={200}
+          onResize={treeSize.setWidth}
+          onReset={treeSize.reset}
+        />
+      )}
       <div className="files-viewer">
         {!selected && <div className="muted files-empty">Select a file to view its code.</div>}
         {selected && (

@@ -3,6 +3,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getWorkflows, runWorkflow } from '../../../lib/api';
+import { useCollapsed } from '../../../lib/use-collapsed';
+import { PaneCollapseButton, PaneStrip } from '../../../components/collapse';
 import type { WorkflowDefinition } from '../../../lib/api';
 import {
   DEFAULT_NODE_CONFIGS,
@@ -41,6 +43,9 @@ function freshGraph(): CanvasGraph {
 }
 
 export default function CanvasPage() {
+  // Collapse pass: the node palette rail collapses against the canvas
+  // (`kriyadot:collapse:wf-palette`).
+  const paletteCol = useCollapsed('wf-palette');
   const [graph, setGraph] = useState<CanvasGraph>(freshGraph);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [connectMode, setConnectMode] = useState(false);
@@ -371,8 +376,15 @@ export default function CanvasPage() {
 
       <div style={{ display: 'flex', gap: 12, alignItems: 'stretch', marginTop: 12 }}>
         {/* Palette */}
-        <div className="card" style={{ width: 170, flexShrink: 0 }}>
-          <strong className="small">Add node</strong>
+        <div className="card" style={{ width: paletteCol.collapsed ? 44 : 170, flexShrink: 0, padding: paletteCol.collapsed ? 4 : undefined }}>
+          {paletteCol.collapsed ? (
+            <PaneStrip label="Add node" side="left" onExpand={() => paletteCol.setCollapsed(false)} />
+          ) : (
+            <>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
+            <strong className="small">Add node</strong>
+            <PaneCollapseButton label="node palette" side="left" onCollapse={() => paletteCol.setCollapsed(true)} />
+          </div>
           <div className="mt">
             {NODE_TYPES.map((t) => (
               <button
@@ -396,6 +408,8 @@ export default function CanvasPage() {
           >
             {connectMode ? 'Cancel connect' : 'Connect from selected'}
           </button>
+            </>
+          )}
         </div>
 
         {/* Canvas */}

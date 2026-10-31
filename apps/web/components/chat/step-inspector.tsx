@@ -14,6 +14,7 @@ import {
   type TrajRun,
   type TrajSpan,
 } from '../../lib/trajectory';
+import { PaneCollapseButton } from '../collapse';
 
 type InspectorTab = 'summary' | 'payload' | 'result' | 'schema' | 'timing';
 
@@ -47,12 +48,15 @@ export function StepInspector({
   run,
   sessionStart,
   onClose,
+  onCollapse,
 }: {
   event: TrajEvent;
   span: TrajSpan | null;
   run: TrajRun | null;
   sessionStart: number;
   onClose: () => void;
+  /** Collapse the pane to its slim re-open strip (shared collapse pattern). */
+  onCollapse?: () => void;
 }) {
   const [tab, setTab] = useState<InspectorTab>('summary');
   useEffect(() => {
@@ -68,9 +72,12 @@ export function StepInspector({
           <span className={`traj-badge traj-badge--${event.badge}`}>{event.badge.toUpperCase()}</span>
           <strong className="insp-name">{event.title}</strong>
         </div>
-        <button type="button" className="icon-btn" onClick={onClose} aria-label="Close step inspector" title="Close">
-          ✕
-        </button>
+        <span className="fpp-actions">
+          {onCollapse && <PaneCollapseButton label="step inspector" side="right" onCollapse={onCollapse} />}
+          <button type="button" className="icon-btn" onClick={onClose} aria-label="Close step inspector" title="Close">
+            ✕
+          </button>
+        </span>
       </div>
       <div className="insp-tabs" role="tablist" aria-label="Inspector sections">
         {TABS.map((t) => (

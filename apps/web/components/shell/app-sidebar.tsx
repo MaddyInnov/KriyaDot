@@ -30,6 +30,8 @@ import {
 } from '../../lib/sessions-history';
 import { THEMES, useTheme, type ThemeChoice } from '../../lib/theme';
 import { useUxMode, type UxMode } from '../../lib/ux-mode';
+import { useCollapsed } from '../../lib/use-collapsed';
+import { CollapseChevron } from '../collapse';
 import { LanguageSwitcher, useI18n } from '../../lib/i18n';
 import { BrandPet } from '../pet/BrandPet';
 import { PauseControl } from '../pause-control';
@@ -144,6 +146,98 @@ const SETTINGS_LINKS = [
 
 const WS_ALL = '__all__';
 
+/** Sidebar display mode (collapse pass): full / icon rail / fully hidden.
+ *  Persisted under the shared collapse key `kriyadot:collapse:sidebar`
+ *  (mode string instead of the boolean flag — the sidebar has 3 states). */
+type SbMode = 'full' | 'rail' | 'hidden';
+const SB_MODE_KEY = 'kriyadot:collapse:sidebar';
+
+const eyeOffIcon = icon(
+  <>
+    <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94" />
+    <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
+    <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24" />
+    <path d="m1 1 22 22" />
+  </>,
+);
+
+/**
+ * One row of the Workspaces list: the workspace itself (click = filter
+ * the history) plus its own collapse/expand chevron revealing that
+ * workspace's sessions inline. Collapsed by default — the flat Sessions
+ * list below remains the primary history view. Persisted per workspace
+ * as `kriyadot:collapse:sb-ws:<id>`.
+ */
+function SidebarWorkspaceRow({
+  label,
+  id,
+  sessionCount,
+  active,
+  sessions,
+  activeMap,
+  onPick,
+  onOpenSession,
+}: {
+  label: string;
+  id: string | null;
+  sessionCount: number;
+  active: boolean;
+  sessions: SessionHistoryEntry[];
+  activeMap: Record<string, string>;
+  onPick: () => void;
+  onOpenSession: (e: SessionHistoryEntry) => void;
+}) {
+  const { collapsed, toggle } = useCollapsed(`sb-ws:${id ?? '__default__'}`, true);
+  return (
+    <div className="sb-ws-group">
+      <div className="sb-ws-row">
+        <button
+          className={`sb-ws${active ? ' active' : ''}`}
+          role="option"
+          aria-selected={active}
+          onClick={onPick}
+          title={id ?? label}
+        >
+          <span className="sb-ws-name">{label}</span>
+          <span className="sb-ws-count">{sessionCount}</span>
+        </button>
+        <button
+          type="button"
+          className="sb-ws-chev"
+          aria-expanded={!collapsed}
+          aria-label={`${collapsed ? 'Show' : 'Hide'} sessions in ${label}`}
+          title={`${collapsed ? 'Show' : 'Hide'} sessions in ${label}`}
+          onClick={toggle}
+        >
+          <CollapseChevron collapsed={collapsed} />
+        </button>
+      </div>
+      {!collapsed && (
+        <div className="sb-ws-sessions">
+          {sessions.map((e) => (
+            <button
+              key={`${e.botId}:${e.convoId}`}
+              className={`sb-session${activeMap[e.botId] === e.convoId ? ' active' : ''}`}
+              onClick={() => onOpenSession(e)}
+              title={e.title}
+            >
+              <span className="sb-session-title">
+                {e.pinned ? '📌 ' : ''}
+                {e.title}
+              </span>
+              <span className="sb-session-meta">
+                <span className="sb-session-bot">{e.botName}</span>
+                <span className="sb-session-time">{relativeTime(e.lastActivity, Date.now())}</span>
+              </span>
+            </button>
+          ))}
+          {sessions.length === 0 && <p className="sb-empty">No sessions in this workspace.</p>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function AppSidebar() {
   const pathname = usePathname() ?? '/';
   const router = useRouter();
@@ -162,6 +256,20 @@ export default function AppSidebar() {
   const [themeChoice, setThemeChoice] = useTheme();
   const [themeOpen, setThemeOpen] = useState(false);
   const themeRef = useRef<HTMLDivElement>(null);
+  // Whole-sidebar mode + section collapse (collapse pass, shared pattern).
+  const [sbMode, setSbModeState] = useState<SbMode>('full');
+  const lastVisibleMode = useRef<'full' | 'rail'>('full');
+  const wsSection = useCollapsed('sb-workspaces');
+  const sessSection = useCollapsed('sb-sessions');
+
+  const setSbMode = useCallback((m: SbMode) => {
+    setSbModeState(m);
+    if (m !== 'hidden') lastVisibleMode.current = m;
+    try {
+      if (m === 'full') localStorage.removeItem(SB_MODE_KEY);
+      else localStorage.setItem(SB_MODE_KEY, m);
+    } catch { /* ignore */ }
+  }, []);
   const botsRef = useRef<BotConfig[]>([]);
   botsRef.current = bots;
 
@@ -176,6 +284,13 @@ export default function AppSidebar() {
 
   useEffect(() => {
     setApiBase(getApiBase() || '(same origin)');
+    try {
+      const savedMode = localStorage.getItem(SB_MODE_KEY);
+      if (savedMode === 'rail' || savedMode === 'hidden') {
+        setSbModeState(savedMode);
+        if (savedMode === 'rail') lastVisibleMode.current = 'rail';
+      }
+    } catch { /* ignore */ }
     try {
       const saved = localStorage.getItem('kriyadot:ws-filter');
       if (saved === WS_ALL) setWsSel(undefined);
@@ -310,15 +425,59 @@ export default function AppSidebar() {
       </div>
       {open && <button className="sb-scrim" aria-label="Close menu" onClick={() => setOpen(false)} />}
 
-      <aside className={`app-sidebar${open ? ' open' : ''}`} aria-label="Sidebar">
+      {sbMode === 'hidden' && (
+        <button
+          className="sb-reopen"
+          onClick={() => setSbMode(lastVisibleMode.current)}
+          aria-label="Show sidebar"
+          title="Show sidebar"
+        >
+          {icon(
+            <>
+              <rect x="3" y="4" width="18" height="16" rx="2" />
+              <path d="M9.5 4v16" />
+            </>,
+          )}
+        </button>
+      )}
+
+      <aside
+        className={`app-sidebar${open ? ' open' : ''}${sbMode === 'rail' ? ' kd-rail' : ''}${sbMode === 'hidden' ? ' kd-hidden' : ''}`}
+        aria-label="Sidebar"
+      >
         <div className="sb-brand">
           <Link href="/" className="sb-brand-link" onClick={() => setOpen(false)}>
             <BrandPet />
             <span className="sb-brand-name">KriyaDot</span>
           </Link>
-          <button className="sb-close" aria-label="Close menu" onClick={() => setOpen(false)}>
-            ✕
-          </button>
+          <span className="sb-brand-right">
+            <span className="sb-mode-btns">
+              <button
+                className="sb-mode-btn"
+                onClick={() => setSbMode('rail')}
+                aria-label="Collapse sidebar to icons"
+                title="Collapse sidebar to icons"
+              >
+                {icon(
+                  <>
+                    <path d="m11 6-6 6 6 6" />
+                    <path d="M19 4v16" />
+                  </>,
+                )}
+              </button>
+              <button
+                className="sb-mode-btn"
+                onClick={() => setSbMode('hidden')}
+                aria-label="Hide sidebar"
+                title="Hide sidebar"
+              >
+                {eyeOffIcon}
+              </button>
+            </span>
+            <button className="sb-close" aria-label="Close menu" onClick={() => setOpen(false)}>
+              ✕
+            </button>
+          </span>
         </div>
 
         <button className="sb-new" onClick={newChat}>
@@ -359,43 +518,68 @@ export default function AppSidebar() {
           ))}
         </nav>
 
-        <div className="sb-section">Workspaces</div>
-        <div className="sb-workspaces" role="listbox" aria-label="Workspaces">
+        <div className="sb-section-wrap">
           <button
-            className={`sb-ws${wsSel === undefined ? ' active' : ''}`}
-            role="option"
-            aria-selected={wsSel === undefined}
-            onClick={() => pickWorkspace(undefined)}
+            type="button"
+            className="sb-section sb-section-toggle"
+            aria-expanded={!wsSection.collapsed}
+            onClick={wsSection.toggle}
           >
-            <span className="sb-ws-name">All workspaces</span>
-            <span className="sb-ws-count">{history.length}</span>
+            <span>Workspaces</span>
+            <CollapseChevron collapsed={wsSection.collapsed} />
           </button>
-          {workspaces.map((w) => (
-            <button
-              key={w.id ?? '__default__'}
-              className={`sb-ws${wsSel !== undefined && wsSel === w.id ? ' active' : ''}`}
-              role="option"
-              aria-selected={wsSel !== undefined && wsSel === w.id}
-              onClick={() => pickWorkspace(w.id)}
-              title={w.id ?? w.label}
-            >
-              <span className="sb-ws-name">{w.label}</span>
-              <span className="sb-ws-count">{w.sessionCount}</span>
-            </button>
-          ))}
+          <div className={`kd-collapsible${wsSection.collapsed ? ' closed' : ''}`}>
+            <div className="kd-collapsible-inner">
+              <div className="sb-workspaces" role="listbox" aria-label="Workspaces">
+                <button
+                  className={`sb-ws${wsSel === undefined ? ' active' : ''}`}
+                  role="option"
+                  aria-selected={wsSel === undefined}
+                  onClick={() => pickWorkspace(undefined)}
+                >
+                  <span className="sb-ws-name">All workspaces</span>
+                  <span className="sb-ws-count">{history.length}</span>
+                </button>
+                {workspaces.map((w) => (
+                  <SidebarWorkspaceRow
+                    key={w.id ?? '__default__'}
+                    label={w.label}
+                    id={w.id}
+                    sessionCount={w.sessionCount}
+                    active={wsSel !== undefined && wsSel === w.id}
+                    sessions={searchHistory(filterHistoryByWorkspace(history, w.id), query).slice(0, 12)}
+                    activeMap={pathname === '/' ? activeMap : {}}
+                    onPick={() => pickWorkspace(w.id)}
+                    onOpenSession={openSession}
+                  />
+                ))}
+              </div>
+            </div>
+          </div>
         </div>
 
-        <div className="sb-section">Sessions</div>
-        <div className="sb-search">
-          <input
-            type="search"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search sessions"
-            aria-label="Search sessions"
-          />
-        </div>
-        <div className="sb-sessions">
+        <div className="sb-section-wrap grow">
+          <button
+            type="button"
+            className="sb-section sb-section-toggle"
+            aria-expanded={!sessSection.collapsed}
+            onClick={sessSection.toggle}
+          >
+            <span>Sessions</span>
+            <CollapseChevron collapsed={sessSection.collapsed} />
+          </button>
+          <div className={`kd-collapsible sb-grow-wrap${sessSection.collapsed ? ' closed' : ''}`}>
+            <div className="kd-collapsible-inner">
+              <div className="sb-search">
+                <input
+                  type="search"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Search sessions"
+                  aria-label="Search sessions"
+                />
+              </div>
+              <div className="sb-sessions">
           {universalOn && !query && (
             <button className="sb-session sb-session-universal" onClick={openUniversal}>
               <span className="sb-session-title">✦ Universal Chat</span>
@@ -428,6 +612,9 @@ export default function AppSidebar() {
           {visibleHistory.length === 0 && universalOn && (
             <p className="sb-empty">No saved sessions in this view.</p>
           )}
+              </div>
+            </div>
+          </div>
         </div>
 
         <div className="sb-footer">
@@ -533,6 +720,31 @@ export default function AppSidebar() {
               <span className="sb-account-sub">api: {apiBase}</span>
             </span>
           </Link>
+          {/* Rail mode: the only footer content left visible — expand back
+              to full, or hide the sidebar entirely (collapse pass). */}
+          <div className="sb-rail-actions">
+            <button
+              className="sb-mode-btn"
+              onClick={() => setSbMode('full')}
+              aria-label="Expand sidebar"
+              title="Expand sidebar"
+            >
+              {icon(
+                <>
+                  <path d="m6 6 6 6-6 6" />
+                  <path d="m13 6 6 6-6 6" />
+                </>,
+              )}
+            </button>
+            <button
+              className="sb-mode-btn"
+              onClick={() => setSbMode('hidden')}
+              aria-label="Hide sidebar"
+              title="Hide sidebar"
+            >
+              {eyeOffIcon}
+            </button>
+          </div>
         </div>
       </aside>
     </>

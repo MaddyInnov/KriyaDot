@@ -1,0 +1,549 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Universal collapse/expand + pane resize (2026-10-31 collapse pass).
+   One pattern for every section and divided window: the accent ▾/▸
+   chevron (same mark as the dc-details/dc-accordion disclosures), the
+   kd-collapsible grid-rows animation for section bodies, a slim
+   kd-strip re-open affordance for collapsed side panes, and a
+   kd-resize-handle window-splitter for resizable panes. State lives in
+   localStorage via lib/use-collapsed.ts (`kriyadot:collapse:<panelId>`
+   and `kriyadot:size:<panelId>`). The main chat column is the one fixed
+   element — it flexes into whatever space collapsing frees. Theme
+   variables come from globals.css; imported after declutter.css. */
+
+/* ---------- shared pieces ---------- */
+
+.kd-chev {
+  color: var(--accent);
+  font-size: 11px;
+  line-height: 1;
+  flex: none;
+}
+
+.kd-collapsible {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 0.22s var(--ease);
+}
+
+.kd-collapsible.closed {
+  grid-template-rows: 0fr;
+}
+
+.kd-collapsible-inner {
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* Slim re-open strip left behind by a collapsed side pane. */
+.kd-strip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 10px 0;
+}
+
+.kd-strip-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--glass-border);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--accent);
+  font-size: 14px;
+  cursor: pointer;
+  box-shadow: var(--clay-shadow-sm);
+}
+
+.kd-strip-btn:hover {
+  background: var(--surface-2);
+}
+
+.kd-strip-label {
+  writing-mode: vertical-rl;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  user-select: none;
+}
+
+/* Content wrapper inside a collapsible side pane (kept mounted while
+   collapsed so inner state — inspector tab, preview scroll — survives). */
+.kd-pane-fill {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+/* ---------- resize handles (window splitters) ---------- */
+
+.kd-resizable {
+  position: relative;
+}
+
+.kd-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 10px;
+  z-index: 6;
+  cursor: col-resize;
+  touch-action: none;
+  outline: none;
+}
+
+.kd-rh-left {
+  left: -5px;
+}
+
+.kd-rh-right {
+  right: -5px;
+}
+
+.kd-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-50%);
+  background: transparent;
+  transition: background 0.15s var(--ease);
+}
+
+.kd-resize-handle:hover::after,
+.kd-resize-handle:focus-visible::after {
+  background: var(--accent);
+}
+
+/* ---------- app sidebar: whole-sidebar modes ---------- */
+
+/* Floating re-open button shown while the sidebar is fully hidden
+   (desktop only — mobile keeps its top-strip burger + drawer). */
+.sb-reopen {
+  display: none;
+}
+
+.sb-section-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: calc(100% - 12px);
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sb-section-toggle:hover {
+  color: var(--text-2);
+}
+
+/* The sessions block carries the sidebar's flexible growth. */
+.sb-grow-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.sb-grow-wrap.closed {
+  flex: 0 0 auto;
+}
+
+.sb-grow-wrap > .kd-collapsible-inner {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+/* Per-workspace session groups inside the Workspaces list. */
+.sb-ws-row {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+}
+
+.sb-ws-row .sb-ws {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.sb-ws-chev {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  border: none;
+  border-radius: 10px;
+  background: none;
+  cursor: pointer;
+}
+
+.sb-ws-chev:hover {
+  background: var(--surface-2);
+}
+
+.sb-ws-sessions {
+  margin: 2px 0 6px 10px;
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.sb-ws-sessions .sb-session {
+  padding: 5px 8px;
+}
+
+/* Sidebar section wrappers: the toggle + collapsible body stack; the
+   sessions wrapper carries the sidebar's flexible growth so the footer
+   stays pinned to the bottom even when the section is collapsed. */
+.sb-section-wrap {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.sb-section-wrap.grow {
+  flex: 1 1 auto;
+}
+
+.sb-brand-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+/* Brand-row sidebar-mode buttons (full mode) + rail-mode action stack. */
+.sb-mode-btns {
+  display: inline-flex;
+  gap: 4px;
+  flex: none;
+}
+
+.sb-mode-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+.sb-mode-btn:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.sb-rail-actions {
+  display: none;
+}
+
+@media (max-width: 1023px) {
+  /* Sidebar modes are a desktop treatment; the mobile drawer keeps its
+     own burger + close controls. */
+  .sb-mode-btns {
+    display: none;
+  }
+}
+
+@media (min-width: 1024px) {
+  .app-sidebar {
+    transition:
+      width 0.22s var(--ease),
+      min-width 0.22s var(--ease);
+  }
+
+  .sb-reopen {
+    display: inline-flex;
+    position: fixed;
+    top: 10px;
+    left: 10px;
+    z-index: 46;
+    width: 34px;
+    height: 34px;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--glass-border);
+    border-radius: 10px;
+    background: var(--glass-bg);
+    backdrop-filter: blur(18px) saturate(1.4);
+    -webkit-backdrop-filter: blur(18px) saturate(1.4);
+    color: var(--text-2);
+    cursor: pointer;
+    box-shadow: var(--shadow-sm);
+  }
+
+  .sb-reopen:hover {
+    color: var(--text);
+  }
+
+  .app-sidebar.kd-hidden {
+    display: none;
+  }
+
+  /* Icon rail: destinations, shortcuts and New Chat stay usable;
+     sections, history and footer detail tuck away. */
+  .app-sidebar.kd-rail {
+    width: 60px;
+    min-width: 60px;
+    padding: 14px 8px 12px;
+  }
+
+  .kd-rail .sb-brand {
+    justify-content: center;
+    padding: 2px 0 10px;
+  }
+
+  .kd-rail .sb-brand-name,
+  .kd-rail .sb-mode-btns,
+  .kd-rail .sb-section-wrap {
+    display: none;
+  }
+
+  .kd-rail .sb-new {
+    font-size: 0;
+    padding: 10px 0;
+  }
+
+  .kd-rail .sb-new > span {
+    font-size: 15px;
+  }
+
+  .kd-rail .sb-shortcuts {
+    grid-template-columns: 1fr;
+  }
+
+  .kd-rail .sb-shortcut {
+    justify-content: center;
+    padding: 8px 0;
+  }
+
+  .kd-rail .sb-shortcut > span,
+  .kd-rail .sb-navlink > span:not(.sb-nav-icon) {
+    display: none;
+  }
+
+  .kd-rail .sb-navlink {
+    justify-content: center;
+    padding: 8px 0;
+  }
+
+  .kd-rail .sb-footer {
+    align-items: center;
+  }
+
+  .kd-rail .sb-footer > *:not(.sb-rail-actions) {
+    display: none;
+  }
+
+  .kd-rail .sb-rail-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    align-items: center;
+  }
+}
+
+/* ---------- chat: side panes (inspector / file preview) ---------- */
+
+@media (min-width: 901px) {
+  .chat-side-pane.kd-collapsed {
+    width: 40px;
+    min-width: 40px;
+  }
+
+  .chat-side-pane.kd-collapsed .kd-pane-fill,
+  .chat-side-pane.kd-collapsed .kd-resize-handle {
+    display: none;
+  }
+
+  .chat-side-pane .kd-strip {
+    flex: 1 1 auto;
+  }
+}
+
+@media (max-width: 900px) {
+  /* Stacked layout: a collapsed pane simply shows its content, and a
+     stored pane width never fights the full-width stacking. */
+  .chat-side-pane .kd-strip,
+  .chat-side-pane .kd-resize-handle {
+    display: none;
+  }
+
+  .chat-side-pane.kd-resizable {
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+}
+
+/* ---------- chat: conversations/bots roster ---------- */
+
+.roster-head-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  margin-bottom: 2px;
+}
+
+@media (min-width: 861px) {
+  .chat-layout .bot-roster.kd-collapsed {
+    width: 40px;
+    min-width: 40px;
+    padding: 6px 0;
+    overflow: hidden;
+  }
+
+  .chat-layout .bot-roster.kd-collapsed .roster-fill {
+    display: none;
+  }
+
+  .chat-layout .bot-roster .kd-strip {
+    height: 100%;
+  }
+}
+
+@media (max-width: 860px) {
+  .chat-layout .bot-roster .kd-strip,
+  .roster-head-row {
+    display: none;
+  }
+}
+
+/* ---------- bots page: roster against the editor ---------- */
+
+@media (min-width: 861px) {
+  .chat-layout.bots-layout .bot-roster.kd-collapsed {
+    width: 44px;
+    min-width: 44px;
+    flex: none;
+    padding: 6px 0;
+    overflow: hidden;
+  }
+}
+
+/* ---------- workspace: files tree / viewer split ---------- */
+
+.files-tree-head-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+@media (min-width: 861px) {
+  .files-layout.kd-files {
+    grid-template-columns: 300px 12px minmax(0, 1fr);
+    gap: 16px 4px;
+  }
+
+  .files-layout.kd-files .kd-resize-handle {
+    position: relative;
+    left: auto;
+    right: auto;
+    width: 12px;
+  }
+
+  .files-layout.kd-files.kd-tree-collapsed {
+    grid-template-columns: 44px minmax(0, 1fr);
+  }
+
+  .files-tree.kd-collapsed {
+    padding: 4px;
+    overflow: visible;
+  }
+
+  .files-tree.kd-collapsed > *:not(.kd-strip) {
+    display: none;
+  }
+}
+
+@media (max-width: 860px) {
+  .files-layout.kd-files {
+    grid-template-columns: 1fr !important;
+  }
+
+  .files-layout.kd-files .kd-resize-handle {
+    display: none;
+  }
+}
+
+/* ---------- store: section headers ---------- */
+
+.store-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.store-filters-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 0 0 10px;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+/* ---------- activity: work day-group headers ---------- */
+
+.work-day-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.work-day-count {
+  color: var(--text-3);
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* ---------- reduced motion ---------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .kd-collapsible,
+  .app-sidebar,
+  .kd-resize-handle::after {
+    transition: none;
+  }
+}

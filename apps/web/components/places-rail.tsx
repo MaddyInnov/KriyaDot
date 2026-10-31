@@ -8,6 +8,8 @@
 'use client';
 
 import React, { useEffect, useState } from 'react';
+import { useCollapsed } from '../lib/use-collapsed';
+import { PaneStrip } from './collapse';
 
 export interface PlacePin { id: string; label: string; href: string; external?: boolean }
 
@@ -54,12 +56,29 @@ export function PlacesRail() {
   const [openExternal, setOpenExternal] = useState<PlacePin | null>(null);
   const [draft, setDraft] = useState({ label: '', href: '' });
   const [adding, setAdding] = useState(false);
+  // Collapse pass: the rail itself collapses to a slim re-open strip
+  // (`kriyadot:collapse:chat-places`); the external panel stays closable.
+  const placesCol = useCollapsed('chat-places');
 
   useEffect(() => { setPins(loadPlacePins()); }, []);
   const update = (next: PlacePin[]) => { setPins(next); savePlacePins(next); };
 
   return (
     <>
+      {placesCol.collapsed ? (
+        <div
+          style={{
+            width: 28,
+            flex: 'none',
+            borderRight: '1px solid var(--border, #2a2a35)',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+          }}
+        >
+          <PaneStrip label="Places" side="left" onExpand={() => placesCol.setCollapsed(false)} />
+        </div>
+      ) : (
       <nav className="places-rail" aria-label="Pinned places"
         style={{ display: 'flex', flexDirection: 'column', gap: 4, padding: '8px 4px', borderRight: '1px solid var(--border, #2a2a35)', width: 52, alignItems: 'center' }}>
         {pins.map((pin) => (
@@ -97,7 +116,11 @@ export function PlacesRail() {
             <button type="submit" className="btn btn-primary btn-sm" style={{ marginTop: 6 }}>Pin place</button>
           </form>
         )}
+        <button type="button" className="icon-btn" aria-label="Collapse places rail" title="Collapse places rail"
+          style={{ marginTop: 'auto' }}
+          onClick={() => placesCol.setCollapsed(true)}>«</button>
       </nav>
+      )}
       {openExternal && (
         <aside className="places-panel" aria-label={`${openExternal.label} panel`}
           style={{ width: 420, maxWidth: '44vw', borderRight: '1px solid var(--border, #2a2a35)', display: 'flex', flexDirection: 'column' }}>

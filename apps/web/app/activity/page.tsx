@@ -9,6 +9,8 @@ import { SpacePanel } from '../../components/activity/space-panel';
 import { OmniPanel } from '../../components/activity/omni-panel';
 import { CostPanel } from '../../components/activity/cost-panel';
 import { useUxMode } from '../../lib/ux-mode';
+import { useCollapsed } from '../../lib/use-collapsed';
+import { CollapseChevron } from '../../components/collapse';
 
 import { RulesPanel } from '../../components/activity/rules-panel';
 import { WatchPanel } from '../../components/activity/watch-panel';
@@ -83,7 +85,10 @@ type ConsumerMode = (typeof CONSUMER_MODES)[number]['id'];
 export default function ActivityPage() {
   const [tab, setTab] = useState<TabId>('work');
   const [consumerMode, setConsumerMode] = useState<ConsumerMode>('tasks');
-  const [moreOpen, setMoreOpen] = useState(false);
+  // "More sections" disclosure — shared collapse pattern, persisted
+  // (`kriyadot:collapse:activity-more`).
+  const moreSection = useCollapsed('activity-more', true);
+  const moreOpen = !moreSection.collapsed;
   const [mode] = useUxMode();
   const visibleTabs = TABS.filter((t) => !t.pro || mode === 'pro');
   const activeTab: TabId = visibleTabs.some((t) => t.id === tab) ? tab : 'work';
@@ -141,9 +146,9 @@ export default function ActivityPage() {
               className="tab dc-more-toggle"
               aria-expanded={showMore}
               aria-controls="activity-more-sections"
-              onClick={() => setMoreOpen((o) => !o)}
+              onClick={moreSection.toggle}
             >
-              More sections {showMore ? '▾' : '▸'}
+              More sections <CollapseChevron collapsed={!showMore} />
             </button>
           </div>
           {showMore && (

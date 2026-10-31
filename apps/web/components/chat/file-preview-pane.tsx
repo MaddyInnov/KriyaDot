@@ -17,6 +17,7 @@
 import { useEffect, useState } from 'react';
 import { authedFetch } from '../../lib/api';
 import { CodeBlock } from '../code/CodeBlock';
+import { PaneCollapseButton } from '../collapse';
 
 const MARKDOWN_EXTS = new Set(['md', 'markdown', 'mdx']);
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico']);
@@ -105,7 +106,16 @@ interface FileContent {
   size: number;
 }
 
-export function FilePreviewPane({ path, onClose }: { path: string; onClose: () => void }) {
+export function FilePreviewPane({
+  path,
+  onClose,
+  onCollapse,
+}: {
+  path: string;
+  onClose: () => void;
+  /** Collapse the pane to its slim re-open strip (shared collapse pattern). */
+  onCollapse?: () => void;
+}) {
   const [state, setState] = useState<
     | { phase: 'loading' }
     | { phase: 'ready'; file: FileContent }
@@ -152,6 +162,7 @@ export function FilePreviewPane({ path, onClose }: { path: string; onClose: () =
           📄 {path}
         </span>
         <span className="fpp-actions">
+          {onCollapse && <PaneCollapseButton label="file preview" side="right" onCollapse={onCollapse} />}
           <a className="copy-btn" href="/workspace" title="Open the Workspace files view">
             Workspace ↗
           </a>

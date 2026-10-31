@@ -19,6 +19,8 @@ import { petDisplayName, usePet, type PetMood } from '../../lib/pet';
 import { Pet } from '../pet/Pet';
 import { RunsPanel } from './runs-panel';
 import { fmtCents, fmtDuration } from './runs-waterfall';
+import { useCollapsed } from '../../lib/use-collapsed';
+import { CollapseChevron } from '../collapse';
 
 export type WorkItemStatus =
   | 'running'
@@ -327,21 +329,38 @@ export function WorkDayGroupView({
   selectedRunId?: string | null;
   onSelect?: (item: WorkItem) => void;
 }) {
+  // Collapse pass: each day group collapses/expands with the shared
+  // pattern, persisted per day (`kriyadot:collapse:work-day:<date>`).
+  const dayCol = useCollapsed(`work-day:${group.date}`);
   return (
     <section data-testid="work-day-group" data-day-label={group.label} aria-label={group.label}>
       <h3 className="small" style={{ margin: '16px 0 8px', textTransform: 'uppercase', letterSpacing: 0.4 }}>
-        {group.label}
+        <button
+          type="button"
+          className="work-day-head"
+          aria-expanded={!dayCol.collapsed}
+          onClick={dayCol.toggle}
+          title={dayCol.collapsed ? `Show ${group.label}` : `Hide ${group.label}`}
+        >
+          <CollapseChevron collapsed={dayCol.collapsed} />
+          <span>{group.label}</span>
+          <span className="work-day-count">
+            {group.items.length} {group.items.length === 1 ? 'item' : 'items'}
+          </span>
+        </button>
       </h3>
-      <ul className="list" style={{ listStyle: 'none', padding: 0, margin: 0 }}>
-        {group.items.map((item) => (
-          <WorkItemRow
-            key={`${item.source}:${item.runId}`}
-            item={item}
-            selected={selectedRunId === item.runId}
-            onSelect={onSelect}
-          />
-        ))}
-      </ul>
+      {!dayCol.collapsed && (
+        <ul className="list" style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+          {group.items.map((item) => (
+            <WorkItemRow
+              key={`${item.source}:${item.runId}`}
+              item={item}
+              selected={selectedRunId === item.runId}
+              onSelect={onSelect}
+            />
+          ))}
+        </ul>
+      )}
     </section>
   );
 }

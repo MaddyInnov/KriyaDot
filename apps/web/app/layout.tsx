@@ -7,6 +7,7 @@ import './pet.css';
 import './shell.css';
 import './trajectory.css';
 import './declutter.css';
+import './collapse.css';
 import AppSidebar from '../components/shell/app-sidebar';
 import PwaInstallBanner from '../components/pwa-install';
 import RemoteScreenBanner from '../components/remote-screen-banner';

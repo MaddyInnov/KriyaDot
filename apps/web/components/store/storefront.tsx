@@ -17,6 +17,8 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { authedFetch } from '../../lib/api';
+import { useCollapsed } from '../../lib/use-collapsed';
+import { CollapseChevron } from '../collapse';
 import {
   KIND_LABEL,
   STORE_CATEGORIES,
@@ -281,6 +283,40 @@ export function StoreDetail({
 // Container
 // ---------------------------------------------------------------------------
 
+/**
+ * One per-category section of the All view. Collapse pass: the section
+ * header is a toggle with the shared chevron, persisted per category
+ * (`kriyadot:collapse:store-cat:<id>`).
+ */
+function StoreCategorySection({
+  category,
+  items,
+  renderItem,
+}: {
+  category: { id: string; label: string };
+  items: StoreItem[];
+  renderItem: (item: StoreItem) => React.ReactNode;
+}) {
+  const col = useCollapsed(`store-cat:${category.id}`);
+  return (
+    <div>
+      <h2 style={{ margin: '20px 0 10px' }}>
+        <button
+          type="button"
+          className="store-section-head"
+          aria-expanded={!col.collapsed}
+          onClick={col.toggle}
+          title={col.collapsed ? `Show ${category.label}` : `Hide ${category.label}`}
+        >
+          <CollapseChevron collapsed={col.collapsed} />
+          <span>{category.label}</span>
+        </button>
+      </h2>
+      {!col.collapsed && <div className="grid-2">{items.map(renderItem)}</div>}
+    </div>
+  );
+}
+
 type ChipSelection = 'featured' | 'all' | StoreCategoryId;
 
 export default function Storefront({
@@ -297,6 +333,9 @@ export default function Storefront({
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [loaded, setLoaded] = useState(false);
+  // Collapse pass: filter card + Featured rail use the shared pattern.
+  const filtersCol = useCollapsed('store-filters');
+  const featuredCol = useCollapsed('store-featured');
 
   const load = useCallback(async () => {
     // Primary feed: the server-side aggregation (GET /api/store). Until
@@ -459,6 +498,20 @@ export default function Storefront({
           border: '1px solid var(--glass-border)',
         }}
       >
+        <button
+          type="button"
+          className="store-filters-head"
+          aria-expanded={!filtersCol.collapsed}
+          onClick={filtersCol.toggle}
+          title={filtersCol.collapsed ? 'Show search and filters' : 'Hide search and filters'}
+        >
+          <span className="label" style={{ margin: 0 }}>
+            Search &amp; filters
+          </span>
+          <CollapseChevron collapsed={filtersCol.collapsed} />
+        </button>
+        {!filtersCol.collapsed && (
+          <>
         <label className="label" htmlFor="store-q">
           Search the whole store
         </label>
@@ -516,6 +569,8 @@ export default function Storefront({
             </button>
           ))}
         </div>
+          </>
+        )}
       </div>
 
       {error && <div className="error-box">{error}</div>}
@@ -525,22 +580,35 @@ export default function Storefront({
 
       {chip === 'all' && !searching && featured.length > 0 && (
         <>
-          <h2 style={{ margin: '8px 0 10px' }}>Featured</h2>
-          <div
-            style={{
-              display: 'flex',
-              gap: 14,
-              overflowX: 'auto',
-              paddingBottom: 8,
-              marginBottom: 10,
-            }}
-          >
-            {featured.map((item) => (
-              <div key={item.id} style={{ flex: '0 0 min(430px, 88vw)' }}>
-                {card(item)}
-              </div>
-            ))}
-          </div>
+          <h2 style={{ margin: '8px 0 10px' }}>
+            <button
+              type="button"
+              className="store-section-head"
+              aria-expanded={!featuredCol.collapsed}
+              onClick={featuredCol.toggle}
+              title={featuredCol.collapsed ? 'Show Featured' : 'Hide Featured'}
+            >
+              <CollapseChevron collapsed={featuredCol.collapsed} />
+              <span>Featured</span>
+            </button>
+          </h2>
+          {!featuredCol.collapsed && (
+            <div
+              style={{
+                display: 'flex',
+                gap: 14,
+                overflowX: 'auto',
+                paddingBottom: 8,
+                marginBottom: 10,
+              }}
+            >
+              {featured.map((item) => (
+                <div key={item.id} style={{ flex: '0 0 min(430px, 88vw)' }}>
+                  {card(item)}
+                </div>
+              ))}
+            </div>
+          )}
         </>
       )}
 
@@ -561,10 +629,12 @@ export default function Storefront({
 
       {chip === 'all' && !searching &&
         sections.map(({ category, items: sectionItems }) => (
-          <div key={category.id}>
-            <h2 style={{ margin: '20px 0 10px' }}>{category.label}</h2>
-            <div className="grid-2">{sectionItems.map(card)}</div>
-          </div>
+          <StoreCategorySection
+            key={category.id}
+            category={category}
+            items={sectionItems}
+            renderItem={card}
+          />
         ))}
 
       {selected && (

@@ -35,6 +35,8 @@ import {
   type DryRunView,
 } from '../../lib/octomind-web';
 import { GuideHint } from '../../components/guide/hint';
+import { useCollapsed } from '../../lib/use-collapsed';
+import { CollapseChevron } from '../../components/collapse';
 
 function downloadText(filename: string, text: string, type: string) {
   const blob = new Blob([text], { type });
@@ -93,6 +95,9 @@ export default function WorkflowsPage() {
   const [dryRunError, setDryRunError] = useState('');
   // Declutter: definitions are the primary focus; run history is one tab away.
   const [view, setView] = useState<'workflows' | 'runs'>('workflows');
+  // Collapse pass: the dry-run plan card collapses to its header with the
+  // shared pattern (`kriyadot:collapse:wf-dryrun`).
+  const dryCol = useCollapsed('wf-dryrun');
 
   const refresh = useCallback(async () => {
     try {
@@ -374,11 +379,22 @@ export default function WorkflowsPage() {
       {dryRunFor && (
         <div className="card mt" role="dialog" aria-label={`Dry-run plan for ${dryRunFor.name}`}>
           <div className="row-between" style={{ flexWrap: 'wrap', gap: 8 }}>
-            <strong>Dry-run plan — {dryRunFor.name}</strong>
+            <button
+              type="button"
+              className="work-day-head"
+              aria-expanded={!dryCol.collapsed}
+              onClick={dryCol.toggle}
+              title={dryCol.collapsed ? 'Expand the dry-run plan' : 'Collapse the dry-run plan'}
+            >
+              <CollapseChevron collapsed={dryCol.collapsed} />
+              <strong>Dry-run plan — {dryRunFor.name}</strong>
+            </button>
             <button type="button" className="btn btn-sm" onClick={() => { setDryRunFor(null); setDryRunView(null); setDryRunError(''); }}>
               Close
             </button>
           </div>
+          {!dryCol.collapsed && (
+            <>
           <p className="small muted">Validation + execution plan only — a dry run spawns nothing and costs nothing.</p>
           {dryRunBusy && <p className="small muted">Building the plan…</p>}
           {dryRunError && <div className="error-box">{dryRunError}</div>}
@@ -412,6 +428,8 @@ export default function WorkflowsPage() {
                 <p className="small muted">The API returned an empty plan for this workflow.</p>
               )}
             </div>
+          )}
+            </>
           )}
         </div>
       )}
