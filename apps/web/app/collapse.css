@@ -23,6 +23,10 @@
   display: grid;
   grid-template-rows: 1fr;
   transition: grid-template-rows 0.22s var(--ease);
+  /* As a flex child it must be allowed to shrink below content height —
+     otherwise it overflows its wrapper and paints over the siblings
+     below (the inner's overflow:hidden only clips to the grid's box). */
+  min-height: 0;
 }
 
 .kd-collapsible.closed {
@@ -168,6 +172,14 @@
 }
 
 /* Per-workspace session groups inside the Workspaces list. */
+/* The list itself scrolls when there are many workspaces, so the
+   sessions section below always keeps usable room (the pre-collapse
+   layout had the same property: the sessions list was the only tall
+   scroller and the workspace list stayed short). */
+.sb-workspaces {
+  max-height: 36vh;
+  overflow-y: auto;
+}
 .sb-ws-row {
   display: flex;
   align-items: stretch;
@@ -215,6 +227,10 @@
   display: flex;
   flex-direction: column;
   min-height: 0;
+  /* A plain section keeps its natural height; the .grow (sessions)
+     wrapper is the one that absorbs shrinkage, exactly like the
+     pre-collapse layout where the sessions list was the flex child. */
+  flex: none;
 }
 
 .sb-section-wrap.grow {
