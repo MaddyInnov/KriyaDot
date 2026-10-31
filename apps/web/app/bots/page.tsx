@@ -816,7 +816,9 @@ function BotsPageInner() {
       const b = await getBots();
       setBots(b);
       setError('');
-      if (b.length > 0) setSelectedBotId((cur) => cur || b[0].id);
+      // Declutter: no auto-selection — the roster is the first-screen
+      // focus; the editor opens only when a bot is picked (and is
+      // dismissible back to the list).
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -947,10 +949,13 @@ function BotsPageInner() {
       {pageTab === 'teams' ? (
         <>
           <TeamsPanel bots={bots} onRosterChanged={refresh} />
-          <PeoplePanel bots={bots} onRosterChanged={refresh} />
+          <details className="dc-details">
+            <summary>People</summary>
+            <PeoplePanel bots={bots} onRosterChanged={refresh} />
+          </details>
         </>
       ) : (
-      <div className="chat-layout">
+      <div className={`chat-layout${!showSetup && !selectedBot ? ' dc-list-focus' : ''}`}>
         <aside className="bot-roster">
           <h3>{t('bots.roster')}</h3>
           {bots.map((b) => (
@@ -1040,7 +1045,11 @@ function BotsPageInner() {
               )}
             </div>
           )}
+          {!selectedBot && !showSetup && (
+            <p className="small muted" style={{ marginTop: 12 }}>{t('bots.selectPrompt')}</p>
+          )}
         </aside>
+        {(showSetup || selectedBot) && (
         <div className="chat-main">
           {showSetup ? (
             <BotSetupPanel
@@ -1049,6 +1058,17 @@ function BotsPageInner() {
             />
           ) : selectedBot ? (
             <>
+              <div className="dc-editor-head">
+                <strong>{selectedBot.name}</strong>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={() => setSelectedBotId('')}
+                  aria-label={`Close editor for ${selectedBot.name}`}
+                >
+                  ✕ Close
+                </button>
+              </div>
               <div className="tabs" role="tablist" aria-label="Bot sections" style={{ marginBottom: 12 }}>
                 {tabs.map((t) => (
                   <button
@@ -1064,25 +1084,49 @@ function BotsPageInner() {
               </div>
               {activeTab === 'policy' ? (
                 <>
-                  <BotPlacementPanel key={`placement-${selectedBot.id}`} botId={selectedBot.id} botName={selectedBot.name} />
-                  <PersonaPicker key={`persona-${selectedBot.id}`} bot={selectedBot} onSaved={onPersonaSaved} />
-                  <WorkspacePicker key={`workspace-${selectedBot.id}`} bot={selectedBot} onSaved={onWorkspaceSaved} />
-                  <ApprovalModeSelector
-                    key={`approval-mode-${selectedBot.id}`}
-                    bot={selectedBot}
-                    onSaved={onApprovalModeSaved}
-                  />
-                  <RulesEditor key={selectedBot.id} bot={selectedBot} onSaved={onSaved} />
-                  <PolicySimulator key={`sim-${selectedBot.id}`} bot={selectedBot} />
+                  <details className="dc-accordion">
+                    <summary>Placement</summary>
+                    <BotPlacementPanel key={`placement-${selectedBot.id}`} botId={selectedBot.id} botName={selectedBot.name} />
+                  </details>
+                  <details className="dc-accordion">
+                    <summary>Personality</summary>
+                    <PersonaPicker key={`persona-${selectedBot.id}`} bot={selectedBot} onSaved={onPersonaSaved} />
+                  </details>
+                  <details className="dc-accordion">
+                    <summary>Workspace</summary>
+                    <WorkspacePicker key={`workspace-${selectedBot.id}`} bot={selectedBot} onSaved={onWorkspaceSaved} />
+                  </details>
+                  <details className="dc-accordion">
+                    <summary>Approval mode</summary>
+                    <ApprovalModeSelector
+                      key={`approval-mode-${selectedBot.id}`}
+                      bot={selectedBot}
+                      onSaved={onApprovalModeSaved}
+                    />
+                  </details>
+                  <details className="dc-accordion" open>
+                    <summary>Policy rules</summary>
+                    <RulesEditor key={selectedBot.id} bot={selectedBot} onSaved={onSaved} />
+                  </details>
+                  <details className="dc-accordion">
+                    <summary>Policy simulator</summary>
+                    <PolicySimulator key={`sim-${selectedBot.id}`} bot={selectedBot} />
+                  </details>
                 </>
               ) : activeTab === 'model' ? (
                 <>
-                  <ModelPicker key={`model-${selectedBot.id}`} bot={selectedBot} onSaved={onModelSaved} />
-                  <VoiceSettingsPanel
-                    key={`voice-${selectedBot.id}`}
-                    bot={selectedBot}
-                    onSaved={onVoiceSaved}
-                  />
+                  <details className="dc-accordion" open>
+                    <summary>Model</summary>
+                    <ModelPicker key={`model-${selectedBot.id}`} bot={selectedBot} onSaved={onModelSaved} />
+                  </details>
+                  <details className="dc-accordion">
+                    <summary>Voice settings</summary>
+                    <VoiceSettingsPanel
+                      key={`voice-${selectedBot.id}`}
+                      bot={selectedBot}
+                      onSaved={onVoiceSaved}
+                    />
+                  </details>
                 </>
               ) : activeTab === 'computer' ? (
                 <ComputerPanel key={`computer-${selectedBot.id}`} botId={selectedBot.id} />
@@ -1096,15 +1140,18 @@ function BotsPageInner() {
                 <RobustnessPanel key={`robustness-${selectedBot.id}`} bot={selectedBot} />
               )}
             </>
-          ) : (
-            <p className="muted">{t('bots.selectPrompt')}</p>
-          )}
+          ) : null}
         </div>
+        )}
       </div>
       )}
       {/* Bridge federation (Octop parity): link this instance to peer
-          KriyaDot instances and browse/chat with their expert bots. */}
-      <FederationPanel />
+          KriyaDot instances and browse/chat with their expert bots.
+          Declutter: behind a disclosure so the roster owns the first screen. */}
+      <details className="dc-details">
+        <summary>Bridge federation — peer KriyaDot instances</summary>
+        <FederationPanel />
+      </details>
     </div>
   );
 }

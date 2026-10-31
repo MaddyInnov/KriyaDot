@@ -97,6 +97,10 @@ import { listPeople, type Person } from '../lib/people';
 import { applyUxMode, getStoredUxMode, useUxMode } from '../lib/ux-mode';
 import { RoutingChip } from '../components/chat/routing-chip';
 import { PlacementPill } from '../components/chat/placement-pill';
+import { TrajectoryView, type TrajSelection } from '../components/chat/trajectory-view';
+import { StepInspector } from '../components/chat/step-inspector';
+import { ChatStatusBar } from '../components/chat/chat-status-bar';
+import { FilePreviewPane } from '../components/chat/file-preview-pane';
 import { CloudSessionsPanel } from '../components/chat/cloud-sessions';
 import { getSyncStatus, type TaskPlacement } from '../lib/frontdoor';
 import { THEMES, applyThemeChoice, getStoredThemeChoice } from '../lib/theme';
@@ -348,6 +352,15 @@ function ToolCallBody({ call }: { call: ToolCall }) {
       <pre className="mono small">{prettyJson(call.args)}</pre>
     </>
   );
+}
+
+/** Workspace path a file-writing tool call produces (null for other calls). */
+function producedFilePath(call: ToolCall): string | null {
+  if (call.name !== 'write_file' && call.name !== 'edit' && call.name !== 'edit_file' && call.name !== 'patch') {
+    return null;
+  }
+  const p = (call.args as Record<string, unknown> | undefined)?.path;
+  return typeof p === 'string' && p ? p : null;
 }
 
 /** Subtle per-turn footer under an assistant message: tokens + $ cost + context meter. */
@@ -667,6 +680,16 @@ function ChatPageInner() {
   const [selectionAction, setSelectionAction] = useState<{ x: number; y: number; blockId: string; ref: string; role: string; text: string } | null>(null);
   // Intent discovery (#166) panel visibility.
   const [discoveryOpen, setDiscoveryOpen] = useState(false);
+  // Chat | Trajectory tabs (2026-10-31 redesign): trajectory tab swaps the
+  // message list for the session's recorded span trajectory; selecting an
+  // event opens the step inspector pane; produced files open a preview pane.
+  const [chatView, setChatView] = useState<'chat' | 'trajectory'>('chat');
+  const [trajSelection, setTrajSelection] = useState<TrajSelection | null>(null);
+  const [trajRefreshKey, setTrajRefreshKey] = useState(0);
+  const [previewPath, setPreviewPath] = useState<string | null>(null);
+  // Live output rate for the status bar: token samples in a trailing window.
+  const [liveTokPerSec, setLiveTokPerSec] = useState<number | null>(null);
+  const tokenSamplesRef = useRef<Array<{ t: number; n: number }>>([]);
   // Conversations (chat sessions) per bot, persisted locally.
   const [convos, setConvos] = useState<Record<string, Conversation[]>>({});
   const [activeConvo, setActiveConvo] = useState<Record<string, string>>({});
@@ -1039,6 +1062,12 @@ function ChatPageInner() {
   const persistConvos = (next: Record<string, Conversation[]>) => {
     setConvos(next);
     saveConvos(next);
+    // Minimal shell: keep the sidebar's session history fresh.
+    try {
+      window.dispatchEvent(new Event('kriyadot:sessions-changed'));
+    } catch {
+      // ignore
+    }
   };
 
   const persistActiveConvo = (next: Record<string, string>) => {
@@ -1550,7 +1579,24 @@ function ChatPageInner() {
     // Unknown event kinds: ignore (no crash on future event shapes).
   };
 
+  /**
+   * Rolling output-token rate for the status bar: token-event content is
+   * estimated with the composer's estimateTokens() and counted over a
+   * trailing ~3s window. Reset by the send loops when a turn ends, so
+   * the bar shows "–" instead of a stale rate between turns.
+   */
+  const noteStreamTokens = (content: string) => {
+    const now = Date.now();
+    const samples = tokenSamplesRef.current;
+    samples.push({ t: now, n: estimateTokens(content) });
+    while (samples.length > 0 && now - samples[0]!.t > 3000) samples.shift();
+    const total = samples.reduce((sum, s) => sum + s.n, 0);
+    const spanMs = samples.length > 1 ? now - samples[0]!.t : 0;
+    setLiveTokPerSec(spanMs >= 250 ? Math.round((total / spanMs) * 1000) : null);
+  };
+
   const applyEvent = useCallback((event: StreamEvent) => {
+    if (event.type === 'token') noteStreamTokens(event.content);
     // Live code session: feed every event; auto-open the session view when
     // the agent starts writing code (unless the user dismissed it this turn).
     codeSessionRef.current.handleEvent(event);
@@ -1784,6 +1830,8 @@ function ChatPageInner() {
     const controller = new AbortController();
     abortRef.current = controller;
     setSending(true);
+    tokenSamplesRef.current = [];
+    setLiveTokPerSec(null);
     // Make sure the universal session is known (boot fetch is best-effort).
     let session = universalSessionRef.current;
     if (!session) {
@@ -1880,6 +1928,11 @@ function ChatPageInner() {
         );
         if (abortRef.current === controller) abortRef.current = null;
         setSending(false);
+        // Turn over: the live rate no longer applies, and the recorded
+        // trajectory for this session just gained a run — refresh it.
+        tokenSamplesRef.current = [];
+        setLiveTokPerSec(null);
+        setTrajRefreshKey((k) => k + 1);
       }
     }
   };
@@ -1908,6 +1961,8 @@ function ChatPageInner() {
     const controller = new AbortController();
     abortRef.current = controller;
     setSending(true);
+    tokenSamplesRef.current = [];
+    setLiveTokPerSec(null);
     // Ensure an active conversation — its id doubles as the backend session id.
     let cid = activeConvoRef.current[selectedBot.id];
     const convoList = convosRef.current[selectedBot.id] ?? [];
@@ -1982,6 +2037,11 @@ function ChatPageInner() {
         );
         if (abortRef.current === controller) abortRef.current = null;
         setSending(false);
+        // Turn over: the live rate no longer applies, and the recorded
+        // trajectory for this session just gained a run — refresh it.
+        tokenSamplesRef.current = [];
+        setLiveTokPerSec(null);
+        setTrajRefreshKey((k) => k + 1);
       }
     }
   };
@@ -2385,6 +2445,68 @@ function ChatPageInner() {
     setSideOpen(false);
   };
 
+  // --- Minimal-shell sidebar bridge (2026-10-31 redesign) -----------------
+  // The app sidebar (components/shell/app-sidebar.tsx) opens sessions via
+  // CustomEvents when this page is mounted, or via sessionStorage pending
+  // keys when navigating here from another destination. Handlers go through
+  // a ref so the once-registered listeners always call the latest closures.
+  const sidebarNavRef = useRef({
+    open: (_botId: string, _convoId: string) => {},
+    fresh: () => {},
+    universal: () => {},
+  });
+  sidebarNavRef.current = {
+    open: (botId, convoId) => {
+      if (botId !== botIdRef.current) setSelectedBotId(botId);
+      switchConvo(botId, convoId);
+    },
+    fresh: () => newConversation(),
+    universal: () => enableUniversal(),
+  };
+  useEffect(() => {
+    const onOpen = (e: Event) => {
+      const d = (e as CustomEvent<{ botId?: string; convoId?: string }>).detail;
+      if (d?.botId && d?.convoId) sidebarNavRef.current.open(d.botId, d.convoId);
+    };
+    const onNew = () => sidebarNavRef.current.fresh();
+    const onUniversal = () => sidebarNavRef.current.universal();
+    window.addEventListener('kriyadot:open-session', onOpen);
+    window.addEventListener('kriyadot:new-session', onNew);
+    window.addEventListener('kriyadot:open-universal', onUniversal);
+    return () => {
+      window.removeEventListener('kriyadot:open-session', onOpen);
+      window.removeEventListener('kriyadot:new-session', onNew);
+      window.removeEventListener('kriyadot:open-universal', onUniversal);
+    };
+  }, []);
+  const pendingNavConsumedRef = useRef(false);
+  useEffect(() => {
+    if (pendingNavConsumedRef.current || bots.length === 0) return;
+    pendingNavConsumedRef.current = true;
+    try {
+      const rawOpen = sessionStorage.getItem('kriyadot:pending-open');
+      if (rawOpen) {
+        sessionStorage.removeItem('kriyadot:pending-open');
+        const d = JSON.parse(rawOpen) as { botId?: string; convoId?: string };
+        if (d?.botId && d?.convoId) {
+          sidebarNavRef.current.open(d.botId, d.convoId);
+          return;
+        }
+      }
+      if (sessionStorage.getItem('kriyadot:pending-universal')) {
+        sessionStorage.removeItem('kriyadot:pending-universal');
+        sidebarNavRef.current.universal();
+        return;
+      }
+      if (sessionStorage.getItem('kriyadot:pending-new')) {
+        sessionStorage.removeItem('kriyadot:pending-new');
+        sidebarNavRef.current.fresh();
+      }
+    } catch {
+      // ignore — pending navigation is best-effort
+    }
+  }, [bots.length]);
+
   const deleteConvo = (botId: string, convoId: string) => {
     if (sending) stopTurn();
     turnSeq.current++;
@@ -2634,6 +2756,45 @@ function ChatPageInner() {
   const botSessionUsage = selectedBotId ? sessionUsage[selectedBotId] : undefined;
   const botSessionCost = selectedBotId ? sessionCost[selectedBotId] : undefined;
   const sessionMeter = botSessionUsage ? contextMeter(botSessionUsage.totalTokens, contextLength) : null;
+  // Trajectory tab targets the current chat session: the active per-bot
+  // conversation id, or the universal session id in Universal mode.
+  const trajectorySessionId = universalMode
+    ? (universalSession?.sessionId ?? '')
+    : selectedBotId
+      ? (activeConvo[selectedBotId] ?? '')
+      : '';
+  const activeTrajSelection =
+    trajSelection && trajSelection.sessionId === trajectorySessionId ? trajSelection : null;
+  // Harness status-bar metrics from the visible blocks: turns = user
+  // blocks; steps = tool blocks + the finished step lines' entries;
+  // tokens = Σ assistant usage. Cache hit only when at least one block's
+  // usage actually reports cache fields (the web TokenUsage type omits
+  // them; the server includes them when the provider reports them).
+  const statusTurns = blocks.filter((b) => b.kind === 'user').length;
+  const statusSteps = blocks.reduce(
+    (n, b) => n + (b.kind === 'tool' ? 1 : b.kind === 'assistant' ? (b.finishedSteps?.length ?? 0) : 0),
+    0,
+  );
+  const statusTotalTokens = blocks.reduce(
+    (n, b) => n + (b.kind === 'assistant' ? (b.usage?.totalTokens ?? 0) : 0),
+    0,
+  );
+  let statusCacheHitPct: number | null = null;
+  {
+    let cacheRead = 0;
+    let promptTotal = 0;
+    let anyCache = false;
+    for (const b of blocks) {
+      if (b.kind !== 'assistant' || !b.usage) continue;
+      const read = (b.usage as { cacheReadTokens?: number }).cacheReadTokens;
+      if (typeof read === 'number') {
+        anyCache = true;
+        cacheRead += read;
+        promptTotal += b.usage.promptTokens;
+      }
+    }
+    if (anyCache && promptTotal > 0) statusCacheHitPct = (cacheRead / promptTotal) * 100;
+  }
 
   return (
     <div className="chat-layout">
@@ -2930,6 +3091,26 @@ function ChatPageInner() {
               — then say “done”
             </span>
           ))}
+          {chatMode === 'chat' && (
+            <div className="mode-toggle" role="group" aria-label="Chat or trajectory view" title="Chat transcript vs the session's recorded trajectory">
+              <button
+                type="button"
+                className={`mode-opt${chatView === 'chat' ? ' active' : ''}`}
+                onClick={() => setChatView('chat')}
+                aria-pressed={chatView === 'chat'}
+              >
+                Chat
+              </button>
+              <button
+                type="button"
+                className={`mode-opt${chatView === 'trajectory' ? ' active' : ''}`}
+                onClick={() => setChatView('trajectory')}
+                aria-pressed={chatView === 'trajectory'}
+              >
+                Trajectory
+              </button>
+            </div>
+          )}
           <div
             className="mode-toggle"
             role="group"
@@ -3112,6 +3293,17 @@ function ChatPageInner() {
         <PinnedBanner pins={pins}
           onJump={(pin) => messagesRef.current?.querySelector(`[data-block-id="${CSS.escape(pin.messageId)}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })}
           onUnpin={(pin) => { void unpinChatMessage(pin.threadId, pin.messageId).catch(() => {}); setPins((prev) => prev.filter((x) => x.messageId !== pin.messageId)); }} />
+        {chatView === 'trajectory' ? (
+          <div className="traj-region">
+            <TrajectoryView
+              sessionId={trajectorySessionId}
+              live={sending}
+              refreshKey={trajRefreshKey}
+              selectedEventId={activeTrajSelection?.event.id ?? null}
+              onSelect={(sel) => setTrajSelection(sel)}
+            />
+          </div>
+        ) : (
         <div className="chat-messages" ref={messagesRef} onMouseUp={handleMessageSelection}>
           {selectedBot?.approvalMode === 'bypass' && (
             <div
@@ -3417,6 +3609,7 @@ function ChatPageInner() {
                     </div>
                   );
                 }
+                const filePath = producedFilePath(b.call);
                 return (
                   <details key={b.id} className="tool-row">
                     <summary>
@@ -3432,6 +3625,16 @@ function ChatPageInner() {
                           <div className="label mt">Result</div>
                           <pre className="mono small">{prettyJson(b.result)}</pre>
                         </>
+                      )}
+                      {filePath && (
+                        <button
+                          type="button"
+                          className="btn btn-sm tool-open-btn"
+                          onClick={() => setPreviewPath(filePath)}
+                          title={`Preview ${filePath} beside the chat`}
+                        >
+                          📄 Open {filePath}
+                        </button>
                       )}
                     </div>
                   </details>
@@ -3557,6 +3760,7 @@ function ChatPageInner() {
             }
           })}
         </div>
+        )}
 
         {/* #37 floating selection action */}
         {selectionAction && (
@@ -3796,6 +4000,14 @@ function ChatPageInner() {
                 disabled={sending}
               />
             )}
+            <label className="small" title="Session model — the same provider/model state as the header picker">
+              Model{' '}
+              <select className="mp-select" value={modelId} aria-label="Model"
+                onChange={(e) => setModelId(e.target.value)}>
+                <option value="">(bot default)</option>
+                {modelOptions.map((m) => (<option key={m.id} value={m.id}>{m.name}</option>))}
+              </select>
+            </label>
             <label className="small" title="Model for the NEXT turn only — after sending, the bot's model applies again">
               Turn model{' '}
               <select className="mp-select" value={turnModel} aria-label="Model for next turn"
@@ -3867,9 +4079,35 @@ function ChatPageInner() {
             )}
           </div>
         </div>
+        <ChatStatusBar
+          turns={statusTurns}
+          steps={statusSteps}
+          liveTokPerSec={liveTokPerSec}
+          totalTokens={statusTotalTokens}
+          cacheHitPct={statusCacheHitPct}
+          contextPct={sessionMeter ? sessionMeter.pct : null}
+        />
           </>
         )}
       </div>
+
+      {/* Step inspector + produced-file preview panes (chat-layout side panes) */}
+      {activeTrajSelection && (
+        <div className="chat-side-pane">
+          <StepInspector
+            event={activeTrajSelection.event}
+            span={activeTrajSelection.span}
+            run={activeTrajSelection.run}
+            sessionStart={activeTrajSelection.sessionStart}
+            onClose={() => setTrajSelection(null)}
+          />
+        </div>
+      )}
+      {previewPath && (
+        <div className="chat-side-pane">
+          <FilePreviewPane path={previewPath} onClose={() => setPreviewPath(null)} />
+        </div>
+      )}
 
       {/* Reply thread panel (slide-over) */}
       {openThread && (

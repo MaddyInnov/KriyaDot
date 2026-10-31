@@ -43,9 +43,31 @@ const TABS = [
   { id: 'services', label: 'Services', pro: false },
   { id: 'cost', label: 'Cost', pro: true },
   { id: 'audit', label: 'Audit log', pro: false },
+  { id: 'permissions', label: 'Permissions', pro: false },
 ] as const;
 
 type TabId = (typeof TABS)[number]['id'];
+
+// Declutter: the Pro tab bar's primary row — the five sections a user
+// checks daily. Every other section lives one click away under the
+// "More sections" disclosure (grouped in MORE_IDS order below).
+const PRIMARY_IDS: TabId[] = ['work', 'approvals', 'runs', 'briefing', 'notifications'];
+const MORE_IDS: TabId[] = [
+  'status',
+  'analyze',
+  'human',
+  'spaces',
+  'summary',
+  'rules',
+  'routing',
+  'recovery',
+  'health',
+  'services',
+  'cost',
+  'audit',
+  'watch',
+  'permissions',
+];
 
 // Simple mode's consumer row (ACT-2): the same underlying panels, framed
 // as the four questions a non-technical user actually asks.
@@ -61,16 +83,21 @@ type ConsumerMode = (typeof CONSUMER_MODES)[number]['id'];
 export default function ActivityPage() {
   const [tab, setTab] = useState<TabId>('work');
   const [consumerMode, setConsumerMode] = useState<ConsumerMode>('tasks');
+  const [moreOpen, setMoreOpen] = useState(false);
   const [mode] = useUxMode();
   const visibleTabs = TABS.filter((t) => !t.pro || mode === 'pro');
   const activeTab: TabId = visibleTabs.some((t) => t.id === tab) ? tab : 'work';
+  const primaryTabs = visibleTabs.filter((t) => PRIMARY_IDS.includes(t.id));
+  const moreTabs = visibleTabs.filter((t) => MORE_IDS.includes(t.id));
+  // The More row stays visible while a More section is active, even if
+  // the disclosure was never opened.
+  const showMore = moreOpen || moreTabs.some((t) => t.id === activeTab);
 
   return (
     <div>
       <h1 className="page-title">Activity</h1>
-      <p className="page-sub">
-        Everything the platform does and asks of you — briefing, human approvals, spaces,
-        summaries, processing rules, cost, and the audit trail.
+      <p className="page-sub dc-compact-sub">
+        Everything the platform does and asks of you — in one place.
       </p>
 
       {mode === 'simple' ? (
@@ -98,7 +125,7 @@ export default function ActivityPage() {
       ) : (
         <>
           <div className="tabs" role="tablist" aria-label="Activity sections">
-            {visibleTabs.map((t) => (
+            {primaryTabs.map((t) => (
               <button
                 key={t.id}
                 role="tab"
@@ -109,7 +136,36 @@ export default function ActivityPage() {
                 {t.label}
               </button>
             ))}
+            <button
+              type="button"
+              className="tab dc-more-toggle"
+              aria-expanded={showMore}
+              aria-controls="activity-more-sections"
+              onClick={() => setMoreOpen((o) => !o)}
+            >
+              More sections {showMore ? '▾' : '▸'}
+            </button>
           </div>
+          {showMore && (
+            <div
+              className="tabs dc-more-tabs"
+              role="tablist"
+              aria-label="More activity sections"
+              id="activity-more-sections"
+            >
+              {moreTabs.map((t) => (
+                <button
+                  key={t.id}
+                  role="tab"
+                  aria-selected={activeTab === t.id}
+                  className={`tab${activeTab === t.id ? " active" : ""}`}
+                  onClick={() => setTab(t.id)}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </div>
+          )}
           <div className="tab-panel page-enter" key={activeTab} role="tabpanel">
             {activeTab === "work" && <WorkPanel />}
             {activeTab === "briefing" && <BriefingPanel />}
@@ -129,6 +185,7 @@ export default function ActivityPage() {
             {activeTab === "services" && <ServicesPanel />}
             {activeTab === "cost" && <CostPanel />}
             {activeTab === "audit" && <AuditPanel hideHeader />}
+            {activeTab === "permissions" && <PermissionsSummary />}
           </div>
         </>
       )}

@@ -68,6 +68,21 @@ describe('observability routes', () => {
     expect(bad.status).toBe(400);
   });
 
+  it('sessionId filter returns only that chat session runs', async () => {
+    // Seed runs share random session ids; create two runs on one session.
+    const shared = store.createRun({ sessionId: 'chat-session-1', botId: 'bot-a' });
+    store.finalizeRun(shared.runId, 'success');
+    const bySession = (await (
+      await fetch(`${base}/api/observability/runs?sessionId=chat-session-1`)
+    ).json()) as { runs: Array<{ runId: string; sessionId: string }> };
+    expect(bySession.runs.map((r) => r.runId)).toEqual([shared.runId]);
+    expect(bySession.runs[0]?.sessionId).toBe('chat-session-1');
+    const none = (await (
+      await fetch(`${base}/api/observability/runs?sessionId=no-such-session`)
+    ).json()) as { runs: unknown[] };
+    expect(none.runs).toHaveLength(0);
+  });
+
   it('run detail returns spans + totals + loop finding; 404 for unknown', async () => {
     const detail = (await (await fetch(`${base}/api/observability/runs/${runId}`)).json()) as {
       run: { outcome: string };

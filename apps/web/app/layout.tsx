@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { Metadata, Viewport } from 'next';
-import Link from 'next/link';
 import './globals.css';
 import './accents.css';
 import './minimal-layout.css';
 import './pet.css';
-import Nav from './nav';
+import './shell.css';
+import './trajectory.css';
+import './declutter.css';
+import AppSidebar from '../components/shell/app-sidebar';
 import PwaInstallBanner from '../components/pwa-install';
 import RemoteScreenBanner from '../components/remote-screen-banner';
-import { PauseControl, PausedBanner } from '../components/pause-control';
-import { BrandPet } from '../components/pet/BrandPet';
+import { PausedBanner } from '../components/pause-control';
 import { I18nProvider } from '../lib/i18n';
 import { BrandProvider } from '../components/brand-provider';
 
@@ -63,16 +64,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <I18nProvider>
         <BrandProvider>
         <div className="shell">
-          <header className="topbar">
-            <Link href="/" className="brand">
-              <BrandPet />
-              KriyaDot
-            </Link>
-            <Nav />
-            <PauseControl />
-          </header>
-          <PausedBanner />
-          <main className="main">{children}</main>
+          <AppSidebar />
+          <div className="shell-main">
+            <PausedBanner />
+            <main className="main">{children}</main>
+          </div>
         </div>
         <PwaInstallBanner />
         <RemoteScreenBanner />

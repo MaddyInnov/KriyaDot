@@ -82,6 +82,11 @@ describe('SpanStore CRUD + nesting', () => {
     expect(store.listRuns({ outcome: 'success' })).toHaveLength(2);
     expect(store.listRuns({ botId: 'bot-a', outcome: 'success' })).toHaveLength(1);
     expect(store.listRuns({ botId: 'bot-a', outcome: 'success' })[0]?.sessionId).toBe('s-a');
+    // sessionId filter: one chat session's runs only, composes with botId.
+    expect(store.listRuns({ sessionId: 's-a' }).map((r) => r.runId)).toEqual([a.run.runId]);
+    expect(store.listRuns({ sessionId: 's-b' })).toHaveLength(1);
+    expect(store.listRuns({ sessionId: 's-a', botId: 'bot-b' })).toHaveLength(0);
+    expect(store.listRuns({ sessionId: 'no-such-session' })).toHaveLength(0);
   });
 });
 

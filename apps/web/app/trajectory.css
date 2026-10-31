@@ -1,0 +1,472 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Chat | Trajectory view + harness-style status bar (2026-10-31 redesign).
+   Theme variables come from globals.css. */
+
+/* Region that replaces the message list when the Trajectory tab is on. */
+.traj-region {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px;
+  min-height: 0;
+}
+
+/* Right panes inside chat-layout (step inspector / file preview). */
+.chat-side-pane {
+  flex: none;
+  width: min(420px, 42vw);
+  min-width: 300px;
+  border-left: 1px solid var(--glass-border);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  background: var(--glass-bg);
+}
+
+@media (max-width: 900px) {
+  .chat-side-pane {
+    width: 100%;
+    min-width: 0;
+    border-left: none;
+    border-top: 1px solid var(--glass-border);
+  }
+}
+
+/* ---------- Trajectory view ---------- */
+
+.traj-empty {
+  padding: 24px 8px;
+  font-size: 13px;
+}
+
+.traj-chips {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.traj-chip {
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  box-shadow: var(--clay-pressed);
+  color: var(--text-2);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.18s var(--ease);
+}
+
+.traj-chip.active {
+  background: var(--surface);
+  color: var(--accent);
+  box-shadow: var(--clay-shadow-sm);
+  border-color: var(--accent);
+}
+
+.traj-count {
+  margin-left: auto;
+}
+
+/* 3-lane timeline strip */
+.traj-lanes {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--clay-inset);
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.traj-lane-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.traj-lane-label {
+  flex: none;
+  width: 44px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-2);
+}
+
+.traj-lane-track {
+  position: relative;
+  flex: 1;
+  height: 14px;
+  border-radius: 7px;
+  background: var(--surface-2);
+}
+
+.traj-seg {
+  position: absolute;
+  top: 2px;
+  height: 10px;
+  min-width: 4px;
+  border: none;
+  border-radius: 5px;
+  padding: 0;
+  cursor: pointer;
+  opacity: 0.85;
+}
+
+.traj-seg:hover {
+  opacity: 1;
+}
+
+.traj-seg.selected {
+  outline: 2px solid var(--text);
+  outline-offset: 1px;
+  opacity: 1;
+}
+
+/* Badge palette — jewel accents over theme variables. */
+.traj-badge {
+  flex: none;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.07em;
+  padding: 3px 7px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+
+.traj-badge--user {
+  color: var(--green);
+  background: var(--green-soft);
+  border-color: var(--green);
+}
+
+.traj-badge--assistant {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.traj-badge--tool {
+  color: var(--amber);
+  background: var(--amber-soft);
+  border-color: var(--amber);
+}
+
+.traj-badge--context {
+  color: var(--text-2);
+  background: var(--surface-2);
+  border-color: var(--border-strong, var(--border));
+}
+
+.traj-badge--subagent {
+  color: var(--info, #2563eb);
+  background: var(--surface-2);
+  border-color: var(--info, #2563eb);
+}
+
+.traj-seg--user { background: var(--green); }
+.traj-seg--assistant { background: var(--accent); }
+.traj-seg--tool { background: var(--amber); }
+.traj-seg--context { background: var(--text-3, var(--muted)); }
+.traj-seg--subagent { background: var(--info, #2563eb); }
+
+/* Event feed */
+.traj-feed {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.traj-event {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card, var(--surface));
+  box-shadow: var(--clay-shadow-sm);
+  padding: 8px 12px;
+  cursor: pointer;
+  transition: all 0.15s var(--ease);
+}
+
+.traj-event:hover {
+  border-color: var(--accent);
+}
+
+.traj-event.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent), var(--clay-shadow-sm);
+}
+
+.traj-event-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.traj-event-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.traj-event-sub {
+  font-size: 12px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.traj-event-meta {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+.traj-status {
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 9px;
+  letter-spacing: 0.05em;
+}
+
+.traj-status--ok,
+.traj-status--success { color: var(--green); }
+.traj-status--error,
+.traj-status--failed { color: var(--red, var(--danger)); }
+.traj-status--running { color: var(--amber); }
+
+/* ---------- Step inspector ---------- */
+
+.step-inspector {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  padding: 12px 14px;
+}
+
+.insp-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.insp-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.insp-name {
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.insp-tabs {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin: 10px 0;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+}
+
+.insp-tab {
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-2);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.insp-tab.active {
+  background: var(--surface);
+  color: var(--accent);
+  border-color: var(--accent);
+  box-shadow: var(--clay-shadow-sm);
+}
+
+.insp-body {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.insp-pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: none;
+}
+
+.insp-rows {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+}
+
+.insp-rows th {
+  text-align: left;
+  color: var(--text-2);
+  font-weight: 600;
+  padding: 4px 10px 4px 0;
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+.insp-rows td {
+  padding: 4px 0;
+  word-break: break-word;
+}
+
+.insp-foot {
+  margin-top: 10px;
+}
+
+/* ---------- Chat status bar ---------- */
+
+.chat-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  padding: 5px 14px;
+  border-top: 1px solid var(--glass-border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+.csb-sep {
+  color: var(--text-3, var(--muted));
+}
+
+.csb-gauge {
+  display: inline-block;
+  width: 72px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  box-shadow: var(--clay-inset);
+  overflow: hidden;
+  vertical-align: middle;
+}
+
+.csb-gauge-fill {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--brand-grad);
+  transition: width 0.3s var(--ease);
+}
+
+.csb-gauge.warn .csb-gauge-fill {
+  background: var(--amber);
+}
+
+/* ---------- File preview pane ---------- */
+
+.file-preview-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  padding: 12px 14px;
+}
+
+.fpp-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.fpp-path {
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fpp-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.fpp-body {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.fpp-markdown {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text);
+}
+
+.fpp-markdown h2,
+.fpp-markdown h3,
+.fpp-markdown h4,
+.fpp-markdown h5 {
+  margin: 12px 0 6px;
+}
+
+.fpp-markdown p {
+  margin: 6px 0;
+}
+
+.fpp-markdown blockquote {
+  margin: 6px 0;
+  padding-left: 10px;
+  border-left: 3px solid var(--accent);
+  color: var(--text-2);
+}
+
+.fpp-markdown .md-pre {
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  padding: 10px;
+  overflow-x: auto;
+  font-size: 12px;
+}
+
+.fpp-markdown code {
+  background: var(--surface-2);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-size: 12px;
+}
+
+/* Produced-file "Open" affordance inside tool rows. */
+.tool-open-btn {
+  margin-top: 8px;
+}

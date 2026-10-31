@@ -1,0 +1,134 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Declutter pass for destination first screens (2026-10-31 redesign):
+   one primary column of focus; secondary panels behind tabs/accordions. */
+
+/* One compact subtitle line instead of stacked explanatory paragraphs. */
+.dc-compact-sub {
+  margin: 0 0 14px;
+  max-width: 72ch;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Disclosure row that reveals a grouped second tab row (Activity "More"). */
+.dc-more-toggle {
+  align-self: center;
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.dc-more-tabs {
+  margin-top: -14px;
+  border-bottom: none;
+}
+
+/* Native <details> disclosure styled with the clay/glass identity. */
+.dc-details {
+  border: 1px solid var(--glass-border, var(--border));
+  border-radius: 18px;
+  background: var(--glass-bg, var(--surface));
+  padding: 4px 16px 12px;
+  margin-bottom: 16px;
+}
+
+.dc-details > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 10px 2px;
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text-2);
+}
+
+.dc-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.dc-details > summary::before {
+  content: '▸ ';
+  color: var(--accent);
+}
+
+.dc-details[open] > summary::before {
+  content: '▾ ';
+}
+
+.dc-details > summary:hover {
+  color: var(--text);
+}
+
+/* Accordion section inside an editor (Bots): header row + indented body. */
+.dc-accordion {
+  margin-bottom: 12px;
+}
+
+.dc-accordion > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-2);
+  padding: 8px 2px;
+}
+
+.dc-accordion > summary::-webkit-details-marker {
+  display: none;
+}
+
+.dc-accordion > summary::before {
+  content: '▸ ';
+  color: var(--accent);
+}
+
+.dc-accordion[open] > summary::before {
+  content: '▾ ';
+}
+
+.dc-accordion > summary:hover {
+  color: var(--text);
+}
+
+/* Small per-card disclosure (Workflows run options & exports). */
+.dc-mini {
+  margin-top: 10px;
+}
+
+.dc-mini > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text-2);
+  padding: 6px 2px;
+}
+
+.dc-mini > summary::-webkit-details-marker {
+  display: none;
+}
+
+.dc-mini > summary::before {
+  content: '▸ ';
+  color: var(--accent);
+}
+
+.dc-mini[open] > summary::before {
+  content: '▾ ';
+}
+
+/* Bots: when no bot is selected the roster takes the whole pane, so the
+   list is the single focus and the editor opens only on selection. */
+.dc-list-focus .bot-roster {
+  flex: 1;
+  width: auto;
+  border-right: none;
+}
+
+/* Bots editor header: bot name + dismiss, above the section tabs. */
+.dc-editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 14px 0;
+}

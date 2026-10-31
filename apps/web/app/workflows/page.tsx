@@ -91,6 +91,8 @@ export default function WorkflowsPage() {
   const [dryRunView, setDryRunView] = useState<DryRunView | null>(null);
   const [dryRunBusy, setDryRunBusy] = useState(false);
   const [dryRunError, setDryRunError] = useState('');
+  // Declutter: definitions are the primary focus; run history is one tab away.
+  const [view, setView] = useState<'workflows' | 'runs'>('workflows');
 
   const refresh = useCallback(async () => {
     try {
@@ -258,9 +260,34 @@ export default function WorkflowsPage() {
   return (
     <div>
       <h1 className="page-title">Workflows</h1>
-      <p className="page-sub">Registered workflow definitions and their runs.</p>
+      <p className="page-sub dc-compact-sub">Registered workflow definitions and their runs.</p>
       {error && <div className="error-box">{error}</div>}
 
+      <div className="tabs" role="tablist" aria-label="Workflows sections">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={view === 'workflows'}
+          className={`tab${view === 'workflows' ? ' active' : ''}`}
+          onClick={() => setView('workflows')}
+        >
+          Workflows
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={view === 'runs'}
+          className={`tab${view === 'runs' ? ' active' : ''}`}
+          onClick={() => setView('runs')}
+        >
+          Runs
+        </button>
+      </div>
+
+      {view === 'workflows' && (
+        <>
+      <details className="dc-details">
+        <summary>Import &amp; interchange — n8n and KriyaDot workflow files</summary>
       <div className="card mt">
         <div className="row-between" style={{ flexWrap: 'wrap', gap: 8 }}>
           <div>
@@ -342,6 +369,7 @@ export default function WorkflowsPage() {
         </div>
         {fileNote && <p className="small mt">{fileNote}</p>}
       </div>
+      </details>
 
       {dryRunFor && (
         <div className="card mt" role="dialog" aria-label={`Dry-run plan for ${dryRunFor.name}`}>
@@ -399,6 +427,23 @@ export default function WorkflowsPage() {
             <p className="small muted">
               {d.nodes.length} node(s): {d.nodes.map((n) => n.id).join(', ')}
             </p>
+            <button
+              className="btn btn-primary btn-sm"
+              disabled={starting === d.id}
+              onClick={() => void start(d)}
+            >
+              {starting === d.id ? 'Starting…' : 'Run'}
+            </button>{' '}
+            <button
+              className="btn btn-sm"
+              disabled={dryRunBusy && dryRunFor?.id === d.id}
+              onClick={() => void dryRun(d)}
+              title="Dry-run: validate and show the execution plan — spawns nothing"
+            >
+              {dryRunBusy && dryRunFor?.id === d.id ? 'Planning…' : 'Dry-run'}
+            </button>
+            <details className="dc-mini">
+              <summary>Run options &amp; exports</summary>
             <div className="field">
               <label className="label" htmlFor={`input-${d.id}`}>
                 Input JSON (optional)
@@ -425,27 +470,12 @@ export default function WorkflowsPage() {
               />
             </div>
             <button
-              className="btn btn-primary btn-sm"
-              disabled={starting === d.id}
-              onClick={() => void start(d)}
-            >
-              {starting === d.id ? 'Starting…' : 'Run'}
-            </button>{' '}
-            <button
               className="btn btn-sm"
               disabled={exportingId === d.id}
               onClick={() => void exportFile(d)}
               title="Download this workflow in n8n format (best-effort)"
             >
               {exportingId === d.id ? 'Exporting…' : 'Export n8n'}
-            </button>{' '}
-            <button
-              className="btn btn-sm"
-              disabled={dryRunBusy && dryRunFor?.id === d.id}
-              onClick={() => void dryRun(d)}
-              title="Dry-run: validate and show the execution plan — spawns nothing"
-            >
-              {dryRunBusy && dryRunFor?.id === d.id ? 'Planning…' : 'Dry-run'}
             </button>{' '}
             <button
               className="btn btn-sm"
@@ -463,6 +493,7 @@ export default function WorkflowsPage() {
             >
               Export TOML
             </button>
+            </details>
           </div>
         ))}
       </div>
@@ -475,7 +506,11 @@ export default function WorkflowsPage() {
           />
         </>
       )}
+        </>
+      )}
 
+      {view === 'runs' && (
+        <>
       <h3 className="mt">Runs</h3>
       <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
         <table className="tbl">
@@ -563,6 +598,8 @@ export default function WorkflowsPage() {
           </tbody>
         </table>
       </div>
+        </>
+      )}
     </div>
   );
 }

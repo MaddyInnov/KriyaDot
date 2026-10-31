@@ -561,15 +561,19 @@ export class SpanStore {
     return row ? this.toRun(row) : undefined;
   }
 
-  /** Newest first. Filters compose (bot AND outcome AND tag). */
+  /** Newest first. Filters compose (bot AND outcome AND tag AND session). */
   listRuns(
-    filter: { botId?: string; outcome?: RunOutcome; tag?: string; limit?: number } = {},
+    filter: { botId?: string; outcome?: RunOutcome; tag?: string; sessionId?: string; limit?: number } = {},
   ): RunRecord[] {
     const conds: string[] = [];
     const args: Array<string | number> = [];
     if (filter.botId) {
       conds.push('r.bot_id = ?');
       args.push(filter.botId);
+    }
+    if (filter.sessionId) {
+      conds.push('r.session_id = ?');
+      args.push(filter.sessionId);
     }
     if (filter.outcome) {
       conds.push('r.outcome = ?');

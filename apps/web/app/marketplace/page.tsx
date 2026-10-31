@@ -146,9 +146,8 @@ export default function MarketplacePage() {
   return (
     <div>
       <h1 className="page-title">Marketplace</h1>
-      <p className="page-sub">
-        The Store brings every bot, skill, workflow, MCP server, and plugin into one catalog.
-        MCP servers are never installed without your approval.
+      <p className="page-sub dc-compact-sub">
+        One catalog — bots, skills, workflows, MCP servers, plugins. MCP installs need your approval.
       </p>
 
       <div className="row-between" style={{ marginBottom: 16 }}>

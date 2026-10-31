@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // W13 observability API: recorded runs (span traces) for Activity → Runs.
 //
-//   GET    /api/observability/runs?botId=&outcome=&tag=&limit=
+//   GET    /api/observability/runs?botId=&outcome=&tag=&sessionId=&limit=
 //   GET    /api/observability/runs/:runId        → run + spans + totals (+ loop finding)
 //   POST   /api/observability/runs/:runId/tags   { tag }
 //   DELETE /api/observability/runs/:runId/tags/:tag
@@ -35,6 +35,8 @@ export function registerObservabilityRoutes(
   router.get('/observability/runs', (req, res) => {
     try {
       const botId = typeof req.query.botId === 'string' && req.query.botId ? req.query.botId : undefined;
+      const sessionId =
+        typeof req.query.sessionId === 'string' && req.query.sessionId ? req.query.sessionId : undefined;
       const tag = typeof req.query.tag === 'string' && req.query.tag ? req.query.tag : undefined;
       let outcome: RunOutcome | undefined;
       if (typeof req.query.outcome === 'string' && req.query.outcome) {
@@ -46,7 +48,7 @@ export function registerObservabilityRoutes(
       }
       const limitRaw = Number(req.query.limit);
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(500, Math.floor(limitRaw)) : 100;
-      const runs = spanStore.listRuns({ botId, outcome, tag, limit }).map((run) => ({
+      const runs = spanStore.listRuns({ botId, outcome, tag, sessionId, limit }).map((run) => ({
         ...run,
         totals: spanStore.runTotals(run.runId),
       }));
