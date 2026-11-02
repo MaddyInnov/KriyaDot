@@ -87,6 +87,33 @@ import {
   resolveAnchorBot,
   type UniversalRouteDecision,
 } from './universal.js';
+import { AUTO_MODEL_SENTINEL, recordAutoModelDecision, resolveAutoModel } from './model-auto.js';
+
+/**
+ * OH-5 follow-up (integration): resolve the 'auto' model sentinel for a
+ * bot about to execute a universal turn. The runtime would otherwise pass
+ * the literal string 'auto' to the provider as a model id. Returns
+ * runTurn overrides ({ providerId, model }) for an 'auto' bot, {} for an
+ * explicit pick. The decision is recorded in the same invocation decision
+ * log /api/chat uses. Never throws — auto must not break chat; on any
+ * failure the turn falls back to the runtime's own model resolution.
+ */
+function autoModelOverrides(
+  deps: UniversalRoutesDeps,
+  bot: BotConfig,
+  message: string,
+): { providerId?: string; model?: string } {
+  if (bot.model !== AUTO_MODEL_SENTINEL) return {};
+  try {
+    const decision = resolveAutoModel(bot, message, {
+      hasTools: Array.isArray(bot.tools) && bot.tools.length > 0,
+    });
+    recordAutoModelDecision(deps.dataDir, bot.id, decision);
+    return { providerId: decision.providerId, model: decision.model };
+  } catch {
+    return {};
+  }
+}
 
 /** Mirrors routes.ts MAX_CHAT_MESSAGE_CHARS (the /api/chat cap). */
 export const MAX_UNIVERSAL_MESSAGE_CHARS = 200_000;
@@ -128,6 +155,11 @@ export interface UniversalRoutesDeps {
   fetchFn?: (url: string, init?: Record<string, unknown>) => Promise<Awaited<ReturnType<typeof fetch>>>;
   /** Resolve a sync link-token bearer to the owner (proxied turns). Default: sync-hub helper. */
   resolveServicePrincipal?: (authorizationHeader: string | undefined) => { userId: string } | null;
+  /**
+   * OH-2: platform embedder for the blended routing lane. Optional —
+   * without it (or with the trigram fallback) routing stays keyword-only.
+   */
+  embedder?: import('@mvp/agent-runtime').SyncEmbedder;
 }
 
 function errorBody(message: string): Record<string, unknown> {
@@ -308,7 +340,9 @@ export function createUniversalRouter(deps: UniversalRoutesDeps): Router {
     // ---- Route (deterministic, rules-only — see universal.ts) ----
     let decision: UniversalRouteDecision;
     try {
-      decision = decideUniversalRoute(message, bots, anchor, loadRouterWeights(deps.dataDir));
+      decision = decideUniversalRoute(message, bots, anchor, loadRouterWeights(deps.dataDir), {
+        embedder: deps.embedder,
+      });
     } catch {
       // Routing must never break chat: any router failure degrades to direct.
       decision = {
@@ -368,6 +402,7 @@ export function createUniversalRouter(deps: UniversalRoutesDeps): Router {
           via: decision.via,
           sessionId,
           anchorBotId: anchor.id,
+          ...(decision.blend ? { blend: decision.blend } : {}),
         },
       });
       // The scored router log too, so the Routing UI shows universal picks.
@@ -443,6 +478,7 @@ export function createUniversalRouter(deps: UniversalRoutesDeps): Router {
           sessionId,
           // ADD-4: universal turns run under the execution policy.
           universal: true,
+          ...autoModelOverrides(deps, anchor, turnMessage),
           onEvent: forward,
         });
       } else if (decision.path === 'specialist') {
@@ -457,6 +493,7 @@ export function createUniversalRouter(deps: UniversalRoutesDeps): Router {
           message: turnMessage,
           sessionId: `universal_via_${target.id}_${userKey(principal.userId)}`,
           universal: true,
+          ...autoModelOverrides(deps, target, turnMessage),
           onEvent: async (e) => {
             if (e.type === 'token') reply += e.content;
             send(e);
@@ -625,8 +662,11 @@ async function runSplit(args: {
   // probe so a not-running local lane is skipped rather than failing the
   // plan. Total failure degrades to a plain direct turn with a notice —
   // the user still gets an answer, never a dead thread.
-  let providerId = anchor.provider ?? 'groq';
-  let model = anchor.model ?? getDefaultModel(providerId) ?? 'default';
+  // OH-5 follow-up: an 'auto' anchor resolves ONCE here; the pick drives
+  // the planner/fuse calls, the direct fallback, and every worker turn.
+  const splitAuto = autoModelOverrides(deps, anchor, taskMessage);
+  let providerId = splitAuto.providerId ?? anchor.provider ?? 'groq';
+  let model = splitAuto.model ?? (anchor.model === AUTO_MODEL_SENTINEL ? undefined : anchor.model) ?? getDefaultModel(providerId) ?? 'default';
   let call: PlanFuseCall;
   if (deps.callLlm) {
     const injected = deps.callLlm;
@@ -643,6 +683,7 @@ async function runSplit(args: {
         message: taskMessage,
         sessionId,
         universal: true,
+        ...splitAuto,
         onEvent: async (e) => send(e),
       });
     };
@@ -738,6 +779,7 @@ async function runSplit(args: {
         message: buildWorkerMessage(input.subtask, input.sharedContext, input.dependencyOutputs, titleMap),
         sessionId: `universal_fusion_${runKey}_${input.subtask.id}`,
         universal: true,
+        ...splitAuto,
         onEvent: (e) => {
           if (e.type === 'token') output += e.content;
         },

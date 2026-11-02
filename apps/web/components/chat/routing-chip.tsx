@@ -7,7 +7,8 @@
 'use client';
 
 import React from 'react';
-import type { UniversalRouting } from '../../lib/api';
+import type { ModelRouteInfo, UniversalRouting } from '../../lib/api';
+import { ModelRouteBadge } from './memory-used-note';
 
 /** Routing info as stored on an assistant chat block (routing frame + split count). */
 export type RoutingChipData = Omit<UniversalRouting, 'sessionId'> & {
@@ -48,10 +49,13 @@ export function RoutingChip({
   routing,
   mode = 'simple',
   subtaskCount,
+  modelRoute,
 }: {
   routing: RoutingChipData;
   mode?: 'simple' | 'pro';
   subtaskCount?: number;
+  /** OH-5: when the turn ran under model 'auto', the model it picked. */
+  modelRoute?: ModelRouteInfo | null;
 }) {
   const count = subtaskCount ?? routing.subtaskCount;
   const label = routingChipLabel(routing, mode, count);
@@ -63,6 +67,7 @@ export function RoutingChip({
       title={`Routed ${routing.path} via ${routing.via || 'router'} · confidence ${routing.confidence}`}
     >
       <span className="routing-chip-label">{label}</span>
+      <ModelRouteBadge route={modelRoute} />
       {showReason ? <span className="routing-chip-reason">{routing.reason}</span> : null}
     </span>
   );

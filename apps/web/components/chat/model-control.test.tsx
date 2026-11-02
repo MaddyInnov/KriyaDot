@@ -159,8 +159,10 @@ describe('ModelControl popover search', () => {
     fireEvent.keyDown(input, { key: 'ArrowUp' });
     fireEvent.keyDown(input, { key: 'ArrowUp' });
     fireEvent.keyDown(input, { key: 'ArrowUp' });
-    // From the current model (index 1) two ups reach Bot default (index 0) and stay.
-    expect(screen.getByRole('button', { name: /Bot default/ })).toHaveClass('highlighted');
+    // Flat order is [Auto, Bot default, current model, …]: from the
+    // current model (index 2) ups reach Bot default (1), then Auto (0),
+    // and clamp there instead of wrapping.
+    expect(screen.getByRole('button', { name: /Auto — pick per message/ })).toHaveClass('highlighted');
   });
 
   it('Enter on a search that only matches Bot default selects the bot default', () => {
@@ -188,5 +190,80 @@ describe('ModelControl popover search', () => {
     fireEvent.mouseEnter(screen.getByRole('button', { name: 'GPT-5' }));
     expect(screen.getByRole('button', { name: 'GPT-5' })).toHaveClass('highlighted');
     expect(screen.getByRole('button', { name: 'Claude Opus 4.5' })).not.toHaveClass('highlighted');
+  });
+});
+
+describe('ModelControl Auto row (OH-5)', () => {
+  function renderAutoControl(modelId: string) {
+    const handlers = {
+      onSelectModel: vi.fn(),
+      onSelectBotDefault: vi.fn(),
+      onTurnModelChange: vi.fn(),
+      onSandboxChange: vi.fn(),
+      onEffortChange: vi.fn(),
+      onQueueModeChange: vi.fn(),
+    };
+    const utils = render(
+      <ModelControl
+        providers={PROVIDERS}
+        providerId="openrouter"
+        modelId={modelId}
+        botDefaultLabel="Scout default (GPT-OSS 120B)"
+        turnModel=""
+        sandboxMode="workspace-write"
+        reasoningEffort="medium"
+        queueMode="queue"
+        {...handlers}
+      />,
+    );
+    return { handlers, ...utils };
+  }
+
+  it('renders the Auto row at the top, above Bot default and provider groups', () => {
+    const { container } = renderControl();
+    openPopover();
+    const rows = Array.from(container.querySelectorAll('.mc-row'));
+    expect(rows[0]).toHaveTextContent('Auto — pick per message');
+    expect(rows[0]).toHaveTextContent(/Chooses from your configured providers per message shape/);
+    expect(rows[1]).toHaveTextContent('Bot default');
+  });
+
+  it('selecting Auto sets the model to "auto" through onSelectModel', () => {
+    const { handlers } = renderControl();
+    openPopover();
+    fireEvent.click(screen.getByRole('button', { name: /Auto — pick per message/ }));
+    expect(handlers.onSelectModel).toHaveBeenCalledWith('openrouter', 'auto');
+    expect(handlers.onSelectBotDefault).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText('Search models')).not.toBeInTheDocument();
+  });
+
+  it('Enter selects Auto when it is the highlighted row', () => {
+    const { handlers } = renderControl();
+    openPopover();
+    fireEvent.change(searchInput(), { target: { value: 'auto' } });
+    fireEvent.keyDown(searchInput(), { key: 'Enter' });
+    expect(handlers.onSelectModel).toHaveBeenCalledWith('openrouter', 'auto');
+  });
+
+  it('stays visible for an "auto" search but hides for unrelated terms', () => {
+    renderControl();
+    openPopover();
+    fireEvent.change(searchInput(), { target: { value: 'aut' } });
+    expect(screen.getByRole('button', { name: /Auto — pick per message/ })).toBeInTheDocument();
+    fireEvent.change(searchInput(), { target: { value: 'haiku' } });
+    expect(screen.queryByRole('button', { name: /Auto — pick per message/ })).not.toBeInTheDocument();
+  });
+
+  it('when the selection is auto, the closed label shows "Auto" and the row is checkmarked', () => {
+    renderAutoControl('auto');
+    const control = screen.getByTitle(/Provider · model · effort · access/);
+    expect(control).toHaveTextContent('Auto');
+    expect(control).not.toHaveTextContent('OpenRouter');
+    fireEvent.click(control);
+    const autoRow = screen.getByRole('button', { name: /Auto — pick per message/ });
+    expect(autoRow).toHaveClass('current');
+    expect(autoRow).toHaveTextContent('✓');
+    expect(autoRow).toHaveClass('highlighted');
+    expect(screen.getByRole('button', { name: /Bot default/ })).not.toHaveClass('current');
   });
 });

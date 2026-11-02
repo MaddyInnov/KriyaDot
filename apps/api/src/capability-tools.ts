@@ -98,6 +98,10 @@ export function createCapabilityTools(deps: CapabilityToolsDeps): ToolDefinition
           whenToUse: h.entry.whenToUse,
           howToInvoke: h.entry.howToInvoke,
           score: h.score,
+          // OH-2 additive blend detail (present only on blended hits).
+          ...(h.keywordScore !== undefined
+            ? { keywordScore: h.keywordScore, semanticScore: h.semanticScore, semanticActive: h.semanticActive }
+            : {}),
         })),
         ...(handoffs[0] ? { handoff: handoffs[0] } : {}),
       };

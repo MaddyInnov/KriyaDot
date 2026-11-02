@@ -43,7 +43,8 @@
 //   // registerChiefToolsWiring({ ..., capabilityService }) for the prompt
 //   // section (chief-wiring builds a bots+tools default when not passed).
 
-import { ftsTerms } from '@mvp/agent-runtime';
+import { blendRank, cosineSimilarity, ftsTerms, isSemanticEmbedder } from '@mvp/agent-runtime';
+import type { SyncEmbedder } from '@mvp/agent-runtime';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -627,6 +628,10 @@ export function buildCapabilityRegistry(deps: CapabilityRegistryDeps): Capabilit
 export interface CapabilitySearchHit {
   entry: CapabilityEntry;
   score: number;
+  /** OH-2: present only on blended (embedder) hits — additive detail. */
+  keywordScore?: number;
+  semanticScore?: number | null;
+  semanticActive?: boolean;
 }
 
 const KIND_TIE_ORDER: Record<CapabilityKind, number> = {
@@ -639,6 +644,35 @@ function termHits(fieldTokens: Set<string>, term: string): boolean {
   if (term.length > 3 && term.endsWith('s') && fieldTokens.has(term.slice(0, -1))) return true;
   if (fieldTokens.has(`${term}s`)) return true;
   return false;
+}
+
+/** Raw keyword score for one entry (the exact scoring searchCapabilities has always used). */
+export function capabilityKeywordScore(entry: CapabilityEntry, terms: string[], phrase: string): number {
+  const nameTokens = new Set(tokensOf(entry.name));
+  const keywordTokens = new Set(entry.keywords);
+  const invokeTokens = new Set(tokensOf(
+    `${entry.howToInvoke.description} ${entry.howToInvoke.toolName ?? ''} ${entry.howToInvoke.botId ?? ''} ${entry.howToInvoke.route ?? ''}`,
+  ));
+  const whenTokens = new Set(tokensOf(entry.whenToUse));
+  const whatTokens = new Set(tokensOf(entry.whatItDoes));
+  const groupTokens = new Set(tokensOf(entry.group));
+
+  let score = 0;
+  for (const term of terms) {
+    if (termHits(nameTokens, term)) score += 6;
+    if (termHits(keywordTokens, term)) score += 5;
+    if (termHits(invokeTokens, term)) score += 4;
+    if (termHits(whenTokens, term)) score += 3;
+    if (termHits(whatTokens, term)) score += 3;
+    if (termHits(groupTokens, term)) score += 2;
+  }
+  if (phrase.length >= 4) {
+    if (entry.name.toLowerCase().includes(phrase)) score += 12;
+    else if (entry.keywords.some((k) => k.length >= 4 && phrase.includes(k))) score += 8;
+    if (entry.whatItDoes.toLowerCase().includes(phrase)) score += 4;
+    if (entry.whenToUse.toLowerCase().includes(phrase)) score += 4;
+  }
+  return score;
 }
 
 export function searchCapabilities(
@@ -654,30 +688,7 @@ export function searchCapabilities(
 
   for (const entry of registry.entries) {
     if (opts.kinds && !opts.kinds.includes(entry.kind)) continue;
-    const nameTokens = new Set(tokensOf(entry.name));
-    const keywordTokens = new Set(entry.keywords);
-    const invokeTokens = new Set(tokensOf(
-      `${entry.howToInvoke.description} ${entry.howToInvoke.toolName ?? ''} ${entry.howToInvoke.botId ?? ''} ${entry.howToInvoke.route ?? ''}`,
-    ));
-    const whenTokens = new Set(tokensOf(entry.whenToUse));
-    const whatTokens = new Set(tokensOf(entry.whatItDoes));
-    const groupTokens = new Set(tokensOf(entry.group));
-
-    let score = 0;
-    for (const term of terms) {
-      if (termHits(nameTokens, term)) score += 6;
-      if (termHits(keywordTokens, term)) score += 5;
-      if (termHits(invokeTokens, term)) score += 4;
-      if (termHits(whenTokens, term)) score += 3;
-      if (termHits(whatTokens, term)) score += 3;
-      if (termHits(groupTokens, term)) score += 2;
-    }
-    if (phrase.length >= 4) {
-      if (entry.name.toLowerCase().includes(phrase)) score += 12;
-      else if (entry.keywords.some((k) => k.length >= 4 && phrase.includes(k))) score += 8;
-      if (entry.whatItDoes.toLowerCase().includes(phrase)) score += 4;
-      if (entry.whenToUse.toLowerCase().includes(phrase)) score += 4;
-    }
+    const score = capabilityKeywordScore(entry, terms, phrase);
     if (score > 0) hits.push({ entry, score });
   }
 
@@ -687,6 +698,60 @@ export function searchCapabilities(
     a.entry.name.localeCompare(b.entry.name),
   );
   return hits.slice(0, limit);
+}
+
+/**
+ * OH-2: blended re-ranking — the keyword ranking above blended with
+ * embedding cosine over each capability's name + description text via
+ * the runtime's blendRank. With a neural/onnx embedder the blend is
+ * 0.6 keyword / 0.4 semantic; with the trigram hash fallback blendRank
+ * drops the semantic weight to 0.1 and reports semanticActive=false
+ * (the semantic lane is lexical there too, so it must not double-count).
+ * Any embedder failure degrades to the plain keyword ranking.
+ */
+export function searchCapabilitiesBlended(
+  registry: CapabilityRegistry,
+  query: string,
+  embedder: SyncEmbedder,
+  opts: { limit?: number; kinds?: CapabilityKind[] } = {},
+): CapabilitySearchHit[] {
+  const terms = tokensOf(query ?? '');
+  if (terms.length === 0) return [];
+  const phrase = (query ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const limit = Math.max(1, Math.min(25, opts.limit ?? 5));
+  const entries = registry.entries.filter((e) => !opts.kinds || opts.kinds.includes(e.kind));
+  if (entries.length === 0) return [];
+  let vectors: Float32Array[];
+  try {
+    vectors = embedder.embedSync([
+      query,
+      ...entries.map((e) => `${e.name}. ${e.whatItDoes} ${e.whenToUse}`),
+    ]);
+  } catch {
+    return searchCapabilities(registry, query, opts);
+  }
+  const queryVec = vectors[0];
+  if (!queryVec) return searchCapabilities(registry, query, opts);
+  const semanticActive = isSemanticEmbedder(embedder);
+  const blended = blendRank(
+    entries.map((entry, i) => ({
+      id: entry.id,
+      keywordScore: capabilityKeywordScore(entry, terms, phrase),
+      semanticScore: vectors[i + 1] ? cosineSimilarity(queryVec, vectors[i + 1]!) : undefined,
+    })),
+    { semanticActive },
+  );
+  const byId = new Map(entries.map((e) => [e.id, e]));
+  return blended.hits
+    .filter((h) => h.score >= 0.05)
+    .slice(0, limit)
+    .map((h) => ({
+      entry: byId.get(h.id)!,
+      score: h.score,
+      keywordScore: h.keywordScore,
+      semanticScore: h.semanticScore,
+      semanticActive: blended.semanticActive,
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -874,7 +939,7 @@ export const DEFAULT_CAPABILITY_TTL_MS = 30_000;
 
 export function createCapabilityService(
   deps: CapabilityRegistryDeps,
-  opts: { ttlMs?: number; nowMs?: () => number } = {},
+  opts: { ttlMs?: number; nowMs?: () => number; embedder?: SyncEmbedder } = {},
 ): CapabilityService {
   const ttlMs = Math.max(0, opts.ttlMs ?? DEFAULT_CAPABILITY_TTL_MS);
   const nowMs = opts.nowMs ?? (() => Date.now());
@@ -890,7 +955,13 @@ export function createCapabilityService(
 
   return {
     getRegistry,
-    search: (query, searchOpts) => searchCapabilities(getRegistry(), query, searchOpts),
+    // OH-2: blended re-ranking when the host supplied an embedder;
+    // keyword-only otherwise (graceful degradation, semanticActive=false
+    // path inside blendRank for the trigram fallback).
+    search: (query, searchOpts) =>
+      opts.embedder
+        ? searchCapabilitiesBlended(getRegistry(), query, opts.embedder, searchOpts)
+        : searchCapabilities(getRegistry(), query, searchOpts),
     summary: (summaryOpts) => buildCapabilitySummary(getRegistry(), summaryOpts),
     promptSection: (summaryOpts) => buildCapabilityPromptSection(getRegistry(), summaryOpts),
     suggestHandoffs: (text, handoffOpts) => suggestCapabilityHandoffs(getRegistry(), text, handoffOpts),

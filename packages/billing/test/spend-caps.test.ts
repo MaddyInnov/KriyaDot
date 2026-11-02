@@ -169,7 +169,11 @@ describe('checkSpendCaps', () => {
     const caps = emptyCaps();
     caps.global.monthlyCents = 500;
     // Jump the clock forward into next month: today's events fall outside.
-    const nextMonth = new Date(2026, 10, 5, 12, 0, 0).getTime();
+    // Computed from the real clock (a hardcoded "next month" date expires
+    // as wall-clock time reaches it — this test originally pinned
+    // 2026-11-05, which stopped being next month on 2026-11-01).
+    const base = new Date();
+    const nextMonth = new Date(base.getFullYear(), base.getMonth() + 1, 5, 12, 0, 0).getTime();
     const res = checkSpendCaps({ caps, botId: 'scout', estimatedAdditionalCents: 100, spentLookup: lookupWith(tracker), now: nextMonth });
     expect(res.allowed).toBe(true);
     tracker.close();

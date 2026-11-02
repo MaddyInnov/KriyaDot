@@ -19,6 +19,7 @@
 
 import { cosineSimilarity, type SyncEmbedder } from './hybrid-search.js';
 import { embeddingCacheKey } from './embeddings.js';
+import { blendRank, isSemanticEmbedder, keywordScoreForText } from './semantic-rank.js';
 
 export type DiscoverableKind = 'bot' | 'skill' | 'mcp' | 'capability';
 
@@ -196,7 +197,17 @@ export async function rankBotsByIntent(
   intent: string,
   bots: RankableBot[],
   embedder: SyncEmbedder,
-  opts: { topK?: number; minScore?: number } = {},
+  opts: {
+    topK?: number;
+    minScore?: number;
+    /**
+     * OH-2 additive blend: when supplied, the embedding ranking is
+     * blended with the caller's per-bot keyword scores (semantic-rank.ts).
+     * `minScore` then applies to the BLENDED score. Existing callers
+     * that omit `blend` are unaffected.
+     */
+    blend?: { keywordScores: Map<string, number> };
+  } = {},
 ): Promise<DiscoveryHit[]> {
   const items: DiscoverableItem[] = bots.map((b) => ({
     kind: 'bot',
@@ -204,7 +215,31 @@ export async function rankBotsByIntent(
     name: b.name,
     description: b.description ?? '',
   }));
-  return discoverByIntent(intent, items, embedder, opts);
+  if (!opts.blend) return discoverByIntent(intent, items, embedder, opts);
+  const semanticHits = await discoverByIntent(intent, items, embedder, {
+    topK: items.length,
+    minScore: -1,
+  });
+  const semById = new Map(semanticHits.map((h) => [h.item.id, h.score]));
+  const itemById = new Map(items.map((i) => [i.id, i]));
+  const blended = blendRank(
+    items.map((i) => ({
+      id: i.id,
+      keywordScore: opts.blend!.keywordScores.get(i.id) ?? 0,
+      semanticScore: semById.get(i.id),
+    })),
+    { semanticActive: isSemanticEmbedder(embedder) },
+  );
+  const minScore = opts.minScore ?? -1;
+  return blended.hits
+    .filter((h) => h.score >= minScore)
+    .slice(0, opts.topK ?? 5)
+    .map((h) => ({ item: itemById.get(h.id)!, score: h.score }));
+}
+
+/** OH-2: keyword scores for a bot list, for use with rankBotsByIntent's blend option. */
+export function keywordScoresForBots(intent: string, bots: RankableBot[]): Map<string, number> {
+  return new Map(bots.map((b) => [b.id, keywordScoreForText(intent, `${b.name}: ${b.description ?? ''}`)]));
 }
 
 /** Pick the best bot for an intent, or undefined when nothing clears minScore. */
@@ -243,6 +278,8 @@ export function decideMcpAutoActivation(
 export function createDiscoverSpecialistsTool(deps: {
   items: () => DiscoverableItem[] | Promise<DiscoverableItem[]>;
   embedder: SyncEmbedder;
+  /** OH-2: when true, rankings blend keyword overlap with embedding cosine (semantic-rank.ts). */
+  blend?: boolean;
 }): ToolDefinition {
   return {
     name: 'discover_specialists',
@@ -264,7 +301,18 @@ export function createDiscoverSpecialistsTool(deps: {
       const all = await deps.items();
       const kind = typeof args.kind === 'string' ? args.kind : undefined;
       const items = kind ? all.filter((i) => i.kind === kind) : all;
-      const hits = await discoverByIntent(intent, items, deps.embedder, { topK: 5 });
+      let hits: DiscoveryHit[];
+      if (deps.blend) {
+        const bots: RankableBot[] = items.map((i) => ({ id: i.id, name: i.name, description: i.description }));
+        hits = await rankBotsByIntent(intent, bots, deps.embedder, {
+          topK: 5,
+          blend: { keywordScores: keywordScoresForBots(intent, bots) },
+        });
+        const itemById = new Map(items.map((i) => [i.id, i]));
+        hits = hits.map((h) => ({ item: itemById.get(h.item.id)!, score: h.score }));
+      } else {
+        hits = await discoverByIntent(intent, items, deps.embedder, { topK: 5 });
+      }
       return {
         matches: hits.map((h) => ({
           kind: h.item.kind,

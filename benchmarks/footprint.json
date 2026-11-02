@@ -1,0 +1,164 @@
+{
+  "date": "2026-11-02T07:02:13.840Z",
+  "env": {
+    "node": "v24.22.1",
+    "platform": "linux/x64"
+  },
+  "server": {
+    "command": "node apps/api/dist/index.js",
+    "env": {
+      "PORT": 43917,
+      "DATA_DIR": "/tmp/kriyadot-footprint-sW0P20",
+      "providerKeys": "none set (boot does not require them)"
+    },
+    "healthEndpoint": "http://127.0.0.1:<PORT>/api/health",
+    "healthBody": {
+      "ok": true,
+      "groqConfigured": false,
+      "openRouterConfigured": false
+    },
+    "coldStartMs": 1170,
+    "rssSamples": [
+      {
+        "atSecondsAfterReady": 15,
+        "rssKb": 253980
+      },
+      {
+        "atSecondsAfterReady": 30,
+        "rssKb": 258752
+      },
+      {
+        "atSecondsAfterReady": 45,
+        "rssKb": 258752
+      },
+      {
+        "atSecondsAfterReady": 60,
+        "rssKb": 259764
+      }
+    ],
+    "idleRssKb": 259764,
+    "idleRssMb": 253.7,
+    "rssScope": "main server process only (VmRSS from /proc/<pid>/status); child processes, if any, are not summed"
+  },
+  "sizes": {
+    "apiDist": {
+      "totalKb": 11523.9,
+      "byExtensionKb": {
+        ".js": 6400.4,
+        ".map": 4231.4,
+        ".ts": 892
+      }
+    },
+    "webOut": {
+      "totalKb": 5956.9,
+      "topLevel": [
+        {
+          "name": "_next",
+          "kb": 4005.2
+        },
+        {
+          "name": "modules",
+          "kb": 620.8
+        },
+        {
+          "name": "more",
+          "kb": 84.1
+        },
+        {
+          "name": "workflows",
+          "kb": 81
+        },
+        {
+          "name": "preferences.html",
+          "kb": 40.8
+        },
+        {
+          "name": "workspace",
+          "kb": 38.9
+        },
+        {
+          "name": "index.html",
+          "kb": 37.1
+        },
+        {
+          "name": "activity.html",
+          "kb": 36.1
+        },
+        {
+          "name": "more.html",
+          "kb": 34.6
+        },
+        {
+          "name": "bots.html",
+          "kb": 34.4
+        },
+        {
+          "name": "providers.html",
+          "kb": 33.8
+        },
+        {
+          "name": "accounts.html",
+          "kb": 32.1
+        },
+        {
+          "name": "workspace.html",
+          "kb": 31.9
+        },
+        {
+          "name": "approvals.html",
+          "kb": 31.6
+        },
+        {
+          "name": "marketplace.html",
+          "kb": 31.5
+        }
+      ]
+    },
+    "serverBinary": {
+      "path": "dist/mvp-server",
+      "kb": 84973.5
+    },
+    "desktopBinary": "not built"
+  },
+  "mockStreaming": {
+    "runs": 7,
+    "prompt": "Explain what a benchmark is in one short paragraph.",
+    "firstTokenMedianMs": 0.01,
+    "totalMedianMs": 0.016,
+    "usagePerRun": {
+      "promptTokens": 10,
+      "completionTokens": 5,
+      "totalTokens": 15
+    },
+    "samples": [
+      {
+        "firstTokenMs": 0.307,
+        "totalMs": 0.39
+      },
+      {
+        "firstTokenMs": 0.036,
+        "totalMs": 0.052
+      },
+      {
+        "firstTokenMs": 0.01,
+        "totalMs": 0.017
+      },
+      {
+        "firstTokenMs": 0.005,
+        "totalMs": 0.011
+      },
+      {
+        "firstTokenMs": 0.004,
+        "totalMs": 0.01
+      },
+      {
+        "firstTokenMs": 0.004,
+        "totalMs": 0.01
+      },
+      {
+        "firstTokenMs": 0.01,
+        "totalMs": 0.016
+      }
+    ]
+  }
+}

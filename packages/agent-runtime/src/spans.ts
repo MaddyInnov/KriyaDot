@@ -419,6 +419,24 @@ export interface EndSpanPatch {
 
 export class SpanStore {
   private readonly db: DatabaseSync;
+  private readonly spanEndListeners = new Set<(span: Span) => void>();
+
+  /**
+   * OH-7: subscribe to span completion. The listener receives the final
+   * stored span (post-redaction) each time endSpan() completes one.
+   * Listener errors are swallowed — observability never breaks a turn.
+   * Returns an unsubscribe function.
+   */
+  onSpanEnd(listener: (span: Span) => void): () => void {
+    this.spanEndListeners.add(listener);
+    return () => { this.spanEndListeners.delete(listener); };
+  }
+
+  private notifySpanEnd(span: Span): void {
+    for (const fn of this.spanEndListeners) {
+      try { fn(span); } catch { /* listener errors never propagate */ }
+    }
+  }
 
   constructor(dbPath: string) {
     this.db = openDb(dbPath);
@@ -457,6 +475,7 @@ export class SpanStore {
       );
       CREATE INDEX IF NOT EXISTS idx_spans_run ON spans(run_id, started_at, id);
       CREATE INDEX IF NOT EXISTS idx_span_runs_bot ON span_runs(bot_id, started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_span_runs_ended ON span_runs(ended_at);
       CREATE INDEX IF NOT EXISTS idx_run_tags_tag ON run_tags(tag);
     `);
     // ADD-4: attempt-trail column for databases created before it existed.
@@ -500,6 +519,58 @@ export class SpanStore {
     this.db
       .prepare('UPDATE span_runs SET outcome = ?, ended_at = ? WHERE run_id = ?')
       .run(outcome, endedAt, runId);
+  }
+
+  /**
+   * Retention (Pack B footprint): bound the span database, which
+   * otherwise grows without limit on an always-on install. Deletes ENDED
+   * runs older than `maxAgeMs`; then, if ended runs still exceed
+   * `maxRuns`, the oldest ended runs beyond the cap — together with their
+   * spans and tags. In-flight runs (ended_at NULL) are never pruned.
+   * Defaults: 30 days / 20,000 runs. The host sweep (API boot) reads the
+   * KRIYADOT_SPAN_RETENTION_DAYS / KRIYADOT_SPAN_MAX_RUNS env overrides
+   * and passes them in; this method itself stays env-free.
+   */
+  pruneOldRuns(opts?: { maxAgeMs?: number; maxRuns?: number; now?: number }): { runsRemoved: number; spansRemoved: number } {
+    const now = opts?.now ?? Date.now();
+    const maxAgeMs = opts?.maxAgeMs ?? 30 * 24 * 60 * 60 * 1000;
+    const maxRuns = opts?.maxRuns ?? 20_000;
+    const cutoff = now - Math.max(0, maxAgeMs);
+    let runsRemoved = 0;
+    let spansRemoved = 0;
+    const removeRuns = (ids: string[]): void => {
+      for (let i = 0; i < ids.length; i += 500) {
+        const batch = ids.slice(i, i + 500);
+        const ph = batch.map(() => '?').join(', ');
+        const s = this.db.prepare(`DELETE FROM spans WHERE run_id IN (${ph})`).run(...batch);
+        spansRemoved += Number(s.changes ?? 0);
+        this.db.prepare(`DELETE FROM run_tags WHERE run_id IN (${ph})`).run(...batch);
+        const r = this.db.prepare(`DELETE FROM span_runs WHERE run_id IN (${ph})`).run(...batch);
+        runsRemoved += Number(r.changes ?? 0);
+      }
+    };
+    this.db.exec('BEGIN');
+    try {
+      const aged = this.db
+        .prepare('SELECT run_id FROM span_runs WHERE ended_at IS NOT NULL AND ended_at < ?')
+        .all(cutoff) as unknown as Array<{ run_id: string }>;
+      removeRuns(aged.map((r) => r.run_id));
+      const remaining = this.db
+        .prepare('SELECT COUNT(*) AS n FROM span_runs WHERE ended_at IS NOT NULL')
+        .get() as unknown as { n: number };
+      const excess = Number(remaining.n) - Math.max(0, maxRuns);
+      if (excess > 0) {
+        const oldest = this.db
+          .prepare('SELECT run_id FROM span_runs WHERE ended_at IS NOT NULL ORDER BY ended_at ASC, run_id ASC LIMIT ?')
+          .all(excess) as unknown as Array<{ run_id: string }>;
+        removeRuns(oldest.map((r) => r.run_id));
+      }
+      this.db.exec('COMMIT');
+    } catch (err) {
+      try { this.db.exec('ROLLBACK'); } catch { /* ignore */ }
+      throw err;
+    }
+    return { runsRemoved, spansRemoved };
   }
 
   flagLoop(runId: string, evidence: LoopEvidence[]): void {
@@ -715,7 +786,9 @@ export class SpanStore {
         patch.error !== undefined ? sanitizeSpanText(patch.error) : null,
         id,
       );
-    return this.getSpan(id);
+    const ended = this.getSpan(id);
+    if (ended) this.notifySpanEnd(ended);
+    return ended;
   }
 
   /** One-shot span insert (already finished) — used by importers/tests. */

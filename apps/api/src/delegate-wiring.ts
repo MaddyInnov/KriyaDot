@@ -149,7 +149,7 @@ export function registerDelegateTools(opts: DelegateWiringOpts): void {
       // store too (the closure runs per turn, after childRuntime exists).
       extraToolsForBot: (botId): ToolDefinition[] => {
         const b = opts.getBotConfig(botId);
-        return b ? childRuntime.createSpillTools(b) : [];
+        return b ? childRuntime.createSpillTools(b, { handleTools: true }) : [];
       },
     });
 

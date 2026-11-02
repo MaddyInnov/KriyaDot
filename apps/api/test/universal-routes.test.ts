@@ -59,6 +59,8 @@ interface TurnCall {
   bot: BotConfig;
   message: string;
   sessionId?: string;
+  providerId?: string;
+  model?: string;
 }
 
 function makeRuntime() {
@@ -71,9 +73,11 @@ function makeRuntime() {
         bot: BotConfig;
         message: string;
         sessionId?: string;
+        providerId?: string;
+        model?: string;
         onEvent: (e: { type: string; content?: string; usage?: TokenUsage }) => void | Promise<void>;
       }) => {
-        calls.push({ bot: opts.bot, message: opts.message, sessionId: opts.sessionId });
+        calls.push({ bot: opts.bot, message: opts.message, sessionId: opts.sessionId, providerId: opts.providerId, model: opts.model });
         await opts.onEvent({ type: 'token', content: `reply from ${opts.bot.id}` });
         await opts.onEvent({ type: 'done', usage: U });
         return U;
@@ -109,7 +113,7 @@ const splitCallLlm: UniversalLlmCaller = async (
   return { content: 'FUSED ANSWER', usage: U };
 };
 
-function makeApp(dataDir: string, opts?: { callLlm?: UniversalLlmCaller }) {
+function makeApp(dataDir: string, opts?: { callLlm?: UniversalLlmCaller; bots?: BotConfig[] }) {
   const { runtime, calls, appended } = makeRuntime();
   const fusionStore = new FusionRunStore(dataDir);
   const app = express();
@@ -118,7 +122,7 @@ function makeApp(dataDir: string, opts?: { callLlm?: UniversalLlmCaller }) {
     '/api/universal',
     createUniversalRouter({
       dataDir,
-      getBots: () => BOTS,
+      getBots: () => opts?.bots ?? BOTS,
       getChiefBotId: () => 'chief',
       agentRuntime: runtime,
       audit: () => undefined,
@@ -258,6 +262,28 @@ describe('universal routes (HTTP)', () => {
   });
   afterEach(() => {
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("OH-5: an anchor bot with model 'auto' executes with a resolved provider/model, never the literal 'auto'", async () => {
+    const autoChief: BotConfig = { ...CHIEF, model: 'auto' } as BotConfig;
+    const { app, calls } = makeApp(dir, { bots: [autoChief, CODER, WRITER] });
+    const { server, base } = await listen(app);
+    try {
+      const frames = await postChat(base, 'hello there');
+      expect(frames.some((f) => f.type === 'routing')).toBe(true);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.bot.id).toBe('chief');
+      // The runtime must receive concrete runTurn overrides: the sentinel
+      // resolved against configured providers (ovh-anonymous is keyless,
+      // hence configured in this environment).
+      expect(typeof calls[0]!.providerId).toBe('string');
+      expect(calls[0]!.providerId!.length).toBeGreaterThan(0);
+      expect(typeof calls[0]!.model).toBe('string');
+      expect(calls[0]!.model!.length).toBeGreaterThan(0);
+      expect(calls[0]!.model).not.toBe('auto');
+    } finally {
+      server.close();
+    }
   });
 
   it('rejects unauthenticated calls', async () => {

@@ -42,6 +42,7 @@ import {
   pinChatMessage,
   unpinChatMessage,
   polishComposerText,
+  setBotModel,
   type PinnedChatMessage,
   type CurrentTurnState,
   type FusionStreamEvent,
@@ -99,6 +100,8 @@ import { TokenCostChip } from '../components/chat/token-cost-chip';
 import { listPeople, type Person } from '../lib/people';
 import { applyUxMode, getStoredUxMode, useUxMode } from '../lib/ux-mode';
 import { RoutingChip } from '../components/chat/routing-chip';
+import { MemoryUsedNote, ModelRouteBadge } from '../components/chat/memory-used-note';
+import type { MemoryUsedItem, ModelRouteInfo } from '../lib/api';
 import { PlacementPill } from '../components/chat/placement-pill';
 import { TrajectoryView, type TrajSelection } from '../components/chat/trajectory-view';
 import { StepInspector } from '../components/chat/step-inspector';
@@ -138,7 +141,7 @@ import { CodingSessionStrip } from '../components/code/CodingSessionStrip';
 
 type ChatBlock =
   | { kind: 'user'; id: string; text: string; ts: number }
-  | { kind: 'assistant'; id: string; text: string; streaming: boolean; usage?: TokenUsage; costUsd?: number; ts: number; botName?: string; step?: StepLineState; citations?: unknown; finishedSteps?: string[]; routing?: Omit<UniversalRouting, 'sessionId'> & { subtaskCount?: number } }
+  | { kind: 'assistant'; id: string; text: string; streaming: boolean; usage?: TokenUsage; costUsd?: number; ts: number; botName?: string; step?: StepLineState; citations?: unknown; finishedSteps?: string[]; routing?: Omit<UniversalRouting, 'sessionId'> & { subtaskCount?: number }; memoryUsed?: MemoryUsedItem[]; modelRoute?: ModelRouteInfo }
   /** A `/goal` run started in this chat (W8f) — status polls the goal record. */
   | { kind: 'goal'; id: string; goalId: string; title: string }
   | { kind: 'tool'; id: string; call: ToolCall; result?: unknown; denied?: boolean }
@@ -1557,7 +1560,7 @@ function ChatPageInner() {
         message: text,
         sessionId: rep.threadSessionId,
         provider: providerIdRef.current || undefined,
-        model: modelIdRef.current || undefined,
+        model: modelIdRef.current === 'auto' ? undefined : modelIdRef.current || undefined,
         signal: controller.signal,
       })) {
         if ((event as { type?: string }).type === 'queued') continue;
@@ -1680,7 +1683,18 @@ function ChatPageInner() {
         for (let i = next.length - 1; i >= 0; i--) {
           const b = next[i];
           if (b && b.kind === 'assistant') {
-            next[i] = { ...b, streaming: false, step: undefined, usage: event.usage ?? undefined, costUsd, finishedSteps: b.step ? [b.step.step] : b.finishedSteps };
+            next[i] = {
+              ...b,
+              streaming: false,
+              step: undefined,
+              usage: event.usage ?? undefined,
+              costUsd,
+              finishedSteps: b.step ? [b.step.step] : b.finishedSteps,
+              // OH-3/OH-5: cited recall + auto-model choice ride the
+              // done frame (absent on ordinary turns — block stays clean).
+              ...(event.memoryUsed ? { memoryUsed: event.memoryUsed } : {}),
+              ...(event.modelRoute ? { modelRoute: event.modelRoute } : {}),
+            };
             break;
           }
         }
@@ -2018,7 +2032,9 @@ function ChatPageInner() {
         message: text,
         sessionId: cid,
         provider: providerIdRef.current || undefined,
-        model: turnModelValue || modelIdRef.current || undefined,
+        // 'auto' is never pinned per-turn: the bot's saved 'auto' model
+        // makes the server route per message (OH-5).
+        model: turnModelValue || (modelIdRef.current === 'auto' ? undefined : modelIdRef.current) || undefined,
         modelOverride: turnModelValue || undefined,
         reasoningEffort: reasoningEffortRef.current,
         fileIds: files,
@@ -3481,7 +3497,11 @@ function ChatPageInner() {
                         {botLabel.charAt(0).toUpperCase()}
                       </span>
                       <span className="msg-author">{botLabel}</span>
-                      {b.routing && <RoutingChip routing={b.routing} mode={uxMode} />}
+                      {b.routing ? (
+                        <RoutingChip routing={b.routing} mode={uxMode} modelRoute={b.modelRoute} />
+                      ) : (
+                        <ModelRouteBadge route={b.modelRoute} />
+                      )}
                       <span className="msg-time">{fmtTime(b.ts)}</span>
                       {b.text.length > 0 && <CopyBtn text={b.text} />}
                       {!b.streaming && b.text.length > 0 && (
@@ -3531,6 +3551,7 @@ function ChatPageInner() {
                     </div>
                     {b.streaming && b.step && <StepLine state={b.step} />}
                     {!b.streaming && b.finishedSteps && <FinishedSteps steps={b.finishedSteps} />}
+                    {!b.streaming && <MemoryUsedNote items={b.memoryUsed} />}
                     {!b.streaming && <CitationChips citations={b.citations} />}
                     {!b.streaming && (
                       <MessageReactions
@@ -4098,6 +4119,17 @@ function ChatPageInner() {
               onSelectModel={(pid, mid) => {
                 setProviderId(pid);
                 setModelId(mid);
+                if (mid === 'auto' && selectedBot) {
+                  // OH-5: 'auto' is a BOT-level setting — persist it via
+                  // the bot-model PUT so the server routes per message.
+                  // The session selection above only drives the control's
+                  // "Auto" label; send paths never pin 'auto' per-turn
+                  // (an explicit per-turn model would block auto routing).
+                  void setBotModel(selectedBot.id, 'auto', null)
+                    .then(() => getBots())
+                    .then((list) => setBots(list))
+                    .catch(() => {});
+                }
               }}
               onSelectBotDefault={() => {
                 setModelId('');

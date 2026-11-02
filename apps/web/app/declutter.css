@@ -452,6 +452,15 @@ html[data-ux='simple'] .places-rail {
   font-size: 12px;
   margin-left: auto;
 }
+/* Stacked row (Auto): the explanatory sublabel wraps under the name. */
+.mc-row-stack {
+  flex-wrap: wrap;
+}
+.mc-row-stack .mc-row-sub {
+  margin-left: 0;
+  flex-basis: 100%;
+  white-space: normal;
+}
 .mc-check {
   color: var(--accent);
   font-weight: 800;

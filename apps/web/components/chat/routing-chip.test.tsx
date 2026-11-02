@@ -88,4 +88,19 @@ describe('RoutingChip', () => {
     );
     expect(html).toContain('✦ Split into 2 subtasks · Scout');
   });
+  it('OH-5: shows "Auto → <model>" next to the chip when modelRoute is present', () => {
+    const html = renderToStaticMarkup(
+      React.createElement(RoutingChip, {
+        routing: base,
+        modelRoute: { chosen: 'llama-3.3-70b', reason: 'Short factual turn' },
+      }),
+    );
+    expect(html).toContain('Auto → llama-3.3-70b');
+    expect(html).toContain('routing-chip-auto');
+  });
+  it('OH-5: no Auto marker when modelRoute is absent', () => {
+    const html = renderToStaticMarkup(React.createElement(RoutingChip, { routing: base }));
+    expect(html).not.toContain('routing-chip-auto');
+    expect(html).not.toContain('Auto →');
+  });
 });

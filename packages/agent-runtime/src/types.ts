@@ -326,6 +326,15 @@ export interface ToolDefinition {
    * Read-only tools (read_file, glob, web_search, ...) leave this unset.
    */
   mutating?: boolean;
+  /**
+   * OH-1 governance-verbatim: when true, this tool's results bypass
+   * tool-result compression AND spill truncation — the model receives
+   * the full text verbatim (e.g. approval-evidence tools whose output
+   * must reach the model / approver unaltered). Oversized results are
+   * then the caller's existing responsibility, exactly as before spill
+   * existed. Default unset/false: normal compression + spill applies.
+   */
+  verbatimResults?: boolean;
 }
 
 /**

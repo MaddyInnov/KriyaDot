@@ -300,7 +300,17 @@ export type StreamEvent =
   | { type: 'split_plan'; runId?: string; subtasks: { id: string; title: string }[] }
   | { type: 'tool_call'; call: ToolCall; approvalRequired: boolean; approvalId?: string }
   | { type: 'tool_result'; call: ToolCall; result: unknown; denied?: boolean }
-  | { type: 'done'; usage: TokenUsage | null }
+  /**
+   * Turn end. OH-3/OH-5 additive fields (present only when the turn
+   * produced them): the memories the turn cited and — under model
+   * 'auto' — the model the router picked.
+   */
+  | {
+      type: 'done';
+      usage: TokenUsage | null;
+      memoryUsed?: MemoryUsedItem[];
+      modelRoute?: ModelRouteInfo;
+    }
   | { type: 'error'; message: string }
   | { type: 'interrupted'; reason: string }
   | { type: 'approval_required'; approvalId: string; call: ToolCall }
@@ -2744,3 +2754,194 @@ export const setBotAvatar = (
   apiJson(`/api/bots/${encodeURIComponent(botId)}/avatar`, {
     method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ avatar }),
   });
+
+// ---- OpenHuman adoption (OH-3/OH-4/OH-5): memory citations, explorer, auto --
+// Message metadata (additive): assistant messages may carry the memories a
+// turn actually used and — when the bot's model is 'auto' — the model the
+// router picked for that turn. Both are absent on ordinary turns, and the
+// chat renders nothing extra in that case (no layout shift).
+
+/** One memory atom a chat turn used, as cited on the assistant message. */
+export interface MemoryUsedItem {
+  atomId: string;
+  fact: string;
+  category: string;
+  sourceTurn: string;
+}
+
+/** Auto-routing outcome for one turn: the model chosen and why. */
+export interface ModelRouteInfo {
+  chosen: string;
+  reason: string;
+}
+
+/** Optional per-message metadata on assistant messages (OH-3/OH-5). */
+export interface AssistantMessageMeta {
+  memoryUsed?: MemoryUsedItem[];
+  modelRoute?: ModelRouteInfo;
+}
+
+// ---- Memory explorer (OH-3) -------------------------------------------------
+// Wire shapes mirror the API's AtomCard (+ provenance block on the
+// inspector route) — see apps/api/src/memory-upkeep-routes.ts.
+
+export interface MemoryAtomRecord {
+  id: string;
+  botId: string;
+  fact: string;
+  entities: string[];
+  confidence: number;
+  sourceTurn: string;
+  createdAt: number;
+  tier: string;
+  pinned: boolean;
+  category: string;
+  active: boolean;
+  archived?: boolean;
+  provenance?: {
+    sourceTurn: string | null;
+    grounding: string | null;
+    quote: string | null;
+    quoteSource: string | null;
+    evidenceLinks: string[];
+    outcome: string;
+    useCredit: number;
+  };
+}
+
+export interface MemoryAtomsResponse {
+  ok: boolean;
+  botId: string;
+  atoms: MemoryAtomRecord[];
+}
+
+/**
+ * GET /api/memory/atoms?botId= (+ q, category filters per the OH-3
+ * contract). The pre-existing route also accepts `pattern`; q/category
+ * are additive — an older server ignores them, so callers that need the
+ * filter to hold today should ALSO filter client-side (the explorer does).
+ */
+export const getMemoryAtoms = (
+  botId: string,
+  opts?: { q?: string; category?: string; limit?: number },
+): Promise<MemoryAtomsResponse> => {
+  const params = new URLSearchParams({ botId });
+  if (opts?.q) params.set('q', opts.q);
+  if (opts?.category) params.set('category', opts.category);
+  if (opts?.limit) params.set('limit', String(opts.limit));
+  return apiJson(`/api/memory/atoms?${params.toString()}`);
+};
+
+/** DELETE /api/memory/atoms/:id?botId= — forget one atom (existing route). */
+export const deleteMemoryAtom = (
+  botId: string,
+  atomId: string,
+): Promise<{ ok: boolean; deleted: string }> =>
+  apiJson(`/api/memory/atoms/${encodeURIComponent(atomId)}?botId=${encodeURIComponent(botId)}`, {
+    method: 'DELETE',
+  });
+
+/** Aggregate counts for the explorer header (GET /api/memory/stats?botId=). */
+export interface MemoryStats {
+  ok?: boolean;
+  botId?: string;
+  total: number;
+  pinned?: number;
+  active?: number;
+  archived?: number;
+  byCategory?: Record<string, number>;
+  byTier?: Record<string, number>;
+}
+
+export const getMemoryStats = (botId: string): Promise<MemoryStats> =>
+  apiJson(`/api/memory/stats?botId=${encodeURIComponent(botId)}`);
+
+/** One citation behind an Ask-memory answer: the atom it came from. */
+export interface MemoryAskCitation {
+  atomId: string;
+  fact: string;
+  category?: string;
+  sourceTurn?: string;
+}
+
+export interface MemoryAskResult {
+  ok?: boolean;
+  answer: string;
+  citations: MemoryAskCitation[];
+  /** 'extractive' = matching memories shown verbatim (no AI answer);
+   *  'llm' = a grounded answer composed by the bot's own model. */
+  mode: string;
+}
+
+/** POST /api/memory/ask { botId, question } → { answer, citations, mode }. */
+export const askMemory = (botId: string, question: string): Promise<MemoryAskResult> =>
+  apiJson('/api/memory/ask', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ botId, question }),
+  });
+
+// ---- Memory ingestion (OH-4) ------------------------------------------------
+// Per-bot auto-ingestion switches for connected sources. `available` is
+// server-reported (a source whose account is not connected is unavailable
+// and carries `unavailableReason`); the UI never invents availability.
+
+export type MemoryIngestionSourceId = 'files' | 'rss' | 'gmail' | 'drive';
+
+export interface MemoryIngestionSource {
+  id: MemoryIngestionSourceId | string;
+  enabled: boolean;
+  available: boolean;
+  unavailableReason?: string;
+  /** RSS only: subscribed feed URLs. */
+  feeds?: string[];
+  /** RSS only (single-feed shape): one feed URL. */
+  feedUrl?: string;
+}
+
+/**
+ * The persisted ingestion settings shape (PUT body + `settings` on GET):
+ * per-source on/off booleans plus the RSS feed list. The GET response
+ * pairs it with the per-source status array (`sources`).
+ */
+export interface MemoryIngestionSettings {
+  sources: Partial<Record<MemoryIngestionSourceId, boolean>>;
+  rssFeeds?: string[];
+  updatedAt?: string;
+}
+
+export interface MemoryIngestionConfig {
+  ok?: boolean;
+  botId: string;
+  settings?: MemoryIngestionSettings;
+  sources: MemoryIngestionSource[];
+}
+
+export interface MemoryIngestionRunResult {
+  ok?: boolean;
+  botId?: string;
+  added: number;
+  skipped: number;
+  perSource?: Record<string, { added: number; skipped: number }>;
+  /** Set when a guard (pause / privacy / local-only) blocked the run. */
+  blocked?: string;
+}
+
+/** GET /api/memory-ingestion/:botId — settings + per-source statuses. */
+export const getMemoryIngestion = (botId: string): Promise<MemoryIngestionConfig> =>
+  apiJson(`/api/memory-ingestion/${encodeURIComponent(botId)}`);
+
+/** PUT /api/memory-ingestion/:botId — save the settings shape. */
+export const saveMemoryIngestion = (
+  botId: string,
+  settings: MemoryIngestionSettings,
+): Promise<MemoryIngestionConfig> =>
+  apiJson(`/api/memory-ingestion/${encodeURIComponent(botId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings),
+  });
+
+/** POST /api/memory-ingestion/:botId/run — run one ingestion pass now. */
+export const runMemoryIngestion = (botId: string): Promise<MemoryIngestionRunResult> =>
+  apiJson(`/api/memory-ingestion/${encodeURIComponent(botId)}/run`, { method: 'POST' });

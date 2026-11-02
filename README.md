@@ -268,6 +268,17 @@ bun scripts/e2e-mock.ts  # mocked end-to-end: chat turn -> tool call -> approval
            # No provider API key needed.
 ```
 
+## Benchmarks
+
+A public, reproducible benchmark pack lives in [`benchmarks/`](benchmarks/README.md):
+13 auto-scored tasks (chat routing, tool use with oversized results,
+coding fixes, memory recall, a real workflow run) plus footprint
+measurements (server cold start, idle memory, bundle sizes). Mock-mode
+results prove the suite and scorers end to end — they are not model
+scores; real-provider runs are env-gated and refuse to start without a
+key. Latest measured results: [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md)
+and [`benchmarks/FOOTPRINT.md`](benchmarks/FOOTPRINT.md).
+
 ## Status / known limits (MVP)
 
 - Live chat requires a provider key (no key is bundled; mocked in tests).

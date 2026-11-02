@@ -10,11 +10,13 @@ import DevicesPanel from '../../components/panels/devices-panel';
 import BackupPanel from '../../components/panels/backup-panel';
 import { CloudPanel } from '../../components/panels/cloud-panel';
 import FolderSessionsPanel from '../../components/panels/folder-sessions-panel';
+import { MemoryExplorerPanel } from '../../components/panels/memory-explorer';
 
 const TABS = [
   { id: 'notes', label: 'Notes' },
   { id: 'tasks', label: 'Tasks' },
   { id: 'files', label: 'Files' },
+  { id: 'memory', label: 'Memory', title: 'Explore what your bots remember' },
   { id: 'phone', label: 'Phone', title: 'Control your phone' },
   { id: 'devices', label: 'Devices', title: 'Control KriyaDot from your phone' },
   { id: 'backup', label: 'Backup', title: 'Back up and restore your workspace' },
@@ -52,6 +54,8 @@ export default function WorkspacePage() {
           <NotesPanel hideHeader />
         ) : tab === 'tasks' ? (
           <TasksPanel hideHeader />
+        ) : tab === 'memory' ? (
+          <MemoryExplorerPanel />
         ) : tab === 'phone' ? (
           <PhonePanel />
         ) : tab === 'devices' ? (

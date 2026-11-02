@@ -5223,6 +5223,75 @@ html[data-ux='simple'] .chat-layout .msg.assistant.streaming {
   color: var(--text-2);
 }
 
+/* --- Auto route badge (OH-5): which model 'auto' picked for this turn --- */
+.routing-chip-auto {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* --- Memory used note (OH-3): cited memories under an assistant message --- */
+.memory-used-note {
+  margin-top: 6px;
+  max-width: 560px;
+}
+
+.memory-used-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  cursor: pointer;
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 700;
+  font-family: inherit;
+}
+
+.memory-used-head:hover {
+  color: var(--text);
+}
+
+.memory-used-list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 8px 10px;
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent) 6%, var(--surface));
+}
+
+.memory-used-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12.5px;
+}
+
+.memory-used-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.memory-used-cat {
+  font-size: 10.5px;
+  padding: 0 6px;
+}
+
 /* --- Sidebar: Universal entry as the primary row --- */
 .bot-roster .universal-item {
   background: color-mix(in srgb, var(--accent) 10%, var(--surface));

@@ -402,6 +402,16 @@ function isConfigured(providerId: string): boolean {
   }
 }
 
+/** OH-5: exported for the automatic model router (model-auto.ts). */
+export function isProviderConfigured(providerId: string): boolean {
+  return isConfigured(providerId);
+}
+
+/** OH-5: exported for the automatic model router (model-auto.ts). */
+export async function resolveProviderModels(providerId: string): Promise<ModelInfo[]> {
+  return resolveModels(providerId);
+}
+
 async function resolveModels(providerId: string): Promise<ModelInfo[]> {
   const preset = getProviderPreset(providerId) ?? getCustomProviderPreset(providerId);
   const catalogModels: ModelInfo[] = (preset?.models ?? []).map((m) => ({

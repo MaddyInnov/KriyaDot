@@ -1,0 +1,196 @@
+{
+  "provider": "mock",
+  "model": "mock-model",
+  "env": {
+    "node": "v24.22.1",
+    "platform": "linux/x64",
+    "date": "2026-11-02T07:00:00.558Z"
+  },
+  "summary": {
+    "total": 13,
+    "passed": 13,
+    "meanScore": 1,
+    "totalMs": 46,
+    "byCategory": {
+      "chat-routing": {
+        "total": 4,
+        "passed": 4,
+        "scoreSum": 4
+      },
+      "tool-spill": {
+        "total": 1,
+        "passed": 1,
+        "scoreSum": 1
+      },
+      "fix-the-bug": {
+        "total": 2,
+        "passed": 2,
+        "scoreSum": 2
+      },
+      "memory-recall": {
+        "total": 2,
+        "passed": 2,
+        "scoreSum": 2
+      },
+      "workflow-run": {
+        "total": 1,
+        "passed": 1,
+        "scoreSum": 1
+      },
+      "extract-values": {
+        "total": 2,
+        "passed": 2,
+        "scoreSum": 2
+      },
+      "follow-instructions": {
+        "total": 1,
+        "passed": 1,
+        "scoreSum": 1
+      }
+    }
+  },
+  "results": [
+    {
+      "id": "route-code-to-coder",
+      "category": "chat-routing",
+      "kind": "harness",
+      "score": 1,
+      "pass": true,
+      "ms": 2,
+      "detail": "routed to coder via keyword-score (path=specialist, confidence=1); expected coder/specialist"
+    },
+    {
+      "id": "route-writing-to-writer",
+      "category": "chat-routing",
+      "kind": "harness",
+      "score": 1,
+      "pass": true,
+      "ms": 1,
+      "detail": "routed to writer via keyword-score (path=specialist, confidence=0.69); expected writer/specialist"
+    },
+    {
+      "id": "route-finance-to-finance",
+      "category": "chat-routing",
+      "kind": "harness",
+      "score": 1,
+      "pass": true,
+      "ms": 0,
+      "detail": "routed to finance via keyword-score (path=specialist, confidence=0.6); expected finance/specialist"
+    },
+    {
+      "id": "route-unmatched-to-anchor",
+      "category": "chat-routing",
+      "kind": "harness",
+      "score": 1,
+      "pass": true,
+      "ms": 0,
+      "detail": "routed to chief via default (path=direct, confidence=0); expected chief/direct"
+    },
+    {
+      "id": "tool-spill-huge-result",
+      "category": "tool-spill",
+      "kind": "harness",
+      "score": 1,
+      "pass": true,
+      "ms": 3,
+      "detail": "original 120018 bytes spilled as spill_mvywsq6b_1; model payload 4433 bytes (bound 8192, ok; store-reported modelBytes=4029, compressionRatio=0.0335699645053242); paged read retrieved 120018 bytes in 16 pages, byte-identical=true; search('NEEDLE_TAIL_MARKER') totalMatches=1, ok=true"
+    },
+    {
+      "id": "fix-bug-cart-discount",
+      "category": "fix-the-bug",
+      "kind": "provider",
+      "score": 1,
+      "pass": true,
+      "ms": 3,
+      "usage": {
+        "promptTokens": 10,
+        "completionTokens": 5,
+        "totalTokens": 15
+      },
+      "detail": "all 4 assertions passed"
+    },
+    {
+      "id": "fix-bug-clamp-range",
+      "category": "fix-the-bug",
+      "kind": "provider",
+      "score": 1,
+      "pass": true,
+      "ms": 2,
+      "usage": {
+        "promptTokens": 10,
+        "completionTokens": 5,
+        "totalTokens": 15
+      },
+      "detail": "all 5 assertions passed"
+    },
+    {
+      "id": "memory-recall-deployment-window",
+      "category": "memory-recall",
+      "kind": "harness",
+      "score": 1,
+      "pass": true,
+      "ms": 14,
+      "detail": "expected atom at rank 1 of 3 hits"
+    },
+    {
+      "id": "memory-recall-project-codename",
+      "category": "memory-recall",
+      "kind": "harness",
+      "score": 1,
+      "pass": true,
+      "ms": 7,
+      "detail": "expected atom at rank 1 of 3 hits"
+    },
+    {
+      "id": "workflow-sequential-pipeline",
+      "category": "workflow-run",
+      "kind": "harness",
+      "score": 1,
+      "pass": true,
+      "ms": 14,
+      "detail": "run 74e29c30-689d-461c-8c2b-cc34ff2f0946 status=succeeded; summary output={\"title\":\"hello\",\"count\":2,\"upper\":[\"A\",\"B\"]}; expected {\"title\":\"hello\",\"count\":2,\"upper\":[\"A\",\"B\"]}"
+    },
+    {
+      "id": "extract-invoice-fields",
+      "category": "extract-values",
+      "kind": "provider",
+      "score": 1,
+      "pass": true,
+      "ms": 0,
+      "usage": {
+        "promptTokens": 10,
+        "completionTokens": 5,
+        "totalTokens": 15
+      },
+      "detail": "all 5 fields exact"
+    },
+    {
+      "id": "extract-event-dates",
+      "category": "extract-values",
+      "kind": "provider",
+      "score": 1,
+      "pass": true,
+      "ms": 0,
+      "usage": {
+        "promptTokens": 10,
+        "completionTokens": 5,
+        "totalTokens": 15
+      },
+      "detail": "all 4 fields exact"
+    },
+    {
+      "id": "follow-json-only",
+      "category": "follow-instructions",
+      "kind": "provider",
+      "score": 1,
+      "pass": true,
+      "ms": 0,
+      "usage": {
+        "promptTokens": 10,
+        "completionTokens": 5,
+        "totalTokens": 15
+      },
+      "detail": "exact JSON-only reply"
+    }
+  ]
+}

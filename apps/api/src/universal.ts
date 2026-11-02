@@ -31,15 +31,30 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import {
+  blendRank,
+  cosineSimilarity,
+  isSemanticEmbedder,
   openDb,
   scoreBotsForRouting,
   type BotConfig,
   type RouterWeights,
+  type SyncEmbedder,
 } from '@mvp/agent-runtime';
 
 export type UniversalPath = 'direct' | 'specialist' | 'split';
 
 export type UniversalRouteVia = 'mention' | 'split-rules' | 'keyword-score' | 'default' | 'cloud';
+
+/** OH-2 blend detail recorded on a decision when semantic blending ran. */
+export interface UniversalBlendInfo {
+  semanticActive: boolean;
+  /** Blended score of the winning bot (0..1 blendRank scale). */
+  winnerScore: number;
+  /** Winner's normalized keyword score inside the blend. */
+  keywordScore: number;
+  /** Winner's embedding cosine, or null when unavailable. */
+  semanticScore: number | null;
+}
 
 export interface UniversalRouteDecision {
   path: UniversalPath;
@@ -51,6 +66,8 @@ export interface UniversalRouteDecision {
   /** 0..1 — heuristic confidence (1 for mention-forced routes). */
   confidence: number;
   via: UniversalRouteVia;
+  /** OH-2: present only when the semantic blend lane ran (additive). */
+  blend?: UniversalBlendInfo;
 }
 
 /** Minimum keyword score for an unforced specialist route. */
@@ -172,6 +189,7 @@ export function decideUniversalRoute(
   bots: BotConfig[],
   anchor: BotConfig,
   weights?: RouterWeights,
+  opts?: { embedder?: SyncEmbedder },
 ): UniversalRouteDecision {
   // 1. Explicit @mention forces the named bot.
   const mentioned = parseBotMention(text, bots);
@@ -222,6 +240,61 @@ export function decideUniversalRoute(
       })),
       weights,
     );
+    // OH-2: semantic blend lane. CONSERVATIVE ACTIVATION: blending runs
+    // ONLY when a non-hash (neural/onnx) embedder is active — the
+    // trigram fallback is lexical too, so blending it would double-count
+    // keyword overlap and could flip keyword-proven winners. With a real
+    // embedder, the blended ranking may pick the winner; the specialist
+    // gates then apply to the BLENDED outcome (winner blended score +
+    // winner share of total blended score). When the blended gate does
+    // not clear, the keyword gate below still applies unchanged, so
+    // keyword-only behavior remains the fallback in every other case.
+    if (opts?.embedder && isSemanticEmbedder(opts.embedder)) {
+      try {
+        const routingTexts = candidates.map(
+          (b) => `${b.name}. ${b.description ?? ''} ${(b.routeKeywords ?? []).join(' ')}`,
+        );
+        const vectors = opts.embedder.embedSync([text, ...routingTexts]);
+        const queryVec = vectors[0];
+        if (queryVec) {
+          const blended = blendRank(
+            candidates.map((b, i) => ({
+              id: b.id,
+              keywordScore: scored[i]!.score,
+              semanticScore: vectors[i + 1] ? cosineSimilarity(queryVec, vectors[i + 1]!) : undefined,
+            })),
+            { semanticActive: true },
+          );
+          const top = blended.hits[0];
+          const blendedTotal = blended.hits.reduce((acc, h) => acc + h.score, 0);
+          const blendedConfidence = blendedTotal > 0 && top ? Math.round((top.score / blendedTotal) * 100) / 100 : 0;
+          if (top && top.score >= 0.35 && blendedConfidence >= SPECIALIST_MIN_CONFIDENCE) {
+            const bot = candidates.find((b) => b.id === top.id)!;
+            const kw = scored.find((s) => s.botId === top.id);
+            const hits = [...new Set(kw?.hits ?? [])].slice(0, 4).join(', ');
+            return {
+              path: 'specialist',
+              botId: bot.id,
+              botName: bot.name,
+              reason:
+                `strong domain match for ${bot.name} (${hits || 'semantic match'})` +
+                ` [semantic blend: score ${top.score.toFixed(2)}, cosine ${top.semanticScore?.toFixed(2) ?? 'n/a'}]`,
+              confidence: blendedConfidence,
+              via: 'keyword-score',
+              blend: {
+                semanticActive: true,
+                winnerScore: top.score,
+                keywordScore: top.keywordScore,
+                semanticScore: top.semanticScore,
+              },
+            };
+          }
+        }
+      } catch {
+        // Embedder failure must never break routing — keyword gate below.
+      }
+    }
+
     const total = scored.reduce((acc, s) => acc + s.score, 0);
     let winner = scored[0]!;
     for (const s of scored) if (s.score > winner.score) winner = s;

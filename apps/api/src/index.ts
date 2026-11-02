@@ -14,7 +14,7 @@
 import cors from 'cors';
 import express from 'express';
 import fs from 'node:fs';
-import { createRequire } from 'node:module';
+import { createRequire, enableCompileCache } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -142,6 +142,8 @@ import {
   OnBehalfOfLedger,
 } from '@mvp/agent-runtime';
 import { createMemoryUpkeepRouter, startMemoryUpkeep, aboutMeContext } from './memory-upkeep-routes.js';
+import { createMemoryIngestionRouter } from './memory-ingestion-routes.js';
+import { startMemoryIngestionScheduler } from './memory-ingestion.js';
 import {
   TurnTracker,
   OrphanLedger,
@@ -318,6 +320,18 @@ import { createWsElicitationBridge, registerCompanionElicitationSurface } from '
 import { SessionOverlayStore } from './session-overlays.js';
 import type { SessionCommandService } from './session-commands-routes.js';
 import { CostTracker, SpendCapStore } from '@mvp/billing';
+
+// Pack B footprint: enable Node's module compile cache as the first
+// executable step. The static import graph above is already loaded by the
+// time this runs, but the dozens of route/service modules boot() pulls in
+// via dynamic import() are parsed on every cold start; with the cache
+// (default dir under the OS temp dir, or $NODE_COMPILE_CACHE) repeat boots
+// skip that parse work. Guarded: older Node without the API just skips it.
+try {
+  enableCompileCache();
+} catch {
+  // Compile cache is a pure optimization; absence must never break boot.
+}
 
 // Pipe/JSON chat mode: `mvp-server chat --bot <id> [--json]`. Parsed at the
 // very top, before boot(), so `chat` never starts the HTTP server.
@@ -911,7 +925,7 @@ async function boot(): Promise<void> {
     // CN-4..CN-8 + CN-3: verified Composio app capabilities and the
     // first-party Google Workspace entry join the curated feature table.
     features: [...PRODUCT_FEATURES, ...composioAppCapabilityFeatures(), googleWorkspaceCapabilityFeature()],
-  });
+  }, { embedder: platformEmbedder });
   registerCapabilityTools({ registry: toolRegistry, service: capabilityService });
   // CN-3: first-party Google Workspace tools (Gmail/Calendar/Drive) on
   // the existing OAuth framework — fail closed until the founder's
@@ -1291,7 +1305,7 @@ async function boot(): Promise<void> {
       // The tool is bound to THIS bot's spill store, so it rides the
       // per-bot extras channel (agentRuntime is initialized by the time
       // any turn runs; same late-binding pattern as the worktree hook).
-      const spill: ToolDefinition[] = bot ? agentRuntime.createSpillTools(bot) : [];
+      const spill: ToolDefinition[] = bot ? agentRuntime.createSpillTools(bot, { handleTools: true }) : [];
       return [...perBotMcpManager.toolDefinitions(botId), ...local, ...spill];
     },
     governance: governanceAdapter,
@@ -1371,6 +1385,18 @@ async function boot(): Promise<void> {
     // rates, and token cost per bot turn. Metadata-tier only, guarded.
     telemetry,
   });
+
+  // OH-7: span exporters (Langfuse / OTLP) — no-op unless LANGFUSE_* or
+  // OTEL_EXPORTER_OTLP_ENDPOINT is configured. Null-store safe; exporter
+  // names only are logged, never keys/endpoints.
+  const { attachSpanExporters } = await import('@mvp/agent-runtime');
+  const spanStoreForExport = agentRuntime.getSpanStore();
+  const spanExport: import('@mvp/agent-runtime').SpanExportHandle = spanStoreForExport
+    ? attachSpanExporters(spanStoreForExport, process.env)
+    : { exporters: [], flush: async () => {}, close: () => {} };
+  if (spanExport.exporters.length > 0) {
+    console.log(`[observability] span exporters active: ${spanExport.exporters.join(', ')}`);
+  }
 
   // Lossless-compaction recall tool (Octomind parity): bots dereference
   // compaction archive ids from summary headers back to the original
@@ -4507,6 +4533,8 @@ async function boot(): Promise<void> {
       // Front-door Part 5: cloud-only gate + per-task cloud proxying.
       placementStore,
       instanceRole: frontdoorRole,
+      // OH-2: blended routing lane (activates only on a non-hash embedder).
+      embedder: platformEmbedder,
     }),
   );
 
@@ -4736,6 +4764,29 @@ async function boot(): Promise<void> {
   }
   // Capability registry endpoint (Muse closure ADD-2) + user guide (ADD-3).
   app.use('/api/capabilities', createCapabilitiesRouter({ service: capabilityService }));
+  // OH-4: opt-in account ingestion into bot memory (OFF by default) +
+  // its 30-min scheduler. Guards: system pause, Privacy Mode, local-only.
+  {
+    const ingestionDeps = {
+      dataDir: config.dataDir,
+      tieredMemoryStore,
+      getBot: (botId: string) => botsById.get(botId),
+      workspaceDirForBot: workspaceDirForBotConfig,
+      isPaused: () => pauseRegistry.isPaused(),
+      isLocalOnly: (botId: string) => placementStore.isLocalOnly(botId),
+    };
+    app.use(
+      '/api/memory-ingestion',
+      createMemoryIngestionRouter({
+        ...ingestionDeps,
+        getBots: () => seed.bots,
+      }),
+    );
+    startMemoryIngestionScheduler({
+      ...ingestionDeps,
+      getBotIds: () => seed.bots.map((b) => b.id),
+    });
+  }
   app.use(
     '/api/guide',
     createGuideRouter({
@@ -5289,6 +5340,31 @@ async function boot(): Promise<void> {
     setTimeout(sweepCheckpoints, 90_000).unref();
     setInterval(sweepCheckpoints, 24 * 60 * 60 * 1000).unref();
   }
+  // Span retention (Pack B footprint): the observability DB otherwise
+  // grows without bound on an always-on install. Daily sweep (first run
+  // shortly after boot) pruning ended runs past the age/count caps;
+  // env-tunable via KRIYADOT_SPAN_RETENTION_DAYS / KRIYADOT_SPAN_MAX_RUNS.
+  {
+    const sweepSpans = () => {
+      try {
+        const store = agentRuntime.getSpanStore();
+        if (!store) return;
+        const days = Number(process.env.KRIYADOT_SPAN_RETENTION_DAYS);
+        const maxRuns = Number(process.env.KRIYADOT_SPAN_MAX_RUNS);
+        const res = store.pruneOldRuns({
+          maxAgeMs: (Number.isFinite(days) && days > 0 ? days : 30) * 24 * 60 * 60 * 1000,
+          maxRuns: Number.isFinite(maxRuns) && maxRuns > 0 ? Math.floor(maxRuns) : 20_000,
+        });
+        if (res.runsRemoved > 0) {
+          console.log(`[observability] span retention pruned ${res.runsRemoved} run(s), ${res.spansRemoved} span(s)`);
+        }
+      } catch {
+        // Retention must never break boot or the server loop.
+      }
+    };
+    setTimeout(sweepSpans, 120_000).unref();
+    setInterval(sweepSpans, 24 * 60 * 60 * 1000).unref();
+  }
   app.get('/_kriyadot/', (_req, res) => {
     try {
       res.type('html').send(
@@ -5509,6 +5585,13 @@ async function boot(): Promise<void> {
     }
     try {
       governance.close();
+    } catch {
+      // ignore
+    }
+    try {
+      // OH-7: flush + close span exporters last (best-effort).
+      await spanExport.flush();
+      spanExport.close();
     } catch {
       // ignore
     }

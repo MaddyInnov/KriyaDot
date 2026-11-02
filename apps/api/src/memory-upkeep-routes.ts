@@ -47,11 +47,39 @@ import {
   writeAboutMe,
 } from '@mvp/agent-runtime';
 import { MemoryBackupStore, adoptMemoryPack, doctorMemory, exportMemoryPack, type MemoryPack } from './memory-pack.js';
+import { getProviderPreset, resolveApiKey } from '@mvp/agent-runtime';
+import { buildBotChatFn } from './memory-fabric.js';
+import { citationsFromAtoms } from './memory-citations.js';
+
+/** OH-3: is the bot's provider usable without new user setup? Local/keyless lanes count as configured. */
+export function defaultBotProviderConfigured(bot: import('@mvp/agent-runtime').BotConfig): boolean {
+  try {
+    const preset = getProviderPreset(bot.provider ?? 'groq');
+    if (preset?.local || preset?.keyless) return true;
+    return Boolean(resolveApiKey(bot.provider ?? 'groq'));
+  } catch {
+    return false;
+  }
+}
 
 export interface MemoryUpkeepRouterDeps {
   dataDir: string;
   tieredMemoryStore: TieredMemoryStore;
   getBots: () => Array<{ id: string }>;
+  /**
+   * OH-3: full bot lookup for the memory ask endpoint (grounded LLM
+   * answers use the bot's own provider/model). Optional — without it
+   * (or without a configured provider) /ask stays extractive.
+   */
+  getBotById?: (botId: string) => import('@mvp/agent-runtime').BotConfig | undefined;
+  /** OH-3: injectable grounded-answer chat fn (tests mock the provider). */
+  askChatFn?: (
+    bot: import('@mvp/agent-runtime').BotConfig,
+    question: string,
+    atoms: import('@mvp/agent-runtime').AtomCard[],
+  ) => Promise<string | null>;
+  /** OH-3: injectable provider-configured check (default: catalog + key resolution). */
+  isProviderConfigured?: (bot: import('@mvp/agent-runtime').BotConfig) => boolean;
   /** Verifier gate for near-duplicate merges (#80). Defaults to buildGroundedMergeVerifier() so the gate is LIVE. */
   mergeVerifier?: (keep: import('@mvp/agent-runtime').AtomCard, duplicate: import('@mvp/agent-runtime').AtomCard, similarity: number) => boolean;
   /** Per-privacy-tier hot-atom budgets (#80 watermarks). */
@@ -299,6 +327,12 @@ export function createMemoryUpkeepRouter(deps: MemoryUpkeepRouterDeps): Router {
         const re = new RegExp('^' + pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$', 'i');
         atoms = atoms.filter((a) => re.test(a.fact));
       }
+      // OH-3 explorer filters (additive): `q` = case-insensitive substring
+      // over the fact text; `category` = exact memory category.
+      const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+      if (q) atoms = atoms.filter((a) => a.fact.toLowerCase().includes(q));
+      const category = typeof req.query.category === 'string' ? req.query.category.trim() : '';
+      if (category) atoms = atoms.filter((a) => a.category === category);
       res.json({
         ok: true,
         botId,
@@ -346,6 +380,82 @@ export function createMemoryUpkeepRouter(deps: MemoryUpkeepRouterDeps): Router {
       return;
     }
     res.json({ ok: true, deleted: req.params.id });
+  });
+
+  // -- OH-3: memory explorer — stats + cited ask ------------------------------
+  // GET /api/memory/stats?botId → { ok, botId, total, byCategory }
+  router.get('/stats', (req, res) => {
+    const botId = typeof req.query.botId === 'string' ? req.query.botId : '';
+    if (!botId || !deps.getBots().some((b) => b.id === botId)) {
+      res.status(400).json(errorBody('query param "botId" (a known bot) is required'));
+      return;
+    }
+    try {
+      const atoms = deps.tieredMemoryStore.getAtoms(botId, 20000);
+      const byCategory: Record<string, number> = {};
+      for (const a of atoms) byCategory[a.category] = (byCategory[a.category] ?? 0) + 1;
+      res.json({ ok: true, botId, total: atoms.length, byCategory });
+    } catch (err) {
+      res.status(500).json(errorBody('Failed to compute memory stats', err instanceof Error ? err.message : String(err)));
+    }
+  });
+
+  // POST /api/memory/ask { botId, question } →
+  //   { ok, botId, question, answer, citations: [{ atomId, fact, category }], mode: 'llm' | 'extractive' }
+  // Grounded LLM answers are used ONLY when the bot's provider is
+  // already configured; otherwise the top recalled atoms are rendered
+  // extractively as the answer (deterministic, zero model calls).
+  router.post('/ask', async (req, res) => {
+    let botId: string;
+    try {
+      botId = requireBotId(req.body, deps.getBots);
+    } catch (err) {
+      res.status(400).json(errorBody(err instanceof Error ? err.message : 'Invalid request'));
+      return;
+    }
+    const question = typeof (req.body as { question?: unknown })?.question === 'string'
+      ? ((req.body as { question: string }).question).trim()
+      : '';
+    if (!question) {
+      res.status(400).json(errorBody('"question" is required'));
+      return;
+    }
+    try {
+      const atoms = deps.tieredMemoryStore.searchAtoms(botId, question, 8);
+      const citations = citationsFromAtoms(atoms);
+      const bot = deps.getBotById?.(botId);
+      const configured = bot
+        ? (deps.isProviderConfigured ? deps.isProviderConfigured(bot) : defaultBotProviderConfigured(bot))
+        : false;
+      if (bot && configured && atoms.length > 0) {
+        try {
+          let answer: string | null = null;
+          if (deps.askChatFn) {
+            answer = await deps.askChatFn(bot, question, atoms);
+          } else {
+            const chat = buildBotChatFn(bot);
+            if (chat) {
+              answer = await chat(
+                'Answer the question using ONLY the memories listed by the user message. If the memories do not contain the answer, say so plainly. Do not invent facts.',
+                `Question: ${question}\n\nMemories:\n${atoms.map((a, i) => `${i + 1}. ${a.fact}`).join('\n')}`,
+              );
+            }
+          }
+          if (answer && answer.trim()) {
+            res.json({ ok: true, botId, question, answer: answer.trim(), citations, mode: 'llm' as const });
+            return;
+          }
+        } catch {
+          // LLM failure degrades to extractive — never an error surface.
+        }
+      }
+      const answer = atoms.length > 0
+        ? atoms.map((a) => `- ${a.fact}`).join('\n')
+        : 'No memories matched that question yet.';
+      res.json({ ok: true, botId, question, answer, citations, mode: 'extractive' as const });
+    } catch (err) {
+      res.status(500).json(errorBody('Memory ask failed', err instanceof Error ? err.message : String(err)));
+    }
   });
 
   // -- Memory portability (item 12) ------------------------------------------

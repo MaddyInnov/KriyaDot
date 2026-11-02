@@ -34,8 +34,14 @@ export interface ModelControlProvider {
   models: { id: string; name: string }[];
 }
 
+/** The sentinel model id for per-message auto routing (OH-5). Selecting
+ *  it goes through the same onSelectModel path as any other model — the
+ *  API resolves 'auto' per message from the configured providers. */
+export const AUTO_MODEL_ID = 'auto';
+
 /** One selectable row in the popover's flattened, filter-aware order. */
 type FlatEntry =
+  | { kind: 'auto'; key: string }
   | { kind: 'default'; key: string }
   | { kind: 'model'; key: string; providerId: string; modelId: string };
 
@@ -149,6 +155,7 @@ export function ModelControl(props: ModelControlProps) {
     }
     const currentIdx = flatRef.current.findIndex(
       (e) =>
+        (e.kind === 'auto' && modelId === AUTO_MODEL_ID) ||
         (e.kind === 'default' && modelId === '') ||
         (e.kind === 'model' && e.providerId === providerId && e.modelId === modelId),
     );
@@ -156,16 +163,22 @@ export function ModelControl(props: ModelControlProps) {
     searchRef.current?.focus();
   }, [open ]);
 
+  const isAuto = modelId === AUTO_MODEL_ID;
   const currentProvider = providers.find((p) => p.id === providerId);
   const providerLabel = currentProvider?.name ?? providerId ?? 'Provider';
-  const modelLabel = modelId
-    ? (currentProvider?.models.find((m) => m.id === modelId)?.name ?? modelId)
-    : botDefaultLabel;
+  const modelLabel = isAuto
+    ? 'Auto'
+    : modelId
+      ? (currentProvider?.models.find((m) => m.id === modelId)?.name ?? modelId)
+      : botDefaultLabel;
 
   // --- Search / filter ---------------------------------------------------
   const q = query.trim().toLowerCase();
   const searching = q.length > 0;
   const matchesText = (text: string) => text.toLowerCase().includes(q);
+  // The Auto row stays visible only for an empty term or one matching
+  // 'auto' — the same section-hiding rule the other rows follow.
+  const autoVisible = !searching || matchesText('auto');
   const botDefaultVisible =
     !searching || matchesText('Bot default') || matchesText(botDefaultLabel);
   const visibleGroups = providers
@@ -185,6 +198,7 @@ export function ModelControl(props: ModelControlProps) {
     .filter((g) => g.models.length > 0 || (!searching && g.provider.models.length === 0));
 
   const flat: FlatEntry[] = [];
+  if (autoVisible) flat.push({ kind: 'auto', key: 'auto' });
   if (botDefaultVisible) flat.push({ kind: 'default', key: 'default' });
   for (const g of visibleGroups) {
     for (const m of g.models) {
@@ -204,6 +218,7 @@ export function ModelControl(props: ModelControlProps) {
   const choose = (entry: FlatEntry) => {
     setOpen(false);
     if (entry.kind === 'default') onSelectBotDefault();
+    else if (entry.kind === 'auto') onSelectModel(providerId, AUTO_MODEL_ID);
     else onSelectModel(entry.providerId, entry.modelId);
   };
 
@@ -245,7 +260,7 @@ export function ModelControl(props: ModelControlProps) {
       >
         <span className="model-control-glyph" aria-hidden="true">◈</span>
         <span className="model-control-label">
-          {providerLabel} · {modelLabel}
+          {isAuto ? 'Auto' : `${providerLabel} · ${modelLabel}`}
         </span>
         <span className="model-control-chevron" aria-hidden="true">▾</span>
       </button>
@@ -269,6 +284,20 @@ export function ModelControl(props: ModelControlProps) {
           </div>
           <div className="mc-section">
             <div className="mc-heading">Model</div>
+            {autoVisible && (
+              <button
+                type="button"
+                id={`mc-opt-${indexByKey.get('auto')}`}
+                className={`mc-row mc-row-stack${isAuto ? ' current' : ''}${hl === indexByKey.get('auto') ? ' highlighted' : ''}`}
+                aria-pressed={isAuto}
+                onMouseEnter={() => setHighlight(indexByKey.get('auto') ?? 0)}
+                onClick={() => choose({ kind: 'auto', key: 'auto' })}
+              >
+                <span className="mc-row-name">Auto — pick per message</span>
+                <span className="mc-row-sub">Chooses from your configured providers per message shape</span>
+                {isAuto && <span className="mc-check" aria-hidden="true">✓</span>}
+              </button>
+            )}
             {botDefaultVisible && (
               <button
                 type="button"

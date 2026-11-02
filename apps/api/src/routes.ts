@@ -140,6 +140,9 @@ import { saveBotVoice } from './bot-voice.js';
 import { saveBotApprovalModeForBot } from './bot-approval-modes.js';
 import { saveBotLayersForBot } from './bot-layers.js';
 import { buildBotChatFn, saveBotMemorySettings, wireMemoryDistillers } from './memory-fabric.js';
+import { MessageMetaStore } from './message-meta.js';
+import { citationsFromPack, type MemoryCitation } from './memory-citations.js';
+import { AUTO_MODEL_SENTINEL, recordAutoModelDecision, resolveAutoModel } from './model-auto.js';
 import { createMemoryFabricRouter } from './memory-fabric-routes.js';
 import { createMemoryUpkeepRouter } from './memory-upkeep-routes.js';
 import { createCrashRecoveryRouter } from './crash-recovery.js';
@@ -532,6 +535,11 @@ export function createRouter(deps: RouteDeps): express.Router {
   // and the billing routes serve GET /api/usage/breakdown from the same
   // store. Declared up front so the chat route closure can reach it.
   const costTracker = new CostTracker(join(config.dataDir, 'billing.db'));
+
+  // OH-3/OH-5: per-message metadata sidecar (message-meta.db) — cited
+  // recall (`memoryUsed`) and auto model routing (`modelRoute`) persist
+  // against the assistant message a turn produced, additively.
+  const messageMetaStore = new MessageMetaStore(config.dataDir);
 
   // Spend-cap enforcement (OpenMausBot parity P1 #21): attach the default
   // gate factory to the runtime so every runTurn (chat, group rooms,
@@ -1314,6 +1322,8 @@ export function createRouter(deps: RouteDeps): express.Router {
       dataDir: config.dataDir,
       tieredMemoryStore,
       getBots: () => bots.map((b) => ({ id: b.id })),
+      // OH-3: full bot lookup so /memory/ask can use the bot's provider.
+      getBotById: (id: string) => bots.find((b) => b.id === id),
       // CA-37: incognito sessions never distill into long-term memory.
       allowsMemoryWrite: (sessionId) => agentRuntime.sessionAllowsMemoryWrite(sessionId),
     }),
@@ -1939,6 +1949,13 @@ export function createRouter(deps: RouteDeps): express.Router {
     // Tiered-memory per-turn accumulators (reset in runOneTurn).
     let turnAssistantText = '';
     let turnToolCalls: string[] = [];
+    // OH-3/OH-5: the CURRENT turn's response meta (set by runOneTurn
+    // before the turn executes; read by onEvent to augment the SSE
+    // `done` frame). Absent fields stay absent from the payload.
+    let activeTurnMeta: {
+      memoryUsed?: MemoryCitation[];
+      modelRoute?: { chosen: string; reason: string };
+    } = {};
     res.on('close', () => {
       closed = true;
       clearInterval(heartbeat);
@@ -2020,7 +2037,23 @@ export function createRouter(deps: RouteDeps): express.Router {
           }
         }
       }
-      res.write(`data: ${serializeEvent(event)}\n\n`);
+      // OH-3/OH-5: the turn's final SSE frame carries memoryUsed /
+      // modelRoute (when the turn produced them) so the web can render
+      // citations + the auto-model choice live. Additive fields only.
+      if (
+        event.type === 'done' &&
+        (activeTurnMeta.memoryUsed !== undefined || activeTurnMeta.modelRoute !== undefined)
+      ) {
+        res.write(
+          `data: ${JSON.stringify({
+            ...event,
+            ...(activeTurnMeta.memoryUsed ? { memoryUsed: activeTurnMeta.memoryUsed } : {}),
+            ...(activeTurnMeta.modelRoute ? { modelRoute: activeTurnMeta.modelRoute } : {}),
+          })}\n\n`,
+        );
+      } else {
+        res.write(`data: ${serializeEvent(event)}\n\n`);
+      }
     };
 
     // W8h: build the streaming-TTS pipeline for this request when the
@@ -2203,6 +2236,14 @@ export function createRouter(deps: RouteDeps): express.Router {
         memoryPack = undefined;
         memoryContext = undefined; // memory must never break chat
       }
+      // OH-3: citations from the SAME pack the prompt block was rendered
+      // from — what gets cited is exactly what the model was shown.
+      const turnMemoryUsed = citationsFromPack(memoryPack);
+      // OH-5: auto-model decision for this turn (set below when the
+      // bot's model is the 'auto' sentinel and nothing explicit wins).
+      let turnModelRoute: { chosen: string; reason: string } | undefined;
+      let autoProviderId: string | undefined;
+      let autoModel: string | undefined;
       // Departments: the bot's department instructions ride the same
       // context channel into the system prompt.
       try {
@@ -2238,6 +2279,37 @@ export function createRouter(deps: RouteDeps): express.Router {
       } catch {
         // Force-load must never break chat.
       }
+      // OH-5: automatic model routing. Only when the bot's effective
+      // model is the 'auto' sentinel AND no explicit choice wins:
+      // per-turn overrides (turnOpts.model) and space overrides beat
+      // auto, and explicit (non-'auto') bot picks are never touched.
+      try {
+        if (
+          bot.model === AUTO_MODEL_SENTINEL &&
+          !turnOpts.model &&
+          !spaceCtx?.space.modelOverride &&
+          !visionModelOverride
+        ) {
+          const decision = resolveAutoModel(bot, turnMessage, {
+            hasTools: Array.isArray(bot.tools) && bot.tools.length > 0,
+          });
+          autoProviderId = decision.providerId;
+          autoModel = decision.model;
+          turnModelRoute = { chosen: decision.chosen, reason: decision.reason };
+          recordAutoModelDecision(config.dataDir, bot.id, decision);
+        }
+      } catch {
+        // Auto routing must never break chat — the turn falls back to
+        // the runtime's own model resolution.
+        autoProviderId = undefined;
+        autoModel = undefined;
+        turnModelRoute = undefined;
+      }
+      // Publish this turn's meta for the SSE done-frame augmentation.
+      activeTurnMeta = {
+        ...(turnMemoryUsed ? { memoryUsed: turnMemoryUsed } : {}),
+        ...(turnModelRoute ? { modelRoute: turnModelRoute } : {}),
+      };
       // Run-health turn telemetry (features #2/#5): latency, tokens, errors
       // are recorded for health scoring + regression detection. The
       // try/finally guarantees a sample even when the turn throws, and the
@@ -2316,11 +2388,13 @@ export function createRouter(deps: RouteDeps): express.Router {
           // Per-bot computers (P1 #14): this chat's conversation id, so a
           // pinned "Works on" surface for this conversation applies.
           conversationId: body.sessionId,
-          providerId: visionProviderId ?? turnOpts.providerId,
+          providerId: visionProviderId ?? turnOpts.providerId ?? autoProviderId,
           // Spaces: an explicit call-site model wins; otherwise the space's
           // model override applies (bot pin / smart routing as before when unset).
           // The vision fallback (#38) outranks both when it upgraded the turn.
-          model: visionModelOverride ?? turnOpts.model ?? spaceCtx?.space.modelOverride,
+          // OH-5: the auto-model choice applies only when none of the
+          // explicit winners above named a model.
+          model: visionModelOverride ?? turnOpts.model ?? spaceCtx?.space.modelOverride ?? autoModel,
           taskType: turnOpts.taskType,
           signal: turnController!.signal,
           autoApprove: turnOpts.autoApprove,
@@ -2511,10 +2585,37 @@ export function createRouter(deps: RouteDeps): express.Router {
           // reflection bookkeeping must never break chat
         }
       }
+      // OH-3/OH-5: persist this turn's meta against the assistant
+      // message the turn produced (sidecar store; additive only). The
+      // last assistant message in the thread is this turn's reply.
+      if (sessionKey && (turnMemoryUsed !== undefined || turnModelRoute !== undefined)) {
+        try {
+          const store = agentRuntime.sessionStore as unknown as {
+            listThreadMessages?: (id: string) => Array<{ id: number | string; role: string }>;
+          };
+          if (typeof store.listThreadMessages === 'function') {
+            const msgs = store.listThreadMessages(sessionKey);
+            const lastAssistant = [...msgs].reverse().find((m) => m.role === 'assistant');
+            if (lastAssistant) {
+              if (turnMemoryUsed) messageMetaStore.set(sessionKey, String(lastAssistant.id), 'memoryUsed', turnMemoryUsed);
+              if (turnModelRoute) messageMetaStore.set(sessionKey, String(lastAssistant.id), 'modelRoute', turnModelRoute);
+            }
+          }
+        } catch {
+          // Meta persistence must never break chat.
+        }
+      }
       // The runtime should emit done/error itself; emit a terminal event only
       // if it resolved without one so clients never hang.
       if (!terminalEmitted && !closed) {
-        res.write(`data: ${JSON.stringify({ type: 'done', usage: null })}\n\n`);
+        res.write(
+          `data: ${JSON.stringify({
+            type: 'done',
+            usage: null,
+            ...(turnMemoryUsed ? { memoryUsed: turnMemoryUsed } : {}),
+            ...(turnModelRoute ? { modelRoute: turnModelRoute } : {}),
+          })}\n\n`,
+        );
       }
     };
 

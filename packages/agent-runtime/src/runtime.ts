@@ -134,7 +134,7 @@ import { TrigramEmbedder, type SyncEmbedder } from './hybrid-search.js';
 import { SteerQueue } from './steer.js';
 import { filterToolsForMode, type ConversationMode } from './conversation-modes.js';
 import { fitToolsToLimit, selectToolsByIntentSync } from './tool-fitting.js';
-import { ToolSpillStore, createSpillTools } from './tool-spill.js';
+import { ToolSpillStore, createSpillTools, type SpillMetrics } from './tool-spill.js';
 import { makeToolHistoryEntry } from './history-entry.js';
 import { providerHealth } from './failover.js';
 import { join, dirname } from 'node:path';
@@ -866,7 +866,7 @@ export class AgentRuntime {
   isTurnRunning(sessionId: string): boolean { return Boolean(this.turnStates.snapshot(sessionId)); }
   getContextBudget(sessionId: string): ReturnType<SessionStore['getContextBudget']> { return this.store.getContextBudget(sessionId); }
   spillStoreFor(bot: BotConfig, threshold?: number): ToolSpillStore { const ws = this.workspaceDirForBot?.(bot); const dir = ws ? join(ws, 'spill') : join(dirname(this.dbPath === ':memory:' ? join(process.cwd(), 'agent.db') : this.dbPath), 'spill', bot.id); const key = dir + ':' + (threshold ?? ''); let st = this.spillStores.get(key); if (!st) { st = new ToolSpillStore(dir, threshold); this.spillStores.set(key, st); } return st; }
-  createSpillTools(bot: BotConfig): ToolDefinition[] { return createSpillTools(this.spillStoreFor(bot)); }
+  createSpillTools(bot: BotConfig, opts: { handleTools?: boolean } = {}): ToolDefinition[] { return createSpillTools(this.spillStoreFor(bot), opts); }
   /**
    * Parallel threads (W8g): per-bot cap of 16 concurrent turns. Turns
    * for different threads/bots never serialize on each other — a turn
@@ -1725,6 +1725,9 @@ ${record.priorContext ?? ''}`;
     let turnSpanId: string | null = null;
     let turnOutcome: RunOutcome = 'success';
     let turnError: string | undefined;
+    // OH-1: compression/spill metrics for this turn, recorded onto the
+    // turn span at finalize time (compression ratio queryable there).
+    const spillMetrics: SpillMetrics[] = [];
     const spanStart = (
       kind: SpanKind,
       name: string,
@@ -3753,7 +3756,7 @@ ${revised}` });
             }
           }
           const rawToolText = typeof result === 'string' ? result : JSON.stringify(result);
-          const spillRef = (() => { try { return this.spillStoreFor(opts.bot, opts.spillThresholdBytes).maybeSpill(call.name, rawToolText); } catch { return null; } })();
+          const spillRef = (() => { try { return this.spillStoreFor(opts.bot, opts.spillThresholdBytes).maybeSpill(call.name, rawToolText, { verbatim: def.verbatimResults === true, onMetrics: (m) => { spillMetrics.push(m); } }); } catch { return null; } })();
           const modelToolText = spillRef ? this.spillStoreFor(opts.bot, opts.spillThresholdBytes).formatForModel(call.name, spillRef) : rawToolText;
           const toolMsg: ChatMessage = {
             role: 'tool',
@@ -3840,7 +3843,11 @@ ${revised}` });
       if (spanStore && spanRunId) {
         try {
           const status = turnOutcome === 'success' ? 'ok' : 'error';
-          spanEnd(turnSpanId, { status, error: turnError });
+          spanEnd(turnSpanId, {
+            status,
+            error: turnError,
+            ...(spillMetrics.length > 0 ? { payload: { spillMetrics } } : {}),
+          });
           spanEnd(sessionSpanId, { status, error: turnError });
           const loops = detectLoops(spanStore.listSpans(spanRunId));
           if (loops.length > 0) spanStore.flagLoop(spanRunId, loops);
