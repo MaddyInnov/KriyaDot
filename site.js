@@ -1,17 +1,82 @@
 // SPDX-License-Identifier: Apache-2.0
-// KriyaDot landing site behaviour: live star count, mobile nav,
-// scroll reveal, and the self-playing "watch it write code" demo.
+// KriyaDot landing site behaviour: manual light/dark theme toggle
+// (persisted in localStorage), the frontdoor health probe that adapts
+// the primary CTA to the hosting mode, live star count, mobile nav,
+// scroll reveal, and the screenshot lightbox.
 (function () {
   'use strict';
   var reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* ---- theme toggle ----
+     The initial theme is set by the inline bootstrap in index.html
+     (saved choice, else prefers-color-scheme). Toggling flips
+     html[data-theme] and persists the choice. */
+  var toggle = document.getElementById('theme-toggle');
+  function syncToggle() {
+    if (!toggle) return;
+    var dark = document.documentElement.getAttribute('data-theme') === 'dark';
+    toggle.setAttribute('aria-pressed', String(dark));
+    toggle.setAttribute('aria-label', dark ? 'Switch to light theme' : 'Switch to dark theme');
+  }
+  if (toggle) {
+    syncToggle();
+    toggle.addEventListener('click', function () {
+      var next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', next);
+      try { window.localStorage.setItem('kriyadot-theme', next); } catch (e) { /* private mode */ }
+      syncToggle();
+    });
+  }
+  // If the OS theme flips and the user has never chosen manually, follow it.
+  var osDark = window.matchMedia('(prefers-color-scheme: dark)');
+  if (osDark && osDark.addEventListener) {
+    osDark.addEventListener('change', function (e) {
+      var saved = null;
+      try { saved = window.localStorage.getItem('kriyadot-theme'); } catch (err) { /* ignore */ }
+      if (saved !== 'light' && saved !== 'dark') {
+        document.documentElement.setAttribute('data-theme', e.matches ? 'dark' : 'light');
+        syncToggle();
+      }
+    });
+  }
+
+  /* ---- frontdoor probe ----
+     When this page is served by the KriyaDot frontdoor service, the
+     service answers GET api/health and the primary CTA ("Create your
+     workspace", href "auth/google") starts the Google sign-in flow.
+     When the page is hosted statically (e.g. GitHub Pages) there is no
+     service behind it, so the probe fails and the CTA degrades
+     gracefully: it points at the downloads section instead and invites
+     the visitor to download the fully local desktop app. */
+  var cta = document.getElementById('cta-primary');
+  var ctaNote = document.getElementById('cta-note');
+  if (cta) {
+    var probeDone = false;
+    function staticMode() {
+      if (probeDone) return;
+      probeDone = true;
+      cta.setAttribute('href', '#downloads');
+      cta.textContent = 'Download the app';
+      if (ctaNote) {
+        ctaNote.textContent = 'You are viewing the static site. The desktop app is fully local-first — no account needed. Cloud workspaces launch from here once sign-in is live.';
+      }
+    }
+    var timer = setTimeout(staticMode, 3500);
+    fetch('api/health', { method: 'GET', headers: { 'Accept': 'application/json' } })
+      .then(function (r) {
+        clearTimeout(timer);
+        // Any non-OK response (404 on static hosts, proxy errors) means
+        // the frontdoor service is not behind this page.
+        if (!r.ok) staticMode();
+        else probeDone = true; // service is live: keep the sign-in CTA as-is
+      })
+      .catch(function () { clearTimeout(timer); staticMode(); });
+  }
 
   /* ---- live GitHub star count ---- */
   function paintStars(n) {
     document.querySelectorAll('[data-stars]').forEach(function (el) {
       el.textContent = n == null ? 'Star' : '★ ' + n;
-    });
-    document.querySelectorAll('[data-stars-num]').forEach(function (el) {
-      el.textContent = n == null ? '–' : String(n);
     });
   }
   fetch('https://api.github.com/repos/MaddyInnov/KriyaDot')
@@ -33,7 +98,7 @@
   }
 
   /* ---- scroll reveal ---- */
-  var revealEls = document.querySelectorAll('.card, .shot, .steps li, .stat');
+  var revealEls = document.querySelectorAll('.card, .shot, .steps li, .note-card, .hero-shot, .section-shot, .arch-box');
   revealEls.forEach(function (el) { el.classList.add('reveal'); });
   if ('IntersectionObserver' in window && !reduced) {
     var io = new IntersectionObserver(function (entries) {
@@ -44,88 +109,6 @@
     revealEls.forEach(function (el) { io.observe(el); });
   } else {
     revealEls.forEach(function (el) { el.classList.add('in'); });
-  }
-
-  /* ---- "watch it write code" self-playing demo ----
-     Types out a diff: deleted lines in red, added lines in green,
-     with a blinking caret. Loops forever (pauses offscreen). */
-  var LINES = [
-    { t: 'del', code: 'export function greet(name: string): string {' },
-    { t: 'del', code: '  return "Hello, " + name;' },
-    { t: 'del', code: '}' },
-    { t: 'add', code: 'export function greet(name: string, punct = "!"): string {' },
-    { t: 'add', code: '  const clean = name.trim() || "friend";' },
-    { t: 'add', code: '  return `Hello, ${clean}${punct}`;' },
-    { t: 'add', code: '}' },
-    { t: 'add', code: '' },
-    { t: 'add', code: 'export function greetAll(names: string[]): string[] {' },
-    { t: 'add', code: '  return names.map((n) => greet(n));' },
-    { t: 'add', code: '}' },
-  ];
-
-  function highlight(code) {
-    // Order matters: strings first, so later replacements never match
-    // inside the spans this function itself inserts (e.g. class="tok-k").
-    return code
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/("[^"]*"|`[^`]*`)/g, '<span class="tok-s">$1</span>')
-      .replace(/\b(export|function|return|const)\b/g, '<span class="tok-k">$1</span>')
-      .replace(/\b(greet|greetAll|trim|map)\b(?![^<]*>)/g, '<span class="tok-f">$1</span>');
-  }
-
-  var pre = document.getElementById('demo-code');
-  if (pre) {
-    var lineIdx = 0, charIdx = 0, visible = true, timer = null;
-
-    function render() {
-      var html = '';
-      for (var i = 0; i < lineIdx; i++) {
-        var L = LINES[i];
-        var cls = L.t === 'add' ? 'ln ln-add' : 'ln ln-del';
-        var prefix = L.t === 'add' ? '+' : '−';
-        html += '<span class="' + cls + '"><span class="p">' + prefix + '</span> ' + highlight(L.code) + '</span>';
-      }
-      if (lineIdx < LINES.length) {
-        var cur = LINES[lineIdx];
-        var cls2 = cur.t === 'add' ? 'ln ln-add' : 'ln ln-del';
-        var prefix2 = cur.t === 'add' ? '+' : '−';
-        html += '<span class="' + cls2 + '"><span class="p">' + prefix2 + '</span> ' +
-          highlight(cur.code.slice(0, charIdx)) + '<span class="caret"></span></span>';
-      } else {
-        html += '<span class="ln"><span class="caret"></span></span>';
-      }
-      pre.innerHTML = html;
-    }
-
-    function tick() {
-      if (!visible) return;
-      var cur = LINES[lineIdx];
-      if (!cur) { // finished — hold, then restart
-        timer = setTimeout(function () { lineIdx = 0; charIdx = 0; schedule(); }, 4200);
-        return;
-      }
-      charIdx += 1;
-      if (charIdx > cur.code.length) { lineIdx += 1; charIdx = 0; }
-      render();
-      schedule();
-    }
-    function schedule() {
-      clearTimeout(timer);
-      var speed = reduced ? 0 : 26 + Math.random() * 30;
-      timer = setTimeout(tick, speed);
-    }
-
-    if ('IntersectionObserver' in window) {
-      new IntersectionObserver(function (entries) {
-        visible = entries[0].isIntersecting;
-        if (visible) schedule(); else clearTimeout(timer);
-      }).observe(pre);
-    }
-    if (reduced) { // static full render, no animation
-      lineIdx = LINES.length; charIdx = 0; render();
-    } else {
-      render(); schedule();
-    }
   }
 
   /* ---- screenshot lightbox ---- */
