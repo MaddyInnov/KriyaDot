@@ -30,7 +30,9 @@ import {
   isFreeModel,
   listProviderPresets,
   resolveApiKey,
+  resolveBaseUrl,
   revokeBridgeConsent,
+  templateFieldEnvName,
   usageWarningFromSnapshot,
 } from '@mvp/agent-runtime';
 import type { CliBridgeId, ModelInfo } from '@mvp/agent-runtime';
@@ -43,6 +45,8 @@ export interface ProviderKeyInput {
   apiKey: string;
   baseUrl?: string;
   headers?: Record<string, string>;
+  /** Templated presets only: endpoint field values (Azure resource, Cloudflare account/gateway ID). */
+  templateValues?: Record<string, string>;
 }
 
 export function localKeysPath(dataDir: string): string {
@@ -315,6 +319,31 @@ export function saveProviderKey(
     );
   }
   const file = readKeyFile(dataDir);
+  // Templated presets (Azure OpenAI, Cloudflare): the endpoint fields are
+  // stored alongside the key under their own env names. A field may be
+  // omitted on re-save when a value is already stored (the UI never reads
+  // stored values back), but saving a key with NO value anywhere for a
+  // required field fails with a message naming the field.
+  const preset = getProviderPreset(providerId);
+  const templateFields = preset?.templateFields ?? [];
+  if (templateFields.length > 0) {
+    const missing: string[] = [];
+    for (const field of templateFields) {
+      const name = templateFieldEnvName(envKey, field.name);
+      const incoming = input.templateValues?.[field.name];
+      if (typeof incoming === 'string' && incoming.trim().length > 0) {
+        file[name] = incoming.trim();
+      } else if (typeof file[name] !== 'string' || file[name].length === 0) {
+        missing.push(field.label);
+      }
+    }
+    if (missing.length > 0) {
+      throw new Error(
+        `Provider "${providerId}" needs ${missing.join(' + ')} to build its endpoint. ` +
+          `Enter ${missing.length === 1 ? 'it' : 'them'} together with the API key.`,
+      );
+    }
+  }
   file[envKey] = input.apiKey;
   if (input.baseUrl) file[`${envKey}_BASE_URL`] = input.baseUrl;
   else delete file[`${envKey}_BASE_URL`];
@@ -329,6 +358,10 @@ export function saveProviderKey(
   // Bridge into the runtime: it resolves keys via env vars and can no
   // longer read the encrypted envelope itself.
   injectEnvKey(envKey, input.apiKey);
+  for (const field of templateFields) {
+    const name = templateFieldEnvName(envKey, field.name);
+    if (typeof file[name] === 'string') injectEnvKey(name, file[name]);
+  }
   if (input.baseUrl) injectEnvKey(`${envKey}_BASE_URL`, input.baseUrl);
   if (input.headers && Object.keys(input.headers).length > 0) {
     injectEnvKey(`${envKey}_HEADERS`, JSON.stringify(input.headers));
@@ -374,6 +407,11 @@ export function removeProviderKey(dataDir: string, providerId: string): boolean 
   if (!envKey) return false;
   const file = readKeyFile(dataDir);
   const names = [envKey, `${envKey}_BASE_URL`, `${envKey}_HEADERS`];
+  // Templated presets: the endpoint field values belong to the key record
+  // and are removed with it.
+  for (const field of getProviderPreset(providerId)?.templateFields ?? []) {
+    names.push(templateFieldEnvName(envKey, field.name));
+  }
   let removed = false;
   for (const key of names) {
     if (key in file) {
@@ -396,7 +434,11 @@ function isConfigured(providerId: string): boolean {
     // Keyless lanes (OVHcloud anonymous, LLM7, AI Horde) need no key by
     // design — configured by definition, like local providers.
     if (preset?.keyless) return true;
-    return Boolean(resolveApiKey(providerId));
+    if (!resolveApiKey(providerId)) return false;
+    // Templated presets (Azure OpenAI, Cloudflare) also need their endpoint
+    // fields before the base URL can be built at all.
+    if (preset?.baseUrlTemplate) return resolveBaseUrl(providerId).length > 0;
+    return true;
   } catch {
     return false;
   }
@@ -488,6 +530,13 @@ export async function listProviders(dataDir: string): Promise<ProviderInfo[]> {
       keyless: preset.keyless === true,
       bestEffort: preset.bestEffort === true,
       limitsNote: preset.limitsNote,
+      notes: preset.notes,
+      baseUrlTemplate: preset.baseUrlTemplate,
+      templateFields: preset.templateFields?.map((f) => ({
+        name: f.name,
+        label: f.label,
+        hint: f.hint,
+      })),
     };
     if (preset.bridge) {
       const detection = detections.get(preset.bridge);

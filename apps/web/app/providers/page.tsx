@@ -302,6 +302,11 @@ export default function ProvidersPage() {
   const [keys, setKeys] = useState<Record<string, string>>({});
   const [baseUrls, setBaseUrls] = useState<Record<string, string>>({});
   const [headers, setHeaders] = useState<Record<string, string>>({});
+  // Templated presets (Azure OpenAI, Cloudflare): endpoint field values,
+  // keyed by provider id then field name. Stored values are never read
+  // back (keys are write-only), so a blank field on a configured provider
+  // means "keep the saved value".
+  const [templateVals, setTemplateVals] = useState<Record<string, Record<string, string>>>({});
   // In-app CLI sign-in status (OpenMausBot parity).
   const [cliAuth, setCliAuth] = useState<CliLoginStatus[]>([]);
   const [signInFor, setSignInFor] = useState<ProviderInfo | null>(null);
@@ -380,11 +385,27 @@ export default function ProvidersPage() {
         return;
       }
     }
+    // Templated presets: every endpoint field is required on first save;
+    // on re-save a blank field keeps the stored value (the API enforces
+    // the same rule and names any field that is missing entirely).
+    let templateValues: Record<string, string> | undefined;
+    if (p.templateFields && p.templateFields.length > 0) {
+      templateValues = {};
+      for (const field of p.templateFields) {
+        const v = (templateVals[p.id]?.[field.name] ?? '').trim();
+        if (v) templateValues[field.name] = v;
+        else if (!p.configured) {
+          setError(`${p.name} needs its ${field.label} to build the endpoint — enter it together with the API key.`);
+          return;
+        }
+      }
+      if (Object.keys(templateValues).length === 0) templateValues = undefined;
+    }
     setSaving(p.id);
     setError('');
     setNotice('');
     try {
-      await saveProviderKey(p.id, apiKey, (baseUrls[p.id] ?? '').trim() || undefined, parsedHeaders);
+      await saveProviderKey(p.id, apiKey, (baseUrls[p.id] ?? '').trim() || undefined, parsedHeaders, templateValues);
       setKeys((s) => ({ ...s, [p.id]: '' }));
       setNotice(`Key saved for ${p.name}.`);
       await refresh();
@@ -635,6 +656,7 @@ export default function ProvidersPage() {
                 ? 'No free models on this provider.'
                 : 'No catalog models.'}
           </p>
+          {p.notes && <p className="small muted">{p.notes}</p>}
           {keylessLaneFor(p) && (
             <p className="small muted">
               <strong>{keylessLaneFor(p)!.label}.</strong> {keylessLaneFor(p)!.note}
@@ -642,6 +664,37 @@ export default function ProvidersPage() {
             </p>
           )}
           <RateLimitLine rateLimit={p.rateLimit} />
+          {p.templateFields && p.templateFields.length > 0 && (
+            <>
+              <div className="grid-2">
+                {p.templateFields.map((field) => (
+                  <div className="field" key={field.name}>
+                    <label className="label" htmlFor={`tpl-${p.id}-${field.name}`}>
+                      {field.label}
+                    </label>
+                    <input
+                      id={`tpl-${p.id}-${field.name}`}
+                      className="input mono"
+                      autoComplete="off"
+                      placeholder={p.configured ? '•••••••• (saved)' : field.hint}
+                      value={templateVals[p.id]?.[field.name] ?? ''}
+                      onChange={(e) =>
+                        setTemplateVals((s) => ({
+                          ...s,
+                          [p.id]: { ...(s[p.id] ?? {}), [field.name]: e.target.value },
+                        }))
+                      }
+                    />
+                  </div>
+                ))}
+              </div>
+              {p.baseUrlTemplate && (
+                <p className="small muted mono" style={{ marginTop: 4 }}>
+                  Endpoint: {p.baseUrlTemplate}
+                </p>
+              )}
+            </>
+          )}
           <div className="grid-2">
             <div className="field">
               <label className="label" htmlFor={`key-${p.id}`}>

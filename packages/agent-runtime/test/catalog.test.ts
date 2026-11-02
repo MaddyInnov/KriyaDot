@@ -10,8 +10,11 @@ import {
   getProviderPreset,
   isFreeModel,
   listProviderPresets,
+  renderBaseUrlTemplate,
   resolveApiKey,
   resolveBaseUrl,
+  resolveTemplateValues,
+  templateFieldEnvName,
 } from '../src/providers/catalog.js';
 import { createProvider } from '../src/providers/factory.js';
 import { OpenAICompatibleProvider } from '../src/providers/openai-compatible.js';
@@ -28,6 +31,16 @@ const ENV_KEYS = [
   'CEREBRAS_API_KEY',
   'MINIMAX_API_KEY',
   'MOONSHOT_API_KEY',
+  'HF_TOKEN',
+  'GEMINI_API_KEY',
+  'BASETEN_API_KEY',
+  'AZURE_OPENAI_API_KEY',
+  'AZURE_OPENAI_API_KEY_TPL_RESOURCE',
+  'CLOUDFLARE_API_KEY',
+  'CLOUDFLARE_API_KEY_TPL_ACCOUNTID',
+  'CLOUDFLARE_AI_GATEWAY_API_KEY',
+  'CLOUDFLARE_AI_GATEWAY_API_KEY_TPL_ACCOUNTID',
+  'CLOUDFLARE_AI_GATEWAY_API_KEY_TPL_GATEWAYID',
   'PROVIDERS_FILE',
 ];
 let savedEnv: Record<string, string | undefined> = {};
@@ -221,6 +234,149 @@ describe('direct openai-compatible provider presets', () => {
       expect(() => createProvider(expected.id)).toThrow(new RegExp(expected.envKey));
     });
   }
+});
+
+describe('catalog schema invariants', () => {
+  it('every preset is well-formed (id, name, envKey, models array)', () => {
+    const presets = listProviderPresets();
+    expect(presets.length).toBeGreaterThanOrEqual(42);
+    for (const p of presets) {
+      expect(p.id).toBeTruthy();
+      expect(p.name).toBeTruthy();
+      expect(p.envKey).toBeTruthy();
+      expect(Array.isArray(p.models)).toBe(true);
+    }
+  });
+
+  it('template placeholders and declared template fields match exactly', () => {
+    for (const p of listProviderPresets()) {
+      const placeholders = [
+        ...(p.baseUrlTemplate ?? '').matchAll(/\{([A-Za-z][A-Za-z0-9]*)\}/g),
+      ].map((m) => m[1]);
+      const declared = (p.templateFields ?? []).map((f) => f.name);
+      expect(new Set(placeholders), p.id).toEqual(new Set(declared));
+      if (p.baseUrlTemplate) expect(p.templateFields?.length ?? 0).toBeGreaterThan(0);
+      if (p.templateFields?.length) expect(p.baseUrlTemplate, p.id).toBeTruthy();
+      for (const f of p.templateFields ?? []) {
+        expect(f.label, `${p.id}.${f.name}`).toBeTruthy();
+        expect(templateFieldEnvName(p.envKey, f.name)).toMatch(/_TPL_[A-Z0-9]+$/);
+      }
+    }
+  });
+
+  it('does not ship the excluded China-specific harness variants', () => {
+    const ids = listProviderPresets().map((p) => p.id);
+    expect(ids).not.toContain('minimax-cn');
+    expect(ids).not.toContain('ant-ling');
+  });
+});
+
+describe('harness-gap static presets (huggingface, google-aistudio, baseten)', () => {
+  const EXPECTED = [
+    {
+      id: 'huggingface',
+      baseUrl: 'https://router.huggingface.co/v1',
+      envKey: 'HF_TOKEN',
+      defaultModel: 'meta-llama/Llama-3.3-70B-Instruct',
+    },
+    {
+      id: 'google-aistudio',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+      envKey: 'GEMINI_API_KEY',
+      defaultModel: 'gemini-2.5-flash',
+    },
+    {
+      id: 'baseten',
+      baseUrl: 'https://inference.baseten.co/v1',
+      envKey: 'BASETEN_API_KEY',
+      defaultModel: 'openai/gpt-oss-120b',
+    },
+  ];
+
+  for (const e of EXPECTED) {
+    it(`${e.id}: openai-compatible preset with live model listing`, () => {
+      const preset = getProviderPreset(e.id);
+      expect(preset).toBeDefined();
+      expect(preset?.api).toBe('openai-compatible');
+      expect(preset?.baseUrl).toBe(e.baseUrl);
+      expect(preset?.envKey).toBe(e.envKey);
+      expect(preset?.liveModels).toBe(true);
+      expect(preset?.baseUrlTemplate).toBeUndefined();
+      expect(getDefaultModel(e.id)).toBe(e.defaultModel);
+    });
+
+    it(`${e.id}: createProvider constructs with a key, names the env var without one`, () => {
+      expect(() => createProvider(e.id)).toThrow(new RegExp(e.envKey));
+      process.env[e.envKey] = 'test-key';
+      const provider = createProvider(e.id);
+      expect(provider).toBeInstanceOf(OpenAICompatibleProvider);
+      expect(provider.providerId).toBe(e.id);
+    });
+  }
+});
+
+describe('templated provider presets (azure-openai, cloudflare)', () => {
+  it('azure-openai: renders the v1 endpoint from the resource name', () => {
+    expect(resolveBaseUrl('azure-openai')).toBe('');
+    process.env.AZURE_OPENAI_API_KEY_TPL_RESOURCE = 'my-res';
+    expect(resolveTemplateValues('azure-openai')).toEqual({ resource: 'my-res' });
+    expect(resolveBaseUrl('azure-openai')).toBe('https://my-res.openai.azure.com/openai/v1/');
+  });
+
+  it('azure-openai: createProvider needs key AND resource', () => {
+    process.env.AZURE_OPENAI_API_KEY = 'test-key';
+    expect(() => createProvider('azure-openai')).toThrow(/resource name/i);
+    process.env.AZURE_OPENAI_API_KEY_TPL_RESOURCE = 'my-res';
+    const provider = createProvider('azure-openai');
+    expect(provider).toBeInstanceOf(OpenAICompatibleProvider);
+    expect(provider.providerId).toBe('azure-openai');
+  });
+
+  it('cloudflare-workers-ai: renders the account-scoped endpoint', () => {
+    expect(resolveBaseUrl('cloudflare-workers-ai')).toBe('');
+    process.env.CLOUDFLARE_API_KEY_TPL_ACCOUNTID = 'acct42';
+    expect(resolveBaseUrl('cloudflare-workers-ai')).toBe(
+      'https://api.cloudflare.com/client/v4/accounts/acct42/ai/v1',
+    );
+  });
+
+  it('cloudflare-ai-gateway: needs BOTH account and gateway ids', () => {
+    process.env.CLOUDFLARE_AI_GATEWAY_API_KEY_TPL_ACCOUNTID = 'acct42';
+    expect(resolveBaseUrl('cloudflare-ai-gateway')).toBe('');
+    process.env.CLOUDFLARE_AI_GATEWAY_API_KEY_TPL_GATEWAYID = 'default';
+    expect(resolveBaseUrl('cloudflare-ai-gateway')).toBe(
+      'https://gateway.ai.cloudflare.com/v1/acct42/default/compat',
+    );
+  });
+
+  it('template values also resolve from providers.local.json', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agent-providers-tpl-'));
+    const file = join(dir, 'providers.local.json');
+    writeFileSync(file, JSON.stringify({ AZURE_OPENAI_API_KEY_TPL_RESOURCE: 'file-res' }));
+    process.env.PROVIDERS_FILE = file;
+    expect(resolveBaseUrl('azure-openai')).toBe('https://file-res.openai.azure.com/openai/v1/');
+  });
+
+  it('renderBaseUrlTemplate: missing/blank values fail closed, values are trimmed + encoded', () => {
+    expect(renderBaseUrlTemplate('https://{r}.example.com/v1', {})).toBeUndefined();
+    expect(renderBaseUrlTemplate('https://{r}.example.com/v1', { r: '  ' })).toBeUndefined();
+    expect(renderBaseUrlTemplate('https://{r}.example.com/v1', { r: ' my res ' })).toBe(
+      'https://my%20res.example.com/v1',
+    );
+    expect(templateFieldEnvName('AZURE_OPENAI_API_KEY', 'resource')).toBe(
+      'AZURE_OPENAI_API_KEY_TPL_RESOURCE',
+    );
+  });
+
+  it('templated presets ship curated starter models and no liveModels (these bases do not serve /models)', () => {
+    for (const id of ['azure-openai', 'cloudflare-workers-ai', 'cloudflare-ai-gateway']) {
+      const preset = getProviderPreset(id);
+      expect(preset?.liveModels, id).toBe(false);
+      expect(preset?.models.length ?? 0, id).toBeGreaterThan(0);
+      expect(preset?.notes, id).toBeTruthy();
+      expect(preset?.baseUrlTemplate, id).toBeTruthy();
+    }
+  });
 });
 
 describe('isFreeModel', () => {

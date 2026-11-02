@@ -119,8 +119,12 @@ export function createProvider(providerId: string, opts?: { apiKey?: string }): 
 
   const baseUrl = resolveBaseUrl(providerId);
   if (!baseUrl) {    const label = preset.byo ? `${preset.name} is a bring-your-own provider: no endpoint is pre-configured. ` : '';
+    const templated = preset.templateFields?.length
+      ? `This provider's endpoint is built from ${preset.templateFields.map((f) => f.label).join(' + ')} — ` +
+        `enter those on the Providers settings page (they are still missing or incomplete). `
+      : '';
     throw new Error(
-      `${label}Open the Providers settings page and enter an API endpoint (base URL) plus your own ${preset.envKey}, then try again. ` +
+      `${label}${templated}Open the Providers settings page and enter an API endpoint (base URL) plus your own ${preset.envKey}, then try again. ` +
         `Never use a shared or pooled key.`,
     );
   }

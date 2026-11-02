@@ -2957,6 +2957,16 @@ export function createRouter(deps: RouteDeps): express.Router {
       res.status(400).json(errorBody('headers must be an object'));
       return;
     }
+    if (
+      body.templateValues !== undefined &&
+      (typeof body.templateValues !== 'object' ||
+        body.templateValues === null ||
+        Array.isArray(body.templateValues) ||
+        Object.values(body.templateValues).some((v) => typeof v !== 'string'))
+    ) {
+      res.status(400).json(errorBody('templateValues must be an object of string values'));
+      return;
+    }
     try {
       if (!isKnownProviderId(body.providerId)) {
         res.status(400).json(
@@ -2969,6 +2979,7 @@ export function createRouter(deps: RouteDeps): express.Router {
         apiKey: body.apiKey,
         baseUrl: body.baseUrl,
         headers: body.headers,
+        templateValues: body.templateValues,
       });
       // Sync the new key into process.env immediately so it works without a restart.
       syncProviderKeysToEnv(config.dataDir);

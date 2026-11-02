@@ -502,6 +502,12 @@ export interface ProviderInfo {
   keyless?: boolean;
   /** Honest limits note for a keyless/shared lane, from the provider catalog. */
   limitsNote?: string;
+  /** Catalog notes for the preset (setup caveats), when the preset carries any. */
+  notes?: string;
+  /** Templated presets only (Azure OpenAI, Cloudflare): endpoint shape with `{field}` placeholders. */
+  baseUrlTemplate?: string;
+  /** Templated presets only: the endpoint fields the user supplies alongside the API key. */
+  templateFields?: { name: string; label: string; hint?: string }[];
 }
 
 export interface WorkflowNodeDef {
@@ -1634,11 +1640,12 @@ export function saveProviderKey(
   apiKey: string,
   baseUrl?: string,
   headers?: Record<string, string>,
+  templateValues?: Record<string, string>,
 ): Promise<{ ok: boolean }> {
   return apiJson('/api/providers/keys', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ providerId, apiKey, baseUrl, headers }),
+    body: JSON.stringify({ providerId, apiKey, baseUrl, headers, templateValues }),
   });
 }
 

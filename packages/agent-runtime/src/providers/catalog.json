@@ -59,6 +59,57 @@
       ],
       "name": "Anthropic"
     },
+    "azure-openai": {
+      "api": "openai-compatible",
+      "baseUrl": "",
+      "baseUrlTemplate": "https://{resource}.openai.azure.com/openai/v1/",
+      "envKey": "AZURE_OPENAI_API_KEY",
+      "id": "azure-openai",
+      "liveModels": false,
+      "models": [
+        {
+          "default": true,
+          "id": "gpt-4o",
+          "name": "GPT-4o (deployment name)",
+          "contextLength": 128000
+        },
+        {
+          "id": "gpt-4.1",
+          "name": "GPT-4.1 (deployment name)",
+          "contextLength": 1047576
+        },
+        {
+          "id": "gpt-4o-mini",
+          "name": "GPT-4o Mini (deployment name)",
+          "contextLength": 128000
+        }
+      ],
+      "name": "Azure OpenAI",
+      "notes": "Azure OpenAI via the v1 API (no api-version parameter needed). Enter your resource name and the resource key. Model ids are DEPLOYMENT names: the model field is sent verbatim, so the starter list only works when your deployments use the standard model names. Azure does not list your deployments on the OpenAI-compatible /models endpoint, so models are not auto-detected; a deployment with a custom name can still be used wherever a bot model id is entered directly (e.g. bot import), since the model field is sent verbatim.",
+      "templateFields": [
+        {
+          "name": "resource",
+          "label": "Azure OpenAI resource name",
+          "hint": "e.g. my-company-openai (from https://<resource>.openai.azure.com)"
+        }
+      ]
+    },
+    "baseten": {
+      "api": "openai-compatible",
+      "baseUrl": "https://inference.baseten.co/v1",
+      "envKey": "BASETEN_API_KEY",
+      "id": "baseten",
+      "liveModels": true,
+      "models": [
+        {
+          "default": true,
+          "id": "openai/gpt-oss-120b",
+          "name": "GPT-OSS 120B (Baseten Model APIs)"
+        }
+      ],
+      "name": "Baseten",
+      "notes": "Baseten Model APIs: Baseten-hosted open models behind one shared OpenAI-compatible endpoint; the live /models list is authoritative. Your own dedicated Truss deployments live on per-model URLs (https://model-<id>.api.baseten.co/environments/production/sync/v1) instead; add those as a custom endpoint."
+    },
     "bedrock": {
       "api": "bedrock",
       "baseUrl": "",
@@ -109,6 +160,79 @@
         }
       ],
       "name": "Cerebras"
+    },
+    "cloudflare-ai-gateway": {
+      "api": "openai-compatible",
+      "baseUrl": "",
+      "baseUrlTemplate": "https://gateway.ai.cloudflare.com/v1/{accountId}/{gatewayId}/compat",
+      "envKey": "CLOUDFLARE_AI_GATEWAY_API_KEY",
+      "id": "cloudflare-ai-gateway",
+      "liveModels": false,
+      "models": [
+        {
+          "default": true,
+          "id": "workers-ai/@cf/meta/llama-3.3-70b-fp8-fast",
+          "name": "Workers AI - Llama 3.3 70B FP8 Fast (via gateway)"
+        },
+        {
+          "id": "openai/gpt-4o",
+          "name": "OpenAI - GPT-4o (via gateway)"
+        },
+        {
+          "id": "anthropic/claude-sonnet-4-5",
+          "name": "Anthropic - Claude Sonnet 4.5 (via gateway)"
+        },
+        {
+          "id": "google-ai-studio/gemini-2.5-flash",
+          "name": "Google AI Studio - Gemini 2.5 Flash (via gateway)"
+        }
+      ],
+      "name": "Cloudflare AI Gateway",
+      "notes": "Cloudflare AI Gateway unified (OpenAI-compatible) endpoint. Model ids are provider/model; the gateway routes by the prefix, so the key you paste must belong to the provider named in the model id (for workers-ai/* models it is your Cloudflare API token). The gateway does not serve a model list on this endpoint, so the starter list is curated; any provider/model id the gateway supports can be set as a bot's model. If your gateway has authentication enabled it also expects a cf-aig-authorization header, which this preset does not send; leave gateway authentication off for this preset.",
+      "templateFields": [
+        {
+          "name": "accountId",
+          "label": "Cloudflare account ID",
+          "hint": "Shown in the Cloudflare dashboard URL and the Workers overview"
+        },
+        {
+          "name": "gatewayId",
+          "label": "AI Gateway ID",
+          "hint": "Your gateway name; 'default' is created automatically on first use"
+        }
+      ]
+    },
+    "cloudflare-workers-ai": {
+      "api": "openai-compatible",
+      "baseUrl": "",
+      "baseUrlTemplate": "https://api.cloudflare.com/client/v4/accounts/{accountId}/ai/v1",
+      "envKey": "CLOUDFLARE_API_KEY",
+      "id": "cloudflare-workers-ai",
+      "liveModels": false,
+      "models": [
+        {
+          "default": true,
+          "id": "@cf/meta/llama-3.3-70b-fp8-fast",
+          "name": "Llama 3.3 70B FP8 Fast (Workers AI)"
+        },
+        {
+          "id": "@cf/meta/llama-3.1-8b-instruct",
+          "name": "Llama 3.1 8B Instruct (Workers AI)"
+        },
+        {
+          "id": "@cf/openai/gpt-oss-120b",
+          "name": "GPT-OSS 120B (Workers AI)"
+        }
+      ],
+      "name": "Cloudflare Workers AI",
+      "notes": "Cloudflare Workers AI via its account-scoped OpenAI-compatible endpoint. Paste a Cloudflare API token with the Workers AI permission plus your account ID. The OpenAI-compatible base does not serve /models, so the list is curated; newer @cf models can be used by setting a bot's model to the exact @cf model id.",
+      "templateFields": [
+        {
+          "name": "accountId",
+          "label": "Cloudflare account ID",
+          "hint": "Shown in the Cloudflare dashboard URL and the Workers overview"
+        }
+      ]
     },
     "claude-subscription": {
       "id": "claude-subscription",
@@ -281,6 +405,33 @@
       ],
       "name": "Fireworks AI"
     },
+    "google-aistudio": {
+      "api": "openai-compatible",
+      "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai/",
+      "envKey": "GEMINI_API_KEY",
+      "id": "google-aistudio",
+      "liveModels": true,
+      "models": [
+        {
+          "default": true,
+          "id": "gemini-2.5-flash",
+          "name": "Gemini 2.5 Flash",
+          "contextLength": 1048576
+        },
+        {
+          "id": "gemini-2.5-pro",
+          "name": "Gemini 2.5 Pro",
+          "contextLength": 1048576
+        },
+        {
+          "id": "gemini-2.0-flash",
+          "name": "Gemini 2.0 Flash",
+          "contextLength": 1048576
+        }
+      ],
+      "name": "Google AI Studio (Gemini)",
+      "notes": "Google AI Studio / Gemini API through Google's OpenAI-compatible endpoint; paste an AI Studio API key (aistudio.google.com/apikey). Models are fetched live from the endpoint. Vertex AI (GCP service accounts) is the separate Vertex preset."
+    },
     "groq": {
       "api": "openai-compatible",
       "baseUrl": "https://api.groq.com/openai/v1",
@@ -310,6 +461,30 @@
         }
       ],
       "name": "Groq"
+    },
+    "huggingface": {
+      "api": "openai-compatible",
+      "baseUrl": "https://router.huggingface.co/v1",
+      "envKey": "HF_TOKEN",
+      "id": "huggingface",
+      "liveModels": true,
+      "models": [
+        {
+          "default": true,
+          "id": "meta-llama/Llama-3.3-70B-Instruct",
+          "name": "Llama 3.3 70B Instruct (HF Router)"
+        },
+        {
+          "id": "Qwen/Qwen2.5-72B-Instruct",
+          "name": "Qwen 2.5 72B Instruct (HF Router)"
+        },
+        {
+          "id": "mistralai/Mistral-7B-Instruct-v0.3",
+          "name": "Mistral 7B Instruct v0.3 (HF Router)"
+        }
+      ],
+      "name": "Hugging Face",
+      "notes": "Hugging Face Inference Providers router. Paste a Hub access token with the 'Make calls to Inference Providers' permission. Model ids are Hub ids (owner/model); the live /models list is authoritative. Append :fastest, :cheapest or :<provider> to a model id to steer which inference provider serves it."
     },
     "hyperbolic": {
       "api": "openai-compatible",

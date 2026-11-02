@@ -45,6 +45,23 @@ export interface ProviderModelPreset {
   free?: boolean;
 }
 
+/**
+ * One user-supplied value a templated preset needs to build its base URL
+ * (e.g. an Azure resource name or a Cloudflare account ID). The value is
+ * stored exactly like an API key — in the encrypted providers file / env
+ * under `templateFieldEnvName(envKey, name)` — and substituted into
+ * `baseUrlTemplate` by resolveBaseUrl(). Fields are REQUIRED: the preset
+ * is not configured until every field resolves to a non-empty value.
+ */
+export interface ProviderTemplateField {
+  /** Placeholder name inside baseUrlTemplate, e.g. "accountId" for "{accountId}". */
+  name: string;
+  /** Human label shown next to the input on the Providers settings page. */
+  label: string;
+  /** Optional example/hint shown as the input placeholder. */
+  hint?: string;
+}
+
 export interface ProviderPreset {
   id: string;
   name: string;
@@ -72,6 +89,16 @@ export interface ProviderPreset {
   limitsNote?: string;
   /** Base URL of the chat-completions (or messages) API. Empty for BYO presets until the user configures it. */
   baseUrl: string;
+  /**
+   * Templated base URL for account-scoped endpoints (Azure OpenAI,
+   * Cloudflare): contains `{field}` placeholders that are filled from
+   * `templateFields` values at resolve time. When set, baseUrl stays ""
+   * and resolveBaseUrl() renders the template (a manually saved base URL
+   * override still wins when the template cannot be rendered).
+   */
+  baseUrlTemplate?: string;
+  /** The user-supplied values `baseUrlTemplate` needs. Required when baseUrlTemplate is set. */
+  templateFields?: ProviderTemplateField[];
   /** Env var holding the user's API key. */
   envKey: string;
   /** Bring-your-own: no pre-configured endpoint or credentials; the user points this at their own access. */
@@ -323,15 +350,80 @@ export function resolveApiKey(providerId: string): string | undefined {
   return typeof fromFile === 'string' && fromFile.length > 0 ? fromFile : undefined;
 }
 
+/** Env var / key-file name under which a template field value is stored. */
+export function templateFieldEnvName(envKey: string, fieldName: string): string {
+  return `${envKey}_TPL_${fieldName.toUpperCase()}`;
+}
+
+/**
+ * Substitute `{field}` placeholders in a baseUrlTemplate. Returns undefined
+ * when any placeholder has no non-empty value — the endpoint genuinely
+ * cannot be built yet, and callers must treat the preset as unconfigured.
+ */
+export function renderBaseUrlTemplate(
+  template: string,
+  values: Record<string, string>,
+): string | undefined {
+  let missing = false;
+  const out = template.replace(/\{([A-Za-z][A-Za-z0-9]*)\}/g, (_m, name: string) => {
+    const v = values[name];
+    if (typeof v !== 'string' || v.trim().length === 0) {
+      missing = true;
+      return '';
+    }
+    return encodeURIComponent(v.trim());
+  });
+  return missing ? undefined : out;
+}
+
+/**
+ * Resolve a templated preset's field values through the same chain as API
+ * keys: real env → config `.env` → project `.env` → providers.local.json.
+ * Returns undefined for presets without template fields; otherwise a
+ * (possibly partial) map of the values that were found.
+ */
+export function resolveTemplateValues(providerId: string): Record<string, string> | undefined {
+  const preset = resolvePreset(providerId);
+  if (!preset?.templateFields || preset.templateFields.length === 0) return undefined;
+  const configEnv = readDotEnvFile(configEnvFilePath());
+  const projectEnv = readDotEnvFile(projectEnvFilePath());
+  const local = readLocalOverrides();
+  const out: Record<string, string> = {};
+  for (const field of preset.templateFields) {
+    const name = templateFieldEnvName(preset.envKey, field.name);
+    const fromEnv = process.env[name];
+    const v =
+      fromEnv && fromEnv.length > 0
+        ? fromEnv
+        : configEnv[name] && configEnv[name].length > 0
+          ? configEnv[name]
+          : projectEnv[name] && projectEnv[name].length > 0
+            ? projectEnv[name]
+            : local[name];
+    if (typeof v === 'string' && v.length > 0) out[field.name] = v;
+  }
+  return out;
+}
+
 /**
  * Resolve the base URL for a provider. BYO presets (e.g. omnirush) ship with
  * an empty baseUrl; the user supplies their own endpoint via the Providers
  * settings page, which the API persists to providers.local.json as
- * "<ENV_KEY>_BASE_URL" (e.g. "OMNIRUSH_API_KEY_BASE_URL").
+ * "<ENV_KEY>_BASE_URL" (e.g. "OMNIRUSH_API_KEY_BASE_URL"). Templated presets
+ * (Azure OpenAI, Cloudflare) render `baseUrlTemplate` from their stored
+ * field values first; an unrenderable template falls through to the same
+ * manual base URL override, and to "" when neither is available.
  */
 export function resolveBaseUrl(providerId: string): string {
   const preset = resolvePreset(providerId);
   if (!preset) return '';
+  if (preset.baseUrlTemplate) {
+    const rendered = renderBaseUrlTemplate(
+      preset.baseUrlTemplate,
+      resolveTemplateValues(providerId) ?? {},
+    );
+    if (rendered) return rendered;
+  }
   if (preset.baseUrl && preset.baseUrl.length > 0) return preset.baseUrl;
   const local = readLocalOverrides();
   const key = `${preset.envKey}_BASE_URL`;

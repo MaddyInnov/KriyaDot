@@ -28,6 +28,7 @@
 
 import {
   FREE_MODELS_ONLY_ENV_VAR,
+  getProviderPreset,
   isFreeModel,
   listProviderPresets,
 } from './providers/catalog.js';
@@ -194,7 +195,13 @@ function resolveOverride(botModel: string): Candidate {
   if (hits.length === 0) {
     throw new Error(`routeModel: override model "${botModel}" not found in the catalog.`);
   }
-  return hits[0]!;
+  // A bare model id names the model itself. When several presets carry the
+  // same id (e.g. "gpt-4o-mini" on OpenAI directly and as an Azure OpenAI
+  // deployment-name example), the direct provider wins: templated presets'
+  // model ids are deployment names / routed ids, not canonical model ids.
+  // They stay reachable via an explicit "providerId/modelId" override.
+  const direct = hits.find((c) => !getProviderPreset(c.providerId)?.baseUrlTemplate);
+  return direct ?? hits[0]!;
 }
 
 /**

@@ -65,6 +65,15 @@ export interface ProviderKeyBody {
   apiKey: string;
   baseUrl?: string;
   headers?: Record<string, string>;
+  /** Templated presets only: values for the preset's endpoint fields (e.g. Azure resource name, Cloudflare account ID). */
+  templateValues?: Record<string, string>;
+}
+
+/** One user-supplied endpoint field of a templated provider preset (mirrors the runtime catalog type). */
+export interface ProviderTemplateFieldInfo {
+  name: string;
+  label: string;
+  hint?: string;
 }
 
 export interface ProviderInfo {
@@ -106,6 +115,15 @@ export interface ProviderInfo {
   bestEffort?: boolean;
   /** Human-honest limits copy for keyless / BYOK lanes, shown in the UI. */
   limitsNote?: string;
+  /** Catalog notes for the preset (setup caveats the UI should show verbatim), when the preset carries any. */
+  notes?: string;
+  /**
+   * Templated presets only (Azure OpenAI, Cloudflare): the base URL shape
+   * with `{field}` placeholders, plus the endpoint fields the user must
+   * supply alongside the API key. The UI renders one input per field.
+   */
+  baseUrlTemplate?: string;
+  templateFields?: ProviderTemplateFieldInfo[];
 }
 
 export interface RunWorkflowBody {

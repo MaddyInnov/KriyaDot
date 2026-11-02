@@ -49,6 +49,18 @@ describe('routeModel', () => {
     expect(r.modelId).toBe('gpt-4o-mini');
   });
 
+  it('bare model id prefers the direct provider over a templated preset carrying the same id', () => {
+    // "gpt-4o" exists both on openai (direct) and on azure-openai as a
+    // deployment-name example (templated). The bare id must mean OpenAI.
+    const r = routeModel({ taskType: 'chat', botModel: 'gpt-4o' });
+    expect(r.providerId).toBe('openai');
+    expect(r.modelId).toBe('gpt-4o');
+    // The templated preset stays reachable with an explicit provider prefix.
+    const az = routeModel({ taskType: 'chat', botModel: 'azure-openai/gpt-4o' });
+    expect(az.providerId).toBe('azure-openai');
+    expect(az.modelId).toBe('gpt-4o');
+  });
+
   it('override of an unknown model throws (fail closed)', () => {
     expect(() => routeModel({ taskType: 'chat', botModel: 'nope/ghost-9000' })).toThrow(
       /does not match any catalog model/,
