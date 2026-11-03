@@ -23,6 +23,8 @@
   },
   "bundle": {
     "active": true,
+    "copyright": "Copyright © 2026 Ashutosh Sahoo",
+    "publisher": "Ashutosh Sahoo",
     "externalBin": [
       "binaries/mvp-api"
     ],

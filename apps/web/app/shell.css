@@ -364,6 +364,11 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.sb-copyright {
+  margin: 2px 9px 0;
+  font-size: 10.5px;
+  color: var(--text-3);
+}
 
 /* ---------- mobile: top strip + overlay drawer ---------- */
 @media (max-width: 1023px) {

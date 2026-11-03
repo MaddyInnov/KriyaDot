@@ -720,6 +720,7 @@ export default function AppSidebar() {
               <span className="sb-account-sub">api: {apiBase}</span>
             </span>
           </Link>
+          <p className="sb-copyright">© 2026 Ashutosh Sahoo · KriyaDot</p>
           {/* Rail mode: the only footer content left visible — expand back
               to full, or hide the sidebar entirely (collapse pass). */}
           <div className="sb-rail-actions">

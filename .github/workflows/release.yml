@@ -124,10 +124,86 @@ jobs:
             apps/api/src/index.ts \
             --outfile apps/desktop/src-tauri/binaries/${{ matrix.sidecar-name }}
 
+      # --- Windows code signing (SSL.com eSigner, cloud HSM) --------------
+      # Active only when the repo carries the ESIGNER_* secrets. The gate
+      # step detects them and every signing step below is skipped when they
+      # are absent, so runs without secrets build exactly as before
+      # (unsigned). With secrets present: the API sidecar .exe is signed
+      # here (before bundling embeds it), and the app .exe + NSIS installer
+      # are signed inside the tauri build via a custom signCommand injected
+      # as a --config merge file (scripts/sign-windows.ps1), which calls
+      # CodeSignTool — the file's hash is signed by SSL.com's cloud HSM and
+      # returned signed + RFC 3161 timestamped. Local tauri.conf.json is
+      # deliberately untouched, so local builds never see the sign command.
+      - name: Check eSigner secrets (Windows signing gate)
+        id: signcheck
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          ESIGNER_USERNAME: ${{ secrets.ESIGNER_USERNAME }}
+        run: |
+          if [ -n "$ESIGNER_USERNAME" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "eSigner secrets present - Windows artifacts will be signed."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::ESIGNER_* secrets not configured - building unsigned Windows artifacts."
+          fi
+
+      - name: Sign API sidecar with eSigner
+        if: runner.os == 'Windows' && steps.signcheck.outputs.enabled == 'true'
+        uses: sslcom/esigner-codesign@v1.3.0
+        with:
+          command: sign
+          username: ${{ secrets.ESIGNER_USERNAME }}
+          password: ${{ secrets.ESIGNER_PASSWORD }}
+          credential_id: ${{ secrets.ESIGNER_CREDENTIAL_ID }}
+          totp_secret: ${{ secrets.ESIGNER_TOTP_SECRET }}
+          file_path: ${{ github.workspace }}/apps/desktop/src-tauri/binaries/mvp-api-x86_64-pc-windows-msvc.exe
+          override: true
+          environment_name: PROD
+
+      - name: Prepare CodeSignTool + Tauri sign command
+        id: signprep
+        if: runner.os == 'Windows' && steps.signcheck.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = 'v1.3.2'
+          $zip = Join-Path $env:RUNNER_TEMP "CodeSignTool-$version-windows.zip"
+          Invoke-WebRequest -Uri "https://github.com/SSLcom/CodeSignTool/releases/download/$version/CodeSignTool-$version-windows.zip" -OutFile $zip
+          $dest = Join-Path $env:GITHUB_WORKSPACE '.codesigntool'
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $bat = Get-ChildItem -Path $dest -Recurse -Filter 'CodeSignTool.bat' | Select-Object -First 1
+          if (-not $bat) { throw 'CodeSignTool.bat not found in the extracted CodeSignTool archive.' }
+          "CODESIGNTOOL_BAT=$($bat.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $script = Join-Path $env:GITHUB_WORKSPACE 'scripts/sign-windows.ps1'
+          $cfg = @{
+            bundle = @{
+              windows = @{
+                signCommand = @{
+                  cmd  = 'powershell.exe'
+                  args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script, '%1')
+                }
+              }
+            }
+          } | ConvertTo-Json -Depth 6
+          $cfgPath = Join-Path $env:RUNNER_TEMP 'tauri-signing.json'
+          $cfg | Out-File -FilePath $cfgPath -Encoding utf8
+          "tauri_args=--config $cfgPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Consumed by scripts/sign-windows.ps1 during the Windows build.
+          # Empty when the secrets are not configured -> the script no-ops
+          # and the artifacts stay unsigned (legacy behavior).
+          ESIGNER_USERNAME: ${{ secrets.ESIGNER_USERNAME }}
+          ESIGNER_PASSWORD: ${{ secrets.ESIGNER_PASSWORD }}
+          ESIGNER_CREDENTIAL_ID: ${{ secrets.ESIGNER_CREDENTIAL_ID }}
+          ESIGNER_TOTP_SECRET: ${{ secrets.ESIGNER_TOTP_SECRET }}
         with:
+          args: ${{ steps.signprep.outputs.tauri_args }}
           tagName: ${{ github.event.inputs.tag || github.ref_name }}
           releaseName: 'KriyaDot ${{ github.event.inputs.tag || github.ref_name }}'
           releaseBody: |
