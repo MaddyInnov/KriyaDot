@@ -33,6 +33,11 @@ import { redactSecrets } from '@mvp/governance';
 import type { ComposioClient } from './composio.js';
 import { fetchComposioClient, readComposioEnables } from './composio.js';
 import { resolveAccount } from './composio-accounts.js';
+import {
+  classifyConnectionNeed,
+  featuredAppDefinition,
+  type ConnectionNeeded,
+} from './connected-apps.js';
 
 /** Execute one Composio action. Approval-gated (mutating). */
 export const COMPOSIO_CALL_TOOL = 'composio_call';
@@ -91,6 +96,26 @@ export interface ComposioToolHostOptions {
 
 const ACCOUNT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const ACTION_SLUG_RE = /^[A-Z0-9_]{1,128}$/;
+const TOOLKIT_SLUG_RE = /^[a-z0-9_-]{1,64}$/;
+
+/**
+ * The connection-needed card for "Composio itself is not set up" when no
+ * specific app was asked about. The classifier would build the href as
+ * '/accounts?app=&setup=platform' for the empty slug, so the action href
+ * is corrected explicitly to the platform-setup URL.
+ */
+function platformConnectionNeeded(): ConnectionNeeded {
+  const need = classifyConnectionNeed({
+    platformConfigured: false,
+    inCatalog: true,
+    hasActiveAccount: false,
+    enabledForBot: false,
+    appSlug: '',
+    appName: 'Composio apps',
+  });
+  if (need.kind === 'ready') throw new Error('unreachable: unconfigured platform classified ready');
+  return { ...need, action: { ...need.action, href: '/accounts?setup=platform' } };
+}
 const MAX_ARGS_BYTES = 64 * 1024;
 const DEFAULT_MAX_RESULT_CHARS = 8000;
 const MAX_TOOLS_PER_ACCOUNT = 25;
@@ -299,7 +324,10 @@ export function createComposioListActionsTool(opts: ComposioToolHostOptions): To
     name: COMPOSIO_LIST_ACTIONS_TOOL,
     description:
       'List Composio actions available to this bot, grouped by connected account. ' +
-      'Call this before composio_call to discover action names and parameters. Read-only.',
+      'Call this before composio_call to discover action names and parameters. Read-only. ' +
+      'Pass toolkitSlug to ask about ONE app: the result then carries a just-in-time ' +
+      'connectionNeeded card (platform setup / connect account / enable for this bot) ' +
+      'when that app is not ready, or connectionStatus "ready" plus its actions when it is.',
     parameters: {
       type: 'object',
       properties: {
@@ -311,11 +339,18 @@ export function createComposioListActionsTool(opts: ComposioToolHostOptions): To
           type: 'string',
           description: 'Filter actions by substring in name/description (max 100 chars).',
         },
+        toolkitSlug: {
+          type: 'string',
+          description:
+            'Optional: one toolkit slug (lowercase, e.g. "canva") to check just-in-time — ' +
+            'returns a connectionNeeded card when that app cannot be used yet.',
+        },
       },
       additionalProperties: false,
     },
     handler: async (args, ctx: ToolContext) => {
       const accountId = strArg(args, 'accountId', false, ACCOUNT_ID_RE);
+      const toolkitSlug = strArg(args, 'toolkitSlug', false, TOOLKIT_SLUG_RE);
       const searchRaw = args['search'];
       const search =
         typeof searchRaw === 'string' ? searchRaw.trim().toLowerCase().slice(0, 100) : '';
@@ -323,7 +358,21 @@ export function createComposioListActionsTool(opts: ComposioToolHostOptions): To
       const userId = resolveUserId(ctx);
       const apiKey = opts.getApiKey(userId);
       if (!apiKey) {
-        return { ok: true, accounts: [], connected: false };
+        if (toolkitSlug) {
+          // Just-in-time: name exactly what stands in the way — the
+          // platform itself is not set up yet.
+          const need = classifyConnectionNeed({
+            platformConfigured: false,
+            inCatalog: true,
+            hasActiveAccount: false,
+            enabledForBot: false,
+            appSlug: toolkitSlug,
+            appName: featuredAppDefinition(toolkitSlug)?.name ?? toolkitSlug,
+            botId: ctx.botId,
+          });
+          return { ok: true, accounts: [], connected: false, connectionNeeded: need };
+        }
+        return { ok: true, accounts: [], connected: false, connectionNeeded: platformConnectionNeeded() };
       }
       const enables = readComposioEnables(opts.dataDir, userId)[ctx.botId] ?? {};
       let accounts;
@@ -338,12 +387,60 @@ export function createComposioListActionsTool(opts: ComposioToolHostOptions): To
       // the thread carries a connector override (Octop #110), in the
       // override too (intersection: threads narrow, never widen).
       const override = threadOverrideFor(opts, ctx);
+
+      // Just-in-time connection check for one toolkit: classify BEFORE
+      // listing so an unusable app returns its connectionNeeded card
+      // instead of an empty, unexplained action list.
+      let catalogCheck: 'unavailable' | undefined;
+      if (toolkitSlug) {
+        let inCatalog = true; // benefit of the doubt until the catalog says otherwise
+        let catalogName: string | undefined;
+        try {
+          const apps = await client.listApps(apiKey);
+          const found = apps.find((a) => a.appId.toLowerCase() === toolkitSlug);
+          inCatalog = Boolean(found);
+          catalogName = found?.name;
+        } catch {
+          // Catalog unreachable: never fabricate a not_in_catalog verdict —
+          // degrade to the account/enablement checks and say so.
+          catalogCheck = 'unavailable';
+        }
+        const hasActiveAccount = accounts.some(
+          (a) => a.toolkitSlug.toLowerCase() === toolkitSlug && a.status === 'ACTIVE',
+        );
+        const enabledForBot =
+          enables[toolkitSlug] === true &&
+          (!override || override.includes(toolkitSlug));
+        const need = classifyConnectionNeed({
+          platformConfigured: true,
+          inCatalog,
+          hasActiveAccount,
+          enabledForBot,
+          appSlug: toolkitSlug,
+          appName: featuredAppDefinition(toolkitSlug)?.name ?? catalogName ?? toolkitSlug,
+          botId: ctx.botId,
+        });
+        if (need.kind !== 'ready') {
+          return {
+            ok: true,
+            connected: true,
+            accounts: [],
+            connectionNeeded: need,
+            ...(catalogCheck ? { catalogCheck } : {}),
+          };
+        }
+        // Ready: fall through to the normal listing, narrowed to this toolkit.
+      }
+
       let usable = accounts.filter(
         (a) =>
           a.status === 'ACTIVE' &&
           enables[a.toolkitSlug] === true &&
           (!override || override.includes(a.toolkitSlug.toLowerCase())),
       );
+      if (toolkitSlug) {
+        usable = usable.filter((a) => a.toolkitSlug.toLowerCase() === toolkitSlug);
+      }
       if (accountId) {
         usable = usable.filter((a) => a.id === accountId);
         if (usable.length === 0) {
@@ -382,6 +479,16 @@ export function createComposioListActionsTool(opts: ComposioToolHostOptions): To
             parameters: compactParameters(t.inputParameters),
           })),
         });
+      }
+      if (toolkitSlug) {
+        // The JIT classification above already proved this toolkit ready.
+        return {
+          ok: true,
+          connected: true,
+          accounts: out,
+          connectionStatus: 'ready',
+          ...(catalogCheck ? { catalogCheck } : {}),
+        };
       }
       return { ok: true, connected: true, accounts: out };
     },

@@ -87,6 +87,7 @@ import { BotPicker } from '../components/chat/bot-picker';
 import { ModelControl } from '../components/chat/model-control';
 import { BotConversationSheet, BotNoticeRow, type BotNoticeData } from '../components/chat/bot-notice';
 import { PublishedPageCard, publishedPageFromToolResult } from '../components/chat/published-page-card';
+import { ConnectionNeededCard, connectionNeededFromToolResult } from '../components/chat/connection-needed-card';
 import { MessageReactions } from '../components/chat/message-reactions';
 import { CommandPalette, useCommandPaletteShortcut, type PaletteItem } from '../components/command-palette';
 import { PlacesRail } from '../components/places-rail';
@@ -3634,6 +3635,15 @@ function ChatPageInner() {
                       bots={bots.map((x) => ({ id: x.id, name: x.name }))}
                       onOpenSheet={(peerId) => setConvSheetPeer(peerId)}
                     />
+                  );
+                }
+                const connectionNeeded =
+                  b.result !== undefined ? connectionNeededFromToolResult(b.call.name, b.result) : null;
+                if (connectionNeeded) {
+                  return (
+                    <div key={b.id} className="msg-row assistant">
+                      <ConnectionNeededCard data={connectionNeeded} />
+                    </div>
                   );
                 }
                 const publishedPage =

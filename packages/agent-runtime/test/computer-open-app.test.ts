@@ -199,3 +199,39 @@ describe('approval gating', () => {
     }
   });
 });
+
+describe('blender alias (W2 bridge)', () => {
+  it('defines the blender alias for every platform', () => {
+    expect(APP_ALIASES['blender']).toEqual({
+      exes: ['blender.exe'],
+      macNames: ['Blender'],
+      linuxNames: ['blender'],
+    });
+    expect(APP_ALIASES['blender3d']).toEqual(APP_ALIASES['blender']);
+  });
+
+  it('normalizes "Blender" to the blender key', () => {
+    expect(normalizeAppName('Blender')).toBe('blender');
+    expect(normalizeAppName('  BLENDER ')).toBe('blender');
+    expect(normalizeAppName('Blender App')).toBe('blender');
+  });
+
+  it('resolves blender on Linux to the blender binary', () => {
+    const attempts = resolveLaunchAttempts('blender', 'linux');
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]).toEqual({ command: 'blender', args: [], label: 'binary blender' });
+  });
+
+  it('resolves blender on Windows to a blender.exe start', () => {
+    const attempts = resolveLaunchAttempts('blender', 'win32');
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]!.command).toBe('cmd');
+    expect(attempts[0]!.args).toEqual(['/c', 'start', '', 'blender.exe']);
+    expect(attempts[0]!.label).toBe('start blender.exe');
+  });
+
+  it('resolves blender on macOS via open -a Blender', () => {
+    const attempts = resolveLaunchAttempts('blender', 'darwin');
+    expect(attempts[0]).toEqual({ command: 'open', args: ['-a', 'Blender'], label: 'open -a "Blender"' });
+  });
+});

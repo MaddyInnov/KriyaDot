@@ -135,7 +135,7 @@ const MORE_LINKS = [
 ];
 
 const SETTINGS_LINKS = [
-  { href: '/accounts', label: 'Accounts & API keys' },
+  { href: '/accounts', label: 'Connected Apps' },
   { href: '/providers', label: 'Providers & models' },
   { href: '/messaging', label: 'Messaging' },
   { href: '/usage', label: 'Usage & costs' },

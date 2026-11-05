@@ -113,6 +113,8 @@ export const APP_ALIASES: Readonly<Record<string, AppAlias>> = {
   music: { macNames: ['Music'] },
   files: { exes: ['explorer.exe'], macNames: ['Finder'], linuxNames: ['nautilus', 'dolphin'] },
   settings: { uris: ['ms-settings:'], exes: ['control.exe'], macNames: ['System Settings'] },
+  blender: { exes: ['blender.exe'], macNames: ['Blender'], linuxNames: ['blender'] },
+  blender3d: { exes: ['blender.exe'], macNames: ['Blender'], linuxNames: ['blender'] },
 };
 
 /**

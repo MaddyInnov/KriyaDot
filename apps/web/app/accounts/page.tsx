@@ -13,6 +13,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { authedFetch, getApiBase } from '../../lib/api';
+import { ConnectedAppsHub } from '../../components/connected-apps/connected-apps-hub';
 
 const base = () => getApiBase();
 
@@ -1171,7 +1172,9 @@ function WalletPanel() {
 export default function AccountsPage() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <h1>Accounts</h1>
+      <h1>Connected Apps</h1>
+      <ConnectedAppsHub />
+      <h2 style={{ marginBottom: 0 }}>Accounts, keys &amp; advanced</h2>
       <ConnectedAccounts />
       <ComposioPanel />
       <ComposioAccountsPanel />

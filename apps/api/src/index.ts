@@ -300,6 +300,8 @@ import {
   googleWorkspaceToolPolicies,
 } from './google-workspace.js';
 import { composioAppCapabilityFeatures, googleWorkspaceCapabilityFeature } from './composio-apps.js';
+import { connectedAppCapabilityFeatures } from './connected-apps.js';
+import { blenderToolPolicies, registerBlenderTools, BLENDER_TOOL_NAMES } from './blender.js';
 import {
   registerCapabilityTools,
   grantCapabilityToolsToBots,
@@ -553,6 +555,14 @@ async function boot(): Promise<void> {
   // composio_call / composio_list_actions tools (derived from the
   // composio-enables.json files, so grants survive restarts).
   applyComposioToolGrants(seed.bots, config.dataDir);
+  // Blender bridge: bots that can already drive the desktop
+  // (computer_open_app) also gain the governed Blender tools.
+  for (const bot of seed.bots) {
+    if (!Array.isArray(bot.tools) || !bot.tools.includes('computer_open_app')) continue;
+    for (const name of BLENDER_TOOL_NAMES) {
+      if (!bot.tools.includes(name)) bot.tools.push(name);
+    }
+  }
 
   // 2. Governance + tools.
   // Phase 4: prepend approval-gating rules for the new agent tools
@@ -561,7 +571,7 @@ async function boot(): Promise<void> {
   // so deny-by-default is preserved and extended.
   const globalPolicy: Policy = {
     ...DEFAULT_POLICY,
-    rules: [...publishPagePolicyRules(), ...interconnectionPolicyRules(), ...computerUsePolicyRules(), ...museModuleToolPolicies(), ...composioToolPolicies(), ...signInCodePolicyRules(), ...purchasePolicyRules(), ...phoneActionPolicyRules(), ...phoneDataPolicyRules(), ...phonePackagedPolicyRules(), ...phoneBackgroundPolicyRules(), ...cameraCapturePolicyRules(), ...osBindingPolicyRules(), ...whatsappLocalPolicyRules(), ...shellyPolicyRules(), ...ippPolicyRules(), ...outboundCallPolicyRules(), ...phoneSmsPolicyRules(), ...googleWorkspaceToolPolicies(), ...capabilityToolsPolicyRules(), ...DEFAULT_POLICY.rules],
+    rules: [...publishPagePolicyRules(), ...interconnectionPolicyRules(), ...computerUsePolicyRules(), ...museModuleToolPolicies(), ...composioToolPolicies(), ...signInCodePolicyRules(), ...purchasePolicyRules(), ...phoneActionPolicyRules(), ...phoneDataPolicyRules(), ...phonePackagedPolicyRules(), ...phoneBackgroundPolicyRules(), ...cameraCapturePolicyRules(), ...osBindingPolicyRules(), ...whatsappLocalPolicyRules(), ...shellyPolicyRules(), ...ippPolicyRules(), ...outboundCallPolicyRules(), ...phoneSmsPolicyRules(), ...googleWorkspaceToolPolicies(), ...blenderToolPolicies(), ...capabilityToolsPolicyRules(), ...DEFAULT_POLICY.rules],
   };
   const governance = new GovernanceGateway({
     dbPath: `${config.dataDir}/governance.db`,
@@ -896,6 +906,11 @@ async function boot(): Promise<void> {
     resolveUserId: () => 'default-user',
     audit: (action, fields) => governance.audit(action, fields),
   });
+  // Blender bridge (Connected Apps build D): governed Blender tools —
+  // status is read-only; open/run-script/render are approval-gated via
+  // blenderToolPolicies() above. Script/render paths are confined to the
+  // workspace root.
+  registerBlenderTools(toolRegistry, { workspaceRoots: [config.workspaceDir] });
   // Capability awareness (Muse closure ADD-2): a GENERATED registry over
   // the live catalogs (bots, tools, skills, workflows, plugins, channels +
   // product features). discover_capabilities is granted to every bot; the
@@ -924,7 +939,7 @@ async function boot(): Promise<void> {
     channels: () => listChannelIds().map((id) => ({ id })),
     // CN-4..CN-8 + CN-3: verified Composio app capabilities and the
     // first-party Google Workspace entry join the curated feature table.
-    features: [...PRODUCT_FEATURES, ...composioAppCapabilityFeatures(), googleWorkspaceCapabilityFeature()],
+    features: [...PRODUCT_FEATURES, ...composioAppCapabilityFeatures(), ...connectedAppCapabilityFeatures(), googleWorkspaceCapabilityFeature()],
   }, { embedder: platformEmbedder });
   registerCapabilityTools({ registry: toolRegistry, service: capabilityService });
   // CN-3: first-party Google Workspace tools (Gmail/Calendar/Drive) on

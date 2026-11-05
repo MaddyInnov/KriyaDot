@@ -162,6 +162,10 @@ import { registerTenancyRoutes } from './tenancy.js';
 import { registerVaultRoutes } from './vault.js';
 import { registerComposioRoutes } from './composio.js';
 import { registerComposioAccountRoutes } from './composio-accounts.js';
+import { registerConnectedAppsRoutes } from './connected-apps.js';
+import { registerAutomationStartersRoutes } from './automation-starters.js';
+import { registerLocalAppRoutes } from './blender.js';
+import { localAppEntries } from './local-apps-entries.js';
 import { registerDatabasesRoutes } from './databases.js';
 import { registerNotionImportRoutes } from './notion-import.js';
 import { registerProtocolRoutes } from './protocols.js';
@@ -3696,6 +3700,22 @@ export function createRouter(deps: RouteDeps): express.Router {
   // Composio connected accounts: OAuth connect links, account list/labels,
   // disconnect, and per-account tool browsers.
   registerComposioAccountRoutes(router, { config, governance, bots, loopbackToken: deps.loopbackToken });
+  // Connected Apps hub: one aggregate read model over Composio apps +
+  // accounts, native channels/OAuth, MCP servers, the paired phone and
+  // local desktop apps (incl. Blender) — GET /api/connected-apps (+ /need).
+  registerConnectedAppsRoutes(router, {
+    config,
+    governance,
+    bots,
+    loopbackToken: deps.loopbackToken,
+    lazyMcpManager: deps.lazyMcpManager,
+    sources: { localApps: localAppEntries },
+  });
+  // Local desktop apps: detection status (GET /api/local-apps).
+  registerLocalAppRoutes(router, { config, loopbackToken: deps.loopbackToken });
+  // Automation starters: ready-to-customize recipes that materialize as
+  // DISABLED routines (GET /api/automation-starters, POST .../:id/create).
+  registerAutomationStartersRoutes(router, { config, governance, bots, loopbackToken: deps.loopbackToken });
   // Notion parity: databases/table view + Notion HTML/ZIP import.
   {
     const databasesRouter = express.Router();

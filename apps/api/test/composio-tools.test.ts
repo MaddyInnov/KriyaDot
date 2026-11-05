@@ -234,7 +234,21 @@ describe('composio_list_actions handler', () => {
   it('reports disconnected gracefully', async () => {
     const tool = makeTool(undefined);
     const result = (await tool.handler({}, CTX_BOT1)) as { ok: boolean; connected: boolean; accounts: unknown[] };
-    expect(result).toEqual({ ok: true, accounts: [], connected: false });
+    // Connected Apps build: the graceful result now also carries the
+    // structured just-in-time connection need (platform not configured) so
+    // chat can render a setup card instead of a dead end.
+    expect(result).toEqual({
+      ok: true,
+      accounts: [],
+      connected: false,
+      connectionNeeded: {
+        kind: 'platform_not_configured',
+        appSlug: '',
+        appName: 'Composio apps',
+        message: expect.any(String),
+        action: { type: 'setup_platform', href: '/accounts?setup=platform' },
+      },
+    });
   });
 
   it('lists only ACTIVE accounts whose app is enabled for the bot', async () => {

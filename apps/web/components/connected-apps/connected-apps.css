@@ -1,0 +1,105 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Connected Apps hub (W4): grid, monogram tiles, WhatsApp mode rows.
+ * Theme-safe: only theme CSS vars (with legacy-name fallbacks), never
+ * hard-coded light-only colors. */
+
+.ca-setup {
+  border-style: dashed;
+}
+
+.ca-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0 4px;
+}
+
+.ca-chip-active {
+  background: var(--accent-soft, var(--accent));
+  color: var(--accent, var(--text));
+  border-color: var(--accent, var(--border));
+}
+
+.ca-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.ca-card {
+  background: var(--surface, var(--panel));
+  border: 1px solid var(--border, var(--line));
+  border-radius: var(--radius-sm, 12px);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ca-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.ca-monogram {
+  width: 40px;
+  height: 40px;
+  flex: 0 0 40px;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+  font-size: 18px;
+  background: var(--accent-soft, var(--surface-2));
+  color: var(--accent, var(--text));
+  border: 1px solid var(--border, var(--line));
+}
+
+.ca-logo {
+  width: 40px;
+  height: 40px;
+  flex: 0 0 40px;
+  border-radius: 10px;
+  object-fit: contain;
+  background: var(--surface-2, var(--surface));
+  border: 1px solid var(--border, var(--line));
+}
+
+.ca-caps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ca-manage {
+  border-top: 1px solid var(--border, var(--line));
+  padding-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ca-mode-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border, var(--line));
+}
+
+.ca-mode-row:first-of-type {
+  border-top: none;
+}
+
+.ca-dim {
+  color: var(--text-2, var(--text-dim));
+}
+
+.ca-highlight {
+  outline: 2px solid var(--accent, var(--border-strong));
+  outline-offset: 2px;
+}
