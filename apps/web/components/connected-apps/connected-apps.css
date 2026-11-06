@@ -1,7 +1,13 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Connected Apps hub (W4): grid, monogram tiles, WhatsApp mode rows.
  * Theme-safe: only theme CSS vars (with legacy-name fallbacks), never
- * hard-coded light-only colors. */
+ * hard-coded light-only colors.
+ *
+ * Layout rules (UI pass): cards are full-height flex columns with
+ * min-width:0 so grid tracks can shrink below long nowrap content;
+ * status chips live on their own row under the app name (never beside
+ * it), starter trigger labels are an eyebrow above the title, and card
+ * actions pin to the bottom via margin-top:auto so rows align. */
 
 .ca-setup {
   border-style: dashed;
@@ -20,11 +26,45 @@
   border-color: var(--accent, var(--border));
 }
 
+/* Section header (starters title + bot picker): wraps cleanly instead
+ * of squeezing — both children may shrink, the picker never overflows. */
+.ca-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.ca-section-head > * {
+  min-width: 0;
+}
+
+.ca-bot-picker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.ca-bot-picker select {
+  min-width: 0;
+  max-width: 100%;
+}
+
 .ca-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  /* min(260px, 100%): a track can never force the grid wider than its
+   * container — this is what removes the page-level horizontal
+   * scrollbar on narrow viewports. */
+  grid-template-columns: repeat(auto-fill, minmax(min(260px, 100%), 1fr));
+  grid-auto-rows: 1fr;
+  align-items: stretch;
   gap: 12px;
   margin-top: 10px;
+  min-width: 0;
 }
 
 .ca-card {
@@ -35,12 +75,78 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
+  height: 100%;
+  min-width: 0;
 }
 
+/* Long unbroken text (names, descriptions, account ids, notes) wraps
+ * instead of inflating the card's min-content width. */
+.ca-long-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.ca-card .chip {
+  max-width: 100%;
+}
+
+/* App card head: row 1 is logo + name block only. The status chip moved
+ * to .ca-status-row below, so it can never crowd or overlap the name
+ * tail on a ~260px card. */
 .ca-card-head {
   display: flex;
   align-items: flex-start;
   gap: 10px;
+  min-width: 0;
+}
+
+.ca-card-title {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.ca-card-name {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.ca-status-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ca-status-row .chip {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* Starter cards: trigger label as a small-caps eyebrow ABOVE the title;
+ * the title owns its block and wraps without competing with a pill. */
+.ca-starter-eyebrow {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-2, var(--text-dim));
+}
+
+.ca-starter-title {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+}
+
+/* Bottom-pinned card actions (Create / Connect / Manage …). */
+.ca-card-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: auto;
+  padding-top: 4px;
+  min-width: 0;
 }
 
 .ca-monogram {
@@ -72,6 +178,17 @@
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  min-width: 0;
+}
+
+/* Capability chips carry full sentences ("Read your Facebook Pages,
+ * posts and insights") — as nowrap pills their min-content (~300px+)
+ * exceeds a card's content width and the pill is clipped at the card
+ * edge. Let the chip TEXT wrap inside the pill instead. */
+.ca-caps .chip {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  min-width: 0;
 }
 
 .ca-manage {
@@ -80,19 +197,48 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-width: 0;
 }
 
+.ca-account-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* WhatsApp mode rows: label block may shrink/wrap; the chip+button
+ * group wraps under it when the card is narrow, and stacks fully
+ * vertically under ~480px (see breakpoints). */
 .ca-mode-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 10px;
   padding: 8px 0;
   border-top: 1px solid var(--border, var(--line));
+  min-width: 0;
 }
 
 .ca-mode-row:first-of-type {
   border-top: none;
+}
+
+.ca-mode-main {
+  flex: 1 1 140px;
+  min-width: 0;
+}
+
+.ca-mode-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.ca-mode-actions .chip {
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .ca-dim {
@@ -102,4 +248,47 @@
 .ca-highlight {
   outline: 2px solid var(--accent, var(--border-strong));
   outline-offset: 2px;
+}
+
+/* ---------- responsive ---------- */
+
+@media (max-width: 1100px) {
+  .ca-grid {
+    grid-template-columns: repeat(auto-fill, minmax(min(240px, 100%), 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .ca-grid {
+    grid-template-columns: repeat(auto-fill, minmax(min(220px, 100%), 1fr));
+    gap: 10px;
+  }
+
+  .ca-card {
+    padding: 12px;
+  }
+
+  .ca-section-head {
+    align-items: flex-start;
+  }
+}
+
+@media (max-width: 480px) {
+  .ca-grid {
+    grid-template-columns: minmax(min(200px, 100%), 1fr);
+  }
+
+  /* Mode rows stack: label, then chip/button group on its own line. */
+  .ca-mode-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .ca-mode-actions {
+    justify-content: flex-start;
+  }
+
+  .ca-bot-picker {
+    flex-wrap: wrap;
+  }
 }

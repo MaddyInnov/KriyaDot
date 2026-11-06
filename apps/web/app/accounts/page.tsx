@@ -726,11 +726,11 @@ function ComposioAccountsPanel() {
           {accounts.map((a) => (
             <div key={a.id} className="card" style={{ marginBottom: 8, padding: 12 }}>
               <div className="row-between">
-                <div>
+                <div style={{ minWidth: 0 }}>
                   <strong>{a.label || a.toolkitName || a.toolkitSlug}</strong>{' '}
                   <span className={`chip ${a.status === 'ACTIVE' ? 'green' : 'amber'}`}>{a.status}</span>
                   {a.label && <span className="small muted"> · {a.toolkitName || a.toolkitSlug}</span>}
-                  <div className="small muted mono">{a.id}</div>
+                  <div className="small muted mono" style={{ minWidth: 0, overflowWrap: 'anywhere' }}>{a.id}</div>
                 </div>
                 <div style={{ display: 'flex', gap: 8 }}>
                   <button className="btn btn-sm" disabled={busy === a.id} onClick={() => void toggleTools(a.id)}>

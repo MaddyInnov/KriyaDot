@@ -194,6 +194,28 @@ describe('ConnectedAppsHub', () => {
     expect(within(card).getByTestId('mode-desktop')).toHaveTextContent('On this computer');
   });
 
+  it('status chip sits on its own row, never inside the card head next to the name', async () => {
+    setAggregate(true, [
+      app({
+        id: 'figma',
+        name: 'Figma With A Very Long Name That Would Crowd A Chip',
+        category: 'design-media',
+        status: 'not_in_catalog',
+        composioSlug: 'figma',
+      }),
+    ]);
+    render(<ConnectedAppsHub />);
+    const card = await screen.findByTestId('app-card-figma');
+    const head = card.querySelector('.ca-card-head');
+    expect(head).not.toBeNull();
+    expect(within(head as HTMLElement).queryByText('Not in your Composio workspace')).toBeNull();
+    const statusRow = card.querySelector('.ca-status-row');
+    expect(statusRow).not.toBeNull();
+    expect(
+      within(statusRow as HTMLElement).getByText('Not in your Composio workspace'),
+    ).toBeInTheDocument();
+  });
+
   it('local app reports its installed version and offers Open', async () => {
     setAggregate(true, [
       app({

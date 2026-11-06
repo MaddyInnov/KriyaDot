@@ -5,14 +5,26 @@
 // honest note pointing at Bots → Routines to review and enable. The
 // highlightApp prop (from a card's "Automate it") filters/highlights the
 // recipes that need that app.
+//
+// Layout: each card is a full-height flex column — a small eyebrow row
+// carries the trigger label ABOVE the title (they never share a row, so a
+// long recipe name wraps cleanly instead of squeezing against a pill),
+// dependency chips wrap, and the Create action is pinned to the card
+// bottom (margin-top:auto) so buttons align across a grid row. Category
+// chips filter client-side via starterCategory (API field + slug
+// fallback); a highlight resets the category filter to All.
 
 'use client';
 
 import React, { useCallback, useEffect, useState } from 'react';
 import {
+  STARTER_CATEGORY_FILTERS,
+  STARTER_CATEGORY_LABELS,
   createStarter,
   fetchStarters,
+  filterStartersByCategory,
   triggerKindLabel,
+  type StarterCategory,
   type StarterRecipe,
   type WebBot,
 } from '../../lib/connected-apps';
@@ -26,6 +38,7 @@ export interface StartersSectionProps {
 export function StartersSection({ bots, highlightApp }: StartersSectionProps) {
   const [botId, setBotId] = useState('');
   const [starters, setStarters] = useState<StarterRecipe[]>([]);
+  const [category, setCategory] = useState<StarterCategory | 'all'>('all');
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState('');
@@ -34,6 +47,12 @@ export function StartersSection({ bots, highlightApp }: StartersSectionProps) {
   useEffect(() => {
     if (!botId && bots.length > 0) setBotId(bots[0].id);
   }, [bots, botId]);
+
+  // A highlight ("Automate it" for an app) must not be hidden by a stale
+  // category selection — reset the category filter whenever one arrives.
+  useEffect(() => {
+    if (highlightApp) setCategory('all');
+  }, [highlightApp]);
 
   const refresh = useCallback(async (forBotId: string) => {
     if (!forBotId) {
@@ -71,17 +90,18 @@ export function StartersSection({ bots, highlightApp }: StartersSectionProps) {
     }
   };
 
-  const shown = highlightApp
+  const byHighlight = highlightApp
     ? starters.filter((s) =>
         s.requiredApps.some((a) => a.toLowerCase() === highlightApp.toLowerCase()),
       )
     : starters;
+  const shown = filterStartersByCategory(byHighlight, category);
 
   return (
     <div className="card" id="ca-starters">
-      <div className="row-between" style={{ flexWrap: 'wrap', gap: 8 }}>
+      <div className="ca-section-head">
         <h2 style={{ margin: 0 }}>Automations you can start</h2>
-        <label className="small" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <label className="small ca-bot-picker">
           <strong>Bot</strong>
           <select
             className="input"
@@ -102,6 +122,20 @@ export function StartersSection({ bots, highlightApp }: StartersSectionProps) {
         Ready-made routines that use your connected apps. Creating one never turns it on.
         {highlightApp ? ` Showing recipes that use ${highlightApp}.` : ''}
       </p>
+      {starters.length > 0 && (
+        <div className="ca-chips" role="group" aria-label="Filter automations by category">
+          {STARTER_CATEGORY_FILTERS.map((chipDef) => (
+            <button
+              key={chipDef.id}
+              className={`chip-btn${category === chipDef.id ? ' ca-chip-active' : ''}`}
+              aria-pressed={category === chipDef.id}
+              onClick={() => setCategory(chipDef.id)}
+            >
+              {chipDef.label}
+            </button>
+          ))}
+        </div>
+      )}
       {error && (
         <p className="small" style={{ color: 'var(--red, #c0392b)' }}>
           {error}
@@ -116,7 +150,11 @@ export function StartersSection({ bots, highlightApp }: StartersSectionProps) {
       {bots.length === 0 && <p className="small muted">No bots yet — create one on the Bots page.</p>}
       {bots.length > 0 && shown.length === 0 && (
         <p className="small muted">
-          {highlightApp ? 'No automations use that app yet.' : 'No automations available for this bot yet.'}
+          {highlightApp
+            ? 'No automations use that app yet.'
+            : category !== 'all'
+              ? `No ${STARTER_CATEGORY_LABELS[category]} automations for this bot yet.`
+              : 'No automations available for this bot yet.'}
         </p>
       )}
       <div className="ca-grid">
@@ -131,11 +169,13 @@ export function StartersSection({ bots, highlightApp }: StartersSectionProps) {
               className={`ca-card${highlighted ? ' ca-highlight' : ''}`}
               data-testid={`starter-${starter.id}`}
             >
-              <div className="row-between">
-                <strong>{starter.name}</strong>
-                <span className="chip gray">{triggerKindLabel(starter.triggerKind)}</span>
-              </div>
-              {starter.description && <p className="small muted" style={{ margin: 0 }}>{starter.description}</p>}
+              <div className="ca-starter-eyebrow">{triggerKindLabel(starter.triggerKind)}</div>
+              <strong className="ca-starter-title">{starter.name}</strong>
+              {starter.description && (
+                <p className="small muted ca-long-text" style={{ margin: 0 }}>
+                  {starter.description}
+                </p>
+              )}
               <div className="ca-caps">
                 {starter.requiredApps.map((req) => {
                   const missing = starter.missing?.includes(req);
@@ -148,11 +188,11 @@ export function StartersSection({ bots, highlightApp }: StartersSectionProps) {
                 })}
               </div>
               {!starter.ready && starter.missing?.length > 0 && (
-                <p className="small muted" style={{ margin: 0 }}>
+                <p className="small muted ca-long-text" style={{ margin: 0 }}>
                   Connect {starter.missing.join(', ')} first to use this automation.
                 </p>
               )}
-              <div>
+              <div className="ca-card-actions">
                 <button
                   className="btn btn-sm btn-primary"
                   disabled={busy === starter.id || !starter.ready || Boolean(created[starter.id])}

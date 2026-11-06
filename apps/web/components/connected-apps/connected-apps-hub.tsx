@@ -257,7 +257,7 @@ export function ConnectedAppsHub() {
           <strong className="small">Accounts</strong>
           {(app.accounts ?? []).map((account) => (
             <div key={account.id} className="row-between" style={{ padding: '6px 0', flexWrap: 'wrap', gap: 6 }}>
-              <span className="small">
+              <span className="small ca-account-label">
                 {account.label || account.id}{' '}
                 <span className={`chip ${account.status === 'ACTIVE' || account.status === 'connected' ? 'green' : 'gray'}`}>
                   {account.status}
@@ -379,23 +379,23 @@ export function ConnectedAppsHub() {
               {app.name.charAt(0).toUpperCase()}
             </div>
           )}
-          <div style={{ minWidth: 0 }}>
-            <strong>{app.name}</strong>
-            <div className="small muted">{app.connectionType}</div>
+          <div className="ca-card-title">
+            <strong className="ca-card-name">{app.name}</strong>
+            <div className="small muted ca-long-text">{app.connectionType}</div>
           </div>
-          <span className={`chip ${statusTone(app.status)}`} style={{ marginLeft: 'auto' }}>
-            {statusLabel(app.status)}
-          </span>
+        </div>
+        <div className="ca-status-row">
+          <span className={`chip ${statusTone(app.status)}`}>{statusLabel(app.status)}</span>
         </div>
 
         {app.description && (
-          <p className="small muted" style={{ margin: 0 }}>
+          <p className="small muted ca-long-text" style={{ margin: 0 }}>
             {app.description}
           </p>
         )}
 
         {app.status === 'connected' && (app.accounts ?? []).length > 0 && (
-          <p className="small" style={{ margin: 0 }}>
+          <p className="small ca-long-text" style={{ margin: 0 }}>
             {(app.accounts ?? []).map((a) => a.label || a.id).join(', ')}
           </p>
         )}
@@ -412,7 +412,7 @@ export function ConnectedAppsHub() {
         )}
 
         {isLocalApp(app) && app.local && (
-          <p className="small" style={{ margin: 0 }}>
+          <p className="small ca-long-text" style={{ margin: 0 }}>
             {app.local.installed
               ? `Installed${app.local.version ? ` v${app.local.version}` : ''}${app.local.running ? ' · running now' : ''}`
               : 'Not detected on this computer'}
@@ -423,7 +423,7 @@ export function ConnectedAppsHub() {
         )}
 
         {app.notes && (
-          <p className="small muted" style={{ margin: 0 }}>
+          <p className="small muted ca-long-text" style={{ margin: 0 }}>
             {app.notes}
           </p>
         )}
@@ -432,11 +432,11 @@ export function ConnectedAppsHub() {
           <div>
             {(app.modes ?? []).map((mode) => (
               <div key={mode.id} className="ca-mode-row" data-testid={`mode-${mode.id}`}>
-                <div style={{ minWidth: 0 }}>
+                <div className="ca-mode-main">
                   <strong className="small">{mode.label}</strong>
-                  <div className="small muted">{mode.detail}</div>
+                  <div className="small muted ca-long-text">{mode.detail}</div>
                 </div>
-                <span style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <span className="ca-mode-actions">
                   <span className={`chip ${statusTone(mode.status)}`}>{statusLabel(mode.status)}</span>
                   {mode.status === 'connected' || mode.status === 'on_this_computer' ? (
                     <button
@@ -462,7 +462,7 @@ export function ConnectedAppsHub() {
             ))}
           </div>
         ) : (
-          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 'auto' }}>
+          <div className="ca-card-actions">
             {app.status === 'needs_platform_setup' && (
               <button className="btn btn-sm btn-primary" onClick={focusSetup}>
                 Set up platform

@@ -106,6 +106,11 @@ export interface ComposioAccountsResponse {
 
 export type StarterTriggerKind = 'event' | 'schedule' | 'manual';
 
+/** Starter grouping used by the section's category filter chips. The API
+ * adds this field per starter; when it is absent the slug fallback in
+ * `starterCategory` keeps grouping working. */
+export type StarterCategory = 'content' | 'communication' | 'work' | 'business' | 'development';
+
 export interface StarterRecipe {
   id: string;
   name: string;
@@ -114,6 +119,7 @@ export interface StarterRecipe {
   triggerKind: StarterTriggerKind;
   ready: boolean;
   missing: string[];
+  category?: StarterCategory | string;
 }
 
 export interface StartersResponse {
@@ -380,6 +386,80 @@ export function statusTone(status: ConnectedAppStatus | string): 'green' | 'ambe
     default:
       return 'gray';
   }
+}
+
+export const STARTER_CATEGORY_LABELS: Record<StarterCategory, string> = {
+  content: 'Content & social',
+  communication: 'Communication',
+  work: 'Work',
+  business: 'Business',
+  development: 'Development',
+};
+
+export const STARTER_CATEGORY_FILTERS: Array<{ id: StarterCategory | 'all'; label: string }> = [
+  { id: 'all', label: 'All' },
+  { id: 'content', label: 'Content & social' },
+  { id: 'communication', label: 'Communication' },
+  { id: 'work', label: 'Work' },
+  { id: 'business', label: 'Business' },
+  { id: 'development', label: 'Development' },
+];
+
+const STARTER_CATEGORIES: StarterCategory[] = [
+  'content',
+  'communication',
+  'work',
+  'business',
+  'development',
+];
+
+/**
+ * Slug → category fallback, keyed by the normalized required-app slug
+ * (lowercased, non-alphanumerics stripped, so 'google-sheets',
+ * 'Google Sheets' and 'googlesheets' all hit the same entry). Used only
+ * when a starter carries no (or an unknown) API `category`.
+ */
+const STARTER_SLUG_CATEGORY: Record<string, StarterCategory> = {
+  canva: 'content',
+  instagram: 'content',
+  linkedin: 'content',
+  youtube: 'content',
+  tiktok: 'content',
+  facebook: 'content',
+  whatsapp: 'communication',
+  slack: 'communication',
+  gmail: 'communication',
+  zoom: 'communication',
+  github: 'development',
+  stripe: 'business',
+  shopify: 'business',
+  googlesheets: 'business',
+};
+
+/**
+ * Resolve a starter's category: the API `category` wins when it is one of
+ * the known values; otherwise the first required app that appears in the
+ * slug fallback map decides; otherwise 'work'.
+ */
+export function starterCategory(
+  starter: Pick<StarterRecipe, 'category' | 'requiredApps'>,
+): StarterCategory {
+  const raw = (starter.category ?? '').toLowerCase();
+  if ((STARTER_CATEGORIES as string[]).includes(raw)) return raw as StarterCategory;
+  for (const app of starter.requiredApps ?? []) {
+    const slug = app.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const hit = STARTER_SLUG_CATEGORY[slug];
+    if (hit) return hit;
+  }
+  return 'work';
+}
+
+export function filterStartersByCategory(
+  starters: StarterRecipe[],
+  category: StarterCategory | 'all',
+): StarterRecipe[] {
+  if (category === 'all') return starters;
+  return starters.filter((s) => starterCategory(s) === category);
 }
 
 export function triggerKindLabel(kind: StarterTriggerKind | string): string {
