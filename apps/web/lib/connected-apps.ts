@@ -163,6 +163,79 @@ export function connectComposioPlatform(apiKey: string): Promise<unknown> {
   return api('POST', '/api/composio/connect', { apiKey });
 }
 
+export function disconnectComposioPlatform(): Promise<unknown> {
+  return api('DELETE', '/api/composio/connect');
+}
+
+// ---------------------------------------------------------------------------
+// Composio platform mode (BYOK vs KriyaDot Managed)
+// ---------------------------------------------------------------------------
+
+export type ComposioMode = 'byok' | 'managed';
+
+export interface ComposioManagedStatus {
+  serviceConfigured: boolean;
+  tokenConfigured: boolean;
+  plan?: string;
+  used?: number;
+  quota?: number;
+  quotaExceeded?: boolean;
+}
+
+export interface ComposioStatus {
+  connected: boolean;
+  mode: ComposioMode;
+  managed?: ComposioManagedStatus;
+}
+
+export function fetchComposioStatus(): Promise<ComposioStatus> {
+  return api<ComposioStatus>('GET', '/api/composio/status');
+}
+
+export function setComposioMode(mode: ComposioMode): Promise<{ mode: ComposioMode }> {
+  return api<{ mode: ComposioMode }>('POST', '/api/composio/mode', { mode });
+}
+
+export function saveComposioManagedToken(
+  token: string,
+): Promise<{ ok: boolean; plan?: string; quota?: number }> {
+  return api<{ ok: boolean; plan?: string; quota?: number }>('POST', '/api/composio/managed-token', {
+    token,
+  });
+}
+
+export function deleteComposioManagedToken(): Promise<unknown> {
+  return api('DELETE', '/api/composio/managed-token');
+}
+
+export const MANAGED_QUOTA_EXCEEDED_MESSAGE =
+  'Your managed allowance is used up for this month — upgrade your plan or switch to your own Composio key.';
+
+export const MANAGED_PRIVACY_SENTENCE =
+  'In Managed mode, app actions pass through a KriyaDot-operated service. Your app sign-ins stay with the providers; the service keeps only usage counts.';
+
+/** True when the managed allowance is exhausted (explicit flag or used >= quota). */
+export function isManagedQuotaExceeded(
+  managed: ComposioManagedStatus | undefined | null,
+): boolean {
+  if (!managed) return false;
+  if (managed.quotaExceeded) return true;
+  if (
+    typeof managed.used === 'number' &&
+    typeof managed.quota === 'number' &&
+    managed.quota > 0 &&
+    managed.used >= managed.quota
+  ) {
+    return true;
+  }
+  return false;
+}
+
+export function isComposioQuotaExceeded(status: ComposioStatus | null | undefined): boolean {
+  if (!status) return false;
+  return isManagedQuotaExceeded(status.managed);
+}
+
 export function createComposioLink(
   toolkitSlug: string,
   label?: string,

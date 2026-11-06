@@ -52,9 +52,9 @@ import {
 import type { ComposioClient } from './composio.js';
 import {
   composioEntityId,
-  fetchComposioClient,
   getComposioApiKey,
   readComposioEnables,
+  resolveComposioClient,
 } from './composio.js';
 import { resolveAccount } from './composio-accounts.js';
 
@@ -105,13 +105,35 @@ export interface ComposioEventExecutor {
 export function createComposioEventExecutor(deps: {
   dataDir: string;
   client?: ComposioClient;
+  /** Managed-apps service URL override (defaults to KRIYADOT_MANAGED_APPS_URL). */
+  managedAppsUrl?: string;
+  /** Fetch override for managed-service calls (tests); defaults to global fetch. */
+  managedFetch?: typeof fetch;
 }): ComposioEventExecutor {
-  const client = deps.client ?? fetchComposioClient;
   return {
     async executeTool(input) {
-      const apiKey = getComposioApiKey(deps.dataDir, input.userId);
-      if (!apiKey) {
-        throw new Error('Composio is not connected — connect an API key in Accounts first.');
+      // An injected client (tests) keeps the exact legacy BYOK semantics:
+      // the vault API key gates access. Without one, resolve per user —
+      // BYOK vault key, or the managed service in managed mode.
+      let client: ComposioClient;
+      let apiKey: string;
+      if (deps.client) {
+        const key = getComposioApiKey(deps.dataDir, input.userId);
+        if (!key) {
+          throw new Error('Composio is not connected — connect an API key in Accounts first.');
+        }
+        client = deps.client;
+        apiKey = key;
+      } else {
+        const resolved = resolveComposioClient(deps.dataDir, input.userId, {
+          serviceUrl: deps.managedAppsUrl,
+          fetchFn: deps.managedFetch,
+        });
+        if (!resolved) {
+          throw new Error('Composio is not connected — connect an API key in Accounts first.');
+        }
+        client = resolved.client;
+        apiKey = resolved.apiKey;
       }
       const account = await resolveAccount(deps.dataDir, input.userId, client, apiKey, input.accountId);
       if (!account) throw new Error(`unknown Composio account "${input.accountId}"`);

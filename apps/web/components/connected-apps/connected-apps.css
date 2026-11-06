@@ -13,6 +13,12 @@
   border-style: dashed;
 }
 
+/* Platform mode cards (Managed vs BYOK): active outline via data attr. */
+[data-testid='platform-mode-managed'][data-active='true'],
+[data-testid='platform-mode-byok'][data-active='true'] {
+  border-color: var(--accent, var(--border-strong, #2563eb));
+}
+
 .ca-chips {
   display: flex;
   flex-wrap: wrap;

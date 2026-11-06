@@ -14,6 +14,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import { authedFetch, getApiBase } from '../../lib/api';
 import { ConnectedAppsHub } from '../../components/connected-apps/connected-apps-hub';
+import { PlatformMode } from '../../components/connected-apps/platform-mode';
+import type { ComposioStatus } from '../../lib/connected-apps';
 
 const base = () => getApiBase();
 
@@ -177,9 +179,7 @@ interface ComposioAppEntry {
   enabled?: boolean;
 }
 
-interface ComposioStatus {
-  connected: boolean;
-}
+type ComposioStatusResponse = ComposioStatus;
 
 interface ComposioAppsResponse {
   connected: boolean;
@@ -199,22 +199,16 @@ async function fetchBots(): Promise<WebBot[]> {
 }
 
 function ComposioPanel() {
-  const [connected, setConnected] = useState<boolean | null>(null);
+  const [status, setStatus] = useState<ComposioStatus | null>(null);
   const [apps, setApps] = useState<ComposioAppEntry[]>([]);
   const [bots, setBots] = useState<WebBot[]>([]);
   const [botId, setBotId] = useState('');
   const [filter, setFilter] = useState('');
-  const [apiKey, setApiKey] = useState('');
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState('');
   const [loaded, setLoaded] = useState(false);
 
-  const refreshStatus = useCallback(async () => {
-    const status = await api<ComposioStatus>('GET', '/api/composio/status');
-    setConnected(status.connected);
-    return status.connected;
-  }, []);
+  const connected = status?.connected ?? null;
 
   const refreshApps = useCallback(
     async (forBotId: string) => {
@@ -232,15 +226,27 @@ function ComposioPanel() {
     [],
   );
 
+  const refreshStatus = useCallback(async () => {
+    const next = await api<ComposioStatusResponse>('GET', '/api/composio/status');
+    // Older API shapes may omit mode — default to byok.
+    const normalized: ComposioStatus = {
+      connected: Boolean(next.connected),
+      mode: next.mode ?? 'byok',
+      managed: next.managed,
+    };
+    setStatus(normalized);
+    return normalized;
+  }, []);
+
   const boot = useCallback(async () => {
     setError(null);
     try {
-      const [isConnected, botList] = await Promise.all([refreshStatus(), fetchBots()]);
+      const [nextStatus, botList] = await Promise.all([refreshStatus(), fetchBots()]);
       setBots(botList);
       const nextBotId = botId || botList[0]?.id || '';
       setBotId(nextBotId);
       setLoaded(true);
-      if (isConnected && nextBotId) await refreshApps(nextBotId);
+      if (nextStatus.connected && nextBotId) await refreshApps(nextBotId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -251,6 +257,26 @@ function ComposioPanel() {
     void boot();
   }, [boot]);
 
+  const handleStatusChange = useCallback(
+    async (next: ComposioStatus) => {
+      setStatus(next);
+      if (!next.connected) {
+        setApps([]);
+        return;
+      }
+      // botId may not be set yet on first load — fall back to first bot.
+      const targetBot = botId || bots[0]?.id || '';
+      if (targetBot) {
+        try {
+          await refreshApps(targetBot);
+        } catch (err) {
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      }
+    },
+    [botId, bots, refreshApps],
+  );
+
   const changeBot = async (next: string) => {
     setBotId(next);
     setError(null);
@@ -258,44 +284,6 @@ function ComposioPanel() {
       await refreshApps(next);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-    }
-  };
-
-  const connect = async () => {
-    const key = apiKey.trim();
-    if (!key) {
-      setError('Paste your Composio API key first.');
-      return;
-    }
-    setBusy('connect');
-    setError(null);
-    setNotice('');
-    try {
-      await api('POST', '/api/composio/connect', { apiKey: key });
-      setApiKey('');
-      setNotice('Composio connected. The key is stored encrypted server-side.');
-      const isConnected = await refreshStatus();
-      if (isConnected && botId) await refreshApps(botId);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy('');
-    }
-  };
-
-  const disconnect = async () => {
-    setBusy('disconnect');
-    setError(null);
-    setNotice('');
-    try {
-      await api('DELETE', '/api/composio/connect');
-      setConnected(false);
-      setApps([]);
-      setNotice('Composio disconnected — the API key was deleted.');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy('');
     }
   };
 
@@ -326,73 +314,27 @@ function ComposioPanel() {
   return (
     <Section
       title="Composio"
-      hint="Let bots act inside 1,000+ external apps (Gmail, Slack, GitHub, …) through one Composio API key. App access is enabled per bot."
+      hint="Let bots act inside 1,000+ external apps (Gmail, Slack, GitHub, …). Choose KriyaDot Managed or your own Composio key below — app access is enabled per bot in either mode."
     >
       <ErrorLine error={error} />
-      {notice && (
-        <div className="card" style={{ borderColor: '#bbf7d0', background: '#f0fdf4' }}>
-          {notice}
-        </div>
-      )}
       {!loaded && <p className="small muted">Loading…</p>}
-      {loaded && connected === false && (
-        <div>
-          <div
-            className="card"
-            style={{ borderStyle: 'dashed', textAlign: 'center', padding: 24 }}
-          >
-            <p style={{ fontSize: 32, margin: '0 0 8px' }} aria-hidden="true">
-              🔌
-            </p>
-            <p>
-              <strong>Composio is not connected.</strong>
-            </p>
-            <p className="small muted">
-              Connect a Composio API key to give your bots access to 1,000+ external
-              apps. The key is stored in the encrypted vault and is never shown
-              again.
-            </p>
-            <p className="small">
-              <a href="https://dashboard.composio.dev" target="_blank" rel="noreferrer">
-                Get a free API key
-              </a>{' '}
-              <span className="muted">(dashboard.composio.dev → Settings → API Keys, PLATFORM mode)</span>
-            </p>
-          </div>
-          <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
-            <input
-              className="input mono"
-              type="password"
-              autoComplete="off"
-              placeholder="paste Composio API key (ak_…)"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              style={{ flex: 1 }}
-            />
-            <button
-              className="btn btn-primary"
-              disabled={busy === 'connect' || !apiKey.trim()}
-              onClick={() => void connect()}
-            >
-              {busy === 'connect' ? 'Connecting…' : 'Connect'}
-            </button>
-          </div>
-        </div>
+      {loaded && (
+        <PlatformMode
+          status={status}
+          onStatusChange={(next) => void handleStatusChange(next)}
+        />
       )}
       {loaded && connected === true && (
-        <div>
+        <div style={{ marginTop: 16 }}>
           <div className="row-between">
             <div>
               <span className="chip green">connected</span>{' '}
-              <span className="small muted">key stored in the vault (never shown)</span>
+              <span className="small muted">
+                {status?.mode === 'managed'
+                  ? 'via KriyaDot Managed'
+                  : 'key stored in the vault (never shown)'}
+              </span>
             </div>
-            <button
-              className="btn btn-sm btn-danger"
-              disabled={busy === 'disconnect'}
-              onClick={() => void disconnect()}
-            >
-              {busy === 'disconnect' ? 'Disconnecting…' : 'Disconnect'}
-            </button>
           </div>
           <div className="row-between" style={{ marginTop: 12, gap: 8, flexWrap: 'wrap' }}>
             <label className="small" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -660,7 +602,7 @@ function ComposioAccountsPanel() {
         </div>
       )}
       {connected === false && (
-        <p className="small muted">Connect a Composio API key in the Composio section above first.</p>
+        <p className="small muted">Set up the app platform in the Composio section above first — either KriyaDot Managed or your own Composio key.</p>
       )}
       {connected === true && (
         <div>

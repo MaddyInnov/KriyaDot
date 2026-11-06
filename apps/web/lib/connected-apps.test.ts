@@ -8,6 +8,8 @@ import {
   filterApps,
   filterStartersByCategory,
   groupApps,
+  isComposioQuotaExceeded,
+  isManagedQuotaExceeded,
   mergeMcpServers,
   starterCategory,
   statusLabel,
@@ -249,5 +251,36 @@ describe('mergeMcpServers', () => {
 
   it('ignores malformed servers', () => {
     expect(mergeMcpServers(apps, [null, {}, { name: 3 }])).toHaveLength(4);
+  });
+});
+
+describe('managed quota helpers', () => {
+  it('detects the explicit quotaExceeded flag', () => {
+    expect(
+      isManagedQuotaExceeded({ serviceConfigured: true, tokenConfigured: true, quotaExceeded: true }),
+    ).toBe(true);
+    expect(isComposioQuotaExceeded({ connected: true, mode: 'managed', managed: { serviceConfigured: true, tokenConfigured: true, quotaExceeded: true } })).toBe(true);
+  });
+
+  it('detects used >= quota when quota > 0', () => {
+    expect(
+      isManagedQuotaExceeded({ serviceConfigured: true, tokenConfigured: true, used: 100, quota: 100 }),
+    ).toBe(true);
+    expect(
+      isManagedQuotaExceeded({ serviceConfigured: true, tokenConfigured: true, used: 101, quota: 100 }),
+    ).toBe(true);
+  });
+
+  it('is false below quota, with no managed block, or with quota 0', () => {
+    expect(
+      isManagedQuotaExceeded({ serviceConfigured: true, tokenConfigured: true, used: 9, quota: 100 }),
+    ).toBe(false);
+    expect(isManagedQuotaExceeded(undefined)).toBe(false);
+    expect(isManagedQuotaExceeded(null)).toBe(false);
+    expect(
+      isManagedQuotaExceeded({ serviceConfigured: true, tokenConfigured: true, used: 0, quota: 0 }),
+    ).toBe(false);
+    expect(isComposioQuotaExceeded(null)).toBe(false);
+    expect(isComposioQuotaExceeded({ connected: false, mode: 'byok' })).toBe(false);
   });
 });

@@ -14,15 +14,19 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation';
 import {
   FILTER_CHIPS,
+  MANAGED_PRIVACY_SENTENCE,
+  MANAGED_QUOTA_EXCEEDED_MESSAGE,
   composioSlugFor,
   connectComposioPlatform,
   deleteComposioAccount,
+  fetchComposioStatus,
   fetchConnectedApps,
   fetchMcpServers,
   fetchWebBots,
   filterApps,
   groupApps,
   isLocalApp,
+  isManagedQuotaExceeded,
   mergeMcpServers,
   setComposioAccountLabel,
   setComposioAppEnabledForBot,
@@ -30,6 +34,7 @@ import {
   statusTone,
   storeChatPrefill,
   type AppFilter,
+  type ComposioStatus,
   type ConnectedAppEntry,
   type WebBot,
 } from '../../lib/connected-apps';
@@ -51,6 +56,7 @@ function manageHref(app: ConnectedAppEntry): string {
 export function ConnectedAppsHub() {
   const router = useRouter();
   const [platformConfigured, setPlatformConfigured] = useState<boolean | null>(null);
+  const [composioStatus, setComposioStatus] = useState<ComposioStatus | null>(null);
   const [apps, setApps] = useState<ConnectedAppEntry[]>([]);
   const [bots, setBots] = useState<WebBot[]>([]);
   const [query, setQuery] = useState('');
@@ -68,14 +74,28 @@ export function ConnectedAppsHub() {
   const deepLinkHandled = useRef(false);
 
   const refresh = useCallback(async () => {
-    const [aggregate, botList] = await Promise.all([fetchConnectedApps(), fetchWebBots()]);
+    const [aggregate, botList, statusRaw] = await Promise.all([
+      fetchConnectedApps(),
+      fetchWebBots(),
+      fetchComposioStatus().catch(() => null),
+    ]);
+    // Only trust the status when it carries a real mode — test doubles and
+    // older APIs may return unrelated shapes.
+    const status =
+      statusRaw && (statusRaw.mode === 'byok' || statusRaw.mode === 'managed')
+        ? statusRaw
+        : null;
+    setComposioStatus(status);
     let merged = aggregate.apps ?? [];
     // Merge MCP servers client-side only when the aggregate lacks them.
     if (!merged.some((a) => a.source === 'mcp')) {
       const servers = await fetchMcpServers().catch(() => [] as unknown[]);
       merged = mergeMcpServers(merged, servers);
     }
-    setPlatformConfigured(Boolean(aggregate.platform?.configured));
+    const managedReady = Boolean(
+      status?.mode === 'managed' && status.managed?.tokenConfigured,
+    );
+    setPlatformConfigured(Boolean(aggregate.platform?.configured) || managedReady);
     setApps(merged);
     setBots(botList);
     return merged;
@@ -143,8 +163,13 @@ export function ConnectedAppsHub() {
   };
 
   const focusSetup = () => {
-    keyInputRef.current?.scrollIntoView?.({ block: 'center' });
-    keyInputRef.current?.focus();
+    if (keyInputRef.current) {
+      keyInputRef.current.scrollIntoView?.({ block: 'center' });
+      keyInputRef.current.focus();
+      return;
+    }
+    // Managed setup card has no key input — scroll to the card itself.
+    document.getElementById('ca-platform-setup')?.scrollIntoView?.({ block: 'center' });
   };
 
   const scrollToStarters = useCallback((slug: string) => {
@@ -532,6 +557,12 @@ export function ConnectedAppsHub() {
     );
   };
 
+  const managedActive = composioStatus?.mode === 'managed';
+  const managedServiceConfigured = Boolean(composioStatus?.managed?.serviceConfigured);
+  const managedQuotaExceeded = isManagedQuotaExceeded(composioStatus?.managed);
+  const showManagedSetupCard =
+    platformConfigured === false && managedActive && managedServiceConfigured;
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       {error && (
@@ -541,7 +572,50 @@ export function ConnectedAppsHub() {
       )}
       {notice && <p className="small">{notice}</p>}
 
-      {platformConfigured === false && (
+      {managedQuotaExceeded && (
+        <div
+          role="alert"
+          data-testid="hub-managed-quota-banner"
+          className="card"
+          style={{ borderColor: '#f59e0b', background: '#fffbeb' }}
+        >
+          <p style={{ margin: 0 }}>
+            <strong>{MANAGED_QUOTA_EXCEEDED_MESSAGE}</strong>
+          </p>
+        </div>
+      )}
+
+      {showManagedSetupCard && (
+        <div className="card ca-setup" id="ca-platform-setup" data-testid="hub-managed-setup-card">
+          <h2 style={{ marginTop: 0 }}>Connect apps with KriyaDot Managed</h2>
+          <p className="small muted">
+            KriyaDot Managed is included with your plan — connect apps with a normal sign-in,
+            no Composio account or API key of your own needed. Usage counts against your
+            plan&apos;s managed allowance.
+          </p>
+          <p className="small muted">{MANAGED_PRIVACY_SENTENCE}</p>
+          {composioStatus?.managed?.tokenConfigured ? (
+            <p className="small">
+              <span className="chip green">Managed is on</span>
+              {composioStatus.managed.plan ? (
+                <span className="muted"> · Plan: {composioStatus.managed.plan}</span>
+              ) : null}
+            </p>
+          ) : (
+            <p className="small muted">
+              Add your managed access token in the Accounts platform area below to finish
+              setup.
+            </p>
+          )}
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <a className="btn btn-primary" href="/accounts">
+              Set up in Accounts
+            </a>
+          </div>
+        </div>
+      )}
+
+      {platformConfigured === false && !showManagedSetupCard && (
         <div className="card ca-setup" id="ca-platform-setup">
           <h2 style={{ marginTop: 0 }}>Connect the app platform once</h2>
           <p className="small muted">

@@ -137,7 +137,12 @@ describe('composio routes', () => {
   it('status is { connected: false } with no key configured', async () => {
     const { status, json } = await call('GET', '/composio/status');
     expect(status).toBe(200);
-    expect(json).toEqual({ connected: false });
+    // Additive managed-mode fields ride along with `connected`.
+    expect(json).toEqual({
+      connected: false,
+      mode: 'byok',
+      managed: { serviceConfigured: false, tokenConfigured: false },
+    });
   });
 
   it('app list is graceful with no key configured (no 500)', async () => {
@@ -179,7 +184,11 @@ describe('composio routes', () => {
     expect(JSON.stringify(json)).not.toContain(VALID_KEY);
     expect(vaultHasKey()).toBe(true);
     const { json: statusJson } = await call('GET', '/composio/status');
-    expect(statusJson).toEqual({ connected: true });
+    expect(statusJson).toEqual({
+      connected: true,
+      mode: 'byok',
+      managed: { serviceConfigured: false, tokenConfigured: false },
+    });
     expect(audit).toHaveBeenCalledWith(
       'composio.connected',
       expect.objectContaining({ toolName: 'composio' }),

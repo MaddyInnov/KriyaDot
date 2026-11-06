@@ -35,9 +35,11 @@ import type {
 import {
   composioCallerOf,
   composioEntityId,
-  fetchComposioClient,
   getComposioApiKey,
+  getComposioPlatformMode,
   readComposioEnables,
+  resolveComposioClient,
+  type ResolvedComposioClient,
 } from './composio.js';
 import { principalMiddleware, type PrincipalContext } from './principal.js';
 
@@ -169,9 +171,6 @@ export async function resolveAccount(
 
 export function registerComposioAccountRoutes(router: express.Router, deps: ComposioDeps): void {
   const { config, governance, bots } = deps;
-  // Injected in tests; the real fetch client in production (zero paid API
-  // usage in tests — same contract as registerComposioRoutes).
-  const client: ComposioClient = deps.composioClient ?? fetchComposioClient;
   const pctx: PrincipalContext = { dataDir: config.dataDir, loopbackToken: deps.loopbackToken };
   const r = express.Router();
   r.use(principalMiddleware(pctx));
@@ -183,20 +182,39 @@ export function registerComposioAccountRoutes(router: express.Router, deps: Comp
     return userId;
   };
 
-  const apiKeyOf = (req: Request): string | undefined =>
-    getComposioApiKey(config.dataDir, callerOf(req));
+  /**
+   * Resolve the client for the caller. An injected composioClient (tests)
+   * keeps the exact legacy BYOK semantics (zero paid API usage in tests —
+   * same contract as registerComposioRoutes); production resolves per
+   * user via resolveComposioClient so managed mode flows through the
+   * managed-apps service. Null = not connected (existing behavior).
+   */
+  const resolveFor = (req: Request): ResolvedComposioClient | null => {
+    const userId = callerOf(req);
+    if (deps.composioClient) {
+      const key = getComposioApiKey(config.dataDir, userId);
+      return key
+        ? { client: deps.composioClient, mode: getComposioPlatformMode(config.dataDir, userId), apiKey: key }
+        : null;
+    }
+    return resolveComposioClient(config.dataDir, userId, {
+      serviceUrl: deps.managedAppsUrl,
+      fetchFn: deps.managedFetch,
+    });
+  };
 
   // POST /composio/accounts/link — start a Connect Link flow for one toolkit.
   // Returns the hosted sign-in URL; the account appears in GET /accounts
   // once the user completes OAuth at the provider.
   r.post('/accounts/link', async (req: Request, res: Response) => {
-    const apiKey = apiKeyOf(req);
-    if (!apiKey) {
+    const resolved = resolveFor(req);
+    if (!resolved) {
       res
         .status(400)
         .json({ ...errorBody('Composio is not connected — connect an API key first') });
       return;
     }
+    const { client, apiKey } = resolved;
     const body = (req.body ?? {}) as { toolkitSlug?: unknown; label?: unknown };
     const toolkitSlug =
       typeof body.toolkitSlug === 'string' ? body.toolkitSlug.trim().toLowerCase() : '';
@@ -255,11 +273,12 @@ export function registerComposioAccountRoutes(router: express.Router, deps: Comp
   // GET /composio/accounts — merged live + cached account list. Consumes
   // pending links whose account has appeared (auto-applying their labels).
   r.get('/accounts', async (req: Request, res: Response) => {
-    const apiKey = apiKeyOf(req);
-    if (!apiKey) {
+    const resolved = resolveFor(req);
+    if (!resolved) {
       res.json({ connected: false, accounts: [] as AccountView[], pending: [] as PendingLink[] });
       return;
     }
+    const { client, apiKey } = resolved;
     const userId = callerOf(req);
     let live: ComposioConnectedAccount[];
     try {
@@ -339,11 +358,12 @@ export function registerComposioAccountRoutes(router: express.Router, deps: Comp
 
   // POST /composio/accounts/:id/label — rename an account (local label).
   r.post('/accounts/:id/label', async (req: Request, res: Response) => {
-    const apiKey = apiKeyOf(req);
-    if (!apiKey) {
+    const resolved = resolveFor(req);
+    if (!resolved) {
       res.status(400).json(errorBody('Composio is not connected — connect an API key first'));
       return;
     }
+    const { client, apiKey } = resolved;
     const id = req.params.id;
     if (!NANOID_RE.test(id)) {
       res.status(400).json(errorBody('invalid account id'));
@@ -393,11 +413,12 @@ export function registerComposioAccountRoutes(router: express.Router, deps: Comp
   // DELETE /composio/accounts/:id — revoke the provider grant and delete
   // the account (idempotent).
   r.delete('/accounts/:id', async (req: Request, res: Response) => {
-    const apiKey = apiKeyOf(req);
-    if (!apiKey) {
+    const resolved = resolveFor(req);
+    if (!resolved) {
       res.status(400).json(errorBody('Composio is not connected — connect an API key first'));
       return;
     }
+    const { client, apiKey } = resolved;
     const id = req.params.id;
     if (!NANOID_RE.test(id)) {
       res.status(400).json(errorBody('invalid account id'));
@@ -430,11 +451,12 @@ export function registerComposioAccountRoutes(router: express.Router, deps: Comp
   // account. With ?botId=, the account's toolkit must be enabled for that
   // bot (403 otherwise) — the per-bot gate, applied at presentation too.
   r.get('/accounts/:id/tools', async (req: Request, res: Response) => {
-    const apiKey = apiKeyOf(req);
-    if (!apiKey) {
+    const resolved = resolveFor(req);
+    if (!resolved) {
       res.status(400).json(errorBody('Composio is not connected — connect an API key first'));
       return;
     }
+    const { client, apiKey } = resolved;
     const id = req.params.id;
     if (!NANOID_RE.test(id)) {
       res.status(400).json(errorBody('invalid account id'));

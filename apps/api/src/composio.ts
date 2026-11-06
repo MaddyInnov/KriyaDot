@@ -7,9 +7,13 @@
 //   registerComposioRoutes(router, { config, governance, bots });
 //
 // Routes (registered on the router passed in, relative paths → /api/...):
-//   GET    /composio/status            → { connected: boolean }
+//   GET    /composio/status            → { connected, mode, managed: {...} }
 //   POST   /composio/connect           → { apiKey } → validate → { connected: true }
 //   DELETE /composio/connect           → forget the key → { connected: false }
+//   POST   /composio/mode              → { mode: 'byok'|'managed' } → { mode }
+//   POST   /composio/managed-token     → { token } → validate vs the managed
+//                                        service → store in the vault
+//   DELETE /composio/managed-token     → forget the managed service token
 //   GET    /composio/apps[?botId=]     → { connected, apps: ComposioApp[] (+enabled when botId) }
 //   POST   /composio/apps/:appId       → { botId, enabled } → per-bot enable toggle
 //                                        (+ grants/revokes the composio_call &
@@ -44,6 +48,11 @@ import { SecureVault } from '@mvp/vault';
 import type { BotConfig } from '@mvp/agent-runtime';
 import type { RouteDeps } from './routes.js';
 import { principalMiddleware, resolvePrincipal, type PrincipalContext } from './principal.js';
+import {
+  createManagedComposioClient,
+  fetchManagedUsage,
+  ManagedAppsError,
+} from './managed-composio.js';
 
 // ---------------------------------------------------------------------------
 // Composio HTTP client (interface + production fetch implementation)
@@ -403,15 +412,23 @@ function enablesPath(dataDir: string, userId: string): string {
   return join(dataDir, `composio-enables${suffix}.json`);
 }
 
-/** Read per-bot per-app enablement. Exported for the tool-execution bridge. */
-export function readComposioEnables(
-  dataDir: string,
-  userId: string,
-): Record<string, Record<string, boolean>> {
+/**
+ * Reserved key inside the enables file holding the per-user platform mode
+ * ('byok' | 'managed'). The mode lives in the SAME per-user store as the
+ * enablement map — never a second store. Its value is a plain string, so
+ * readers that iterate bot entries (applyComposioToolGrants) skip it, and
+ * readComposioEnables strips it before returning the enablement map.
+ */
+const COMPOSIO_MODE_KEY = '__platformMode';
+
+export type ComposioPlatformMode = 'byok' | 'managed';
+
+/** Raw enables-file contents (enablement + reserved keys), {} when absent/corrupt. */
+function readEnablesFileRaw(dataDir: string, userId: string): Record<string, unknown> {
   try {
     const parsed = JSON.parse(readFileSync(enablesPath(dataDir, userId), 'utf8')) as unknown;
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      return parsed as Record<string, Record<string, boolean>>;
+      return parsed as Record<string, unknown>;
     }
   } catch {
     // Missing or corrupt file → treat as empty (never 500).
@@ -419,8 +436,45 @@ export function readComposioEnables(
   return {};
 }
 
+function writeEnablesFileRaw(dataDir: string, userId: string, raw: Record<string, unknown>): void {
+  writeFileSync(enablesPath(dataDir, userId), JSON.stringify(raw, null, 2), { mode: 0o600 });
+}
+
+/** Read per-bot per-app enablement. Exported for the tool-execution bridge. */
+export function readComposioEnables(
+  dataDir: string,
+  userId: string,
+): Record<string, Record<string, boolean>> {
+  const raw = readEnablesFileRaw(dataDir, userId);
+  const out: Record<string, Record<string, boolean>> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (key === COMPOSIO_MODE_KEY) continue;
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      out[key] = value as Record<string, boolean>;
+    }
+  }
+  return out;
+}
+
 function writeEnables(dataDir: string, userId: string, state: Record<string, Record<string, boolean>>): void {
-  writeFileSync(enablesPath(dataDir, userId), JSON.stringify(state, null, 2), { mode: 0o600 });
+  // Preserve the platform mode stored alongside the enablement map.
+  const mode = readEnablesFileRaw(dataDir, userId)[COMPOSIO_MODE_KEY];
+  writeEnablesFileRaw(dataDir, userId, {
+    ...(typeof mode === 'string' ? { [COMPOSIO_MODE_KEY]: mode } : {}),
+    ...state,
+  });
+}
+
+/** The user's Composio platform mode; 'byok' unless explicitly 'managed'. */
+export function getComposioPlatformMode(dataDir: string, userId: string): ComposioPlatformMode {
+  return readEnablesFileRaw(dataDir, userId)[COMPOSIO_MODE_KEY] === 'managed' ? 'managed' : 'byok';
+}
+
+/** Persist the user's platform mode alongside the enablement map. */
+export function setComposioPlatformMode(dataDir: string, userId: string, mode: ComposioPlatformMode): void {
+  const raw = readEnablesFileRaw(dataDir, userId);
+  raw[COMPOSIO_MODE_KEY] = mode;
+  writeEnablesFileRaw(dataDir, userId, raw);
 }
 
 /**
@@ -442,6 +496,72 @@ export function getComposioApiKey(dataDir: string, userId: string): string | und
  */
 export function composioEntityId(userId: string): string {
   return sanitizeNamespace(userId);
+}
+
+// ---------------------------------------------------------------------------
+// Managed mode: per-user service token (vault) + instance service URL (env)
+// ---------------------------------------------------------------------------
+
+/** Vault secret name holding the managed-apps service token (per-user). */
+export const COMPOSIO_MANAGED_TOKEN_NAME = 'composio-managed-token';
+
+/**
+ * The stored managed-apps service token for a user, or undefined when none
+ * is configured. Server-side only — never returned by any route.
+ */
+export function getComposioManagedToken(dataDir: string, userId: string): string | undefined {
+  try {
+    return new SecureVault(dataDir, userId, userId).get(COMPOSIO_MANAGED_TOKEN_NAME)?.value;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The managed-apps service base URL for this instance, from the
+ * KRIYADOT_MANAGED_APPS_URL env var; undefined when not configured.
+ */
+export function getManagedAppsServiceUrl(): string | undefined {
+  const value = process.env.KRIYADOT_MANAGED_APPS_URL?.trim();
+  return value ? value.replace(/\/+$/, '') : undefined;
+}
+
+export interface ResolvedComposioClient {
+  client: ComposioClient;
+  mode: ComposioPlatformMode;
+  /** The credential to pass to client methods (BYOK key or managed token). */
+  apiKey: string;
+}
+
+/**
+ * Resolve the Composio client for one user:
+ *   - mode 'managed' AND the instance service URL is set AND a vault token
+ *     is stored → the managed service client (managed-composio.ts);
+ *   - mode 'managed' but service/token missing → null (callers keep their
+ *     existing "not connected" behavior; GET /composio/status reports the
+ *     two booleans separately so the missing piece is distinguishable);
+ *   - otherwise the BYOK vault-key client (null when no key — the
+ *     long-standing semantics).
+ */
+export function resolveComposioClient(
+  dataDir: string,
+  userId: string,
+  opts?: { serviceUrl?: string; fetchFn?: typeof fetch },
+): ResolvedComposioClient | null {
+  const mode = getComposioPlatformMode(dataDir, userId);
+  if (mode === 'managed') {
+    const serviceUrl = opts?.serviceUrl ?? getManagedAppsServiceUrl();
+    const token = getComposioManagedToken(dataDir, userId);
+    if (!serviceUrl || !token) return null;
+    return {
+      client: createManagedComposioClient({ serviceUrl, token, fetchFn: opts?.fetchFn }),
+      mode,
+      apiKey: token,
+    };
+  }
+  const apiKey = getComposioApiKey(dataDir, userId);
+  if (!apiKey) return null;
+  return { client: fetchComposioClient, mode, apiKey };
 }
 
 // ---------------------------------------------------------------------------
@@ -514,6 +634,10 @@ export type ComposioDeps = Pick<RouteDeps, 'config' | 'governance' | 'bots' | 'l
   composioClient?: ComposioClient;
   /** Tenancy JWT secret override (defaults to the KRIYADOT_TENANCY_JWT_SECRET env). */
   jwtSecret?: string;
+  /** Managed-apps service URL override (defaults to KRIYADOT_MANAGED_APPS_URL). */
+  managedAppsUrl?: string;
+  /** Fetch override for managed-service calls (tests); defaults to global fetch. */
+  managedFetch?: typeof fetch;
 };
 
 function errorBody(error: string, detail?: string): { error: string; detail?: string } {
@@ -526,6 +650,9 @@ function errorBody(error: string, detail?: string): { error: string; detail?: st
 
 export function registerComposioRoutes(router: express.Router, deps: ComposioDeps): void {
   const { config, governance, bots } = deps;
+  // BYOK connect validation uses the injected client (tests) or the real
+  // fetch client; every other operation resolves per user via
+  // resolveComposioClient so managed mode flows through the service.
   const client: ComposioClient = deps.composioClient ?? fetchComposioClient;
   const pctx: PrincipalContext = { dataDir: config.dataDir, loopbackToken: deps.loopbackToken, jwtSecret: deps.jwtSecret };
 
@@ -538,37 +665,184 @@ export function registerComposioRoutes(router: express.Router, deps: ComposioDep
   const vaultOf = (req: Request): SecureVault =>
     new SecureVault(config.dataDir, callerOf(req), callerOf(req));
 
-  /** The stored key, or undefined when not connected. */
+  /** The stored BYOK key, or undefined when not connected. */
   const storedKey = (req: Request): string | undefined =>
     getComposioApiKey(config.dataDir, callerOf(req));
 
-  /** Persist the key: create the vault secret, or update it when present. */
-  const saveKey = (req: Request, apiKey: string): void => {
+  /**
+   * Resolve the client for one user. An injected composioClient (tests)
+   * keeps the exact legacy BYOK semantics: the vault key gates access and
+   * the injected client serves every call.
+   */
+  const resolveFor = (userId: string): ResolvedComposioClient | null => {
+    if (deps.composioClient) {
+      const key = getComposioApiKey(config.dataDir, userId);
+      return key
+        ? { client: deps.composioClient, mode: getComposioPlatformMode(config.dataDir, userId), apiKey: key }
+        : null;
+    }
+    return resolveComposioClient(config.dataDir, userId, {
+      serviceUrl: deps.managedAppsUrl,
+      fetchFn: deps.managedFetch,
+    });
+  };
+
+  /** Persist a vault secret: create it, or update it when present. */
+  const saveSecret = (req: Request, name: string, value: string, description: string): void => {
     const vault = vaultOf(req);
     const existing = (() => {
       try {
-        return vault.get(COMPOSIO_KEY_NAME);
+        return vault.get(name);
       } catch {
         return undefined;
       }
     })();
     if (existing) {
-      vault.update(COMPOSIO_KEY_NAME, apiKey);
+      vault.update(name, value);
     } else {
-      vault.create(COMPOSIO_KEY_NAME, apiKey, 'Composio API key (Workstream E connector)');
+      vault.create(name, value, description);
     }
   };
 
-  const connectedResponse = (req: Request, res: Response): void => {
-    res.json({ connected: storedKey(req) !== undefined });
-  };
+  /** Persist the BYOK key in the vault. */
+  const saveKey = (req: Request, apiKey: string): void =>
+    saveSecret(req, COMPOSIO_KEY_NAME, apiKey, 'Composio API key (Workstream E connector)');
+
+  const managedServiceUrl = (): string | undefined => deps.managedAppsUrl ?? getManagedAppsServiceUrl();
 
   const r = express.Router();
   r.use(principalMiddleware(pctx));
 
-  // GET /composio/status — graceful when no key is configured.
-  r.get('/status', (req: Request, res: Response) => {
-    connectedResponse(req, res);
+  // GET /composio/status — graceful when nothing is configured. `connected`
+  // keeps its BYOK meaning (a stored key) and, in managed mode, is
+  // serviceConfigured && tokenConfigured. The `mode` + `managed` fields are
+  // additive; usage fields are filled by a fail-soft /v1/usage call and are
+  // simply absent when the service cannot be reached.
+  r.get('/status', async (req: Request, res: Response) => {
+    const userId = callerOf(req);
+    const mode = getComposioPlatformMode(config.dataDir, userId);
+    const serviceUrl = managedServiceUrl();
+    const serviceConfigured = Boolean(serviceUrl);
+    const token = getComposioManagedToken(config.dataDir, userId);
+    const tokenConfigured = Boolean(token);
+    const connected = deps.composioClient
+      ? storedKey(req) !== undefined
+      : mode === 'managed'
+        ? serviceConfigured && tokenConfigured
+        : storedKey(req) !== undefined;
+    const managed: {
+      serviceConfigured: boolean;
+      tokenConfigured: boolean;
+      plan?: string;
+      used?: number;
+      quota?: number;
+      quotaExceeded?: boolean;
+    } = { serviceConfigured, tokenConfigured };
+    if (serviceConfigured && tokenConfigured && serviceUrl && token) {
+      try {
+        const usage = await fetchManagedUsage(serviceUrl, token, deps.managedFetch);
+        if (usage.plan !== undefined) managed.plan = usage.plan;
+        if (usage.used !== undefined) managed.used = usage.used;
+        if (usage.quota !== undefined) managed.quota = usage.quota;
+        managed.quotaExceeded =
+          usage.globalCapReached === true ||
+          (typeof usage.used === 'number' &&
+            typeof usage.quota === 'number' &&
+            usage.quota > 0 &&
+            usage.used >= usage.quota);
+      } catch {
+        // Fail-soft: usage fields stay absent; status never fails on it.
+      }
+    }
+    res.json({ connected, mode, managed });
+  });
+
+  // POST /composio/mode { mode } — persist the per-user platform mode.
+  r.post('/mode', (req: Request, res: Response) => {
+    const mode = (req.body as { mode?: unknown } | undefined)?.mode;
+    if (mode !== 'byok' && mode !== 'managed') {
+      res.status(400).json(errorBody("mode must be 'byok' or 'managed'"));
+      return;
+    }
+    const userId = callerOf(req);
+    try {
+      setComposioPlatformMode(config.dataDir, userId, mode);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(500).json(errorBody('Failed to persist the platform mode', message));
+      return;
+    }
+    governance.audit('composio.mode_changed', {
+      actor: userId,
+      toolName: 'composio',
+      detail: { mode },
+    });
+    res.json({ mode });
+  });
+
+  // POST /composio/managed-token { token } — validate the token against
+  // the managed service (/v1/usage), then store it in the vault. The token
+  // is never logged, never echoed back, never in audit detail.
+  r.post('/managed-token', async (req: Request, res: Response) => {
+    const tokenRaw = (req.body as { token?: unknown } | undefined)?.token;
+    if (typeof tokenRaw !== 'string' || tokenRaw.trim().length === 0) {
+      res.status(400).json({ ok: false, ...errorBody('token is required') });
+      return;
+    }
+    const token = tokenRaw.trim();
+    const serviceUrl = managedServiceUrl();
+    if (!serviceUrl) {
+      res.status(503).json({
+        ok: false,
+        ...errorBody(
+          'Managed apps service is not configured on this instance (KRIYADOT_MANAGED_APPS_URL is not set)',
+        ),
+      });
+      return;
+    }
+    let usage: Awaited<ReturnType<typeof fetchManagedUsage>>;
+    try {
+      usage = await fetchManagedUsage(serviceUrl, token, deps.managedFetch);
+    } catch (err) {
+      const status = err instanceof ManagedAppsError ? err.status : undefined;
+      if (status === 401 || status === 403) {
+        res.status(401).json({ ok: false, ...errorBody('The managed service rejected the token') });
+        return;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      res
+        .status(503)
+        .json({ ok: false, ...errorBody('Could not reach the managed apps service', message) });
+      return;
+    }
+    try {
+      saveSecret(req, COMPOSIO_MANAGED_TOKEN_NAME, token, 'Composio managed-apps service token');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ ok: false, ...errorBody('Failed to store the managed token', message) });
+      return;
+    }
+    governance.audit('composio.managed_token_connected', {
+      actor: callerOf(req),
+      toolName: 'composio',
+      detail: usage.plan ? { plan: usage.plan } : undefined,
+    });
+    res.json({
+      ok: true,
+      ...(usage.plan !== undefined ? { plan: usage.plan } : {}),
+      ...(usage.quota !== undefined ? { quota: usage.quota } : {}),
+    });
+  });
+
+  // DELETE /composio/managed-token — forget the managed token (idempotent).
+  r.delete('/managed-token', (req: Request, res: Response) => {
+    try {
+      vaultOf(req).delete(COMPOSIO_MANAGED_TOKEN_NAME);
+    } catch {
+      // Unknown/missing secret is fine — the result is "no token".
+    }
+    governance.audit('composio.managed_token_removed', { actor: callerOf(req), toolName: 'composio' });
+    res.json({ ok: true });
   });
 
   // POST /composio/connect — validate the key, then store it in the vault.
@@ -619,17 +893,18 @@ export function registerComposioRoutes(router: express.Router, deps: ComposioDep
     res.json({ connected: false });
   });
 
-  // GET /composio/apps[?botId=] — catalog of connected apps. Without a key:
+  // GET /composio/apps[?botId=] — catalog of connected apps. When not
+  // connected (no BYOK key, or managed mode without service/token):
   // { connected: false }. With ?botId=, each app carries `enabled` for that bot.
   r.get('/apps', async (req: Request, res: Response) => {
-    const apiKey = storedKey(req);
-    if (!apiKey) {
+    const resolved = resolveFor(callerOf(req));
+    if (!resolved) {
       res.json({ connected: false, apps: [] as ComposioApp[] });
       return;
     }
     let apps: ComposioApp[];
     try {
-      apps = await client.listApps(apiKey);
+      apps = await resolved.client.listApps(resolved.apiKey);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       res.status(502).json({ connected: true, apps: [] as ComposioApp[], ...errorBody('Could not reach the Composio API', message) });
@@ -650,13 +925,14 @@ export function registerComposioRoutes(router: express.Router, deps: ComposioDep
 
   // POST /composio/apps/:appId — enable/disable one app for one bot.
   r.post('/apps/:appId', async (req: Request, res: Response) => {
-    const apiKey = storedKey(req);
-    if (!apiKey) {
+    const resolved = resolveFor(callerOf(req));
+    if (!resolved) {
       res
         .status(400)
         .json({ connected: false, ...errorBody('Composio is not connected — connect an API key first') });
       return;
     }
+    const { client: resolvedClient, apiKey } = resolved;
     const body = (req.body ?? {}) as { botId?: unknown; enabled?: unknown };
     if (typeof body.botId !== 'string' || body.botId.length === 0) {
       res.status(400).json(errorBody('botId is required'));
@@ -673,7 +949,7 @@ export function registerComposioRoutes(router: express.Router, deps: ComposioDep
     }
     let apps: ComposioApp[];
     try {
-      apps = await client.listApps(apiKey);
+      apps = await resolvedClient.listApps(apiKey);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       res.status(502).json(errorBody('Could not reach the Composio API', message));

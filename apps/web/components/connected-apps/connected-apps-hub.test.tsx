@@ -17,6 +17,7 @@ vi.mock('next/navigation', () => ({
 
 const hoisted = vi.hoisted(() => ({
   aggregate: null as unknown,
+  composioStatus: null as unknown,
   calls: [] as Array<{ path: string; method?: string }>,
 }));
 
@@ -32,6 +33,7 @@ vi.mock('../../lib/api', () => {
     authedFetch: async (path: string, init?: RequestInit) => {
       hoisted.calls.push({ path, method: init?.method });
       if (path === '/api/connected-apps') return jr(hoisted.aggregate);
+      if (path === '/api/composio/status') return jr(hoisted.composioStatus ?? { connected: false, mode: 'byok' });
       if (path === '/api/bots') return jr([{ id: 'bot1', name: 'Alpha' }, { id: 'bot2', name: 'Beta' }]);
       if (path === '/api/mcp/servers') return jr([]);
       if (path.startsWith('/api/connected-apps/starters')) return jr({ starters: [] });
@@ -80,11 +82,13 @@ const gmailConnected = app({
 
 function setAggregate(platformConfigured: boolean, apps: ConnectedAppEntry[]) {
   hoisted.aggregate = { platform: { configured: platformConfigured }, apps, generatedAt: 1 };
+  hoisted.composioStatus = { connected: false, mode: 'byok' };
   hoisted.calls.length = 0;
 }
 
 beforeEach(() => {
   window.history.replaceState(null, '', '/accounts');
+  hoisted.composioStatus = { connected: false, mode: 'byok' };
 });
 
 describe('ConnectedAppsHub', () => {
@@ -214,6 +218,48 @@ describe('ConnectedAppsHub', () => {
     expect(
       within(statusRow as HTMLElement).getByText('Not in your Composio workspace'),
     ).toBeInTheDocument();
+  });
+
+  it('managed mode active + configured shows the managed setup card with no Composio key prompt', async () => {
+    setAggregate(false, [canvaSetup]);
+    hoisted.composioStatus = {
+      connected: false,
+      mode: 'managed',
+      managed: { serviceConfigured: true, tokenConfigured: false },
+    };
+    render(<ConnectedAppsHub />);
+    expect(await screen.findByTestId('hub-managed-setup-card')).toBeInTheDocument();
+    expect(screen.getByText('Connect apps with KriyaDot Managed')).toBeInTheDocument();
+    expect(screen.queryByText('Connect the app platform once')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Composio API key')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /set up in accounts/i })).toHaveAttribute(
+      'href',
+      '/accounts',
+    );
+    expect(
+      screen.getByText(/In Managed mode, app actions pass through a KriyaDot-operated service/),
+    ).toBeInTheDocument();
+  });
+
+  it('quota-exceeded banner renders on the hub when managed quota is exceeded', async () => {
+    setAggregate(true, [gmailConnected]);
+    hoisted.composioStatus = {
+      connected: true,
+      mode: 'managed',
+      managed: {
+        serviceConfigured: true,
+        tokenConfigured: true,
+        plan: 'Pro',
+        used: 100,
+        quota: 100,
+        quotaExceeded: true,
+      },
+    };
+    render(<ConnectedAppsHub />);
+    const banner = await screen.findByTestId('hub-managed-quota-banner');
+    expect(banner).toHaveTextContent(
+      'Your managed allowance is used up for this month — upgrade your plan or switch to your own Composio key.',
+    );
   });
 
   it('local app reports its installed version and offers Open', async () => {

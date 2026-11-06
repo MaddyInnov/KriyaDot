@@ -30,8 +30,8 @@ import type {
   ToolDefinition,
 } from '@mvp/agent-runtime';
 import { redactSecrets } from '@mvp/governance';
-import type { ComposioClient } from './composio.js';
-import { fetchComposioClient, readComposioEnables } from './composio.js';
+import type { ComposioClient, ResolvedComposioClient } from './composio.js';
+import { fetchComposioClient, readComposioEnables, resolveComposioClient } from './composio.js';
 import { resolveAccount } from './composio-accounts.js';
 import {
   classifyConnectionNeed,
@@ -79,6 +79,10 @@ export interface ComposioToolHostOptions {
   resolveUserId?: (ctx: ToolContext) => string;
   /** Injected in tests; the real fetch client in production. */
   client?: ComposioClient;
+  /** Managed-apps service URL override (defaults to KRIYADOT_MANAGED_APPS_URL). */
+  managedAppsUrl?: string;
+  /** Fetch override for managed-service calls (tests); defaults to global fetch. */
+  managedFetch?: typeof fetch;
   /**
    * Per-conversation connector override (Octop #110): given a thread
    * (conversation) id, return the app slugs enabled for THAT thread, or
@@ -215,8 +219,34 @@ function compactParameters(schema: unknown): unknown {
   }
 }
 
+/**
+ * Resolve the Composio client + credential for one tool-call user.
+ * An injected client (tests) keeps the exact legacy BYOK semantics: the
+ * host's getApiKey gates access. Without an injected client, resolution
+ * goes through resolveComposioClient (BYOK vault key, or the managed
+ * service when the user's platform mode is 'managed' with service +
+ * token configured); the host getApiKey + fetch client remain as a
+ * fallback for hosts that store the key outside the resolver's vault
+ * helpers. Null = not connected.
+ */
+function resolveToolClient(
+  opts: ComposioToolHostOptions,
+  userId: string,
+): ResolvedComposioClient | null {
+  if (opts.client) {
+    const apiKey = opts.getApiKey(userId);
+    return apiKey ? { client: opts.client, apiKey, mode: 'byok' } : null;
+  }
+  const resolved = resolveComposioClient(opts.dataDir, userId, {
+    serviceUrl: opts.managedAppsUrl,
+    fetchFn: opts.managedFetch,
+  });
+  if (resolved) return resolved;
+  const apiKey = opts.getApiKey(userId);
+  return apiKey ? { client: fetchComposioClient, apiKey, mode: 'byok' } : null;
+}
+
 export function createComposioCallTool(opts: ComposioToolHostOptions): ToolDefinition {
-  const client = opts.client ?? fetchComposioClient;
   const maxResultChars = opts.maxResultChars ?? DEFAULT_MAX_RESULT_CHARS;
   const resolveUserId = opts.resolveUserId ?? (() => 'default-user');
 
@@ -252,10 +282,11 @@ export function createComposioCallTool(opts: ComposioToolHostOptions): ToolDefin
       const parameters = objectArg(args, 'parameters');
 
       const userId = resolveUserId(ctx);
-      const apiKey = opts.getApiKey(userId);
-      if (!apiKey) {
+      const resolved = resolveToolClient(opts, userId);
+      if (!resolved) {
         throw new Error('Composio is not connected — connect an API key in Accounts first.');
       }
+      const { client, apiKey } = resolved;
       const account = await resolveAccount(opts.dataDir, userId, client, apiKey, accountId);
       if (!account) {
         throw new Error(`unknown Composio account "${accountId}"`);
@@ -317,7 +348,6 @@ export function createComposioCallTool(opts: ComposioToolHostOptions): ToolDefin
 }
 
 export function createComposioListActionsTool(opts: ComposioToolHostOptions): ToolDefinition {
-  const client = opts.client ?? fetchComposioClient;
   const resolveUserId = opts.resolveUserId ?? (() => 'default-user');
 
   return {
@@ -356,8 +386,8 @@ export function createComposioListActionsTool(opts: ComposioToolHostOptions): To
         typeof searchRaw === 'string' ? searchRaw.trim().toLowerCase().slice(0, 100) : '';
 
       const userId = resolveUserId(ctx);
-      const apiKey = opts.getApiKey(userId);
-      if (!apiKey) {
+      const resolved = resolveToolClient(opts, userId);
+      if (!resolved) {
         if (toolkitSlug) {
           // Just-in-time: name exactly what stands in the way — the
           // platform itself is not set up yet.
@@ -374,6 +404,7 @@ export function createComposioListActionsTool(opts: ComposioToolHostOptions): To
         }
         return { ok: true, accounts: [], connected: false, connectionNeeded: platformConnectionNeeded() };
       }
+      const { client, apiKey } = resolved;
       const enables = readComposioEnables(opts.dataDir, userId)[ctx.botId] ?? {};
       let accounts;
       try {

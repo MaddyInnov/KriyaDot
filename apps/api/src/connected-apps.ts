@@ -44,9 +44,9 @@ import { principalMiddleware, type PrincipalContext } from './principal.js';
 import {
   composioCallerOf,
   composioEntityId,
-  fetchComposioClient,
   getComposioApiKey,
   readComposioEnables,
+  resolveComposioClient,
   type ComposioApp,
   type ComposioClient,
   type ComposioConnectedAccount,
@@ -156,6 +156,10 @@ export interface ConnectedAppsSources {
 export type ConnectedAppsDeps = Pick<RouteDeps, 'config' | 'governance' | 'bots' | 'loopbackToken'> & {
   /** Injected in tests; defaults to the real fetch client in production. */
   composioClient?: ComposioClient;
+  /** Managed-apps service URL override (defaults to KRIYADOT_MANAGED_APPS_URL). */
+  managedAppsUrl?: string;
+  /** Fetch override for managed-service calls (tests); defaults to global fetch. */
+  managedFetch?: typeof fetch;
   /** Tenancy JWT secret override (defaults to the KRIYADOT_TENANCY_JWT_SECRET env). */
   jwtSecret?: string;
   /** Installed MCP servers; when absent, no mcp entries are produced. */
@@ -552,9 +556,27 @@ async function loadComposioState(
   userId: string,
 ): Promise<ComposioState> {
   const dataDir = deps.config.dataDir;
-  const apiKey = getComposioApiKey(dataDir, userId);
-  if (!apiKey) return { configured: false, catalog: null, accounts: [] };
-  const client: ComposioClient = deps.composioClient ?? fetchComposioClient;
+  // Platform detection goes through the shared resolver: an injected
+  // client (tests) keeps the legacy BYOK-key gate, while production
+  // resolves BYOK *or* managed — a user whose platform mode is 'managed'
+  // with service + token configured counts as configured instead of
+  // misreporting platform_not_configured for lack of a BYOK vault key.
+  let client: ComposioClient;
+  let apiKey: string;
+  if (deps.composioClient) {
+    const key = getComposioApiKey(dataDir, userId);
+    if (!key) return { configured: false, catalog: null, accounts: [] };
+    client = deps.composioClient;
+    apiKey = key;
+  } else {
+    const resolved = resolveComposioClient(dataDir, userId, {
+      serviceUrl: deps.managedAppsUrl,
+      fetchFn: deps.managedFetch,
+    });
+    if (!resolved) return { configured: false, catalog: null, accounts: [] };
+    client = resolved.client;
+    apiKey = resolved.apiKey;
+  }
   let catalog: ComposioApp[] | null = null;
   let catalogError: string | undefined;
   try {

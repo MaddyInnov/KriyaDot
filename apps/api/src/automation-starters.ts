@@ -39,6 +39,7 @@ import {
   fetchComposioClient,
   getComposioApiKey,
   readComposioEnables,
+  resolveComposioClient,
   type ComposioClient,
 } from './composio.js';
 import { readAccountCache } from './composio-accounts.js';
@@ -746,7 +747,13 @@ export function registerAutomationStartersRoutes(
   async function readinessState(userId: string, botId?: string): Promise<StarterReadinessState> {
     const dataDir = deps.config.dataDir;
     const allSlugs = new Set(AUTOMATION_STARTERS.flatMap((r) => r.requiredApps));
-    const apiKey = getComposioApiKey(dataDir, userId);
+    // Managed mode: when no client is injected, resolve BYOK-or-managed so
+    // readiness reflects the managed service (its apiKey is the service
+    // token; the managed client ignores the entity argument server-side).
+    // An injected client keeps the legacy BYOK-key path exactly.
+    const resolved = deps.composioClient ? null : resolveComposioClient(dataDir, userId);
+    const effClient: ComposioClient = resolved?.client ?? client;
+    const apiKey = resolved ? resolved.apiKey : getComposioApiKey(dataDir, userId);
     if (!apiKey) {
       return {
         platformConfigured: false,
@@ -757,14 +764,14 @@ export function registerAutomationStartersRoutes(
     }
     let catalogSlugs: Set<string>;
     try {
-      const apps = await client.listApps(apiKey);
+      const apps = await effClient.listApps(apiKey);
       catalogSlugs = new Set(apps.map((a) => a.appId.toLowerCase()));
     } catch {
       catalogSlugs = allSlugs; // benefit of the doubt — presence unknown
     }
     let activeAccountSlugs = new Set<string>();
     try {
-      const accounts = await client.listConnectedAccounts(apiKey, composioEntityId(userId));
+      const accounts = await effClient.listConnectedAccounts(apiKey, composioEntityId(userId));
       activeAccountSlugs = new Set(
         accounts
           .filter((a) => a.status.toUpperCase() === 'ACTIVE')
