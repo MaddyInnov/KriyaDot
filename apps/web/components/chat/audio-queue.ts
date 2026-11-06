@@ -19,6 +19,17 @@ export interface PlayableAudio {
 
 export type AudioFactory = (src: string, mimeType: string) => PlayableAudio;
 
+/** Options form of the queue's second constructor argument. */
+export interface GaplessAudioQueueOptions {
+  /**
+   * Called exactly when playback state flips: `true` when the first
+   * chunk starts playing, `false` when the last chunk ends or stop()
+   * halts playback. Never fires twice in a row with the same value, so
+   * back-to-back chunk transitions do not flicker it.
+   */
+  onPlayingChange?: (playing: boolean) => void;
+}
+
 function defaultFactory(src: string): PlayableAudio {
   const audio = new Audio(src);
   return audio as unknown as PlayableAudio;
@@ -41,13 +52,36 @@ interface QueuedChunk {
 
 export class GaplessAudioQueue {
   private readonly factory: AudioFactory;
+  private readonly onPlayingChange?: (playing: boolean) => void;
   private readonly queue: QueuedChunk[] = [];
   private current: PlayableAudio | null = null;
   private playingSeqValue: number | null = null;
+  private playingNotified = false;
   private stopped = false;
 
-  constructor(factory: AudioFactory = defaultFactory) {
+  /**
+   * @param factory Injectable audio factory (tests pass a fake).
+   * @param onPlayingChange Change callback, or an options object
+   *   carrying one: `new GaplessAudioQueue(factory, { onPlayingChange })`.
+   */
+  constructor(
+    factory: AudioFactory = defaultFactory,
+    onPlayingChange?: ((playing: boolean) => void) | GaplessAudioQueueOptions,
+  ) {
     this.factory = factory;
+    this.onPlayingChange =
+      typeof onPlayingChange === 'function' ? onPlayingChange : onPlayingChange?.onPlayingChange;
+  }
+
+  /** Flip the notified playing state, invoking the callback on change only. */
+  private setPlaying(playing: boolean): void {
+    if (this.playingNotified === playing) return;
+    this.playingNotified = playing;
+    try {
+      this.onPlayingChange?.(playing);
+    } catch {
+      // A listener must never break playback.
+    }
   }
 
   /** Chunks waiting to play (excluding the one currently playing). */
@@ -85,6 +119,7 @@ export class GaplessAudioQueue {
       this.current = null;
       this.playingSeqValue = null;
     }
+    this.setPlaying(false);
   }
 
   private playNext(): void {
@@ -93,11 +128,13 @@ export class GaplessAudioQueue {
     if (!next) {
       this.current = null;
       this.playingSeqValue = null;
+      this.setPlaying(false);
       return;
     }
     const audio = this.factory(next.src, next.mimeType);
     this.current = audio;
     this.playingSeqValue = next.seq;
+    this.setPlaying(true);
     const advance = (): void => {
       if (this.current === audio) {
         this.current = null;

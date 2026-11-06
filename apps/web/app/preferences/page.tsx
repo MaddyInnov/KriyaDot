@@ -14,6 +14,30 @@ import { AgentImportPanel } from '../../components/panels/agent-import-panel';
 import { CloudSyncPanel } from '../../components/panels/cloud-sync-panel';
 import { useUxMode } from '../../lib/ux-mode';
 import { authedFetch } from '../../lib/api';
+import { usePetSettings, type PetSettings } from '../../lib/pet';
+
+const PET_SETTING_ROWS: Array<{ key: keyof PetSettings; label: string; description: string }> = [
+  {
+    key: 'chatAvatar',
+    label: 'Avatar in chat',
+    description: "The companion appears as the assistant's avatar on chat messages.",
+  },
+  {
+    key: 'speaking',
+    label: 'Speaking animation',
+    description: 'The companion animates while assistant audio plays.',
+  },
+  {
+    key: 'celebration',
+    label: 'Celebration',
+    description: 'The companion celebrates when a long task finishes.',
+  },
+  {
+    key: 'overlay',
+    label: 'Floating overlay',
+    description: 'The companion floats over other apps on desktop.',
+  },
+];
 
 interface LearnedPreference {
   id: string;
@@ -40,6 +64,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 export default function PreferencesPage() {
   const [mode] = useUxMode();
+  const { settings: petSettings, setSetting: setPetSetting } = usePetSettings();
   const [prefs, setPrefs] = useState<LearnedPreference[]>([]);
   const [recordings, setRecordings] = useState<Recording[]>([]);
   const [recording, setRecording] = useState<Recording | null>(null);
@@ -111,6 +136,29 @@ export default function PreferencesPage() {
           while runs are working — thinking, typing away, celebrating when a run lands.
         </p>
         <PetPicker />
+        <div>
+          {PET_SETTING_ROWS.map(({ key, label, description }) => {
+            const checked = petSettings[key];
+            return (
+              <div className="privacy-row" key={key}>
+                <div>
+                  <strong>{label}</strong>
+                  <p className="muted small">{description}</p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={checked}
+                  aria-label={label}
+                  onClick={() => setPetSetting(key, !checked)}
+                  className={`toggle ${checked ? 'toggle-on' : ''}`}
+                >
+                  <span className="toggle-knob" />
+                </button>
+              </div>
+            );
+          })}
+        </div>
       </section>
 
       <section className="card">

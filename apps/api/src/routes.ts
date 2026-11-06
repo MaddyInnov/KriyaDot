@@ -24,6 +24,7 @@ import type { TieredItem } from '@mvp/governance';
 import type { WorkflowRun, WorkflowRunner } from '@mvp/workflows';
 import { createHealthScoring, registerHealthRoutes } from './health-routes.js';
 import { registerObservabilityRoutes } from './observability-routes.js';
+import { registerPetStateRoutes } from './pet-state.js';
 import { registerOmniRoutes } from './omni-routes.js';
 import type { OmniCollector, OmniStore } from './omni.js';
 import { registerBriefingRoutes } from './briefing-routes.js';
@@ -3284,6 +3285,18 @@ export function createRouter(deps: RouteDeps): express.Router {
   if (deps.spanStore) {
     registerObservabilityRoutes(router, { spanStore: deps.spanStore });
   }
+
+  // ---- Floating-overlay pet state (Avatar Presence, Worker 4) -----------
+  // GET /api/pet-state: one tiny aggregate mood for the desktop overlay
+  // window, which polls it independently of the main window. See
+  // pet-state.ts for why no existing endpoint could serve this.
+  registerPetStateRoutes(router, {
+    turnStates: agentRuntime.turnStates,
+    workflowRunner,
+    listApprovals: (status) => governance.listApprovals(status as ApprovalStatus | undefined),
+    chatQueue: chatQueueStore,
+    spanStore: deps.spanStore,
+  });
 
   // ---- Omni rolling summary (Omni panel backend) --------------------------
   // Four temporal layers + pins + time-travel versions; the store is fed by

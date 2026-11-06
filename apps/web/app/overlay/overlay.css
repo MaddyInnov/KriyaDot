@@ -1,0 +1,75 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Floating pet overlay: loaded only by the /overlay route. The
+   `pet-overlay-mode` class (added to <html>/<body> by the page) strips
+   the app shell the root layout mounts and makes the window fully
+   transparent, so the Tauri window shows ONLY the pet. */
+
+html.pet-overlay-mode,
+body.pet-overlay-mode {
+  background: transparent !important;
+  overflow: hidden !important;
+}
+
+body.pet-overlay-mode .app-sidebar,
+body.pet-overlay-mode .sb-topstrip,
+body.pet-overlay-mode .shell-main > :not(.main) {
+  display: none !important;
+}
+
+body.pet-overlay-mode .shell,
+body.pet-overlay-mode .shell-main,
+body.pet-overlay-mode .main {
+  background: transparent !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  height: 100vh;
+  overflow: hidden !important;
+}
+
+.pet-overlay-root {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+
+.pet-overlay-root:active {
+  cursor: grabbing;
+}
+
+.pet-overlay-menu {
+  position: absolute;
+  left: 50%;
+  bottom: 6px;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 112px;
+  padding: 6px;
+  border-radius: 12px;
+  background: rgba(24, 20, 38, 0.92);
+  box-shadow: 0 8px 24px rgba(10, 8, 24, 0.45);
+}
+
+.pet-overlay-menu button {
+  appearance: none;
+  border: 0;
+  border-radius: 8px;
+  padding: 6px 8px;
+  background: rgba(255, 255, 255, 0.1);
+  color: #f4f2ff;
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+  text-align: center;
+}
+
+.pet-overlay-menu button:hover {
+  background: rgba(255, 255, 255, 0.2);
+}

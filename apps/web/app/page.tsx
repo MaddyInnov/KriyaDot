@@ -77,7 +77,7 @@ import type { Widget, WidgetAction, WidgetAnswerState } from '../components/widg
 import { CodeBlock, LineDiffView, UnifiedDiffView } from '../components/code/CodeBlock';
 import LazyClayScene from '../components/three';
 import { Pet } from '../components/pet/Pet';
-import { usePet, type PetMood } from '../lib/pet';
+import { usePet, usePetSettings, type PetMood } from '../lib/pet';
 import { I18nProvider, LanguageSwitcher, useI18n } from '../lib/i18n';
 import { getWebSTTProvider } from '../lib/voice-http';
 import { VOICE_NOTE_PERSIST_LIMIT, type VoiceNote } from '../lib/voice-notes';
@@ -116,6 +116,7 @@ import { THEMES, applyThemeChoice, getStoredThemeChoice } from '../lib/theme';
 import { FinishedSteps, NowCards, StepLine } from '../components/chat/step-line';
 import { applyStepEvent, type StepLineState } from '../components/chat/step-state';
 import { GaplessAudioQueue } from '../components/chat/audio-queue';
+import { reportPlayback, useAssistantSpeaking } from '../lib/playback-signal';
 import { GoalStatusCard } from '../components/chat/goal-card';
 import { BranchPicker, MessageSearchBox } from '../components/chat/message-search';
 import {
@@ -779,6 +780,16 @@ function ChatPageInner() {
   voiceReplyRef.current = voiceReply;
   const audioQueueRef = useRef<GaplessAudioQueue | null>(null);
 
+  // Discarding the chat (unmount): stop the TTS queue and clear its
+  // playback-signal source so no stale "speaking" state leaks.
+  useEffect(() => {
+    return () => {
+      audioQueueRef.current?.stop();
+      reportPlayback('chat-tts-queue', false);
+      audioQueueRef.current = null;
+    };
+  }, []);
+
   // Poll the "Now" registry + this chat's pending sign-in requests.
   useEffect(() => {
     let alive = true;
@@ -896,7 +907,12 @@ function ChatPageInner() {
 
   // Companion pet: reacts to run state (idle → thinking/working → happy on completion).
   const { choice: petChoice, name: petName } = usePet();
+  // Avatar-presence toggles (chat avatar / speaking / celebration).
+  const { settings: petSettings } = usePetSettings();
+  // Assistant audio playback (any source) drives the speaking mood.
+  const assistantSpeaking = useAssistantSpeaking();
   const [celebrate, setCelebrate] = useState(false);
+  const celebrateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const runActiveRef = useRef(false);
   const anyStreaming = sending || blocks.some((b) => b.kind === 'assistant' && b.streaming);
   const waitingForFirstToken =
@@ -911,7 +927,43 @@ function ChatPageInner() {
     }
     runActiveRef.current = anyStreaming;
   }, [anyStreaming]);
-  const petMood: PetMood = celebrate ? 'happy' : waitingForFirstToken ? 'thinking' : anyStreaming ? 'working' : 'idle';
+  // Manual celebration (hero pet double-click): same brief celebrate
+  // window (~2.4s), only when the celebration toggle is on.
+  const triggerCelebrate = useCallback(() => {
+    if (!petSettings.celebration) return;
+    setCelebrate(true);
+    if (celebrateTimerRef.current) clearTimeout(celebrateTimerRef.current);
+    celebrateTimerRef.current = setTimeout(() => setCelebrate(false), 2400);
+  }, [petSettings.celebration]);
+  // Latest assistant message in each list: the one that "speaks" while
+  // assistant audio is playing (message-avatar mood, below).
+  const latestAssistantBlockId = useMemo(() => {
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      if (blocks[i]?.kind === 'assistant') return blocks[i]!.id;
+    }
+    return null;
+  }, [blocks]);
+  const latestThreadAssistantBlockId = useMemo(() => {
+    for (let i = threadBlocks.length - 1; i >= 0; i--) {
+      if (threadBlocks[i]?.kind === 'assistant') return threadBlocks[i]!.id;
+    }
+    return null;
+  }, [threadBlocks]);
+  // Mood precedence: speaking (audio playing) > celebrating/happy
+  // (run just finished) > thinking > working > idle. The speaking and
+  // celebration toggles gate their moods off independently.
+  const petMood: PetMood =
+    petSettings.speaking && assistantSpeaking
+      ? 'speaking'
+      : celebrate
+        ? petSettings.celebration
+          ? 'celebrating'
+          : 'happy'
+        : waitingForFirstToken
+          ? 'thinking'
+          : anyStreaming
+            ? 'working'
+            : 'idle';
 
   // Boot: wait for the API bootstrap token first (single shared promise —
   // concurrent early calls all wait for it exactly once), then load the
@@ -1634,7 +1686,12 @@ function ChatPageInner() {
     }
     if (event.type === 'audio_chunk') {
       // Streaming TTS (W8h): queue the sentence audio for gapless playback.
-      if (!audioQueueRef.current) audioQueueRef.current = new GaplessAudioQueue();
+      // Playback state feeds the shared signal (pet speaking mood).
+      if (!audioQueueRef.current) {
+        audioQueueRef.current = new GaplessAudioQueue(undefined, (playing) =>
+          reportPlayback('chat-tts-queue', playing),
+        );
+      }
       audioQueueRef.current.enqueue({ seq: event.seq, audioBase64: event.audioBase64, mimeType: event.mimeType });
       return;
     }
@@ -1841,6 +1898,14 @@ function ChatPageInner() {
       c.abort();
       abortRef.current = null;
     }
+    // Stop any queued streaming-TTS audio too, and DISCARD the queue:
+    // stop() is permanent (no reset), so the next audio_chunk must build
+    // a fresh queue. stop() fires onPlayingChange(false), clearing the
+    // 'chat-tts-queue' playback source; the explicit report covers the
+    // never-created case.
+    audioQueueRef.current?.stop();
+    audioQueueRef.current = null;
+    reportPlayback('chat-tts-queue', false);
     // Also drop any live fusion SSE subscriptions.
     for (const unsub of fusionStreamsRef.current.values()) {
       try {
@@ -3383,7 +3448,7 @@ function ChatPageInner() {
             <div className="empty-state">
               <LazyClayScene className="empty-3d" />
               <div className="empty-pet">
-                <Pet pet={petChoice.id} size={140} mood={petMood} />
+                <Pet pet={petChoice.id} size={140} mood={petMood} onDoubleClick={triggerCelebrate} />
               </div>
               <p>
                 <strong>{t('chat.emptyAsk', { pet: petName })}</strong>
@@ -3491,12 +3556,24 @@ function ChatPageInner() {
               case 'assistant': {
                 const botLabel = b.botName ?? selectedBot?.name ?? 'Assistant';
                 const summary = threadSummaries[b.id];
+                // Per-message avatar mood: thinking while this message is
+                // streaming, speaking while assistant audio plays and this
+                // is the latest assistant message, otherwise idle.
+                const avatarMood: PetMood = b.streaming
+                  ? 'thinking'
+                  : petSettings.speaking && assistantSpeaking && b.id === latestAssistantBlockId
+                    ? 'speaking'
+                    : 'idle';
                 return (
                   <div key={b.id} data-block-id={b.id} className={`msg assistant${b.streaming ? ' streaming' : ''}`} title={new Date(b.ts).toLocaleString()}>
                     <div className="msg-head">
-                      <span className="avatar bot" aria-hidden="true">
-                        {botLabel.charAt(0).toUpperCase()}
-                      </span>
+                      {petSettings.chatAvatar ? (
+                        <Pet pet={petChoice.id} size={28} mood={avatarMood} variant="2d" label="" className="avatar bot" />
+                      ) : (
+                        <span className="avatar bot" aria-hidden="true">
+                          {botLabel.charAt(0).toUpperCase()}
+                        </span>
+                      )}
                       <span className="msg-author">{botLabel}</span>
                       {b.routing ? (
                         <RoutingChip routing={b.routing} mode={uxMode} modelRoute={b.modelRoute} />
@@ -4308,12 +4385,22 @@ function ChatPageInner() {
                   );
                 }
                 if (b.kind === 'assistant') {
+                  // Same avatar treatment as the main list (see above).
+                  const threadAvatarMood: PetMood = b.streaming
+                    ? 'thinking'
+                    : petSettings.speaking && assistantSpeaking && b.id === latestThreadAssistantBlockId
+                      ? 'speaking'
+                      : 'idle';
                   return (
                     <div key={b.id} className="msg assistant" style={{ marginBottom: 10 }}>
                       <div className="msg-head">
-                        <span className="avatar bot" aria-hidden="true">
-                          {(b.botName ?? selectedBot?.name ?? 'A').charAt(0).toUpperCase()}
-                        </span>
+                        {petSettings.chatAvatar ? (
+                          <Pet pet={petChoice.id} size={28} mood={threadAvatarMood} variant="2d" label="" className="avatar bot" />
+                        ) : (
+                          <span className="avatar bot" aria-hidden="true">
+                            {(b.botName ?? selectedBot?.name ?? 'A').charAt(0).toUpperCase()}
+                          </span>
+                        )}
                         <span className="msg-author">{b.botName ?? selectedBot?.name ?? 'Assistant'}</span>
                         <span className="msg-time">{fmtTime(b.ts)}</span>
                         {b.text.length > 0 && <CopyBtn text={b.text} />}

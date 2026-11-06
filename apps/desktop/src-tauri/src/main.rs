@@ -41,6 +41,11 @@ mod dictation;
 // dictation.rs until CI compiles it (no cargo toolchain on the build VM).
 mod quick_entry;
 
+// Avatar Presence (Worker 4): floating pet overlay window
+// (src/pet_overlay.rs). SOURCE-LEVEL ONLY — same unverified status as
+// quick_entry.rs until CI compiles it (no cargo toolchain on the build VM).
+mod pet_overlay;
+
 /// Fixed loopback port the desktop backend listens on.
 /// The bundled frontend detects Tauri (`window.__TAURI__`) and calls
 /// `http://127.0.0.1:DESKTOP_API_PORT` for all API traffic.
@@ -215,7 +220,15 @@ fn main() {
                 })
                 .build(),
         )
-        .invoke_handler(tauri::generate_handler![dictation::dictation_insert_text])
+        .invoke_handler(tauri::generate_handler![
+            dictation::dictation_insert_text,
+            pet_overlay::pet_overlay_show,
+            pet_overlay::pet_overlay_hide,
+            pet_overlay::pet_overlay_is_enabled,
+            pet_overlay::pet_overlay_set_enabled,
+            pet_overlay::pet_overlay_focus_main,
+            pet_overlay::pet_overlay_save_position
+        ])
         .setup(|app| {
             // Data directory for SQLite DBs + providers.local.json (0600).
             let data_dir = app
@@ -320,6 +333,10 @@ fn main() {
                     _ => {}
                 })
                 .build(app)?;
+
+            // Avatar Presence (Worker 4): floating pet overlay window,
+            // created only when its persisted enabled mirror is on.
+            pet_overlay::init_overlay(app.handle());
 
             spawn_sidecar(app.handle(), &state);
             refresh_tray_menu(app.handle(), &state);

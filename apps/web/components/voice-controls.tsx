@@ -16,6 +16,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { authedFetch } from '../lib/api';
+import { reportPlayback } from '../lib/playback-signal';
 
 export interface VoiceControlsProps {
   /** Called with each finalized transcript. */
@@ -45,6 +46,15 @@ export default function VoiceControls({ onTranscript, speakText, language = 'en'
     };
     setWebSpeech(Boolean(w.SpeechRecognition ?? w.webkitSpeechRecognition));
     return () => {
+      // Unmount: silence any in-flight TTS playback and clear its
+      // playback-signal source so the pet does not speak forever.
+      try {
+        audioRef.current?.pause();
+      } catch {
+        /* nothing playing */
+      }
+      audioRef.current = null;
+      reportPlayback('voice-controls', false);
       try {
         recognitionRef.current?.stop();
       } catch {
@@ -192,17 +202,25 @@ export default function VoiceControls({ onTranscript, speakText, language = 'en'
       const url = URL.createObjectURL(new Blob([bytes], { type: mimeType }));
       const audio = new Audio(url);
       audioRef.current = audio;
+      // Feed the shared playback signal (pet speaking mood): active while
+      // this element is actually playing, cleared on pause/end/error.
+      audio.onplay = () => reportPlayback('voice-controls', true);
+      audio.onpause = () => reportPlayback('voice-controls', false);
       audio.onended = () => {
         URL.revokeObjectURL(url);
+        reportPlayback('voice-controls', false);
         setSpeaking(false);
       };
       audio.onerror = () => {
         URL.revokeObjectURL(url);
+        reportPlayback('voice-controls', false);
         setSpeaking(false);
         setError('Could not play the synthesized audio');
       };
       await audio.play();
+      reportPlayback('voice-controls', true);
     } catch (err) {
+      reportPlayback('voice-controls', false);
       setError(err instanceof Error ? err.message : 'Speech synthesis failed');
       setSpeaking(false);
     }

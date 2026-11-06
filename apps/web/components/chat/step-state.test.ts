@@ -118,4 +118,62 @@ describe('GaplessAudioQueue (W8h)', () => {
     expect(queue.playingSeq).toBeNull();
     void vi;
   });
+
+  it('onPlayingChange fires on start and on last-chunk end, without flicker between chunks', () => {
+    const made: FakeAudio[] = [];
+    const events: boolean[] = [];
+    const queue = new GaplessAudioQueue(
+      (src) => {
+        const a = new FakeAudio(src);
+        made.push(a);
+        return a;
+      },
+      (playing) => events.push(playing),
+    );
+    queue.enqueue({ seq: 0, audioBase64: b64('one'), mimeType: 'audio/wav' });
+    queue.enqueue({ seq: 1, audioBase64: b64('two'), mimeType: 'audio/wav' });
+    expect(events).toEqual([true]);
+    made[0]!.end(); // hands off to chunk 1 — still playing, no new event
+    expect(events).toEqual([true]);
+    made[1]!.end(); // last chunk ends
+    expect(events).toEqual([true, false]);
+  });
+
+  it('onPlayingChange fires false on stop() mid-playback, and not when idle', () => {
+    const made: FakeAudio[] = [];
+    const events: boolean[] = [];
+    const makeQueue = () =>
+      new GaplessAudioQueue(
+        (src) => {
+          const a = new FakeAudio(src);
+          made.push(a);
+          return a;
+        },
+        { onPlayingChange: (playing) => events.push(playing) },
+      );
+    makeQueue().stop(); // idle stop: no state change, no event
+    expect(events).toEqual([]);
+    const queue = makeQueue();
+    queue.enqueue({ seq: 0, audioBase64: b64('one'), mimeType: 'audio/wav' });
+    expect(events).toEqual([true]);
+    queue.stop();
+    expect(events).toEqual([true, false]);
+  });
+
+  it('onPlayingChange fires false when the only chunk errors out', () => {
+    const made: FakeAudio[] = [];
+    const events: boolean[] = [];
+    const queue = new GaplessAudioQueue(
+      (src) => {
+        const a = new FakeAudio(src);
+        made.push(a);
+        return a;
+      },
+      (playing) => events.push(playing),
+    );
+    queue.enqueue({ seq: 0, audioBase64: b64('bad'), mimeType: 'audio/wav' });
+    made[0]!.onerror?.();
+    expect(events).toEqual([true, false]);
+    expect(queue.isPlaying).toBe(false);
+  });
 });

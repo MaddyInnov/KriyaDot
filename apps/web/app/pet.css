@@ -82,6 +82,35 @@
 }
 .pet-mood-sleeping .pet-inner { animation: pet-breathe 4.2s ease-in-out infinite; }
 
+@keyframes pet-nod {
+  0%, 100% { transform: translateY(0) rotate(0deg); }
+  50% { transform: translateY(-2.5%) rotate(1.6deg); }
+}
+.pet-mood-speaking .pet-inner { animation: pet-nod 0.56s ease-in-out infinite; }
+
+/* Talking mouth: scaleY oscillation at speech cadence (~3 mouth flaps/sec
+   combined with the nod above reads as speech, not chewing). */
+@keyframes pet-talk {
+  0%, 100% { transform: scaleY(0.3); }
+  50% { transform: scaleY(1); }
+}
+.pet-mood-speaking .pet-talk-mouth {
+  animation: pet-talk 0.32s ease-in-out infinite;
+  transform-origin: center;
+  transform-box: fill-box;
+}
+
+@keyframes pet-celebrate {
+  0% { transform: translateY(0) rotate(0deg) scale(1, 1); }
+  18% { transform: translateY(-18%) rotate(-8deg) scale(1.04, 1.04); }
+  36% { transform: translateY(0) rotate(8deg) scale(0.96, 1.04); }
+  54% { transform: translateY(-24%) rotate(180deg) scale(1.05, 1.05); }
+  72% { transform: translateY(0) rotate(360deg) scale(1, 1); }
+  86% { transform: translateY(-10%) rotate(368deg) scale(1.03, 1.03); }
+  100% { transform: translateY(0) rotate(360deg) scale(1, 1); }
+}
+.pet-mood-celebrating .pet-inner { animation: pet-celebrate 2.4s ease-in-out infinite; }
+
 /* ---- mood extras (inside the SVG) ---------------------------------- */
 
 .pet .fx { opacity: 0; transition: opacity 0.25s ease; }
@@ -89,6 +118,19 @@
 .pet-mood-happy .fx-happy { opacity: 1; }
 .pet-mood-sleeping .fx-sleep { opacity: 1; }
 .pet-mood-sleeping .fx-lamp { opacity: 0.04; }
+.pet-mood-speaking .fx-speaking { opacity: 1; }
+.pet-mood-celebrating .fx-celebrating { opacity: 1; }
+.pet-mood-celebrating .fx-happy { opacity: 1; }
+
+@keyframes pet-sound-arc-pulse {
+  0%, 100% { opacity: 0.25; }
+  50% { opacity: 1; }
+}
+.pet-mood-speaking .pet-sound-arc { animation: pet-sound-arc-pulse 0.64s ease-in-out infinite; }
+.pet-mood-speaking .pet-sound-arc-2 { animation-delay: 0.12s; }
+.pet-mood-speaking .pet-sound-arc-3 { animation-delay: 0.24s; }
+
+.pet-mood-celebrating .fx-celebrating { animation: pet-sparkle-pop 0.9s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
 
 @keyframes pet-z-float {
   0% { transform: translateY(0); opacity: 0; }
@@ -115,13 +157,23 @@
   .pet .pet-inner,
   .pet .fx,
   .pet .fx-sleep .z,
-  .pet .fx-antenna {
+  .pet .fx-antenna,
+  .pet .pet-talk-mouth,
+  .pet .pet-sound-arc,
+  .pet .fx-celebrating {
     animation: none !important;
   }
+  /* Static speaking mouth / celebration marks stay visible, just still. */
   .pet-mood-thinking .fx-thought,
   .pet-mood-happy .fx-happy,
-  .pet-mood-sleeping .fx-sleep {
+  .pet-mood-sleeping .fx-sleep,
+  .pet-mood-speaking .fx-speaking,
+  .pet-mood-celebrating .fx-celebrating,
+  .pet-mood-celebrating .fx-happy {
     opacity: 1;
+  }
+  .pet-mood-speaking .pet-talk-mouth {
+    transform: none !important;
   }
 }
 

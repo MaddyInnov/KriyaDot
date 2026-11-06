@@ -13,7 +13,7 @@
 
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, type MouseEventHandler } from 'react';
 import * as THREE from 'three';
 import type { PetId, PetMood } from '../../lib/pet';
 
@@ -26,6 +26,62 @@ export interface Pet3DProps {
   label?: string;
   /** Disable pointer interactivity (e.g. decorative previews). */
   interactive?: boolean;
+  /** Double-click handler, forwarded to the wrapper div (e.g. celebrate). */
+  onDoubleClick?: MouseEventHandler<HTMLDivElement>;
+}
+
+/** Speaking cadence in Hz — small nod / jaw bob while the pet talks. */
+export const PET_SPEAKING_CADENCE_HZ = 7;
+/** Duration (seconds) of the one-shot celebrating choreography. */
+export const PET_CELEBRATION_DURATION_S = 2.4;
+
+export interface PetMoodPose {
+  offsetY: number;
+  rotationY: number;
+  rotationZ: number;
+  scale: number;
+  /** -1..1 talk oscillation (mouth / jaw), 0 when not speaking. */
+  talk: number;
+}
+
+const NEUTRAL_POSE: PetMoodPose = { offsetY: 0, rotationY: 0, rotationZ: 0, scale: 1, talk: 0 };
+
+/**
+ * Pure group-level pose for the speaking / celebrating moods.
+ * `elapsed` is seconds since the mood started; `t` is absolute scene time.
+ * Speaking: cadence-driven talk bob for as long as the mood holds.
+ * Celebrating: a timed ~2.4s choreography (bounce jumps, one full spin,
+ * wave wobble) that settles back to neutral once the duration elapses.
+ * Every other mood returns the neutral pose. Safe to unit-test without WebGL.
+ */
+export function petMoodPose(mood: PetMood, elapsed: number, t: number): PetMoodPose {
+  if (mood === 'speaking') {
+    const phase = t * PET_SPEAKING_CADENCE_HZ * Math.PI * 2;
+    return {
+      offsetY: Math.abs(Math.sin(phase)) * 0.035,
+      rotationY: 0,
+      rotationZ: Math.sin(phase) * 0.03,
+      scale: 1,
+      talk: Math.sin(phase),
+    };
+  }
+  if (mood === 'celebrating') {
+    const dur = PET_CELEBRATION_DURATION_S;
+    if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed >= dur) {
+      return elapsed >= dur ? { ...NEUTRAL_POSE } : { ...NEUTRAL_POSE };
+    }
+    const p = elapsed / dur; // 0..1
+    // Three bounce jumps that ease out, one full spin, wave wobble.
+    const jumps = Math.abs(Math.sin(p * Math.PI * 3)) * (1 - p * 0.35);
+    return {
+      offsetY: jumps * 0.38,
+      rotationY: p * Math.PI * 2,
+      rotationZ: Math.sin(p * Math.PI * 6) * 0.14 * (1 - p),
+      scale: 1 + Math.sin(p * Math.PI * 3) * 0.05,
+      talk: 0,
+    };
+  }
+  return { ...NEUTRAL_POSE };
 }
 
 /** Pure config — safe to import in tests without WebGL. */
@@ -132,7 +188,8 @@ function shade(hex: string, f: number): THREE.Color {
 
 interface BuiltPet {
   group: THREE.Group;
-  tick: (t: number, mood: PetMood) => void;
+  /** `moodElapsed` = seconds since the current mood started (0 if unknown). */
+  tick: (t: number, mood: PetMood, moodElapsed?: number) => void;
   dispose: () => void;
 }
 
@@ -200,13 +257,16 @@ function buildKriyaDot(dim: number): BuiltPet {
   group.add(eyes.group);
   makeBlush(group);
 
-  const tick = (t: number, mood: PetMood) => {
+  const tick = (t: number, mood: PetMood, moodElapsed = 0) => {
     const speed = mood === 'sleeping' ? 0.45 : mood === 'working' ? 1.7 : 1;
     const br = 1 + Math.sin(t * 2.1 * speed) * 0.028;
     body.scale.set(br, 1 / Math.sqrt(br), br);
     group.position.y = Math.sin(t * 1.7 * speed) * 0.07 + (mood === 'sleeping' ? -0.18 : 0);
+    const celebrating = mood === 'celebrating' && moodElapsed < PET_CELEBRATION_DURATION_S;
     arms.forEach((arm, i) => {
-      arm.rotation.y = Math.sin(t * (mood === 'working' ? 6 : 2.6) + i * 0.9) * 0.35;
+      arm.rotation.y = celebrating
+        ? Math.sin(moodElapsed * 14 + i * 0.9) * 0.85
+        : Math.sin(t * (mood === 'working' ? 6 : 2.6) + i * 0.9) * 0.35;
     });
     if (mood === 'thinking') group.rotation.z = 0.14;
     else if (mood === 'error') group.position.x = Math.sin(t * 28) * 0.05;
@@ -251,12 +311,14 @@ function buildOcky(dim: number): BuiltPet {
   group.add(eyes.group);
   makeBlush(group, 0.02);
 
-  const tick = (t: number, mood: PetMood) => {
+  const tick = (t: number, mood: PetMood, moodElapsed = 0) => {
     const speed = mood === 'sleeping' ? 0.45 : 1;
     group.position.y = Math.sin(t * 1.5 * speed) * 0.09 + (mood === 'sleeping' ? -0.15 : 0.05);
     group.rotation.y = Math.sin(t * 0.5) * 0.25;
+    const celebrating = mood === 'celebrating' && moodElapsed < PET_CELEBRATION_DURATION_S;
     tentacles.forEach((ten, i) => {
-      ten.rotation.x = Math.PI + Math.sin(t * 2.4 + i * 1.1) * 0.22;
+      ten.rotation.x =
+        Math.PI + Math.sin((celebrating ? moodElapsed * 12 : t * 2.4) + i * 1.1) * (celebrating ? 0.55 : 0.22);
     });
     lampGlow.material.emissiveIntensity = 1.3 + Math.sin(t * 3) * 0.4;
     if (mood === 'thinking') group.rotation.z = 0.12;
@@ -339,15 +401,18 @@ function buildPlip(dim: number): BuiltPet {
   group.add(eyes.group);
   makeBlush(group, -0.28, 0.72);
 
-  const tick = (t: number, mood: PetMood) => {
+  const tick = (t: number, mood: PetMood, moodElapsed = 0) => {
     const energetic = mood === 'working' || mood === 'happy';
     const speed = mood === 'sleeping' ? 0.4 : energetic ? 2.2 : 1.3;
     // Plip cannot sit still: constant squash-and-stretch.
     const sq = Math.sin(t * 3.2 * speed);
     body.scale.set(1 + sq * 0.05, 1 - sq * 0.06, 1 + sq * 0.05);
     group.position.y = Math.abs(Math.sin(t * 2.4 * speed)) * 0.16 + (mood === 'sleeping' ? -0.2 : 0);
+    const celebrating = mood === 'celebrating' && moodElapsed < PET_CELEBRATION_DURATION_S;
     arms.forEach((arm, i) => {
-      arm.rotation.y = Math.sin(t * 5 * speed + i * 1.3) * 0.5;
+      arm.rotation.y = celebrating
+        ? Math.sin(moodElapsed * 15 + i * 1.3) * 0.9
+        : Math.sin(t * 5 * speed + i * 1.3) * 0.5;
     });
     blink(eyes, t, mood);
   };
@@ -400,14 +465,27 @@ function buildBolt(dim: number): BuiltPet {
   armR.position.x = 0.72;
   group.add(armL, armR);
 
-  const tick = (t: number, mood: PetMood) => {
+  const tick = (t: number, mood: PetMood, moodElapsed = 0) => {
     group.position.y = Math.sin(t * 2) * 0.03 + 0.1;
     head.rotation.y = Math.sin(t * 0.8) * (mood === 'thinking' ? 0.5 : 0.2);
+    // Speaking: small cadence nod of the head (jaw-like bob where no jaw exists).
+    if (mood === 'speaking') {
+      head.rotation.x = Math.sin(t * PET_SPEAKING_CADENCE_HZ * Math.PI * 2) * 0.06;
+    } else {
+      head.rotation.x = 0;
+    }
     const active = mood === 'working' || mood === 'happy';
     ledMat.emissiveIntensity = active ? 2.6 + Math.sin(t * 8) * 0.8 : 2;
     tip.material.emissiveIntensity = 1.4 + Math.sin(t * 3) * 0.5;
-    armL.rotation.z = 0.15 + Math.sin(t * (active ? 6 : 2)) * 0.2;
-    armR.rotation.z = -0.15 - Math.sin(t * (active ? 6 : 2) + 1) * 0.2;
+    const celebrating = mood === 'celebrating' && moodElapsed < PET_CELEBRATION_DURATION_S;
+    if (celebrating) {
+      const wave = Math.sin(moodElapsed * 14);
+      armL.rotation.z = 0.9 + wave * 0.55;
+      armR.rotation.z = -0.9 - wave * 0.55;
+    } else {
+      armL.rotation.z = 0.15 + Math.sin(t * (active ? 6 : 2)) * 0.2;
+      armR.rotation.z = -0.15 - Math.sin(t * (active ? 6 : 2) + 1) * 0.2;
+    }
     if (mood === 'error') group.position.x = Math.sin(t * 26) * 0.04;
     else group.position.x = 0;
   };
@@ -520,7 +598,15 @@ async function makeRenderer(canvas: HTMLCanvasElement): Promise<AnyRenderer> {
 /* component                                                           */
 /* ------------------------------------------------------------------ */
 
-export function Pet3D({ pet, mood = 'idle', size = 140, className = '', label, interactive = true }: Pet3DProps) {
+export function Pet3D({
+  pet,
+  mood = 'idle',
+  size = 140,
+  className = '',
+  label,
+  interactive = true,
+  onDoubleClick,
+}: Pet3DProps) {
   const mountRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const moodRef = useRef<PetMood>(mood);
@@ -552,17 +638,34 @@ export function Pet3D({ pet, mood = 'idle', size = 140, className = '', label, i
 
       built = BUILDERS[pet](themeDim());
       const rig = new THREE.Group();
-      rig.add(built.group);
+      // Mood pose group sits between the pointer rig and the pet's own group
+      // so speaking/celebrating transforms never fight tick() or applyInter().
+      const moodGroup = new THREE.Group();
+      moodGroup.add(built.group);
+      rig.add(moodGroup);
       scene.add(rig);
 
       const clock = new THREE.Clock();
       const inter = interRef.current;
+      let lastMood: PetMood | null = null;
+      let moodStartT = 0;
 
       const frame = () => {
         if (!renderer || !built) return;
         const t = clock.getElapsedTime();
+        const currentMood = moodRef.current;
+        if (currentMood !== lastMood) {
+          lastMood = currentMood;
+          moodStartT = t;
+        }
+        const moodElapsed = Math.max(0, t - moodStartT);
         inter.bounce *= 0.94;
-        built.tick(t, moodRef.current);
+        built.tick(t, currentMood, moodElapsed);
+        const pose = petMoodPose(currentMood, moodElapsed, t);
+        moodGroup.position.y = pose.offsetY;
+        moodGroup.rotation.y = pose.rotationY;
+        moodGroup.rotation.z = pose.rotationZ;
+        moodGroup.scale.setScalar(pose.scale);
         applyInter(rig, inter);
         renderer.render(scene, camera);
       };
@@ -643,10 +746,12 @@ export function Pet3D({ pet, mood = 'idle', size = 140, className = '', label, i
   return (
     <div
       ref={mountRef}
-      className={`pet3d${className ? ` ${className}` : ''}`}
+      className={`pet3d pet-mood-${mood}${className ? ` ${className}` : ''}`}
+      data-mood={mood}
       style={{ width: size, height: size, cursor: interactive ? 'pointer' : 'default' }}
       role="img"
       aria-label={label ?? `3D ${pet} companion pet (${mood})`}
+      onDoubleClick={onDoubleClick}
     >
       <canvas ref={canvasRef} style={{ width: '100%', height: '100%', display: 'block' }} />
     </div>

@@ -30,9 +30,20 @@ export interface PetProps {
   variant?: 'auto' | '2d' | '3d';
   /** Disable pointer interactivity on the 3D pet. */
   interactive?: boolean;
+  /** Double-click handler, forwarded to the rendered wrapper (2D span or 3D). */
+  onDoubleClick?: React.MouseEventHandler<HTMLElement>;
 }
 
-export function Pet({ pet, size = 48, mood = 'idle', className = '', label, variant = 'auto', interactive = true }: PetProps) {
+export function Pet({
+  pet,
+  size = 48,
+  mood = 'idle',
+  className = '',
+  label,
+  variant = 'auto',
+  interactive = true,
+  onDoubleClick,
+}: PetProps) {
   const name = petDef(pet).name;
   const ariaLabel = label ?? `${name} the companion pet (${mood})`;
   const use3D = variant === '3d' || (variant === 'auto' && size >= 64 && is3DEnabled());
@@ -46,6 +57,7 @@ export function Pet({ pet, size = 48, mood = 'idle', className = '', label, vari
         className={className}
         label={ariaLabel}
         interactive={interactive}
+        onDoubleClick={onDoubleClick}
       />
     );
   }
@@ -58,6 +70,7 @@ export function Pet({ pet, size = 48, mood = 'idle', className = '', label, vari
       style={{ width: size, height: size }}
       role="img"
       aria-label={ariaLabel}
+      onDoubleClick={onDoubleClick}
     >
       <span className="pet-inner">
         <svg className="pet-svg" viewBox="0 0 120 120" width={size} height={size} aria-hidden="true">

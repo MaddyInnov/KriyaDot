@@ -8,7 +8,15 @@
 import { useCallback, useEffect, useState } from 'react';
 
 export type PetId = 'kriyadot' | 'ocky' | 'nubi' | 'plip' | 'bolt' | 'wisp';
-export type PetMood = 'idle' | 'thinking' | 'working' | 'happy' | 'error' | 'sleeping';
+export type PetMood =
+  | 'idle'
+  | 'thinking'
+  | 'working'
+  | 'happy'
+  | 'error'
+  | 'sleeping'
+  | 'speaking'
+  | 'celebrating';
 
 export interface PetDef {
   id: PetId;
@@ -164,4 +172,108 @@ export function usePet(): UsePet {
 
   const def = petDef(choice.id);
   return { choice, def, name: petDisplayName(choice), setPet, setName };
+}
+
+/* ------------------------------------------------------------------ */
+/* Pet settings (avatar presence toggles)                              */
+/* ------------------------------------------------------------------ */
+
+const SETTINGS_KEY = 'mvp:pet:settings';
+const SETTINGS_CHANGE_EVENT = 'mvp:pet-settings-change';
+
+export interface PetSettings {
+  /** Show the pet as an avatar next to chat messages. */
+  chatAvatar: boolean;
+  /** Allow the speaking (talking) mood / animation. */
+  speaking: boolean;
+  /** Allow the celebrating mood / animation. */
+  celebration: boolean;
+  /** Show the pet as a desktop floating overlay. */
+  overlay: boolean;
+}
+
+export const DEFAULT_PET_SETTINGS: PetSettings = {
+  chatAvatar: true,
+  speaking: true,
+  celebration: true,
+  overlay: true,
+};
+
+const PET_SETTING_KEYS = ['chatAvatar', 'speaking', 'celebration', 'overlay'] as const;
+
+function isPetSettingKey(v: unknown): v is keyof PetSettings {
+  return typeof v === 'string' && (PET_SETTING_KEYS as readonly string[]).includes(v);
+}
+
+function sanitisePetSettings(raw: unknown): PetSettings {
+  const next: PetSettings = { ...DEFAULT_PET_SETTINGS };
+  if (raw && typeof raw === 'object') {
+    const parsed = raw as Partial<Record<keyof PetSettings, unknown>>;
+    for (const key of PET_SETTING_KEYS) {
+      if (typeof parsed[key] === 'boolean') next[key] = parsed[key] as boolean;
+    }
+  }
+  return next;
+}
+
+/** Read the stored pet settings (safe on server / private mode). */
+export function getPetSettings(): PetSettings {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (!raw) return { ...DEFAULT_PET_SETTINGS };
+    return sanitisePetSettings(JSON.parse(raw) as unknown);
+  } catch {
+    return { ...DEFAULT_PET_SETTINGS };
+  }
+}
+
+/** Persist a partial settings update and notify other mounted hooks in this tab. */
+export function setPetSettings(partial: Partial<PetSettings>): PetSettings {
+  const current = getPetSettings();
+  const next: PetSettings = { ...current };
+  if (partial && typeof partial === 'object') {
+    for (const key of PET_SETTING_KEYS) {
+      const value = partial[key];
+      if (typeof value === 'boolean') next[key] = value;
+    }
+  }
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
+  } catch {
+    /* private mode etc. — in-memory only */
+  }
+  try {
+    window.dispatchEvent(new Event(SETTINGS_CHANGE_EVENT));
+  } catch {
+    /* ignore */
+  }
+  return next;
+}
+
+export interface UsePetSettings {
+  settings: PetSettings;
+  setSetting: (key: keyof PetSettings, value: boolean) => void;
+}
+
+/** Reactive hook over the stored pet settings. SSR-safe (hydrates from defaults). */
+export function usePetSettings(): UsePetSettings {
+  const [settings, setSettings] = useState<PetSettings>({ ...DEFAULT_PET_SETTINGS });
+
+  useEffect(() => {
+    setSettings(getPetSettings());
+    const onChange = () => setSettings(getPetSettings());
+    window.addEventListener(SETTINGS_CHANGE_EVENT, onChange);
+    window.addEventListener('storage', onChange);
+    return () => {
+      window.removeEventListener(SETTINGS_CHANGE_EVENT, onChange);
+      window.removeEventListener('storage', onChange);
+    };
+  }, []);
+
+  const setSetting = useCallback((key: keyof PetSettings, value: boolean) => {
+    if (!isPetSettingKey(key) || typeof value !== 'boolean') return;
+    setSettings(setPetSettings({ [key]: value } as Partial<PetSettings>));
+  }, []);
+
+  return { settings, setSetting };
 }

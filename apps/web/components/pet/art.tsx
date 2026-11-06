@@ -37,11 +37,17 @@ function Face({
   const sw = 2.4 * s;
   return (
     <g transform={`translate(${x},${y}) scale(${s})`} strokeLinecap="round">
-      {mood === 'happy' ? (
+      {mood === 'happy' || mood === 'celebrating' ? (
         <>
           <path d="M-17,-1 Q-11,-8 -5,-1" fill="none" stroke={ink} strokeWidth={sw} />
           <path d="M5,-1 Q11,-8 17,-1" fill="none" stroke={ink} strokeWidth={sw} />
           <ellipse cx="0" cy="12" rx="7" ry="5.4" fill={ink} />
+        </>
+      ) : mood === 'speaking' ? (
+        <>
+          <circle cx="-11" cy="0" r="3.6" fill={ink} />
+          <circle cx="11" cy="0" r="3.6" fill={ink} />
+          <ellipse className="pet-talk-mouth" cx="0" cy="12" rx="5.5" ry="5" fill={ink} />
         </>
       ) : mood === 'error' ? (
         <>
@@ -89,6 +95,19 @@ function PetFx({ x, y }: { x: number; y: number }) {
         <path d="M-30,8 C-29.4,5.6 -28.6,4.8 -26,4 C-28.6,3.2 -29.4,2.4 -30,0 C-30.6,2.4 -31.4,3.2 -34,4 C-31.4,4.8 -30.6,5.6 -30,8 Z" />
         <path d="M24,1.6 C24.5,-0.3 25.1,-1 27.2,0 C25.1,1 24.5,1.6 24,3.5 C23.5,1.6 22.9,1 20.8,0 C22.9,-1 23.5,-0.3 24,1.6 Z" />
         <path d="M8,-6 C8.5,-8 9.2,-8.7 11.5,-9.4 C9.2,-10.1 8.5,-10.8 8,-12.8 C7.5,-10.8 6.8,-10.1 4.5,-9.4 C6.8,-8.7 7.5,-8 8,-6 Z" />
+      </g>
+      <g className="fx fx-speaking" transform={`translate(${x + 38},${y - 6})`} fill="none" stroke="#64748b" strokeWidth="2.4" strokeLinecap="round">
+        <path className="pet-sound-arc pet-sound-arc-1" d="M0,-6 Q6,0 0,6" />
+        <path className="pet-sound-arc pet-sound-arc-2" d="M7,-10 Q16,0 7,10" />
+        <path className="pet-sound-arc pet-sound-arc-3" d="M14,-14 Q26,0 14,14" />
+      </g>
+      <g className="fx fx-celebrating" transform={`translate(${x},${y - 52})`}>
+        <circle cx="-32" cy="2" r="3.2" fill="#f87171" />
+        <rect x="-14" y="-10" width="6" height="6" rx="1.5" fill="#60a5fa" transform="rotate(24 -11 -7)" />
+        <circle cx="4" cy="-4" r="3.2" fill="#facc15" />
+        <rect x="18" y="-12" width="6" height="6" rx="1.5" fill="#4ade80" transform="rotate(-18 21 -9)" />
+        <circle cx="33" cy="4" r="3.2" fill="#c084fc" />
+        <path d="M-24,-12 C-23.4,-14.4 -22.6,-15.2 -20,-16 C-22.6,-16.8 -23.4,-17.6 -24,-20 C-24.6,-17.6 -25.4,-16.8 -28,-16 C-25.4,-15.2 -24.6,-14.4 -24,-12 Z" fill="#fbbf24" />
       </g>
       <g className="fx fx-sleep" transform={`translate(${x + 36},${y - 44})`} fill="#818cf8" fontWeight="700">
         <text className="z z1" x="0" y="0" fontSize="13" textAnchor="middle">
@@ -200,7 +219,7 @@ function OckyArt({ mood }: ArtProps) {
       <g>
         <circle cx="47" cy="66" r="10.5" fill="#ffffff" />
         <circle cx="73" cy="66" r="10.5" fill="#ffffff" />
-        {mood === 'happy' ? (
+        {mood === 'happy' || mood === 'celebrating' ? (
           <>
             <path d="M40,66 Q47,58 54,66" fill="none" stroke={ink} strokeWidth="2.6" strokeLinecap="round" />
             <path d="M66,66 Q73,58 80,66" fill="none" stroke={ink} strokeWidth="2.6" strokeLinecap="round" />
@@ -223,8 +242,12 @@ function OckyArt({ mood }: ArtProps) {
       </g>
       {mood === 'error' ? (
         <circle cx="60" cy="88" r="3.6" fill="none" stroke={ink} strokeWidth="2.4" />
+      ) : mood === 'speaking' ? (
+        <ellipse className="pet-talk-mouth" cx="60" cy="87" rx="5.5" ry="5" fill={ink} />
       ) : mood === 'working' ? (
         <ellipse cx="60" cy="87" rx="6" ry="4.4" fill={ink} />
+      ) : mood === 'celebrating' || mood === 'happy' ? (
+        <ellipse cx="60" cy="87" rx="6.5" ry="5" fill={ink} />
       ) : mood !== 'sleeping' ? (
         <path d="M53,86 Q60,91 67,86" fill="none" stroke={ink} strokeWidth="2.4" strokeLinecap="round" />
       ) : null}
@@ -335,7 +358,9 @@ function BoltArt({ mood }: ArtProps) {
       <rect x="63" y="46" width="13" height="18" rx="6.5" fill={eyeFill} opacity={eyeOp} />
       {mood === 'error' ? (
         <path d="M52,72 l4,-4 4,4 4,-4 4,4" fill="none" stroke="#475569" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
-      ) : mood === 'happy' ? (
+      ) : mood === 'speaking' ? (
+        <ellipse className="pet-talk-mouth" cx="60" cy="71" rx="6" ry="4.6" fill="#475569" />
+      ) : mood === 'happy' || mood === 'celebrating' ? (
         <path d="M52,70 Q60,78 68,70" fill="none" stroke="#475569" strokeWidth="2.6" strokeLinecap="round" />
       ) : (
         <g stroke="#475569" strokeWidth="2.4" strokeLinecap="round">
@@ -381,11 +406,17 @@ function WispArt({ mood }: ArtProps) {
           <circle cx="71" cy="60" r="3.4" fill={ink} />
           <circle cx="60" cy="74" r="3.2" fill="none" stroke={ink} strokeWidth="2.4" />
         </>
+      ) : mood === 'speaking' ? (
+        <>
+          <path d="M42,60 Q48,65 54,60" fill="none" stroke={ink} strokeWidth="2.6" strokeLinecap="round" />
+          <path d="M66,60 Q72,65 78,60" fill="none" stroke={ink} strokeWidth="2.6" strokeLinecap="round" />
+          <ellipse className="pet-talk-mouth" cx="60" cy="72" rx="5.5" ry="5" fill={ink} />
+        </>
       ) : (
         <>
           <path d="M42,60 Q48,65 54,60" fill="none" stroke={ink} strokeWidth="2.6" strokeLinecap="round" />
           <path d="M66,60 Q72,65 78,60" fill="none" stroke={ink} strokeWidth="2.6" strokeLinecap="round" />
-          {mood === 'happy' ? (
+          {mood === 'happy' || mood === 'celebrating' ? (
             <ellipse cx="60" cy="72" rx="6" ry="4.4" fill={ink} />
           ) : mood !== 'sleeping' ? (
             <path d="M55,71 Q60,75 65,71" fill="none" stroke={ink} strokeWidth="2.2" strokeLinecap="round" />
