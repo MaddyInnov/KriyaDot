@@ -4,7 +4,7 @@
 //   - runs Google OIDC sign-in and cookie sessions,
 //   - keeps the workspace registry (account -> instance addresses),
 //   - mints single-use link codes and Ed25519 handoff tokens,
-//   - renders the signed-in app shell (/app, /app/chat, /app/lightning,
+//   - renders the signed-in app shell (/app, /app/chat,
 //     /app/plan, /app/whats-new).
 // It NEVER carries chat traffic and NEVER stores chat content or instance
 // credentials — see store.ts. If this service is down, existing instances
@@ -21,7 +21,6 @@ import { OidcClient, type FetchFn } from './oidc.js';
 import {
   chatPage,
   dashboardPage,
-  lightningPage,
   planPage,
   signInNotConfiguredPage,
   simpleMessagePage,
@@ -462,28 +461,13 @@ export function createFrontdoor(config: FrontdoorConfig): Frontdoor {
       return;
     }
 
-    if (path === '/api/lightning' && method === 'GET') {
-      const account = requireAccount(req, res);
-      if (!account) return;
-      sendJson(res, 200, {
-        pricingUrl: 'https://lightning.ai/pricing',
-        billingUrl: 'https://lightning.ai/',
-        tiers: [{ name: 'Free' }, { name: 'Pro' }, { name: 'Teams' }, { name: 'Enterprise' }],
-        workspaces: store.listWorkspaces(account.id).map((w) => ({
-          name: w.name,
-          tierReportedByInstance: w.tier ?? null,
-        })),
-      });
-      return;
-    }
-
     if (path === '/api/plan' && method === 'GET') {
       const account = requireAccount(req, res);
       if (!account) return;
       sendJson(res, 200, {
         gatingEnabled: false,
         platform: 'Open source — Apache-2.0',
-        note: 'License gating is not enabled on KriyaDot. The desktop app is free and open source; cloud plans are between you and Lightning.',
+        note: 'License gating is not enabled on KriyaDot. The desktop app is free and open source; cloud plans are between you and your hosting provider.',
       });
       return;
     }
@@ -536,7 +520,6 @@ export function createFrontdoor(config: FrontdoorConfig): Frontdoor {
     const appPages: Record<string, () => string> = {
       '/app': dashboardPage,
       '/app/chat': chatPage,
-      '/app/lightning': lightningPage,
       '/app/plan': planPage,
       '/app/whats-new': whatsNewPage,
     };

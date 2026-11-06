@@ -2,29 +2,30 @@
 'use client';
 
 /**
- * Cloud panel (Lightning AI) — lives in the Workspace destination.
+ * Cloud panel — lives in the Workspace destination.
  * Why Workspace and not a new destination or Bots: the six top-level
  * destinations are fixed, and the cloud instance is the user's remote
  * *workspace runtime* (their KriyaDot, deployed and reachable from
  * anywhere), which sits naturally beside Files/Backup/Device control.
  *
  * Honesty rules baked in:
- *  - Free tier is "always reachable" (wake-on-traffic, ~4-hourly
- *    restarts) — never "always-on". See CLOUD_FREE_TIER_NOTE.
- *  - The Usage panel shows ONLY the facts the API returns (Studio
- *    status, machine, teamspace, disk). There is no Lightning balance
- *    API, so no credit numbers are rendered — billing deep-links out.
- *  - Upgrades render the tier descriptors the API returns and link to
- *    Lightning for current prices. No prices from local constants.
+ *  - A sleeping host instance is "always reachable" (wake-on-traffic)
+ *    — never "always-on". See CLOUD_FREE_TIER_NOTE.
+ *  - The Usage panel shows ONLY the facts the API returns (instance
+ *    status, machine, workspace, disk). There is no balance API in
+ *    your host's API, so no credit numbers are rendered.
+ *  - Plans render the tier descriptors the API returns as plain info.
+ *    Plans are with the user's hosting provider — KriyaDot does not
+ *    resell or mark them up, and no prices come from local constants.
  */
 import { useCallback, useEffect, useState } from 'react';
 import {
   cloudConnect,
   cloudDeploy,
   cloudDisconnect,
+  cloudInstance,
   cloudPlans,
   cloudStatus,
-  cloudStudio,
   cloudUsage,
   isAbsent,
 } from '../../lib/octomind-api';
@@ -43,7 +44,7 @@ function fmtBytes(n: unknown): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-interface Plan { name: string; summary?: string; checkoutUrl?: string }
+interface Plan { name: string; summary?: string }
 
 export function CloudPanel() {
   const [status, setStatus] = useState<CloudStatusView | null>(null);
@@ -53,13 +54,12 @@ export function CloudPanel() {
   const [busy, setBusy] = useState('');
   // Connect form (the API key is form state only — it goes to the vault
   // via the connect endpoint and is never rendered back).
-  const [userId, setUserId] = useState('');
+  const [accountId, setAccountId] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [repoUrl, setRepoUrl] = useState('');
   const [deployResult, setDeployResult] = useState<Record<string, unknown> | null>(null);
   const [usage, setUsage] = useState<Record<string, unknown> | null>(null);
   const [plans, setPlans] = useState<Plan[]>([]);
-  const [plansUrl, setPlansUrl] = useState('');
 
   const refresh = useCallback(async () => {
     try {
@@ -85,10 +85,8 @@ export function CloudPanel() {
           .map((p) => ({
             name: typeof p.name === 'string' ? p.name : String(p.id ?? 'Plan'),
             ...(typeof p.summary === 'string' ? { summary: p.summary } : {}),
-            ...(typeof p.checkoutUrl === 'string' ? { checkoutUrl: p.checkoutUrl } : {}),
           })),
       );
-      if (typeof raw.plansUrl === 'string') setPlansUrl(raw.plansUrl);
     } catch {
       setPlans([]);
     }
@@ -111,7 +109,7 @@ export function CloudPanel() {
 
   const connect = () =>
     run('connect', async () => {
-      await cloudConnect(userId.trim(), apiKey.trim());
+      await cloudConnect(accountId.trim(), apiKey.trim());
       setApiKey('');
     });
 
@@ -151,18 +149,16 @@ export function CloudPanel() {
 
   return (
     <div>
-      <h3 style={{ marginTop: 0 }}>☁️ Cloud — Lightning AI Studio</h3>
+      <h3 style={{ marginTop: 0 }}>☁️ Cloud instance</h3>
       <p className="small muted">
-        Run this KriyaDot on a Lightning AI Studio so it stays reachable when your machine is
-        off. Connecting is one explicit step: sign in to Lightning yourself (a separate
-        Lightning account — the same Google login works there), copy your user ID + API key
-        from Lightning → Settings → Keys → Programmatic Login, and paste them here. The pair
-        is stored only in your encrypted vault and is never shown again.
+        Run KriyaDot on a cloud host you control so it stays reachable when your machine is
+        off. Connecting is one explicit step — paste your cloud host account ID + API key
+        here. The pair is stored only in your encrypted vault and is never shown again.
       </p>
       <div className="warn-box">{CLOUD_FREE_TIER_NOTE}</div>
       {endpointAbsent && (
         <div className="warn-box" style={{ marginTop: 8 }}>
-          The cloud endpoints (/api/cloud/lightning/*) are not mounted on this API yet, so
+          The cloud endpoints (/api/cloud/*) are not mounted on this API yet, so
           connect / deploy / usage are unavailable here. Nothing was sent anywhere.
         </div>
       )}
@@ -181,7 +177,7 @@ export function CloudPanel() {
         {status?.reachabilityNote && <p className="small muted">{status.reachabilityNote}</p>}
         {status?.connected && (
           <p className="small">
-            {status.studioName && <>Studio: <span className="mono">{status.studioName}</span>{' '}</>}
+            {status.instanceName && <>Instance: <span className="mono">{status.instanceName}</span>{' '}</>}
             {status.machine && <>· Machine: {status.machine}{' '}</>}
             {status.tier && <>· Tier: {status.tier}</>}
           </p>
@@ -193,49 +189,49 @@ export function CloudPanel() {
           </p>
         )}
         {status?.state === 'running' && !status.publicUrl && (
-          <p className="small muted">The Studio is running but reports no public URL yet.</p>
+          <p className="small muted">The instance is running but reports no public URL yet.</p>
         )}
         {status?.connected && status.state !== 'running' && (
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
-            <button type="button" className="btn btn-sm" disabled={busy === 'wake'} onClick={() => void run('wake', () => cloudStudio('start'))}>
-              {busy === 'wake' ? 'Waking…' : 'Wake Studio'}
+            <button type="button" className="btn btn-sm" disabled={busy === 'wake'} onClick={() => void run('wake', () => cloudInstance('start'))}>
+              {busy === 'wake' ? 'Waking…' : 'Wake instance'}
             </button>
             <button type="button" className="btn btn-danger btn-sm" disabled={busy === 'disconnect'} onClick={() => void run('disconnect', cloudDisconnect)}>
-              Disconnect Lightning
+              Disconnect
             </button>
           </div>
         )}
         {status?.state === 'running' && (
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
-            <button type="button" className="btn btn-sm" disabled={busy === 'stop'} onClick={() => void run('stop', () => cloudStudio('stop'))}>Stop Studio</button>
-            <button type="button" className="btn btn-danger btn-sm" disabled={busy === 'disconnect'} onClick={() => void run('disconnect', cloudDisconnect)}>Disconnect Lightning</button>
+            <button type="button" className="btn btn-sm" disabled={busy === 'stop'} onClick={() => void run('stop', () => cloudInstance('stop'))}>Stop instance</button>
+            <button type="button" className="btn btn-danger btn-sm" disabled={busy === 'disconnect'} onClick={() => void run('disconnect', cloudDisconnect)}>Disconnect</button>
           </div>
         )}
       </div>
 
       {status && !status.connected && !endpointAbsent && (
         <div className="card" style={{ marginTop: 12 }}>
-          <strong>Connect Lightning</strong>
+          <strong>Connect cloud host</strong>
           <div className="grid-2" style={{ marginTop: 8 }}>
             <div className="field">
-              <label className="label" htmlFor="cloud-user-id">Lightning user ID</label>
-              <input id="cloud-user-id" className="input mono" value={userId} onChange={(e) => setUserId(e.target.value)} autoComplete="off" placeholder="from Lightning → Settings → Keys" />
+              <label className="label" htmlFor="cloud-account-id">Cloud host account ID</label>
+              <input id="cloud-account-id" className="input mono" value={accountId} onChange={(e) => setAccountId(e.target.value)} autoComplete="off" placeholder="from your cloud host account settings" />
             </div>
             <div className="field">
-              <label className="label" htmlFor="cloud-api-key">Lightning API key</label>
+              <label className="label" htmlFor="cloud-api-key">Cloud host API key</label>
               <input id="cloud-api-key" className="input mono" type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} autoComplete="off" placeholder="paste key (stored in your vault only)" />
             </div>
           </div>
-          <button type="button" className="btn btn-primary btn-sm" disabled={busy === 'connect' || !userId.trim() || !apiKey.trim()} onClick={() => void connect()}>
-            {busy === 'connect' ? 'Verifying…' : 'Connect Lightning'}
+          <button type="button" className="btn btn-primary btn-sm" disabled={busy === 'connect' || !accountId.trim() || !apiKey.trim()} onClick={() => void connect()}>
+            {busy === 'connect' ? 'Verifying…' : 'Connect cloud host'}
           </button>
         </div>
       )}
 
       {status?.connected && (
         <div className="card" style={{ marginTop: 12 }}>
-          <strong>Deploy to Studio</strong>
-          <p className="small muted">Deploys KriyaDot into your Studio and (re)starts it there.</p>
+          <strong>Deploy to instance</strong>
+          <p className="small muted">Deploys KriyaDot into your cloud instance and (re)starts it there.</p>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             <input
               className="input mono"
@@ -246,7 +242,7 @@ export function CloudPanel() {
               aria-label="Deploy repo URL"
             />
             <button type="button" className="btn btn-primary btn-sm" disabled={busy === 'deploy'} onClick={() => void deploy()}>
-              {busy === 'deploy' ? 'Deploying…' : 'Deploy to Studio'}
+              {busy === 'deploy' ? 'Deploying…' : 'Deploy to instance'}
             </button>
           </div>
           {busy === 'deploy' && <p className="small muted" style={{ marginTop: 8 }}><span className="spinner" /> Deploy in progress — this can take a few minutes…</p>}
@@ -281,40 +277,31 @@ export function CloudPanel() {
             </button>
           </div>
           <p className="small muted">
-            Only the facts Lightning&apos;s API actually exposes are shown here. KriyaDot cannot
-            read your Lightning credit balance — no such API exists.
+            Only the facts your host&apos;s API actually exposes are shown here. KriyaDot cannot
+            read your cloud host credit balance — no such API exists.
           </p>
           {usage && (
             <div className="small" style={{ display: 'grid', gap: 4 }}>
-              {typeof usage.studioStatus === 'string' && <div>Studio status: {usage.studioStatus}</div>}
+              {typeof usage.instanceStatus === 'string' && <div>Instance status: {usage.instanceStatus as string}</div>}
               {typeof usage.machine === 'string' && <div>Machine: {usage.machine}</div>}
-              {typeof usage.teamspace === 'string' && <div>Teamspace: {usage.teamspace}</div>}
+              {typeof (usage.workspace ?? usage.teamspace) === 'string' && <div>Workspace: {(usage.workspace ?? usage.teamspace) as string}</div>}
               {usage.diskUsageBytes !== undefined && usage.diskUsageBytes !== null && <div>Disk usage: {fmtBytes(usage.diskUsageBytes)}</div>}
               {typeof usage.tier === 'string' && <div>Tier: {usage.tier}</div>}
               {typeof usage.balanceNote === 'string' && <div className="muted">{usage.balanceNote}</div>}
-              {typeof usage.billingUrl === 'string' && (
-                <div><a href={usage.billingUrl} target="_blank" rel="noreferrer">View billing on Lightning ↗</a></div>
-              )}
             </div>
           )}
         </div>
       )}
 
       <div className="card" style={{ marginTop: 12 }}>
-        <strong>Upgrades</strong>
-        <p className="small muted">See current plans on Lightning AI — prices change, so they are not quoted here.</p>
+        <strong>Plans</strong>
+        <p className="small muted">Plans are with your hosting provider — KriyaDot does not resell or mark them up. Prices change, so they are not quoted here.</p>
         {plans.length === 0 && <p className="small muted">Plan list unavailable from the API right now.</p>}
         {plans.map((p) => (
           <div key={p.name} className="row-between" style={{ gap: 8, padding: '4px 0' }}>
             <span className="small"><strong>{p.name}</strong>{p.summary ? <span className="muted"> — {p.summary}</span> : null}</span>
-            {(p.checkoutUrl ?? plansUrl) && (
-              <a className="btn btn-sm" href={p.checkoutUrl ?? plansUrl} target="_blank" rel="noreferrer">See current plans on Lightning AI ↗</a>
-            )}
           </div>
         ))}
-        {plansUrl && plans.length === 0 && (
-          <a className="btn btn-sm" href={plansUrl} target="_blank" rel="noreferrer">See current plans on Lightning AI ↗</a>
-        )}
       </div>
       {statusRaw && status?.connected && (
         <details style={{ marginTop: 12 }}>

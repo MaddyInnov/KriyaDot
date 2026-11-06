@@ -1,4 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
+**Superseded 2026-11-06.** Lightning AI was eliminated as KriyaDot's cloud host (Ashutosh decision, 2026-11-06 — Lightning disabled new sign-ups platform-wide). The cloud layer is now host-agnostic; this document is kept as the historical record of the original decision.
+
 # Decision: the gateway / balance question (#2) — per-user Lightning accounts
 
 **Status:** decided for the Octomind-parity closure build (2026-10-30).

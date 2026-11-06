@@ -4,7 +4,7 @@
 // Before the fix, swapping the `x-user-id` header let any caller act as
 // another user: read their org's member list, POST an admin invite as them
 // (receiving the invite token), and persist an admin membership via a third
-// identity. The same header scoped cloud (Lightning) credentials, the
+// identity. The same header scoped cloud-host credentials, the
 // Composio vault, brand, installations, and KB ownership.
 //
 // Identity now comes ONLY from verified credentials (apps/api/src/principal.ts):
@@ -30,8 +30,8 @@ import { createInstallationsRouter } from '../src/installations.js';
 import { createKbRouter } from '../src/kb-routes.js';
 import { createOrgLibraryRouter } from '../src/org-library.js';
 import { createPublishedBotsRouter } from '../src/published-bots-routes.js';
-import { createCloudLightningRouter } from '../src/cloud-routes.js';
-import { FakeLightningClient, InMemoryCloudSecretStore } from '../src/cloud-lightning.js';
+import { createCloudRouter } from '../src/cloud-routes.js';
+import { FakeCloudHostClient, InMemoryCloudSecretStore } from '../src/cloud-host.js';
 import { registerComposioRoutes, type ComposioClient } from '../src/composio.js';
 import { getSharedSsoSessionStore } from '../src/auth-sso.js';
 
@@ -118,9 +118,9 @@ beforeAll(async () => {
   app.use('/api/kb', createKbRouter({ dataDir: dir, loopbackToken: OWNER_TOKEN, jwtSecret: JWT_SECRET }));
   app.use('/api/org-library', createOrgLibraryRouter({ dataDir: dir, getBots: () => bots, loopbackToken: OWNER_TOKEN, jwtSecret: JWT_SECRET }));
   app.use('/api/published-bots', createPublishedBotsRouter({ dataDir: dir, getBots: () => bots, loopbackToken: OWNER_TOKEN, jwtSecret: JWT_SECRET }));
-  app.use('/api', createCloudLightningRouter({
+  app.use('/api', createCloudRouter({
     secretStore: new InMemoryCloudSecretStore(),
-    client: new FakeLightningClient([{ name: 'kriyadot', state: 'running', machine: 'CPU-4', teamspace: 'me/default', publicUrl: 'https://x-8080.lightning.ai/' }]),
+    client: new FakeCloudHostClient([{ name: 'kriyadot', state: 'running', machine: 'CPU-4', teamspace: 'me/default', publicUrl: 'https://x-8080.example.com/' }]),
     healthProbe: async () => true,
     loopbackToken: OWNER_TOKEN,
     jwtSecret: JWT_SECRET,
@@ -255,21 +255,21 @@ describe('same swap against every rebound surface', () => {
     expect(aliceRead.json.value).toBe('alice-secret');
   });
 
-  it('cloud: Lightning credentials are scoped to the verified caller', async () => {
-    const connect = await call('POST', '/api/cloud/lightning/connect', {
+  it('cloud: host credentials are scoped to the verified caller', async () => {
+    const connect = await call('POST', '/api/cloud/connect', {
       ...ownerAs('alice'),
-      body: { userId: 'alice-lightning', apiKey: 'alice-cloud-key' },
+      body: { accountId: 'alice-cloud-account', apiKey: 'alice-cloud-key' },
     });
     expect(connect.status).toBe(200);
-    const bobStatus = await call('GET', '/api/cloud/lightning/status', bearer(ctx.bobJwt));
+    const bobStatus = await call('GET', '/api/cloud/status', bearer(ctx.bobJwt));
     expect(bobStatus.json.connected).toBe(false);
-    const bobSwapped = await call('GET', '/api/cloud/lightning/status', { ...bearer(ctx.bobJwt), user: 'alice' });
+    const bobSwapped = await call('GET', '/api/cloud/status', { ...bearer(ctx.bobJwt), user: 'alice' });
     expect(bobSwapped.json.connected).toBe(false);
-    const headerOnly = await call('GET', '/api/cloud/lightning/status', { user: 'alice' });
+    const headerOnly = await call('GET', '/api/cloud/status', { user: 'alice' });
     expect(headerOnly.status).toBe(401);
     // Bob "disconnecting" as alice must not delete alice's stored pair.
-    await call('POST', '/api/cloud/lightning/disconnect', { ...bearer(ctx.bobJwt), user: 'alice' });
-    const aliceStatus = await call('GET', '/api/cloud/lightning/status', ownerAs('alice'));
+    await call('POST', '/api/cloud/disconnect', { ...bearer(ctx.bobJwt), user: 'alice' });
+    const aliceStatus = await call('GET', '/api/cloud/status', ownerAs('alice'));
     expect(aliceStatus.json.connected).toBe(true);
   });
 

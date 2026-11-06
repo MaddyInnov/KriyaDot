@@ -110,7 +110,7 @@ export function createSyncRouter(deps: SyncRouteDeps): Router {
     }
     // The token lives in the 0600 sync-target.json file (the same posture
     // as .api-token / frontdoor.json); the encrypted-vault pattern is used
-    // for Lightning/provider credentials, not device pairing tokens.
+    // for provider credentials, not device pairing tokens.
     writeSyncTarget(deps.dataDir, { instanceUrl, linkToken });
     res.json({ ok: true, configured: true, instanceUrl: instanceUrl.replace(/\/+$/, '') });
   });

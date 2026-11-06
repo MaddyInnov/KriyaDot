@@ -5,7 +5,7 @@
  *    (see apps/api/src/session-craft.ts `buildQuotedReply`),
  *  - #114/#135/#161/#164/#172/#175-#178 chat slash-command catalog,
  *    parsing, /copy segment selection and a generic result renderer model,
- *  - cloud (#cloud) Lightning status mapping — honest free-tier semantics,
+ *  - cloud (#cloud) cloud-host status mapping — honest reachability semantics,
  *  - free-LLM keyless lane labels,
  *  - #47 human-accounting normalization, #166 discovery grouping,
  *  - #143/#151 workflow file (JSON + TOML) serialize/parse + dry-run plan
@@ -255,7 +255,7 @@ export function commandResultToText(payload: unknown, title = 'Result'): string 
 }
 
 // ---------------------------------------------------------------------------
-// Cloud (Lightning) — status mapping with honest free-tier semantics
+// Cloud — status mapping with honest reachability semantics
 // ---------------------------------------------------------------------------
 
 export type CloudUiState = 'disconnected' | 'connected' | 'running' | 'sleeping' | 'waking' | 'unknown';
@@ -264,9 +264,9 @@ export interface CloudStatusView {
   state: CloudUiState;
   label: string;
   connected: boolean;
-  /** Public instance URL when the Studio reports one; never invented. */
+  /** Public instance URL when the instance reports one; never invented. */
   publicUrl: string | null;
-  studioName: string | null;
+  instanceName: string | null;
   machine: string | null;
   tier: string | null;
   reachabilityNote: string | null;
@@ -285,47 +285,48 @@ function str(v: unknown): string | null {
 }
 
 /**
- * Map a GET /api/cloud/lightning/status payload (either the brief's flat
- * shape or cloud-routes.ts's {connected, studio:{state,…}}) onto the UI
- * states: disconnected / connected / studio running / sleeping / waking.
+ * Map a GET /api/cloud/status payload (either the brief's flat shape or
+ * cloud-routes.ts's {connected, instance:{state,…}}) onto the UI states:
+ * disconnected / connected / instance running / sleeping / waking.
  */
 export function mapCloudStatus(raw: unknown): CloudStatusView {
   const root = asRecord(raw) ?? {};
-  const studio = asRecord(root.studio);
-  const connected = root.connected === true || studio !== null;
-  const rawState = str(studio?.state) ?? str(studio?.rawStatus) ?? str(root.state) ?? str(root.status);
+  const instance = asRecord(root.instance);
+  const connected = root.connected === true || instance !== null;
+  const rawState = str(instance?.state) ?? str(instance?.rawStatus) ?? str(root.state) ?? str(root.status);
   const norm = rawState ? rawState.toLowerCase() : '';
   let state: CloudUiState;
   if (!connected) state = 'disconnected';
   else if (RUNNING_STATES.has(norm)) state = 'running';
   else if (SLEEPING_STATES.has(norm)) state = 'sleeping';
   else if (WAKING_STATES.has(norm)) state = 'waking';
-  else if (studio || rawState) state = 'connected';
+  else if (instance || rawState) state = 'connected';
   else state = 'connected';
   const labels: Record<CloudUiState, string> = {
     disconnected: 'Disconnected',
     connected: 'Connected',
-    running: 'Studio running',
-    sleeping: 'Studio sleeping',
-    waking: 'Studio waking…',
+    running: 'Instance running',
+    sleeping: 'Instance sleeping',
+    waking: 'Instance waking…',
     unknown: 'Status unknown',
   };
+  const instanceName = str(instance?.name) ?? str(root.instanceName);
   return {
     state,
     label: labels[state],
     connected,
     publicUrl:
-      str(studio?.publicUrl) ?? str(studio?.url) ?? str(studio?.instanceUrl) ?? str(root.publicUrl) ?? str(root.instanceUrl),
-    studioName: str(studio?.name) ?? str(root.studioName),
-    machine: str(studio?.machine),
+      str(instance?.publicUrl) ?? str(instance?.url) ?? str(instance?.instanceUrl) ?? str(root.publicUrl) ?? str(root.instanceUrl),
+    instanceName,
+    machine: str(instance?.machine),
     tier: str(root.tier),
     reachabilityNote: str(root.reachabilityNote),
   };
 }
 
-/** Honest free-tier copy — "always reachable", never "always-on". */
+/** Honest reachability copy — "always reachable", never "always-on". */
 export const CLOUD_FREE_TIER_NOTE =
-  'Free tier: your Studio sleeps when idle and restarts about every 4 hours. It is always reachable (wake-on-traffic, ~1–2 min cold start) — it is not always-on. Uninterrupted always-on needs a paid Lightning plan.';
+  'If your host sleeps idle instances, yours stays reachable with wake-on-traffic (about a 1–2 min cold start) — that is not always-on. Uninterrupted always-on needs an always-on plan with your host.';
 
 // ---------------------------------------------------------------------------
 // Free-LLM keyless lanes

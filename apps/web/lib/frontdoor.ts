@@ -107,7 +107,8 @@ export function isTimeBasedSchedule(kind: string | null | undefined): boolean {
 /**
  * True when a free-tier caveat applies: the cloud tier is free, the
  * resolved anchor is cloud, and the schedule is time-critical (a sleeping
- * free Studio can add a wake delay; Lightning Pro removes it).
+ * host instance can add a wake delay; an always-on host plan removes
+ * the sleep restriction).
  */
 export function isFreeTier(cloudTier: string | null | undefined): boolean {
   return typeof cloudTier === 'string' && cloudTier.toLowerCase().includes('free');

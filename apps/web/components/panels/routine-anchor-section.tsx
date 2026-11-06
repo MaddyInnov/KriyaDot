@@ -18,7 +18,8 @@
  *  - anchorWarning (local + time-based + no cloud): "only while this PC
  *    is on" + connecting cloud fixes it.
  *  - free-tier caveat (cloud tier free + cloud anchor + time-critical):
- *    a sleeping free Studio can add a wake delay; Lightning Pro removes it.
+ *    a sleeping host instance can add a wake delay; an always-on host
+ *    plan removes the sleep restriction.
  *
  * Reporting: Instant / Daily digest / Both + optional quiet hours.
  */
@@ -202,8 +203,8 @@ export function RoutineAnchorSection({
       )}
       {freeCaveat && (
         <p className="small muted" role="note">
-          Free-tier note: your cloud Studio sleeps when idle, so a time-critical run can see a wake
-          delay. Lightning Pro removes the sleep restriction.
+          Free-tier note: a sleeping host instance can add a wake delay; an always-on host plan
+          removes the sleep restriction.
         </p>
       )}
 

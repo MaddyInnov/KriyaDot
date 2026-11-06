@@ -7,7 +7,7 @@
 // and tools can be called seamlessly with minimal user instruction.
 // Per-bot tool/skill awareness already existed; what was missing is this
 // single product-wide map covering FEATURES (Workflows, Marketplace,
-// Fusion, Lightning cloud + placement + anchors, Feed, Pages, federation…)
+// Fusion, Cloud hosting + placement + anchors, Feed, Pages, federation…)
 // alongside the live catalogs.
 //
 // GENERATED, never hand-maintained: bot, tool, skill, workflow, plugin and
@@ -162,7 +162,7 @@ export interface ProductFeatureDescriptor {
 //   (permissions-tools.ts), POST /api/universal/chat (universal-routes.ts),
 //   POST /api/fusion/runs (fusion-routes.ts), POST /api/workflows/:id/run
 //   (routes.ts), POST /api/marketplace/:id/install (marketplace.ts),
-//   /api/cloud/lightning/* (cloud-routes.ts), /api/placement
+//   /api/cloud/* (cloud-routes.ts), /api/placement
 //   (placement.ts createPlacementRouter), /api/sync/* (sync-routes.ts),
 //   /api/federation/* (federation-routes.ts), POST /api/voice/calls
 //   (voice-call-routes.ts), Feed (muse-modules.ts feed router).
@@ -265,18 +265,18 @@ export const PRODUCT_FEATURES: ProductFeatureDescriptor[] = [
     handoffLabel: 'Publish it as a page',
   },
   {
-    slug: 'lightning-cloud',
-    name: 'Lightning cloud',
+    slug: 'cloud-hosting',
+    name: 'Cloud hosting',
     whatItDoes:
       'Connects this local instance to the user\'s hosted cloud instance, so work can run in the cloud and be reached from anywhere through the front door.',
     whenToUse: 'When the user wants their KriyaDot reachable or running while their own machine is off or away.',
     invoke: {
       type: 'flow',
-      route: 'POST /api/cloud/lightning/connect',
-      description: 'Connect via POST /api/cloud/lightning/connect; status at GET /api/cloud/lightning/status.',
+      route: 'POST /api/cloud/connect',
+      description: 'Connect via POST /api/cloud/connect; status at GET /api/cloud/status.',
     },
-    keywords: ['cloud', 'lightning', 'hosted', 'remote', 'access from anywhere', 'pc is off', 'machine off'],
-    handoffLabel: 'Connect Lightning cloud',
+    keywords: ['cloud', 'hosted', 'remote', 'server', 'vps', 'access from anywhere', 'pc is off', 'machine off'],
+    handoffLabel: 'Connect cloud hosting',
   },
   {
     slug: 'execution-placement',

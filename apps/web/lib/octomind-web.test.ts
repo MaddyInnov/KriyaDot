@@ -120,15 +120,15 @@ describe('generic command-result renderer model', () => {
 
 describe('cloud status mapping', () => {
   it('maps disconnected / connected / running / sleeping / waking', () => {
-    expect(mapCloudStatus({ ok: true, connected: false, studio: null }).state).toBe('disconnected');
-    expect(mapCloudStatus({ ok: true, connected: true, studio: null }).state).toBe('connected');
-    expect(mapCloudStatus({ connected: true, studio: { state: 'running', url: 'https://x' } }).publicUrl).toBe('https://x');
-    expect(mapCloudStatus({ connected: true, studio: { state: 'running' } }).state).toBe('running');
-    expect(mapCloudStatus({ connected: true, studio: { rawStatus: 'STOPPED' } }).state).toBe('sleeping');
-    expect(mapCloudStatus({ connected: true, studio: { state: 'starting' } }).state).toBe('waking');
+    expect(mapCloudStatus({ ok: true, connected: false, instance: null }).state).toBe('disconnected');
+    expect(mapCloudStatus({ ok: true, connected: true, instance: null }).state).toBe('connected');
+    expect(mapCloudStatus({ connected: true, instance: { state: 'running', url: 'https://x' } }).publicUrl).toBe('https://x');
+    expect(mapCloudStatus({ connected: true, instance: { state: 'running' } }).state).toBe('running');
+    expect(mapCloudStatus({ connected: true, instance: { rawStatus: 'STOPPED' } }).state).toBe('sleeping');
+    expect(mapCloudStatus({ connected: true, instance: { state: 'starting' } }).state).toBe('waking');
   });
   it('never invents a public URL', () => {
-    expect(mapCloudStatus({ connected: true, studio: { state: 'running' } }).publicUrl).toBeNull();
+    expect(mapCloudStatus({ connected: true, instance: { state: 'running' } }).publicUrl).toBeNull();
   });
 });
 

@@ -24,7 +24,7 @@ const REQUIRED_IDS = [
   'universal-chat-routing',
   'creating-bots',
   'workflows',
-  'connecting-lightning-cloud',
+  'connecting-cloud-hosting',
   'placement-and-anchors',
   'reporting',
   'approvals-and-safety',

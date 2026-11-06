@@ -20,7 +20,6 @@ function shell(title: string, body: string, script: string): string {
   <nav>
     <a href="/app">Dashboard</a>
     <a href="/app/chat">Chat</a>
-    <a href="/app/lightning">Lightning</a>
     <a href="/app/plan">Plan</a>
     <a href="/app/whats-new">What's new</a>
     <a href="/">Site</a>
@@ -64,14 +63,15 @@ async function generateLinkCode() {
 
 const CONNECT_EXPLAINER = `
 <section class="fd-card">
-  <h2>Connect your cloud workspace</h2>
+  <h2>Connect your workspace</h2>
   <p>You don't have a workspace linked yet. Your bots run on <strong>your own</strong>
-  Lightning cloud instance — this site only introduces you to it.</p>
+  instance — either the desktop app on your machine, or a cloud host or server you
+  control — this site only introduces you to it.</p>
   <ol class="fd-steps">
-    <li><strong>Create a Lightning account</strong> — the same Google login works there.
-      <a href="https://lightning.ai/" target="_blank" rel="noopener">Open Lightning</a></li>
-    <li><strong>In the KriyaDot app, connect Lightning and deploy</strong> — the app provisions
-      your personal instance on your account.</li>
+    <li><strong>Run KriyaDot on your own instance</strong> — use the desktop app on your
+      machine, or a cloud host/server you control.</li>
+    <li><strong>In the KriyaDot app, connect your cloud host and deploy</strong> — the app provisions
+      your personal instance on your host.</li>
     <li><strong>Link it here</strong> — generate a one-time link code below and paste it in the
       app (Settings → Front door link). Your workspace then appears on this page on every device.</li>
   </ol>
@@ -160,35 +160,6 @@ const CONNECT_HTML = ${JSON.stringify(CONNECT_EXPLAINER)};
 })();
 `;
   return shell('Chat', body, script);
-}
-
-export function lightningPage(): string {
-  const body = `
-<h1>Lightning — your cloud</h1>
-<section class="fd-card">
-  <p>Your KriyaDot cloud instance runs on <strong>your own Lightning account</strong>. Plans and
-  billing are between you and Lightning — KriyaDot never resells or marks them up, and this page
-  never invents usage numbers: it shows only what your instances report.</p>
-  <p><a class="fd-btn" href="https://lightning.ai/pricing" target="_blank" rel="noopener">See Lightning pricing</a>
-  <a class="fd-btn fd-btn-ghost" href="https://lightning.ai/" target="_blank" rel="noopener">Open Lightning billing</a></p>
-</section>
-<section class="fd-card" id="tiers"><p class="fd-muted">Loading tiers…</p></section>
-<section class="fd-card" id="ln-workspaces"><p class="fd-muted">Loading your workspaces…</p></section>`;
-  const script = `
-${API_HELPERS}
-(async () => {
-  try {
-    const data = await api('/api/lightning');
-    document.getElementById('tiers').innerHTML = '<h2>Lightning tiers</h2>' +
-      data.tiers.map((t) => '<p><strong>' + esc(t.name) + '</strong> — <a href="' + esc(data.pricingUrl) + '" target="_blank" rel="noopener">details on lightning.ai</a></p>').join('');
-    document.getElementById('ln-workspaces').innerHTML = '<h2>Your workspaces</h2>' +
-      (data.workspaces.length
-        ? data.workspaces.map((w) => '<p><strong>' + esc(w.name) + '</strong> — tier reported by instance: ' + esc(w.tierReportedByInstance ?? 'not reported') + '</p>').join('')
-        : '<p class="fd-muted">No workspaces linked yet.</p>');
-  } catch (e) { document.getElementById('tiers').textContent = 'Could not load Lightning info.'; }
-})();
-`;
-  return shell('Lightning', body, script);
 }
 
 export function planPage(): string {

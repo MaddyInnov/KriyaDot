@@ -109,15 +109,16 @@ describe('RoutineAnchorSection', () => {
     hoisted.cloudTier = 'free';
     render(<RoutineAnchorSection routine={dailyRoutine} />);
     expect(await screen.findByText(CLOUD_LABEL)).toBeInTheDocument();
-    expect(screen.getByText(/sleeps when idle/)).toBeInTheDocument();
-    expect(screen.getByText(/Lightning Pro removes the sleep restriction/)).toBeInTheDocument();
+    expect(screen.getByText(/sleeping host instance can add a wake delay/)).toBeInTheDocument();
+    expect(screen.getByText(/always-on host plan/)).toBeInTheDocument();
+    expect(screen.getByText(/removes the sleep restriction/)).toBeInTheDocument();
   });
 
   it('no free-tier caveat on a paid tier', async () => {
     hoisted.cloudTier = 'pro';
     render(<RoutineAnchorSection routine={dailyRoutine} />);
     expect(await screen.findByText(CLOUD_LABEL)).toBeInTheDocument();
-    expect(screen.queryByText(/sleeps when idle/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/sleeping host instance/)).not.toBeInTheDocument();
   });
 
   it('reporting control: segmented modes + quiet hours, saved with the anchor', async () => {

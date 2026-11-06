@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// Lightning Studio deploy for KriyaDot (Octomind-parity closure, C2/C3).
+// Cloud instance deploy for KriyaDot.
 //
 // deployKriyadot() runs a fixed, scripted sequence inside the user's own
-// Studio over the client's run channel (SDK `Studio.run`):
+// instance over the client's run channel:
 //
-//   1. runtime      — ensure Node.js exists in the Studio (install via nvm
-//                     when missing; installs persist across Studio restarts)
+//   1. runtime      — ensure Node.js exists in the instance (install via
+//                     nvm when missing; installs persist across restarts)
 //   2. source       — git clone the configured KriyaDot source, or
 //                     `git pull --ff-only` when a checkout already exists
 //   3. ollama-install / ollama-pull / ollama-serve   (only when requested)
@@ -13,41 +13,33 @@
 //   5. env-file     — write ~/kriyadot/.env.cloud (mode 0600)
 //   6. supervisor-script — write ~/kriyadot/supervisor.sh (mode 0700)
 //   7. start        — (re)start the server under the supervisor via nohup
-//   8. public-url   — resolve the ports-plugin public URL for the app port
+//   8. public-url   — resolve the public URL for the app port via the client
 //
 // Secrets handling: the user's provider API keys are resolved from their
 // vault by the HOST at deploy time (see CloudRouteDeps.providerEnvForUser
 // in cloud-routes.ts) and injected over the run channel as a base64
-// payload that is decoded only inside the Studio into the 0600 env file.
-// Secret values therefore never appear in this process's logs, in the
-// supervisor script, or in any deploy result — the env file inside the
-// Studio is the one place they exist in plaintext, because the server
-// process needs them, and it is mode-0600 on the user's own machine.
-// The supervisor script itself contains NO secrets; it sources the env
-// file at start.
+// payload that is decoded only inside the instance into the 0600 env
+// file. Secret values therefore never appear in this process's logs, in
+// the supervisor script, or in any deploy result — the env file inside
+// the instance is the one place they exist in plaintext, because the
+// server process needs them, and it is mode-0600 on the user's own
+// machine. The supervisor script itself contains NO secrets; it sources
+// the env file at start.
 
 import { createHash } from 'node:crypto';
 import {
-  DEFAULT_STUDIO_NAME,
-  DEFAULT_STUDIO_PORT,
-  resolveStudioPublicUrl,
-  type LightningClient,
-  type LightningStudio,
-} from './cloud-lightning.js';
+  DEFAULT_INSTANCE_NAME,
+  DEFAULT_INSTANCE_PORT,
+  resolveInstancePublicUrl,
+  type CloudHostClient,
+  type CloudHostInstance,
+} from './cloud-host.js';
 
-/** In-Studio locations (all on the Studio's persistent disk). */
+/** In-instance locations (all on the instance's persistent disk). */
 export const CLOUD_APP_DIR = '~/kriyadot';
 export const CLOUD_ENV_FILE = '~/kriyadot/.env.cloud';
 export const CLOUD_SUPERVISOR_SCRIPT = '~/kriyadot/supervisor.sh';
 export const CLOUD_SUPERVISOR_LOG = '~/kriyadot/supervisor.log';
-
-/**
- * Free-tier Drive constraint (feasibility report §1/§5): the teamspace
- * Drive's first 10 GB are free and are SHARED between the KriyaDot
- * server, the user's data, the Ollama binary, and any pulled models.
- * That is why the Ollama sidecar pre-pulls exactly ONE small model.
- */
-export const FREE_DRIVE_GB = 10;
 
 /** Default (and only pre-pulled) Ollama model: Qwen3-4B, ≈2.5 GB on disk. */
 export const OLLAMA_DEFAULT_MODEL = 'qwen3:4b';
@@ -65,39 +57,40 @@ export interface OllamaDeployOptions {
   enabled: boolean;
   /**
    * Exactly ONE model to pull. A list (comma/space separated) is rejected:
-   * the free Drive is 10 GB total, so the sidecar pre-pulls a single
-   * small model and fetches others only on explicit demand later.
+   * persistent storage is shared with the server and user data, so the
+   * sidecar pre-pulls a single small model and fetches others only on
+   * explicit demand later.
    */
   model?: string;
 }
 
 export interface DeployOptions {
-  /** Git URL of the KriyaDot source to clone/pull inside the Studio. */
+  /** Git URL of the KriyaDot source to clone/pull inside the instance. */
   repoUrl: string;
-  /** App port inside the Studio. Default: DEFAULT_STUDIO_PORT (8080). */
+  /** App port inside the instance. Default: DEFAULT_INSTANCE_PORT (8080). */
   port?: number;
   /** Start command for the server. Default: `npm start`. */
   startCommand?: string;
   /**
    * Provider env vars (the user's own keys, resolved from their vault by
-   * the host at deploy time) written into the 0600 in-Studio env file.
+   * the host at deploy time) written into the 0600 in-instance env file.
    */
   providerEnv?: Record<string, string>;
   ollama?: OllamaDeployOptions;
-  studioName?: string;
+  instanceName?: string;
   /**
    * Sync pairing (front-door Part 4): a link token generated LOCALLY by
    * the caller (cloud-routes). Only its SHA-256 hash is written into the
-   * Studio — the deploy step seeds <studio data>/sync-hub.json with
+   * instance — the deploy step seeds <instance data>/sync-hub.json with
    * { linkTokenHash, ownerUserId } exactly as the instance's own
    * mintLinkToken() would store it, so the deployed instance accepts the
    * token from first boot. The plaintext never leaves the deploy result
    * (returned to the owner as `syncPairing`) and never lands in the
-   * Studio. Generating it locally (instead of inside the Studio) keeps
-   * the whole flow mock-testable through the same run channel.
+   * instance. Generating it locally (instead of inside the instance)
+   * keeps the whole flow mock-testable through the same run channel.
    */
   syncLinkToken?: string;
-  /** KriyaDot user id recorded as the sync owner inside the Studio. */
+  /** KriyaDot user id recorded as the sync owner inside the instance. */
   syncOwnerUserId?: string;
 }
 
@@ -108,7 +101,7 @@ export interface DeployStep {
 }
 
 export interface DeployResult {
-  studio: string;
+  instance: string;
   ok: boolean;
   steps: DeployStep[];
   publicUrl?: string;
@@ -123,7 +116,7 @@ export interface DeployResult {
   warnings: string[];
 }
 
-function validateDeployOptions(opts: DeployOptions): Required<Pick<DeployOptions, 'port' | 'startCommand' | 'studioName'>> & DeployOptions {
+function validateDeployOptions(opts: DeployOptions): Required<Pick<DeployOptions, 'port' | 'startCommand' | 'instanceName'>> & DeployOptions {
   if (typeof opts.repoUrl !== 'string' || !REPO_PATTERN.test(opts.repoUrl.trim())) {
     throw new Error('deploy requires a valid repoUrl (https://… or git@… git URL)');
   }
@@ -131,7 +124,7 @@ function validateDeployOptions(opts: DeployOptions): Required<Pick<DeployOptions
   if (opts.ollama?.enabled) {
     if (/[,\s]/.test(ollamaModel.trim()) || !MODEL_PATTERN.test(ollamaModel.trim())) {
       throw new Error(
-        'ollama.model must be exactly ONE model id (e.g. "qwen3:4b") — the free Drive is 10 GB, so only one model is pre-pulled',
+        'ollama.model must be exactly ONE model id (e.g. "qwen3:4b") — only one model is pre-pulled',
       );
     }
   }
@@ -141,9 +134,9 @@ function validateDeployOptions(opts: DeployOptions): Required<Pick<DeployOptions
   return {
     ...opts,
     repoUrl: opts.repoUrl.trim(),
-    port: opts.port ?? DEFAULT_STUDIO_PORT,
+    port: opts.port ?? DEFAULT_INSTANCE_PORT,
     startCommand: opts.startCommand ?? 'npm start',
-    studioName: opts.studioName ?? DEFAULT_STUDIO_NAME,
+    instanceName: opts.instanceName ?? DEFAULT_INSTANCE_NAME,
   };
 }
 
@@ -151,9 +144,9 @@ function validateDeployOptions(opts: DeployOptions): Required<Pick<DeployOptions
 export function buildSupervisorScript(port: number, startCommand: string): string {
   return [
     '#!/bin/sh',
-    '# KriyaDot in-Studio supervisor — restarts the server when it exits and',
-    '# is itself (re)started by the cloud supervisor after Lightning wakes',
-    '# or restarts the Studio (free tier: every 4 hours). No secrets here:',
+    '# KriyaDot in-instance supervisor — restarts the server when it exits and',
+    '# is itself (re)started by the cloud supervisor after the host wakes',
+    '# or restarts the instance. No secrets here:',
     '# provider keys live in the mode-0600 env file sourced below.',
     'set -u',
     `cd ${CLOUD_APP_DIR} || exit 1`,
@@ -181,26 +174,26 @@ function b64(text: string): string {
 }
 
 /**
- * Deploy (or redeploy) KriyaDot into a Studio. Every step goes through
- * the injected LightningClient, so tests assert the exact step sequence
- * against FakeLightningClient with zero subprocesses and zero network.
+ * Deploy (or redeploy) KriyaDot into an instance. Every step goes through
+ * the injected CloudHostClient, so tests assert the exact step sequence
+ * against FakeCloudHostClient with zero subprocesses and zero network.
  * A failing step aborts the deploy: later steps are not attempted and
  * the failed step carries the runner's stderr (truncated).
  */
 export async function deployKriyadot(
-  client: LightningClient,
+  client: CloudHostClient,
   rawOpts: DeployOptions,
 ): Promise<DeployResult> {
   const opts = validateDeployOptions(rawOpts);
-  const name = opts.studioName;
+  const name = opts.instanceName;
   const steps: DeployStep[] = [];
   let ollamaModel: string | undefined;
   const warnings: string[] = [
-    'Free Lightning tier: this Studio sleeps when idle and restarts every 4 hours. It is always REACHABLE (wake-on-traffic), not always running. Uninterrupted always-on requires the user\'s own Lightning Pro plan.',
+    'Depending on the tier your cloud host reports, this instance may sleep when idle or be restarted periodically. It is always REACHABLE (wake-on-traffic), not always running. Uninterrupted always-on depends on an always-on-capable tier on your host.',
   ];
 
   const run = async (step: string, command: string): Promise<boolean> => {
-    const res = await client.runInStudio(name, command);
+    const res = await client.runOnInstance(name, command);
     if (res.exitCode !== 0) {
       steps.push({
         name: step,
@@ -213,11 +206,11 @@ export async function deployKriyadot(
     return true;
   };
 
-  // Make sure the Studio exists before running anything inside it.
-  const studio: LightningStudio = await client.ensureStudio(name);
-  steps.push({ name: 'ensure-studio', ok: true, detail: `state=${studio.state}` });
+  // Make sure the instance exists before running anything inside it.
+  const instance: CloudHostInstance = await client.ensureInstance(name);
+  steps.push({ name: 'ensure-instance', ok: true, detail: `state=${instance.state}` });
 
-  // 1. Runtime: Node.js (a Studio is Python-first; installs persist).
+  // 1. Runtime: Node.js (an instance may be Python-first; installs persist).
   if (
     !(await run(
       'runtime',
@@ -255,13 +248,13 @@ export async function deployKriyadot(
 
   // 5. Env file (0600). Provider keys arrive from the host's vault lookup
   //    at deploy time; they are base64-wrapped for the run channel and
-  //    decoded only inside the Studio. The Ollama registration below is
+  //    decoded only inside the instance. The Ollama registration below is
   //    how the deployed instance learns its local provider: Ollama on
-  //    loopback inside the same Studio, with the one pulled model.
+  //    loopback inside the same instance, with the one pulled model.
   const envLines: string[] = [
     `PORT=${opts.port}`,
-    'KRIYADOT_CLOUD=lightning',
-    // A deployed Studio IS the cloud side (front-door Part 5 executor gate).
+    'KRIYADOT_CLOUD=cloud-host',
+    // A deployed instance IS the cloud side (front-door Part 5 executor gate).
     'KRIYADOT_INSTANCE_ROLE=cloud',
   ];
   for (const [k, v] of Object.entries(opts.providerEnv ?? {})) envLines.push(`${k}=${v}`);
@@ -279,11 +272,11 @@ export async function deployKriyadot(
     return finish();
 
   // 5b. Sync pairing seed (only when the caller supplied a link token):
-  //     write ONLY the token's SHA-256 hash (+ owner id) into the Studio's
-  //     data dir sync-hub.json, 0600 — the exact file the instance's sync
-  //     hub verifies link tokens against. The Studio's data dir is
-  //     ~/kriyadot/data (the deploy checkout runs with cwd ~/kriyadot and
-  //     no DATA_DIR override in .env.cloud).
+  //     write ONLY the token's SHA-256 hash (+ owner id) into the
+  //     instance's data dir sync-hub.json, 0600 — the exact file the
+  //     instance's sync hub verifies link tokens against. The instance's
+  //     data dir is ~/kriyadot/data (the deploy checkout runs with cwd
+  //     ~/kriyadot and no DATA_DIR override in .env.cloud).
   if (opts.syncLinkToken) {
     const seed = JSON.stringify({
       linkTokenHash: createHash('sha256').update(opts.syncLinkToken).digest('hex'),
@@ -311,17 +304,17 @@ export async function deployKriyadot(
   // 7. Start under the supervisor.
   if (!(await run('start', startSupervisorCommand()))) return finish();
 
-  // 8. Public URL via the ports plugin pattern the client resolved.
-  const after = await client.getStudio(name);
-  const publicUrl = after ? resolveStudioPublicUrl(after, opts.port) : studio.publicUrl;
-  steps.push({ name: 'public-url', ok: true, ...(publicUrl ? { detail: publicUrl } : { detail: 'not yet published — open the Studio ports plugin' }) });
+  // 8. Public URL via the client's resolved port URLs.
+  const after = await client.getInstance(name);
+  const publicUrl = after ? resolveInstancePublicUrl(after, opts.port) : instance.publicUrl;
+  steps.push({ name: 'public-url', ok: true, ...(publicUrl ? { detail: publicUrl } : { detail: 'not yet published — no public URL reported by the host yet' }) });
 
   return finish(publicUrl);
 
   function finish(publicUrl?: string): DeployResult {
     const ok = steps.every((s) => s.ok);
     return {
-      studio: name,
+      instance: name,
       ok,
       steps,
       ...(publicUrl ? { publicUrl } : {}),
@@ -335,7 +328,7 @@ export async function deployKriyadot(
               model: ollamaModel,
               driveNote:
                 `Ollama sidecar: exactly one model pre-pulled (${ollamaModel}, ~2.5 GB). ` +
-                `The free teamspace Drive is ${FREE_DRIVE_GB} GB total, shared with the KriyaDot server and user data — ` +
+                'Persistent storage is shared with the KriyaDot server and user data — ' +
                 'additional models are pulled on demand only, never pre-pulled.',
             },
           }

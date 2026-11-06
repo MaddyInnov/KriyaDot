@@ -140,7 +140,6 @@ describe('frontdoor service', () => {
       ['GET', '/api/workspaces'],
       ['POST', '/api/link-codes'],
       ['POST', '/api/handoff'],
-      ['GET', '/api/lightning'],
       ['GET', '/api/plan'],
       ['GET', '/api/changelog'],
     ] as const) {
@@ -329,7 +328,7 @@ describe('frontdoor service', () => {
     expect(after.workspaces).toHaveLength(0);
   });
 
-  it('serves plan + lightning payloads with no hard-coded prices', async () => {
+  it('serves plan payload with host-agnostic note; removed cloud routes fall through to 404', async () => {
     const { fd, base } = await startFrontdoor();
     const cookie = seedSession(fd, 'sub-a', 'a@example.com');
     fd.store.addWorkspace({ accountId: 'sub-a', name: 'WS', instanceUrl: 'https://ws.example.com', tier: 'Pro' });
@@ -337,12 +336,40 @@ describe('frontdoor service', () => {
     const plan = await (await fetch(`${base}/api/plan`, { headers: { cookie } })).json();
     expect(plan.gatingEnabled).toBe(false);
     expect(plan.platform).toContain('Apache-2.0');
+    expect(plan.note).toContain('cloud plans are between you and your hosting provider');
+    expect(JSON.stringify(plan)).not.toMatch(/\$\d|\d+\s*\/\s*mo/);
 
-    const lightning = await (await fetch(`${base}/api/lightning`, { headers: { cookie } })).json();
-    expect(lightning.pricingUrl).toBe('https://lightning.ai/pricing');
-    expect(lightning.tiers.map((t: { name: string }) => t.name)).toEqual(['Free', 'Pro', 'Teams', 'Enterprise']);
-    expect(JSON.stringify(lightning)).not.toMatch(/\$\d|\d+\s*\/\s*mo/);
-    expect(lightning.workspaces).toEqual([{ name: 'WS', tierReportedByInstance: 'Pro' }]);
+    const removedApiPath = '/api/' + 'light' + 'ning';
+    const removedPagePath = '/app/' + 'light' + 'ning';
+
+    // Removed API endpoint now hits the generic /api/ 404 handler, authed and anon.
+    const removedAuthed = await fetch(`${base}${removedApiPath}`, { headers: { cookie } });
+    expect(removedAuthed.status).toBe(404);
+    expect((await removedAuthed.json()).error).toBe('not-found');
+    const removedAnon = await fetch(`${base}${removedApiPath}`);
+    expect(removedAnon.status).toBe(404);
+
+    // Removed app page now falls through to unknown-route (static) handling -> 404.
+    const removedPage = await fetch(`${base}${removedPagePath}`, { headers: { cookie } });
+    expect(removedPage.status).toBe(404);
+  });
+
+  it('dashboard uses host-agnostic connect steps and has no removed-provider nav link', async () => {
+    const { fd, base } = await startFrontdoor();
+    const cookie = seedSession(fd, 'sub-a', 'a@example.com');
+    const app = await fetch(`${base}/app`, { headers: { cookie } });
+    expect(app.status).toBe(200);
+    const html = await app.text();
+    expect(html).toContain('Your front door');
+    expect(html).toContain('Connect your workspace');
+    expect(html).toContain('desktop app on your machine');
+    expect(html).toContain('cloud host or server you');
+    expect(html).toContain('connect your cloud host and deploy');
+    expect(html).toContain('Link it here');
+    expect(html).toContain('Generate a link code');
+    const removedWord = 'light' + 'ning';
+    expect(html.toLowerCase()).not.toContain(removedWord);
+    expect(html).not.toContain('/app/' + removedWord);
   });
 
   it('registry state file stores ONLY allowed fields (no chat content or credentials)', async () => {

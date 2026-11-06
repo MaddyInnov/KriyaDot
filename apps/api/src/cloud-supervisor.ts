@@ -1,51 +1,52 @@
 // SPDX-License-Identifier: Apache-2.0
-// Cloud supervisor — wake-on-traffic + keep-state for a Lightning Studio
-// (Octomind-parity closure, C2). Pure logic with an injected client, an
-// injected health probe, and an injected clock: fully unit-tested with
-// FakeLightningClient, no timers, no network.
+// Cloud supervisor — wake-on-traffic + keep-state for a cloud-host
+// instance. Pure logic with an injected client, an injected health
+// probe, and an injected clock: fully unit-tested with
+// FakeCloudHostClient, no timers, no network.
 //
-// HONEST STATE MODEL (feasibility report §4 — read before editing):
-// - Free tier is NEVER "always-on". A free Studio sleeps when idle and is
-//   force-restarted every 4 hours. The strongest honest claim is
-//   "always reachable": traffic (or this supervisor's probe) wakes it,
-//   with a cold start that typically takes 1–2 minutes. `alwaysOn` below
-//   is therefore hard-false on the free tier, in every state.
-// - On paid tiers (Pro and above) Lightning removes the 4-hour session
-//   restriction; `alwaysOn` then simply mirrors `reachable`.
+// HONEST STATE MODEL (read before editing):
+// - `alwaysOn` is true only when the host reports an always-on-capable
+//   tier AND the instance is reachable. On tiers that may sleep idle
+//   instances or restart them periodically (free / unknown), the
+//   strongest honest claim is "always reachable": traffic (or this
+//   supervisor's probe) wakes the instance, with a cold start that can
+//   take a minute or two. `alwaysOn` is therefore false on those tiers,
+//   in every state — do not "fix" this to be optimistic.
 // - A `waking` state is exposed (never "down") while a start is in
 //   flight, so clients can render "waking…" instead of an error.
 
 import {
-  DEFAULT_STUDIO_NAME,
-  resolveStudioPublicUrl,
-  type LightningClient,
-  type LightningStudioState,
-} from './cloud-lightning.js';
+  DEFAULT_INSTANCE_NAME,
+  resolveInstancePublicUrl,
+  type CloudHostClient,
+  type CloudHostState,
+} from './cloud-host.js';
 import { startSupervisorCommand } from './cloud-deploy.js';
 
 export type CloudTier = 'free' | 'pro' | 'teams' | 'enterprise' | 'unknown';
 
 export interface CloudInstanceState {
-  studio: string;
+  instance: string;
   /** Mapped state; `waking` covers sleeping/stopped/starting once a wake was requested. */
-  state: LightningStudioState;
+  state: CloudHostState;
   /** True only when the public URL answered the health probe. */
   reachable: boolean;
   tier: CloudTier;
   /**
-   * NEVER true on the free tier (4-hour restarts + idle sleep). On paid
-   * tiers it mirrors `reachable`. Do not "fix" this to be optimistic.
+   * True only when the tier is always-on-capable AND the instance is
+   * reachable. Never true on free/unknown tiers. Do not make this
+   * optimistic.
    */
   alwaysOn: boolean;
   publicUrl?: string;
   machine?: string;
   uptimeSeconds?: number;
   lastCheckedAt: number;
-  /** Times a Lightning-side restart was detected (uptime/startedAt moved backwards). */
+  /** Times a host-side restart was detected (uptime/startedAt moved backwards). */
   detectedRestarts: number;
-  /** Times this supervisor asked Lightning to start the Studio. */
+  /** Times this supervisor asked the host to start the instance. */
   wakeAttempts: number;
-  /** Times this supervisor (re)started the in-Studio supervisor script. */
+  /** Times this supervisor (re)started the in-instance supervisor script. */
   supervisorRestarts: number;
   detail?: string;
 }
@@ -69,17 +70,22 @@ export const fetchHealthProbe: HealthProbe = async (url) => {
 };
 
 export interface CloudSupervisorOptions {
-  client: LightningClient;
-  studioName?: string;
+  client: CloudHostClient;
+  instanceName?: string;
   tier?: CloudTier;
   port?: number;
   healthProbe?: HealthProbe;
   clock?: CloudClock;
 }
 
+/** Tiers on which the host reports always-on capability. */
+export function isAlwaysOnCapableTier(tier: CloudTier): boolean {
+  return tier === 'pro' || tier === 'teams' || tier === 'enterprise';
+}
+
 /**
- * Detect a Lightning-side restart between two observations: the start
- * time moved, or uptime went backwards. Pure; exported for testing.
+ * Detect a host-side restart between two observations: the start time
+ * moved, or uptime went backwards. Pure; exported for testing.
  */
 export function detectRestart(
   prev: { startedAt?: number; uptimeSeconds?: number } | undefined,
@@ -98,7 +104,7 @@ export function detectRestart(
 }
 
 export class CloudSupervisor {
-  private readonly studioName: string;
+  private readonly instanceName: string;
   private readonly tier: CloudTier;
   private readonly port: number;
   private readonly probe: HealthProbe;
@@ -111,7 +117,7 @@ export class CloudSupervisor {
   private lastState?: CloudInstanceState;
 
   constructor(private readonly opts: CloudSupervisorOptions) {
-    this.studioName = opts.studioName ?? DEFAULT_STUDIO_NAME;
+    this.instanceName = opts.instanceName ?? DEFAULT_INSTANCE_NAME;
     this.tier = opts.tier ?? 'free';
     this.port = opts.port ?? 8080;
     this.probe = opts.healthProbe ?? fetchHealthProbe;
@@ -125,23 +131,23 @@ export class CloudSupervisor {
 
   /**
    * One supervisor pass:
-   * 1. Read the Studio's mapped state.
-   * 2. Sleeping/stopped/starting → ask Lightning to start it and report
+   * 1. Read the instance's mapped state.
+   * 2. Sleeping/stopped/starting → ask the host to start it and report
    *    `waking` (wake-on-traffic semantics; the probe counts as traffic).
    * 3. Running → probe the public URL. Unhealthy → (re)start the
-   *    in-Studio supervisor script once and report `waking`.
-   * 4. Running + healthy → `running`/`reachable`. If a Lightning-side
-   *    restart is detected since the last pass (the 4-hour free-tier
-   *    restart), run a keep-state pass: restart the in-Studio supervisor
-   *    so the server comes back under supervision on the fresh Studio.
+   *    in-instance supervisor script once and report `waking`.
+   * 4. Running + healthy → `running`/`reachable`. If a host-side restart
+   *    is detected since the last pass, run a keep-state pass: restart
+   *    the in-instance supervisor so the server comes back under
+   *    supervision on the fresh instance.
    */
   async tick(): Promise<CloudInstanceState> {
     const now = this.clock.now();
-    const studio = await this.opts.client.getStudio(this.studioName);
+    const instance = await this.opts.client.getInstance(this.instanceName);
 
-    if (!studio) {
+    if (!instance) {
       return this.remember({
-        studio: this.studioName,
+        instance: this.instanceName,
         state: 'stopped',
         reachable: false,
         tier: this.tier,
@@ -150,27 +156,27 @@ export class CloudSupervisor {
         detectedRestarts: this.detectedRestarts,
         wakeAttempts: this.wakeAttempts,
         supervisorRestarts: this.supervisorRestarts,
-        detail: 'Studio does not exist yet — deploy first.',
+        detail: 'Instance does not exist yet — deploy first.',
       });
     }
 
-    const publicUrl = resolveStudioPublicUrl(studio, this.port) ?? studio.publicUrl;
+    const publicUrl = resolveInstancePublicUrl(instance, this.port) ?? instance.publicUrl;
     const base = {
-      studio: this.studioName,
+      instance: this.instanceName,
       tier: this.tier,
       ...(publicUrl ? { publicUrl } : {}),
-      ...(studio.machine ? { machine: studio.machine } : {}),
-      ...(studio.uptimeSeconds !== undefined ? { uptimeSeconds: studio.uptimeSeconds } : {}),
+      ...(instance.machine ? { machine: instance.machine } : {}),
+      ...(instance.uptimeSeconds !== undefined ? { uptimeSeconds: instance.uptimeSeconds } : {}),
       lastCheckedAt: now,
       detectedRestarts: this.detectedRestarts,
       wakeAttempts: this.wakeAttempts,
       supervisorRestarts: this.supervisorRestarts,
     };
 
-    if (studio.state !== 'running') {
-      // Wake-on-traffic: a sleeping/stopped Studio gets a start request,
-      // and the exposed state is `waking` — never "down".
-      await this.opts.client.startStudio(this.studioName);
+    if (instance.state !== 'running') {
+      // Wake-on-traffic: a sleeping/stopped instance gets a start
+      // request, and the exposed state is `waking` — never "down".
+      await this.opts.client.startInstance(this.instanceName);
       this.wakeAttempts += 1;
       this.wakeRequested = true;
       return this.remember({
@@ -179,26 +185,26 @@ export class CloudSupervisor {
         reachable: false,
         alwaysOn: false,
         wakeAttempts: this.wakeAttempts,
-        detail: `Studio was ${studio.state}; start requested. Cold start typically takes 1–2 minutes.`,
+        detail: `Instance was ${instance.state}; start requested. Cold start typically takes 1–2 minutes.`,
       });
     }
 
-    // Studio reports running. Did Lightning restart it underneath us?
-    const restarted = detectRestart(this.lastObservation, studio);
+    // Instance reports running. Did the host restart it underneath us?
+    const restarted = detectRestart(this.lastObservation, instance);
     this.lastObservation = {
-      ...(studio.startedAt !== undefined ? { startedAt: studio.startedAt } : {}),
-      ...(studio.uptimeSeconds !== undefined ? { uptimeSeconds: studio.uptimeSeconds } : {}),
+      ...(instance.startedAt !== undefined ? { startedAt: instance.startedAt } : {}),
+      ...(instance.uptimeSeconds !== undefined ? { uptimeSeconds: instance.uptimeSeconds } : {}),
     };
     if (restarted) {
       this.detectedRestarts += 1;
-      // Keep-state pass: the fresh Studio booted without our server —
-      // restart the in-Studio supervisor so the app heals itself.
-      await this.restartInStudioSupervisor();
+      // Keep-state pass: the fresh instance booted without our server —
+      // restart the in-instance supervisor so the app heals itself.
+      await this.restartInInstanceSupervisor();
     }
 
     const healthy = publicUrl ? await this.probe(publicUrl) : false;
     if (!healthy) {
-      if (!restarted) await this.restartInStudioSupervisor();
+      if (!restarted) await this.restartInInstanceSupervisor();
       return this.remember({
         ...base,
         state: 'waking',
@@ -207,8 +213,8 @@ export class CloudSupervisor {
         detectedRestarts: this.detectedRestarts,
         supervisorRestarts: this.supervisorRestarts,
         detail: publicUrl
-          ? 'Studio is running but the app did not answer its health check; in-Studio supervisor restarted.'
-          : 'Studio is running but no public URL is published yet.',
+          ? 'Instance is running but the app did not answer its health check; in-instance supervisor restarted.'
+          : 'Instance is running but no public URL is published yet.',
       });
     }
 
@@ -217,8 +223,9 @@ export class CloudSupervisor {
       ...base,
       state: 'running',
       reachable: true,
-      // Honest semantics: free tier is reachable, never always-on.
-      alwaysOn: this.tier !== 'free' && this.tier !== 'unknown',
+      // Honest semantics: always-on only on an always-on-capable tier,
+      // and only while reachable (this branch is the reachable one).
+      alwaysOn: isAlwaysOnCapableTier(this.tier),
       detectedRestarts: this.detectedRestarts,
       supervisorRestarts: this.supervisorRestarts,
     });
@@ -229,9 +236,9 @@ export class CloudSupervisor {
     return this.tick();
   }
 
-  private async restartInStudioSupervisor(): Promise<void> {
+  private async restartInInstanceSupervisor(): Promise<void> {
     try {
-      await this.opts.client.runInStudio(this.studioName, startSupervisorCommand());
+      await this.opts.client.runOnInstance(this.instanceName, startSupervisorCommand());
       this.supervisorRestarts += 1;
     } catch {
       // Best-effort: the next tick retries. Never throw out of a tick for

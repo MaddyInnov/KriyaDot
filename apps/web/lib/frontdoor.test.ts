@@ -84,7 +84,7 @@ describe('anchorWarningPreview', () => {
 describe('free-tier caveat', () => {
   it('isFreeTier matches free tiers only', () => {
     expect(isFreeTier('free')).toBe(true);
-    expect(isFreeTier('Lightning Free')).toBe(true);
+    expect(isFreeTier('Free tier')).toBe(true);
     expect(isFreeTier('pro')).toBe(false);
     expect(isFreeTier(undefined)).toBe(false);
   });

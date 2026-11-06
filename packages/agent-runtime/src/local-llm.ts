@@ -840,13 +840,13 @@ export class LocalLlmManager {
   }
 
   // -------------------------------------------------------------------------
-  // Ollama sidecar mode (free-LLM stack — Lightning Studio case)
+  // Ollama sidecar mode (free-LLM stack — cloud-host sidecar case)
   //
-  // On a Lightning Studio the guaranteed first-run brain is an Ollama
+  // On a cloud host the guaranteed first-run brain is an Ollama
   // sidecar next to the KriyaDot server, NOT this manager's llama.cpp
   // server. The sidecar rules, from the free-LLM research (§5):
   //  - pre-pull EXACTLY ONE small model (default qwen3:4b, Ollama naming,
-  //    ~2.5 GB Q4_K_M) — the Studio's free Drive is only 10 GB TOTAL,
+  //    ~2.5 GB Q4_K_M) — a small cloud-host disk may be only 10 GB TOTAL,
   //    shared with the KriyaDot server and the Ollama binary, so a
   //    second model is a disk accident waiting to happen;
   //  - check free space (model size + safety margin) BEFORE pulling;

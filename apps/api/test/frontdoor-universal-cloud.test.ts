@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Universal per-task cloud placement (Part 5) + cloud deploy sync pairing
 // (Part 4). The "cloud instance" is a tiny local stub HTTP server; the
-// Lightning client is the existing Fake. No external network.
+// cloud host client is the existing Fake. No external network.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import express from 'express';
 import fs from 'node:fs';
@@ -14,8 +14,8 @@ import { PlacementStore } from '../src/placement.js';
 import { mintLinkToken, verifyLinkToken } from '../src/sync-hub.js';
 import { writeSyncTarget } from '../src/sync-client.js';
 import { deployKriyadot } from '../src/cloud-deploy.js';
-import { FakeLightningClient, InMemoryCloudSecretStore } from '../src/cloud-lightning.js';
-import { createCloudLightningRouter } from '../src/cloud-routes.js';
+import { FakeCloudHostClient, InMemoryCloudSecretStore } from '../src/cloud-host.js';
+import { createCloudRouter } from '../src/cloud-routes.js';
 import { createHash } from 'node:crypto';
 
 const OWNER = 'owner-token-u';
@@ -154,8 +154,8 @@ describe('universal cloud placement', () => {
 });
 
 describe('cloud deploy sync provisioning', () => {
-  it('deployKriyadot seeds only the token HASH into the Studio and returns the pairing', async () => {
-    const fake = new FakeLightningClient([{ name: 'kriyadot', state: 'running', publicUrl: 'https://studio-8080.lightning.ai/' }]);
+  it('deployKriyadot seeds only the token HASH into the instance and returns the pairing', async () => {
+    const fake = new FakeCloudHostClient([{ name: 'kriyadot', state: 'running', publicUrl: 'https://instance-8080.example.com/' }]);
     const result = await deployKriyadot(fake, {
       repoUrl: 'https://github.com/example/kriyadot.git',
       syncLinkToken: 'pair-token-123',
@@ -163,7 +163,7 @@ describe('cloud deploy sync provisioning', () => {
     });
     expect(result.ok).toBe(true);
     expect(result.steps.map((s) => s.name)).toContain('sync-pairing');
-    expect(result.syncPairing).toEqual({ instanceUrl: 'https://studio-8080.lightning.ai/', linkToken: 'pair-token-123' });
+    expect(result.syncPairing).toEqual({ instanceUrl: 'https://instance-8080.example.com/', linkToken: 'pair-token-123' });
     const seedCmd = fake.runCommands.find((c) => c.includes('sync-hub.json')) ?? '';
     expect(seedCmd).toContain('chmod 600');
     const b64 = /printf %s '([^']+)'/.exec(seedCmd)?.[1] ?? '';
@@ -178,7 +178,7 @@ describe('cloud deploy sync provisioning', () => {
       expect(verifyLinkToken(dir2, 'pair-token-123')).toBe(true);
       expect(verifyLinkToken(dir2, 'wrong')).toBe(false);
     } finally { fs.rmSync(dir2, { recursive: true, force: true }); }
-    // And the Studio env carries the cloud role for the executor gate.
+    // And the instance env carries the cloud role for the executor gate.
     const envCmd = fake.runCommands.find((c) => c.includes('.env.cloud')) ?? '';
     const envB64 = /printf %s '([^']+)'/.exec(envCmd)?.[1] ?? '';
     expect(Buffer.from(envB64, 'base64').toString('utf8')).toContain('KRIYADOT_INSTANCE_ROLE=cloud');
@@ -186,20 +186,20 @@ describe('cloud deploy sync provisioning', () => {
 
   it('cloud deploy route returns a syncPairing the local app can store as its target', async () => {
     const dir = tmp('deploy-route-');
-    const fake = new FakeLightningClient([{ name: 'kriyadot', state: 'running', publicUrl: 'https://studio-8080.lightning.ai/' }]);
+    const fake = new FakeCloudHostClient([{ name: 'kriyadot', state: 'running', publicUrl: 'https://instance-8080.example.com/' }]);
     const secrets = new InMemoryCloudSecretStore();
     const app = express();
     app.use(express.json());
-    app.use('/api', createCloudLightningRouter({ secretStore: secrets, client: fake, dataDir: dir, loopbackToken: OWNER, providerEnvForUser: async () => ({}) }));
+    app.use('/api', createCloudRouter({ secretStore: secrets, client: fake, dataDir: dir, loopbackToken: OWNER, providerEnvForUser: async () => ({}) }));
     const { server, base } = await listen(app);
     try {
       const h = { 'content-type': 'application/json', authorization: `Bearer ${OWNER}` };
-      await fetch(`${base}/api/cloud/lightning/connect`, { method: 'POST', headers: h, body: JSON.stringify({ userId: 'lu-1', apiKey: 'lk-1' }) });
-      const res = await fetch(`${base}/api/cloud/lightning/deploy`, { method: 'POST', headers: h, body: JSON.stringify({ repoUrl: 'https://github.com/example/kriyadot.git' }) });
+      await fetch(`${base}/api/cloud/connect`, { method: 'POST', headers: h, body: JSON.stringify({ accountId: 'acct-1', apiKey: 'key-1' }) });
+      const res = await fetch(`${base}/api/cloud/deploy`, { method: 'POST', headers: h, body: JSON.stringify({ repoUrl: 'https://github.com/example/kriyadot.git' }) });
       expect(res.status).toBe(200);
       const json = (await res.json()) as { deploy: { ok: boolean; syncPairing?: { instanceUrl: string; linkToken: string } } };
       expect(json.deploy.ok).toBe(true);
-      expect(json.deploy.syncPairing?.instanceUrl).toBe('https://studio-8080.lightning.ai/');
+      expect(json.deploy.syncPairing?.instanceUrl).toBe('https://instance-8080.example.com/');
       expect(json.deploy.syncPairing?.linkToken.length).toBeGreaterThan(20);
     } finally { server.close(); fs.rmSync(dir, { recursive: true, force: true }); }
   });

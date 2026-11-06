@@ -3658,8 +3658,8 @@ async function boot(): Promise<void> {
     const { createDaemonInjectRouter, NamedSessionRegistry } = await import('./daemon-inject-routes.js');
     const { createLogLevelRouter } = await import('./log-level.js');
     const { createEvolutionRouter } = await import('./evolution-routes.js');
-    const { createCloudLightningRouter } = await import('./cloud-routes.js');
-    const { VaultCloudSecretStore, LIGHTNING_USER_ID_SECRET } = await import('./cloud-lightning.js');
+    const { createCloudRouter } = await import('./cloud-routes.js');
+    const { VaultCloudSecretStore, CLOUD_HOST_ACCOUNT_SECRET } = await import('./cloud-host.js');
     const { createScriptWebhookRouter } = await import('./webhooks.js');
     const { scriptHooksFromConfig } = await import('./hooks-config.js');
     const { runStartupBootstrap } = await import('./boot-bootstrap.js');
@@ -3959,12 +3959,12 @@ async function boot(): Promise<void> {
     // -- Routing evolution reject (#83, reject-only on this host) --------
     app.use('/api/routing', createEvolutionRouter({ dataDir: config.dataDir, only: ['reject'] }));
 
-    // -- Lightning cloud layer (per-user accounts; mock-tested) ----------
+    // -- Cloud host layer (per-user accounts; mock-tested) ---------------
     app.use(
       '/api',
-      createCloudLightningRouter({
+      createCloudRouter({
         secretStore: new VaultCloudSecretStore(config.dataDir),
-        studioName: 'kriyadot',
+        instanceName: 'kriyadot',
         tier: 'free',
         dataDir: config.dataDir,
         loopbackToken,
@@ -3996,7 +3996,7 @@ async function boot(): Promise<void> {
       let cloudConnected = false;
       try {
         cloudConnected =
-          new VaultCloudSecretStore(config.dataDir).get('default-user', LIGHTNING_USER_ID_SECRET) !== undefined;
+          new VaultCloudSecretStore(config.dataDir).get('default-user', CLOUD_HOST_ACCOUNT_SECRET) !== undefined;
       } catch {
         cloudConnected = false;
       }

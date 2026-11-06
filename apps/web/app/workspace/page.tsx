@@ -20,7 +20,7 @@ const TABS = [
   { id: 'phone', label: 'Phone', title: 'Control your phone' },
   { id: 'devices', label: 'Devices', title: 'Control KriyaDot from your phone' },
   { id: 'backup', label: 'Backup', title: 'Back up and restore your workspace' },
-  { id: 'cloud', label: 'Cloud', title: 'Run KriyaDot on a Lightning AI Studio' },
+  { id: 'cloud', label: 'Cloud', title: 'Run KriyaDot on a cloud instance' },
   { id: 'folders', label: 'Folder sessions', title: 'Open a folder as an agent workspace' },
 ] as const;
 

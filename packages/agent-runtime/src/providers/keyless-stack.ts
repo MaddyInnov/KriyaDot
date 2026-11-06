@@ -10,7 +10,7 @@
  * "free with a free key" upgrades, not keyless lanes.
  *
  *   1. ollama-local   — guaranteed: the user's own compute (desktop
- *      Ollama or the Lightning Studio sidecar, see local-llm.ts).
+ *      Ollama or a cloud-host Ollama sidecar, see local-llm.ts).
  *   2. ovh-anonymous  — shared: OVHcloud's documented anonymous tier.
  *   3. llm7-anonymous — best-effort: undocumented anonymous lane.
  *   4. aihorde        — chat-only deep fallback: no tool calls, queued.

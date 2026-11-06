@@ -138,9 +138,9 @@ describe('searchCapabilities (plain-language ranking)', () => {
     expect(hits[0]!.entry.id).toBe('channel:whatsapp');
   });
 
-  it('"run while the PC is off" → automation anchors / Lightning cloud on top', () => {
+  it('"run while the PC is off" → automation anchors / cloud hosting on top', () => {
     const hits = searchCapabilities(registry, 'what can run while the PC is off');
-    expect(['feature:automation-anchors', 'feature:lightning-cloud']).toContain(hits[0]!.entry.id);
+    expect(['feature:automation-anchors', 'feature:cloud-hosting']).toContain(hits[0]!.entry.id);
     const top3 = hits.slice(0, 3).map((h) => h.entry.id);
     expect(top3).toContain('feature:automation-anchors');
   });
@@ -317,7 +317,7 @@ describe('GET /api/capabilities', () => {
     };
     expect(body.query).toBe('run while the PC is off');
     expect(body.generatedAt).toBeTruthy();
-    expect(['feature:automation-anchors', 'feature:lightning-cloud']).toContain(body.entries[0]!.id);
+    expect(['feature:automation-anchors', 'feature:cloud-hosting']).toContain(body.entries[0]!.id);
     expect(body.entries[0]!.score).toBeGreaterThan(0);
   });
 });

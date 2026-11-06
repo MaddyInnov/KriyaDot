@@ -10,7 +10,7 @@
  *
  * Each article lists `relatedCapabilities`: the capability ids it
  * covers, using the ADD-2 capability registry's PRODUCT_FEATURES slugs
- * (universal-chat, workflows, lightning-cloud, automation-anchors, …).
+ * (universal-chat, workflows, cloud-hosting, automation-anchors, …).
  * Registry entries carry ids of the form `feature:<slug>`; the guide
  * names the bare slug, and guide-routes matches on the slug suffix.
  *
@@ -81,7 +81,7 @@ export const GUIDE_ARTICLES: GuideArticle[] = [
       },
       {
         title: '(Optional) Connect a cloud workspace',
-        body: 'If you want your team reachable from other devices and working while this PC is off, connect your own Lightning cloud — see the "Connecting Lightning cloud" article. Local use never requires it.',
+        body: 'If you want your team reachable from other devices and working while this PC is off, connect your own cloud hosting — see the "Connecting cloud hosting" article. Local use never requires it.',
         deepLink: { label: 'Open Preferences', href: '/preferences' },
       },
       {
@@ -90,7 +90,7 @@ export const GUIDE_ARTICLES: GuideArticle[] = [
         deepLink: { label: 'Open the User Guide', href: '/more/guide' },
       },
     ],
-    relatedCapabilities: ['universal-chat', 'lightning-cloud'],
+    relatedCapabilities: ['universal-chat', 'cloud-hosting'],
     keywords: ['install', 'begin', 'start', 'onboarding', 'api key', 'free lane', 'no account', 'setup'],
   },
   {
@@ -205,28 +205,29 @@ export const GUIDE_ARTICLES: GuideArticle[] = [
     keywords: ['workflow', 'automation', 'canvas', 'n8n', 'import', 'dry run', 'run', 'steps', 'nodes'],
   },
   {
-    id: 'connecting-lightning-cloud',
-    title: 'Connecting Lightning cloud: your workspace, in your cloud',
+    id: 'connecting-cloud-hosting',
+    title: 'Connecting cloud hosting: your workspace, in your cloud',
     theme: 'Cloud & devices',
     audience: 'Anyone who wants the team reachable anywhere',
     summary:
-      'KriyaDot never runs on KriyaDot servers. Connecting Lightning deploys your workspace into your own Lightning AI account, so your bots live in your cloud, billed (if at all) by Lightning to you.',
+      'KriyaDot never runs on KriyaDot servers. You connect a cloud host or server that you control, and KriyaDot deploys your workspace into it, so your bots live in your cloud, billed (if at all) by your host provider directly to you.',
     steps: [
       {
-        title: 'Start at the website and sign in with Google',
-        body: 'On the KriyaDot website choose "Create your workspace" and sign in with Google. The site remembers only who you are and your workspace address — it never carries your chat traffic.',
+        title: 'Pick a cloud host you control',
+        body: 'Choose a cloud host or server that you control — for example a VPS or another hosted server. That host is where your cloud workspace will live; KriyaDot itself provides no servers and never hosts your workspace for you.',
       },
       {
-        title: 'Connect your Lightning account',
-        body: 'Lightning AI is where your cloud workspace will live. It uses the same Google login, so connecting is a single tap — no new password and no keys to copy around.',
+        title: 'Paste your host account ID and API key once',
+        body: 'In KriyaDot, paste your cloud host account ID and API key into KriyaDot once. They are stored in your vault, so you do not need to enter them again for later deploys.',
+        deepLink: { label: 'Open Preferences', href: '/preferences' },
       },
       {
         title: 'Let the workspace deploy, then launch it',
-        body: 'KriyaDot deploys into your Lightning account. After that, launching from the website hands your browser off to your own instance, and the browser talks to that instance directly.',
+        body: 'KriyaDot deploys into the cloud host you connected. After that, launching from the website hands your browser off to your own instance, and the browser talks to that instance directly.',
       },
       {
-        title: 'Know the free-tier behaviour',
-        body: 'On Lightning\'s free tier your workspace sleeps when idle and wakes when you visit — reachable and self-healing, with a possible wake delay on the first request. An always-on workspace comes with your own Lightning plan, paid by you directly to Lightning.',
+        title: 'Know the sleep and wake behaviour',
+        body: 'If your host sleeps idle instances, the first request can see a wake delay; an always-on host plan removes it.',
       },
       {
         title: 'Site down does not mean workspace down',
@@ -234,8 +235,8 @@ export const GUIDE_ARTICLES: GuideArticle[] = [
         deepLink: { label: 'Open Preferences', href: '/preferences' },
       },
     ],
-    relatedCapabilities: ['lightning-cloud', 'device-sync'],
-    keywords: ['lightning', 'cloud', 'connect', 'deploy', 'workspace', 'google sign in', 'free tier', 'sleep', 'website'],
+    relatedCapabilities: ['cloud-hosting', 'device-sync'],
+    keywords: ['cloud', 'hosting', 'connect', 'deploy', 'workspace', 'server', 'vps', 'host', 'sleep', 'website'],
   },
   {
     id: 'placement-and-anchors',
@@ -266,12 +267,12 @@ export const GUIDE_ARTICLES: GuideArticle[] = [
         deepLink: { label: 'Open Bots', href: '/bots' },
       },
       {
-        title: 'Remember the free-tier wake caveat',
-        body: 'A cloud-anchored, time-critical routine on Lightning\'s free tier can see a wake delay because the Studio sleeps when idle. The anchor section says so plainly when it applies; Lightning Pro removes the sleep restriction.',
+        title: 'Remember the wake caveat',
+        body: 'A cloud-anchored, time-critical routine can see a wake delay if your host sleeps idle instances. The anchor section says so plainly when it applies; an always-on host plan removes it.',
         deepLink: { label: 'Open Preferences', href: '/preferences' },
       },
     ],
-    relatedCapabilities: ['execution-placement', 'automation-anchors', 'automations', 'lightning-cloud'],
+    relatedCapabilities: ['execution-placement', 'automation-anchors', 'automations', 'cloud-hosting'],
     keywords: ['placement', 'anchor', 'runs while', 'pc off', 'off', 'cloud only', 'report back', 'this device', 'schedule fires', 'wake'],
   },
   {

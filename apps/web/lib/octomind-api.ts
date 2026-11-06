@@ -26,8 +26,9 @@
  *    pattern, like /persona, /model, /voice). No generic bot-update
  *    endpoint exists today, so there is no second fallback — a 404 is
  *    reported verbatim to the editor.
- *  - Cloud: /api/cloud/lightning/{connect,status,disconnect,deploy,usage,plans}
- *    per apps/api/src/cloud-routes.ts (mounted under /api).
+ *  - Cloud: /api/cloud/{connect,status,disconnect,deploy,instance/*,usage,plans,supervisor}
+ *    per apps/api/src/cloud-routes.ts (mounted under /api). Host-agnostic:
+ *    KriyaDot talks to whichever cloud host the user connected.
  */
 import { authedFetch, getChatThreadMessages, shareSession } from './api';
 
@@ -238,25 +239,30 @@ export async function setBotLayers(
   return { ok: res.ok !== false, via: 'PUT /api/bots/:id/layers', ...(res.layers ? { layers: res.layers } : {}) };
 }
 
-// ---- Cloud (Lightning) --------------------------------------------------------
+// ---- Cloud (host-agnostic) ----------------------------------------------------
 
-export const cloudConnect = (userId: string, apiKey: string): Promise<Record<string, unknown>> =>
-  octoJson('/api/cloud/lightning/connect', jsonInit('POST', { userId, apiKey }));
+export const cloudConnect = (accountId: string, apiKey: string): Promise<Record<string, unknown>> =>
+  octoJson('/api/cloud/connect', jsonInit('POST', { accountId, apiKey }));
 
 export const cloudStatus = (): Promise<Record<string, unknown>> =>
-  octoJson('/api/cloud/lightning/status');
+  octoJson('/api/cloud/status');
 
 export const cloudDisconnect = (): Promise<Record<string, unknown>> =>
-  octoJson('/api/cloud/lightning/disconnect', { method: 'POST' });
+  octoJson('/api/cloud/disconnect', { method: 'POST' });
 
-export const cloudDeploy = (body: { repoUrl?: string; ollama?: unknown } = {}): Promise<Record<string, unknown>> =>
-  octoJson('/api/cloud/lightning/deploy', jsonInit('POST', body));
+export const cloudDeploy = (
+  body: { repoUrl?: string; ollama?: unknown; instanceName?: string } = {},
+): Promise<Record<string, unknown>> =>
+  octoJson('/api/cloud/deploy', jsonInit('POST', body));
 
-export const cloudStudio = (action: 'ensure' | 'start' | 'stop'): Promise<Record<string, unknown>> =>
-  octoJson(`/api/cloud/lightning/studio/${action}`, { method: 'POST' });
+export const cloudInstance = (action: 'ensure' | 'start' | 'stop'): Promise<Record<string, unknown>> =>
+  octoJson(`/api/cloud/instance/${action}`, { method: 'POST' });
 
 export const cloudUsage = (): Promise<Record<string, unknown>> =>
-  octoJson('/api/cloud/lightning/usage');
+  octoJson('/api/cloud/usage');
 
 export const cloudPlans = (): Promise<Record<string, unknown>> =>
-  octoJson('/api/cloud/lightning/plans');
+  octoJson('/api/cloud/plans');
+
+export const cloudSupervisor = (): Promise<Record<string, unknown>> =>
+  octoJson('/api/cloud/supervisor');
