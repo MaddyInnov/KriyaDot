@@ -18,6 +18,8 @@
          usesCleartextTraffic is REQUIRED for this to work; switch the app
          and server to HTTPS/WSS before any use outside a trusted LAN. -->
     <application
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:label="KriyaDot Companion"
         android:theme="@style/Theme.KriyaDot"
         android:supportsRtl="true"

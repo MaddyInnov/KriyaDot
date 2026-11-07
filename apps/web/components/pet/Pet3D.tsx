@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Interactive 3D companion pets — WebGL2 with WebGPU where available.
-// Each of the 6 pets is a procedural low-poly clay character (no model files):
+// Each of the five drawn pets is a procedural low-poly clay character (no model files):
 // breathing/bobbing idle motion, blinking, mood-driven behavior, and pointer
 // interactivity (leans toward your cursor, bounces when clicked).
 //
@@ -85,8 +85,8 @@ export function petMoodPose(mood: PetMood, elapsed: number, t: number): PetMoodP
 }
 
 /** Pure config — safe to import in tests without WebGL. */
-export const PET3D_CONFIG: Record<PetId, { body: string; accent: string; description: string }> = {
-  kriyadot: { body: '#4256c8', accent: '#8b9bf5', description: 'ink-blue blob, eight tool arms' },
+export const PET3D_CONFIG: Partial<Record<PetId, { body: string; accent: string; description: string }>> = {
+  kriyadot: { body: '#4256c8', accent: '#8b9bf5', description: 'legacy clay blob (live visual is the hologram portrait)' },
   ocky: { body: '#8b5cf6', accent: '#fbbf24', description: 'purple explorer, headlamp' },
   nubi: { body: '#f1efff', accent: '#f9a8d4', description: 'cloud drifter, rainbow frill' },
   plip: { body: '#2dd4bf', accent: '#a7f3d0', description: 'teardrop, six wiggly arms' },
@@ -94,6 +94,8 @@ export const PET3D_CONFIG: Record<PetId, { body: string; accent: string; descrip
   wisp: { body: '#c4b5fd', accent: '#ede9fe', description: 'ethereal floater, soft glow' },
 };
 
+/** Pets with a procedural 3D builder (the five drawn pets + legacy kriyadot).
+ *  The image pets voxel/droplet have no builder — <Pet> never routes them here. */
 export const PET3D_IDS: PetId[] = ['kriyadot', 'ocky', 'nubi', 'plip', 'bolt', 'wisp'];
 
 /* ------------------------------------------------------------------ */
@@ -555,7 +557,7 @@ function applyInter(rig: THREE.Group, inter: InterState): void {
   rig.scale.setScalar(rig.scale.x + (s - rig.scale.x) * 0.15);
 }
 
-const BUILDERS: Record<PetId, (dim: number) => BuiltPet> = {
+const BUILDERS: Partial<Record<PetId, (dim: number) => BuiltPet>> = {
   kriyadot: buildKriyaDot,
   ocky: buildOcky,
   nubi: buildNubi,
@@ -636,7 +638,9 @@ export function Pet3D({
       camera.position.set(0, 0.4, 5.2);
       camera.lookAt(0, 0.1, 0);
 
-      built = BUILDERS[pet](themeDim());
+      const builder = BUILDERS[pet];
+      if (!builder) return; // image pets never reach Pet3D via <Pet>; no 3D builder exists for them
+      built = builder(themeDim());
       const rig = new THREE.Group();
       // Mood pose group sits between the pointer rig and the pet's own group
       // so speaking/celebrating transforms never fight tick() or applyInter().

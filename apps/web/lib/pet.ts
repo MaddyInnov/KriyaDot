@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Companion pet system: 6 selectable mascot styles, persisted in localStorage
+// Companion pet system: 8 selectable mascot styles, persisted in localStorage
 // under `mvp:pet`. localStorage is the source of truth (the learned-preferences
 // backend API is about tool allow/deny, not UI identity, so no server sync).
 
@@ -7,7 +7,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 
-export type PetId = 'kriyadot' | 'ocky' | 'nubi' | 'plip' | 'bolt' | 'wisp';
+export type PetId = 'kriyadot' | 'ocky' | 'nubi' | 'plip' | 'bolt' | 'wisp' | 'voxel' | 'droplet';
 export type PetMood =
   | 'idle'
   | 'thinking'
@@ -30,8 +30,8 @@ export const PETS: PetDef[] = [
   {
     id: 'kriyadot',
     name: 'KriyaDot',
-    tagline: 'Eight hands. Zero waiting.',
-    blurb: 'The flagship ink-blue blob. Every stubby arm holds a tiny tool, so nothing you ask ever queues.',
+    tagline: 'A face made of light.',
+    blurb: 'The flagship hologram — a face woven from cyan and violet light-lines, with golden eyes that are always listening.',
   },
   {
     id: 'ocky',
@@ -63,9 +63,59 @@ export const PETS: PetDef[] = [
     tagline: 'Here, but barely.',
     blurb: 'A sleepy ethereal floater that drifts through your work leaving a soft glow and finished tasks behind.',
   },
+  {
+    id: 'voxel',
+    name: 'Voxel',
+    tagline: 'Built block by block.',
+    blurb: 'A chunky pixel-cube with a tiny golden cube always floating at its side. Thinks in blocks, ships in stacks.',
+  },
+  {
+    id: 'droplet',
+    name: 'Droplet',
+    tagline: 'Soft landing, every time.',
+    blurb: 'A fuzzy little droplet with its eyes closed in permanent contentment. The calm one — unbothered by deadlines, gentle with everything.',
+  },
 ];
 
 export const DEFAULT_PET_ID: PetId = 'kriyadot';
+
+/* ------------------------------------------------------------------ */
+/* Image pets                                                          */
+/* ------------------------------------------------------------------ */
+
+/** Frame treatment for an image pet: full circle or rounded square. */
+export type PetFrame = 'circle' | 'rounded';
+
+export interface ImagePetDef {
+  /** Full-size portrait (800px), used at large sizes / hero / overlay. */
+  src: string;
+  /** Small portrait (256px), used for avatars, picker and brand-sized renders. */
+  srcSmall: string;
+  frame: PetFrame;
+}
+
+/**
+ * Pets rendered from a portrait image instead of SVG art / the 3D canvas.
+ * `kriyadot` (the Hologram) is the default pet AND the product brand mark;
+ * `voxel` and `droplet` are selectable companions only — never the brand.
+ * Every other pet keeps its hand-drawn SVG + procedural 3D rendering.
+ */
+export const IMAGE_PETS: Partial<Record<PetId, ImagePetDef>> = {
+  kriyadot: { src: '/brand/hologram-avatar.png', srcSmall: '/brand/hologram-avatar-256.png', frame: 'circle' },
+  voxel: { src: '/brand/voxel-avatar.png', srcSmall: '/brand/voxel-avatar-256.png', frame: 'rounded' },
+  droplet: { src: '/brand/droplet-avatar.png', srcSmall: '/brand/droplet-avatar-256.png', frame: 'circle' },
+};
+
+/** Brand mark asset: always the Hologram, regardless of the chosen pet. */
+export const BRAND_MARK_SRC = '/brand/hologram-avatar-256.png';
+
+export function imagePetDef(id: PetId): ImagePetDef | undefined {
+  return IMAGE_PETS[id];
+}
+
+export function isImagePet(id: PetId): boolean {
+  return IMAGE_PETS[id] !== undefined;
+}
 
 const KEY = 'mvp:pet';
 const CHANGE_EVENT = 'mvp:pet-change';

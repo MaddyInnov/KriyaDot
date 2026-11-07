@@ -11,10 +11,12 @@ import {
 } from './pet';
 
 describe('pet registry', () => {
-  it('has exactly 6 distinct styles', () => {
-    expect(PETS).toHaveLength(6);
+  it('has exactly 8 distinct styles', () => {
+    expect(PETS).toHaveLength(8);
     const ids = PETS.map((p) => p.id);
-    expect(new Set(ids).size).toBe(6);
+    expect(new Set(ids).size).toBe(8);
+    expect(ids).toContain('voxel');
+    expect(ids).toContain('droplet');
   });
 
   it('every pet has a name, tagline and blurb', () => {
@@ -93,5 +95,12 @@ describe('pet migration: tentio -> kriyadot', () => {
   it('leaves other pet ids untouched', () => {
     stubStorage({ 'mvp:pet': JSON.stringify({ id: 'ocky', name: '' }) });
     expect(getStoredPet()).toEqual({ id: 'ocky', name: '' });
+  });
+
+  it('parses every stored id in the 8-pet roster (additive ids, no migration)', () => {
+    for (const id of ['kriyadot', 'ocky', 'nubi', 'plip', 'bolt', 'wisp', 'voxel', 'droplet'] as PetId[]) {
+      stubStorage({ 'mvp:pet': JSON.stringify({ id, name: '' }) });
+      expect(getStoredPet(), id).toEqual({ id, name: '' });
+    }
   });
 });

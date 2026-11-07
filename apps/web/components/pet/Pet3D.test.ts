@@ -15,15 +15,22 @@ import { PETS, type PetId } from '../../lib/pet';
 const HEX = /^#[0-9a-f]{6}$/i;
 
 describe('Pet3D config', () => {
-  it('covers every pet id exactly once', () => {
-    const petIds = PETS.map((p) => p.id).sort();
-    expect([...PET3D_IDS].sort()).toEqual(petIds);
+  it('covers exactly the pets that have a 3D builder (drawn pets + legacy kriyadot)', () => {
+    expect([...PET3D_IDS].sort()).toEqual(['bolt', 'kriyadot', 'nubi', 'ocky', 'plip', 'wisp']);
     expect(new Set(PET3D_IDS).size).toBe(PET3D_IDS.length);
+    // The image pets voxel/droplet have no 3D builder — <Pet> renders them as images.
+    const petIds = PETS.map((p) => p.id);
+    expect(petIds).toContain('voxel');
+    expect(petIds).toContain('droplet');
+    expect(PET3D_IDS).not.toContain('voxel');
+    expect(PET3D_IDS).not.toContain('droplet');
+    expect(PET3D_CONFIG.voxel).toBeUndefined();
+    expect(PET3D_CONFIG.droplet).toBeUndefined();
   });
 
   it('every pet has valid body/accent hex colors and a description', () => {
     for (const id of PET3D_IDS) {
-      const cfg = PET3D_CONFIG[id as PetId];
+      const cfg = PET3D_CONFIG[id as PetId]!;
       expect(cfg, id).toBeDefined();
       expect(cfg.body, `${id} body`).toMatch(HEX);
       expect(cfg.accent, `${id} accent`).toMatch(HEX);
@@ -33,7 +40,7 @@ describe('Pet3D config', () => {
 
   it('body and accent differ per pet (visual identity)', () => {
     for (const id of PET3D_IDS) {
-      const cfg = PET3D_CONFIG[id as PetId];
+      const cfg = PET3D_CONFIG[id as PetId]!;
       expect(cfg.body.toLowerCase()).not.toBe(cfg.accent.toLowerCase());
     }
   });

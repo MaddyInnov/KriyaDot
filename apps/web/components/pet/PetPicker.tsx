@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Pet picker: grid of the 6 companion styles with live previews + rename.
+// Pet picker: grid of the 8 companion styles with live previews + rename.
 
 'use client';
 
-import { useEffect, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { PETS, usePet, type PetDef } from '../../lib/pet';
 import { Pet } from './Pet';
 

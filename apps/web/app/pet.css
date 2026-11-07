@@ -153,6 +153,95 @@
 }
 .fx-antenna { animation: pet-antenna-blink 2.2s ease-in-out infinite; }
 
+/* ---- image pets (kriyadot hologram / voxel / droplet) ---------------
+   Portrait <img> pets: mood is carried by glow/filter treatments on the
+   image plus the shared container motion above (.pet-inner keeps the
+   generic mood animations, so celebrating uses the exact same 2.4s
+   bounce+spin choreography as the drawn pets). Speaking is a glow pulse
+   only — no mouth fakery. The outer drop-shadow filter is disabled here:
+   a square drop-shadow would outline the frame, so glow lives on the
+   framed image itself as box-shadow. */
+
+.pet.pet-image { filter: none; }
+.pet.pet-image.pet-mood-thinking,
+.pet.pet-image.pet-mood-working { filter: none; }
+
+.pet-image .pet-inner { overflow: hidden; }
+.pet-frame-circle .pet-inner, .pet-frame-circle .pet-image-img { border-radius: 50%; }
+.pet-frame-rounded .pet-inner, .pet-frame-rounded .pet-image-img { border-radius: 22%; }
+
+.pet-image-img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+  background: #0d0e28;
+  box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.35), 0 0 16px rgba(34, 211, 238, 0.28),
+    0 0 26px rgba(139, 92, 246, 0.22);
+}
+
+@keyframes pet-img-breathe {
+  0%, 100% { filter: brightness(1); box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.35), 0 0 14px rgba(34, 211, 238, 0.24), 0 0 22px rgba(139, 92, 246, 0.18); }
+  50% { filter: brightness(1.07); box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.5), 0 0 22px rgba(34, 211, 238, 0.4), 0 0 36px rgba(139, 92, 246, 0.32); }
+}
+.pet-image.pet-mood-idle .pet-image-img { animation: pet-img-breathe 3.2s ease-in-out infinite; }
+
+@keyframes pet-img-shimmer {
+  0%, 100% { filter: brightness(1) hue-rotate(0deg); }
+  50% { filter: brightness(1.13) hue-rotate(10deg); }
+}
+.pet-image.pet-mood-thinking .pet-image-img {
+  animation: pet-img-shimmer 2.6s ease-in-out infinite;
+  box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.5), 0 0 24px rgba(167, 139, 250, 0.45);
+}
+
+.pet-image.pet-mood-working .pet-image-img {
+  filter: brightness(1.14) saturate(1.12);
+  box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.55), 0 0 26px rgba(34, 211, 238, 0.45),
+    0 0 40px rgba(139, 92, 246, 0.3);
+}
+
+@keyframes pet-img-pulse {
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(1.22); }
+}
+.pet-image.pet-mood-speaking .pet-image-img {
+  animation: pet-img-pulse 0.9s ease-in-out infinite;
+  box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.55), 0 0 28px rgba(34, 211, 238, 0.5),
+    0 0 44px rgba(139, 92, 246, 0.36);
+}
+
+.pet-image.pet-mood-happy .pet-image-img {
+  filter: brightness(1.12) saturate(1.15) sepia(0.22);
+  box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.5), 0 0 26px rgba(251, 191, 36, 0.35),
+    0 0 40px rgba(139, 92, 246, 0.28);
+}
+
+.pet-image.pet-mood-celebrating .pet-image-img {
+  filter: brightness(1.16) saturate(1.18);
+  box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.6), 0 0 30px rgba(34, 211, 238, 0.5),
+    0 0 48px rgba(139, 92, 246, 0.4);
+}
+
+.pet-image.pet-mood-error .pet-image-img {
+  filter: saturate(0.35) brightness(0.94) sepia(0.35) hue-rotate(-38deg);
+  box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.55), 0 0 22px rgba(248, 113, 113, 0.4);
+}
+
+.pet-image.pet-mood-sleeping .pet-image-img {
+  filter: brightness(0.6) saturate(0.55);
+  box-shadow: 0 0 0 1px rgba(100, 116, 139, 0.4), 0 0 10px rgba(100, 116, 139, 0.25);
+}
+
+/* ---- brand mark ------------------------------------------------------ */
+
+.brand-mark-img {
+  display: block;
+  border-radius: 50%;
+  object-fit: cover;
+  background: #0d0e28;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .pet .pet-inner,
   .pet .fx,
@@ -160,7 +249,8 @@
   .pet .fx-antenna,
   .pet .pet-talk-mouth,
   .pet .pet-sound-arc,
-  .pet .fx-celebrating {
+  .pet .fx-celebrating,
+  .pet .pet-image-img {
     animation: none !important;
   }
   /* Static speaking mouth / celebration marks stay visible, just still. */

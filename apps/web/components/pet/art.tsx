@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// Hand-drawn inline SVG art for the 6 companion pets. No image assets.
+// Hand-drawn inline SVG art for the five drawn companion pets (plus the
+// legacy kriyadot blob art, kept for direct-import compatibility — <Pet>
+// renders kriyadot from the Hologram portrait image instead, and the
+// image pets voxel/droplet have no SVG art at all).
 // Every pet renders in a 120x120 viewBox and accepts a `mood` that changes
 // its face; mood *motion* is handled by CSS classes in pet.css.
 
@@ -432,7 +435,7 @@ function WispArt({ mood }: ArtProps) {
 
 /* ------------------------------------------------------------------ */
 
-export const PET_ART: Record<PetId, (props: ArtProps) => React.ReactElement> = {
+export const PET_ART: Partial<Record<PetId, (props: ArtProps) => React.ReactElement>> = {
   kriyadot: KriyaDotArt,
   ocky: OckyArt,
   nubi: NubiArt,

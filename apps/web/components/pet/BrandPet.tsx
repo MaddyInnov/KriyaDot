@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-// Tiny client component for the topbar brand: the user's chosen pet at 26px.
+// BrandPet — the topbar/sidebar brand slot. Thin wrapper kept so existing
+// call sites (app-sidebar.tsx etc.) do not change: it renders BrandMark,
+// i.e. ALWAYS the Hologram brand mark at 26px, never the user's chosen pet.
 
 'use client';
 
-import { usePet } from '../../lib/pet';
-import { Pet } from './Pet';
+import React from 'react';
+import { BrandMark } from './BrandMark';
 
 export function BrandPet() {
-  const { choice } = usePet();
   return (
     <span className="brand-pet" aria-hidden="true">
-      <Pet pet={choice.id} size={26} mood="idle" label="" />
+      <BrandMark size={26} />
     </span>
   );
 }

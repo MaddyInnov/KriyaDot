@@ -44,7 +44,18 @@ describe('WorkPanelHeader', () => {
     expect(html).toContain('KriyaDot');
     expect(html).toContain('Running 2 tasks — researching desks · writing notes');
     expect(html).toContain('href="/preferences"');
-    expect(html).toContain('<svg');
+    // The default pet (kriyadot) is the Hologram image pet: an <img>, not SVG.
+    expect(html).toContain('pet-image');
+    expect(html).toContain('src="/brand/hologram-avatar-256.png"');
+    expect(html).toContain('pet-mood-working');
+  });
+
+  it('renders an image pet (voxel) header face without per-id special-casing', () => {
+    const html = renderToStaticMarkup(
+      <WorkPanelHeader petId="voxel" agentName="Voxel" sentence="Stacking blocks" idle />,
+    );
+    expect(html).toContain('src="/brand/voxel-avatar-256.png"');
+    expect(html).toContain('pet-frame-rounded');
   });
 
   it('renders the idle sentence when nothing is running', () => {
