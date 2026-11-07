@@ -93,7 +93,7 @@ import { CommandPalette, useCommandPaletteShortcut, type PaletteItem } from '../
 import { PlacesRail } from '../components/places-rail';
 import { FindBar } from '../components/chat/find-bar';
 import { PinnedBanner } from '../components/chat/pinned-banner';
-import { CitationChips, SpoilerText } from '../components/chat/message-content';
+import { AssistantMessageText, CitationChips, SpoilerText } from '../components/chat/message-content';
 import { findInMessages, setAppBadge, splitByQuery, unreadDividerIndex } from '../components/chat/chat-polish';
 import { MentionMenu, filterMentions, mentionQueryAt, type MentionEntry } from '../components/chat/mention-menu';
 import { AudioBubble, VoiceNoteRecordButton } from '../components/chat/voice-note-composer';
@@ -2803,10 +2803,15 @@ function ChatPageInner() {
     setFindCurrent(idx);
     messagesRef.current?.querySelector(`[data-block-id="${CSS.escape(m.blockId)}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
   };
-  const renderMsgText = (text: string) => {
+  const renderMsgText = (text: string, role: 'user' | 'assistant' = 'user') => {
     if (findOpen && findQuery.trim()) {
       return (<>{splitByQuery(text, findQuery).map((seg, i) => (seg.hit ? <mark key={i}>{seg.text}</mark> : <span key={i}>{seg.text}</span>))}</>);
     }
+    // Assistant answers are model markdown — render them through the
+    // shared markdown renderer (AssistantMessageText) instead of showing
+    // raw ### / ** markers. User text stays literal: it renders what the
+    // user actually typed.
+    if (role === 'assistant') return <AssistantMessageText text={text} />;
     return <SpoilerText text={text} />;
   };
   const pinBlock = (b: ChatBlock) => {
@@ -3622,7 +3627,7 @@ function ChatPageInner() {
                         </span>
                       ) : (
                         <>
-                          {renderMsgText(b.text)}
+                          {renderMsgText(b.text, 'assistant')}
                           {b.streaming && <span className="stream-caret" aria-hidden="true" />}
                         </>
                       )}
@@ -4414,7 +4419,7 @@ function ChatPageInner() {
                           </span>
                         ) : (
                           <>
-                            {b.text}
+                            <AssistantMessageText text={b.text} />
                             {b.streaming && <span className="stream-caret" aria-hidden="true" />}
                           </>
                         )}

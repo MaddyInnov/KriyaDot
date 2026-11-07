@@ -433,25 +433,35 @@
   color: var(--text);
 }
 
+/* Shared markdown typography: .fpp-markdown is the file preview pane;
+   .msg-md is markdown-rendered assistant text in chat (same renderer,
+   components/chat/markdown.ts — one set of rules for both). */
 .fpp-markdown h2,
 .fpp-markdown h3,
 .fpp-markdown h4,
-.fpp-markdown h5 {
+.fpp-markdown h5,
+.msg-md h2,
+.msg-md h3,
+.msg-md h4,
+.msg-md h5 {
   margin: 12px 0 6px;
 }
 
-.fpp-markdown p {
+.fpp-markdown p,
+.msg-md p {
   margin: 6px 0;
 }
 
-.fpp-markdown blockquote {
+.fpp-markdown blockquote,
+.msg-md blockquote {
   margin: 6px 0;
   padding-left: 10px;
   border-left: 3px solid var(--accent);
   color: var(--text-2);
 }
 
-.fpp-markdown .md-pre {
+.fpp-markdown .md-pre,
+.msg-md .md-pre {
   background: var(--surface-2);
   border-radius: var(--radius-sm);
   padding: 10px;
@@ -459,7 +469,8 @@
   font-size: 12px;
 }
 
-.fpp-markdown code {
+.fpp-markdown code,
+.msg-md code {
   background: var(--surface-2);
   border-radius: 4px;
   padding: 0 4px;

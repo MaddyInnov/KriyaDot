@@ -1564,6 +1564,11 @@ html[data-ux='pro'] .tool-row {
 /* Clay approval card — the star of the show */
 .approval-card {
   align-self: flex-start;
+  /* Never flex-shrink: the card is a direct child of the .chat-messages
+     column flex scroller, and its overflow:hidden (for the top gradient
+     strip) makes its automatic minimum size 0 — without this, a long
+     conversation crushes the card to a thin strip and clips its label. */
+  flex-shrink: 0;
   width: 100%;
   border: 1px solid var(--amber);
   background: var(--surface);
@@ -2821,6 +2826,32 @@ html[data-theme='midnight'] .tk-fn { color: #67e8f9; }
 .msg-text {
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* Markdown-rendered assistant text (AssistantMessageText → .msg-md):
+   block elements manage their own spacing, so the pre-wrap plain-text
+   layout of .msg-text must not leak in. Element typography (p, headings,
+   code, …) is shared with .fpp-markdown in trajectory.css. */
+.msg-md {
+  white-space: normal;
+  line-height: 1.55;
+}
+
+.msg-md > :first-child {
+  margin-top: 0;
+}
+
+.msg-md > :last-child {
+  margin-bottom: 0;
+}
+
+.msg-md ul {
+  margin: 6px 0;
+  padding-left: 20px;
+}
+
+.msg-md li {
+  margin: 2px 0;
 }
 
 .avatar {
@@ -4582,6 +4613,12 @@ html[data-ux='simple'] .mic-btn.recording {
 .url-box { flex: 1; min-width: 0; font-size: 0.75rem; padding: 0.45rem 0.6rem; border-radius: 8px; background: var(--surface-2, #23232e); word-break: break-all; }
 .url-box.secret { font-family: monospace; }
 .url-box.masked { opacity: 0.6; }
+/* Base ghost-button scheme (the .small/.danger modifiers below presuppose
+   it). Without this rule a bare .btn-ghost falls back to the UA button
+   style — a light-gray box whose background ignores the theme, so in dark
+   themes the themed (light) label text sits on a near-white box and the
+   button renders as a blank white rectangle. */
+.btn-ghost { background: var(--surface-2); border: 1px solid var(--border); color: var(--text); cursor: pointer; }
 .btn-ghost.small { font-size: 0.75rem; padding: 0.25rem 0.6rem; }
 .btn-danger { font-size: 0.8rem; padding: 0.35rem 0.7rem; border-radius: 8px; border: 1px solid #fca5a5; background: rgba(252, 165, 165, 0.1); color: #fca5a5; cursor: pointer; }
 .deliveries-head { display: flex; align-items: center; justify-content: space-between; margin-top: 0.6rem; }

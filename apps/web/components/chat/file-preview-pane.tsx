@@ -7,8 +7,8 @@
 // GET /api/files/content?path=… (workspace-confined, text only; binary
 // files are refused server-side with 422).
 //
-//   - Markdown → formatted text (small local renderer in the spirit of
-//     the notes panel's preview; the chat has no shared md renderer).
+//   - Markdown → formatted text (the shared chat renderer in ./markdown,
+//     also used for assistant message text).
 //   - Code / text → the shared CodeBlock (syntax highlight by path).
 //   - Anything the endpoint can't serve (images and other binaries —
 //     the API exposes no raw-bytes URL) → metadata + a link out to the
@@ -18,6 +18,9 @@ import { useEffect, useState } from 'react';
 import { authedFetch } from '../../lib/api';
 import { CodeBlock } from '../code/CodeBlock';
 import { PaneCollapseButton } from '../collapse';
+import { renderMarkdownLite } from './markdown';
+
+export { renderMarkdownLite };
 
 const MARKDOWN_EXTS = new Set(['md', 'markdown', 'mdx']);
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico']);
@@ -25,79 +28,6 @@ const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', '
 function extOf(path: string): string {
   const dot = path.lastIndexOf('.');
   return dot >= 0 ? path.slice(dot + 1).toLowerCase() : '';
-}
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
-function inlineMd(s: string): string {
-  return escapeHtml(s)
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/(?<![*\w])\*([^*\n]+)\*/g, '<em>$1</em>')
-    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
-}
-
-/** Minimal, safe markdown → HTML (headings, lists, quotes, code fences, paragraphs). */
-export function renderMarkdownLite(src: string): string {
-  const out: string[] = [];
-  let inCode = false;
-  let codeBuf: string[] = [];
-  let listOpen = false;
-  const closeList = () => {
-    if (listOpen) {
-      out.push('</ul>');
-      listOpen = false;
-    }
-  };
-  for (const line of src.split('\n')) {
-    if (line.trimStart().startsWith('```')) {
-      if (inCode) {
-        out.push(`<pre class="md-pre">${escapeHtml(codeBuf.join('\n'))}</pre>`);
-        codeBuf = [];
-        inCode = false;
-      } else {
-        closeList();
-        inCode = true;
-      }
-      continue;
-    }
-    if (inCode) {
-      codeBuf.push(line);
-      continue;
-    }
-    const heading = /^(#{1,4})\s+(.*)$/.exec(line);
-    if (heading) {
-      closeList();
-      const level = heading[1]!.length + 1; // h1 in a pane → start at h2
-      out.push(`<h${level}>${inlineMd(heading[2]!)}</h${level}>`);
-      continue;
-    }
-    const item = /^\s*[-*]\s+(.*)$/.exec(line);
-    if (item) {
-      if (!listOpen) {
-        out.push('<ul>');
-        listOpen = true;
-      }
-      out.push(`<li>${inlineMd(item[1]!)}</li>`);
-      continue;
-    }
-    closeList();
-    if (!line.trim()) continue;
-    if (line.trimStart().startsWith('> ')) {
-      out.push(`<blockquote>${inlineMd(line.trimStart().slice(2))}</blockquote>`);
-      continue;
-    }
-    out.push(`<p>${inlineMd(line)}</p>`);
-  }
-  if (inCode) out.push(`<pre class="md-pre">${escapeHtml(codeBuf.join('\n'))}</pre>`);
-  closeList();
-  return out.join('\n');
 }
 
 interface FileContent {

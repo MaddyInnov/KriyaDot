@@ -1,14 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
-// Rich message content (chat polish): spoiler blur rendering and
-// citation chips. SpoilerText renders ||spoiler|| spans blurred until
+// Rich message content (chat polish): spoiler blur rendering,
+// citation chips, and markdown rendering for assistant text.
+// SpoilerText renders ||spoiler|| spans blurred until
 // clicked; CitationChips activates whenever a message carries
 // citations in the {title, url|docId, excerpt} shape (KB shape with
-// docTitle is normalized too).
+// docTitle is normalized too). AssistantMessageText renders assistant
+// answers through the shared markdown renderer (./markdown — the same
+// one the file preview pane uses) instead of raw plain text, so model
+// output no longer shows literal ### / ** markers; ||spoiler|| spans
+// inside an answer stay blurred via SpoilerSpan.
 
 'use client';
 
 import React, { useState } from 'react';
 import { normalizeCitations, parseSpoilerSegments, type ChatCitation } from './chat-polish';
+import { renderMarkdownLite } from './markdown';
 
 export type { ChatCitation };
 
@@ -38,6 +44,38 @@ export function SpoilerText({ text }: { text: string }) {
     <>
       {segments.map((s, i) => (s.spoiler ? <SpoilerSpan key={i} text={s.text} /> : <span key={i}>{s.text}</span>))}
     </>
+  );
+}
+
+/**
+ * Assistant message text rendered as markdown via the shared
+ * renderMarkdownLite (which escapes all source HTML first, so model
+ * text cannot inject markup). Spoiler segments keep the blur-until-
+ * clicked treatment; the surrounding text is rendered per segment, so
+ * a markdown construct split by a spoiler degrades to plainer output
+ * rather than breaking.
+ */
+export function AssistantMessageText({ text }: { text: string }) {
+  const segments = parseSpoilerSegments(text);
+  if (!segments.some((s) => s.spoiler)) {
+    // renderMarkdownLite escapes all source HTML first.
+    return <div className="msg-md" dangerouslySetInnerHTML={{ __html: renderMarkdownLite(text) }} />;
+  }
+  return (
+    <div className="msg-md">
+      {segments.map((s, i) =>
+        s.spoiler ? (
+          <SpoilerSpan key={i} text={s.text} />
+        ) : (
+          <span
+            key={i}
+            style={{ display: 'contents' }}
+            // renderMarkdownLite escapes all source HTML first.
+            dangerouslySetInnerHTML={{ __html: renderMarkdownLite(s.text) }}
+          />
+        ),
+      )}
+    </div>
   );
 }
 
