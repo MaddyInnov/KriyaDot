@@ -6,6 +6,7 @@ import './minimal-layout.css';
 import './pet.css';
 import './shell.css';
 import './trajectory.css';
+import 'katex/dist/katex.min.css';
 import './declutter.css';
 import './collapse.css';
 import AppSidebar from '../components/shell/app-sidebar';

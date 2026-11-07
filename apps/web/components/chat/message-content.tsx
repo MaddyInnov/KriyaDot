@@ -14,7 +14,7 @@
 
 import React, { useState } from 'react';
 import { normalizeCitations, parseSpoilerSegments, type ChatCitation } from './chat-polish';
-import { renderMarkdownLite } from './markdown';
+import { handleMarkdownCopyClick, renderMarkdownLite } from './markdown';
 
 export type { ChatCitation };
 
@@ -49,20 +49,26 @@ export function SpoilerText({ text }: { text: string }) {
 
 /**
  * Assistant message text rendered as markdown via the shared
- * renderMarkdownLite (which escapes all source HTML first, so model
- * text cannot inject markup). Spoiler segments keep the blur-until-
- * clicked treatment; the surrounding text is rendered per segment, so
- * a markdown construct split by a spoiler degrades to plainer output
- * rather than breaking.
+ * renderMarkdownLite (full marked + DOMPurify pipeline — model text
+ * cannot inject markup). Spoiler segments keep the blur-until-clicked
+ * treatment; the surrounding text is rendered per segment, so a
+ * markdown construct split by a spoiler degrades to plainer output
+ * rather than breaking. The onClick delegate powers code-block Copy
+ * buttons inside the rendered HTML.
  */
 export function AssistantMessageText({ text }: { text: string }) {
   const segments = parseSpoilerSegments(text);
   if (!segments.some((s) => s.spoiler)) {
-    // renderMarkdownLite escapes all source HTML first.
-    return <div className="msg-md" dangerouslySetInnerHTML={{ __html: renderMarkdownLite(text) }} />;
+    return (
+      <div
+        className="msg-md"
+        onClick={handleMarkdownCopyClick}
+        dangerouslySetInnerHTML={{ __html: renderMarkdownLite(text) }}
+      />
+    );
   }
   return (
-    <div className="msg-md">
+    <div className="msg-md" onClick={handleMarkdownCopyClick}>
       {segments.map((s, i) =>
         s.spoiler ? (
           <SpoilerSpan key={i} text={s.text} />
@@ -70,7 +76,7 @@ export function AssistantMessageText({ text }: { text: string }) {
           <span
             key={i}
             style={{ display: 'contents' }}
-            // renderMarkdownLite escapes all source HTML first.
+            // renderMarkdownLite: shared marked + DOMPurify pipeline.
             dangerouslySetInnerHTML={{ __html: renderMarkdownLite(s.text) }}
           />
         ),

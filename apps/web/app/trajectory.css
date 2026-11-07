@@ -477,6 +477,265 @@
   font-size: 12px;
 }
 
+.fpp-markdown hr,
+.msg-md hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 12px 0;
+}
+
+.fpp-markdown img,
+.msg-md img {
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--radius-sm);
+}
+
+.fpp-markdown li > input[type='checkbox'],
+.msg-md li > input[type='checkbox'] {
+  margin-right: 6px;
+  accent-color: var(--accent);
+}
+
+/* GFM tables (shared renderer): the wrap scrolls horizontally so a wide
+   table never stretches the 800px chat column or the page. */
+.md-table-wrap {
+  overflow-x: auto;
+  margin: 8px 0;
+  max-width: 100%;
+}
+
+.fpp-markdown table,
+.msg-md table {
+  border-collapse: collapse;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.fpp-markdown th,
+.fpp-markdown td,
+.msg-md th,
+.msg-md td {
+  border: 1px solid var(--border);
+  padding: 5px 9px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.fpp-markdown th,
+.msg-md th {
+  background: var(--surface-2);
+  font-weight: 700;
+  color: var(--text);
+}
+
+.fpp-markdown td,
+.msg-md td {
+  color: var(--text);
+}
+
+/* Fenced code blocks: header strip (language + Copy) over the .md-pre. */
+.md-codeblock {
+  margin: 8px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.md-codeblock-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 6px 3px 10px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.md-codeblock-lang {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-2);
+}
+
+.md-codeblock-copy {
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+.md-codeblock-copy:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.md-codeblock .md-pre {
+  margin: 0;
+  border-radius: 0;
+  overflow-x: auto;
+}
+
+.md-codeblock code {
+  display: block;
+  background: transparent;
+  padding: 0;
+  font-size: 12px;
+}
+
+/* highlight.js token colors (custom, theme-aware — no stock hljs theme
+   so both light and dark theme families stay legible on --surface-2). */
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-built_in,
+.hljs-name {
+  color: #b23a8c;
+}
+.hljs-string,
+.hljs-regexp,
+.hljs-addition {
+  color: #166534;
+}
+.hljs-comment,
+.hljs-quote {
+  color: var(--text-3);
+  font-style: italic;
+}
+.hljs-number,
+.hljs-literal {
+  color: #9a5b00;
+}
+.hljs-title,
+.hljs-title.function_,
+.hljs-section {
+  color: #5b4bc4;
+}
+.hljs-attr,
+.hljs-attribute,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-selector-id,
+.hljs-selector-class {
+  color: #b45309;
+}
+.hljs-type,
+.hljs-title.class_ {
+  color: #0e7490;
+}
+.hljs-deletion {
+  color: #b91c1c;
+}
+.hljs-emphasis {
+  font-style: italic;
+}
+.hljs-strong {
+  font-weight: 700;
+}
+
+html[data-theme='dark'] .hljs-keyword,
+html[data-theme='dark'] .hljs-selector-tag,
+html[data-theme='dark'] .hljs-built_in,
+html[data-theme='dark'] .hljs-name,
+html[data-theme='midnight'] .hljs-keyword,
+html[data-theme='midnight'] .hljs-selector-tag,
+html[data-theme='midnight'] .hljs-built_in,
+html[data-theme='midnight'] .hljs-name,
+html[data-theme='ocean'] .hljs-keyword,
+html[data-theme='ocean'] .hljs-selector-tag,
+html[data-theme='ocean'] .hljs-built_in,
+html[data-theme='ocean'] .hljs-name {
+  color: #ff7b72;
+}
+html[data-theme='dark'] .hljs-string,
+html[data-theme='dark'] .hljs-regexp,
+html[data-theme='dark'] .hljs-addition,
+html[data-theme='midnight'] .hljs-string,
+html[data-theme='midnight'] .hljs-regexp,
+html[data-theme='midnight'] .hljs-addition,
+html[data-theme='ocean'] .hljs-string,
+html[data-theme='ocean'] .hljs-regexp,
+html[data-theme='ocean'] .hljs-addition {
+  color: #a5d6ff;
+}
+html[data-theme='dark'] .hljs-number,
+html[data-theme='dark'] .hljs-literal,
+html[data-theme='midnight'] .hljs-number,
+html[data-theme='midnight'] .hljs-literal,
+html[data-theme='ocean'] .hljs-number,
+html[data-theme='ocean'] .hljs-literal {
+  color: #79c0ff;
+}
+html[data-theme='dark'] .hljs-title,
+html[data-theme='dark'] .hljs-title.function_,
+html[data-theme='dark'] .hljs-section,
+html[data-theme='midnight'] .hljs-title,
+html[data-theme='midnight'] .hljs-title.function_,
+html[data-theme='midnight'] .hljs-section,
+html[data-theme='ocean'] .hljs-title,
+html[data-theme='ocean'] .hljs-title.function_,
+html[data-theme='ocean'] .hljs-section {
+  color: #d2a8ff;
+}
+html[data-theme='dark'] .hljs-attr,
+html[data-theme='dark'] .hljs-attribute,
+html[data-theme='dark'] .hljs-variable,
+html[data-theme='dark'] .hljs-template-variable,
+html[data-theme='dark'] .hljs-selector-id,
+html[data-theme='dark'] .hljs-selector-class,
+html[data-theme='midnight'] .hljs-attr,
+html[data-theme='midnight'] .hljs-attribute,
+html[data-theme='midnight'] .hljs-variable,
+html[data-theme='midnight'] .hljs-template-variable,
+html[data-theme='midnight'] .hljs-selector-id,
+html[data-theme='midnight'] .hljs-selector-class,
+html[data-theme='ocean'] .hljs-attr,
+html[data-theme='ocean'] .hljs-attribute,
+html[data-theme='ocean'] .hljs-variable,
+html[data-theme='ocean'] .hljs-template-variable,
+html[data-theme='ocean'] .hljs-selector-id,
+html[data-theme='ocean'] .hljs-selector-class {
+  color: #ffa657;
+}
+html[data-theme='dark'] .hljs-type,
+html[data-theme='dark'] .hljs-title.class_,
+html[data-theme='midnight'] .hljs-type,
+html[data-theme='midnight'] .hljs-title.class_,
+html[data-theme='ocean'] .hljs-type,
+html[data-theme='ocean'] .hljs-title.class_ {
+  color: #7ee787;
+}
+
+/* KaTeX math: block math scrolls inside its own box, never the page. */
+.md-math-block {
+  overflow-x: auto;
+  overflow-y: hidden;
+  margin: 8px 0;
+  padding: 4px 0;
+  text-align: center;
+}
+
+.md-math .katex,
+.md-math-block .katex {
+  font-size: 1.06em;
+}
+
+/* marked-footnote output. */
+.fpp-markdown .footnotes,
+.msg-md .footnotes {
+  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-2);
+}
+
 /* Produced-file "Open" affordance inside tool rows. */
 .tool-open-btn {
   margin-top: 8px;

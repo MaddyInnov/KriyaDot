@@ -18,7 +18,7 @@ import { useEffect, useState } from 'react';
 import { authedFetch } from '../../lib/api';
 import { CodeBlock } from '../code/CodeBlock';
 import { PaneCollapseButton } from '../collapse';
-import { renderMarkdownLite } from './markdown';
+import { handleMarkdownCopyClick, renderMarkdownLite } from './markdown';
 
 export { renderMarkdownLite };
 
@@ -108,7 +108,8 @@ export function FilePreviewPane({
             {isMarkdown ? (
               <div
                 className="fpp-markdown"
-                // renderMarkdownLite escapes all source HTML first.
+                onClick={handleMarkdownCopyClick}
+                // renderMarkdownLite is the shared marked + DOMPurify pipeline.
                 dangerouslySetInnerHTML={{ __html: renderMarkdownLite(state.file.content) }}
               />
             ) : (
