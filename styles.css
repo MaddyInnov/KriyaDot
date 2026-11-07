@@ -183,6 +183,27 @@ html[data-theme='dark'] .theme-toggle .theme-icon-moon { display: inline; }
     radial-gradient(420px 320px at 78% 55%, var(--bg-glow-2), transparent 65%);
 }
 .hero-inner { position: relative; z-index: 1; }
+/* Hologram hero medallion: the brand portrait (assets/logo.png) as a
+   circular portrait floating above the headline, replacing the old
+   procedural 3D blob canvas. Slow float; static under reduced motion. */
+.hero-hologram { display: flex; justify-content: center; margin-bottom: 30px; }
+.hero-hologram-img {
+  width: 168px; height: 168px; border-radius: 50%; object-fit: cover;
+  background: #0d0e28;
+  box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.4), 0 18px 44px rgba(13, 14, 40, 0.35),
+    0 0 44px rgba(34, 211, 238, 0.32), 0 0 84px rgba(139, 92, 246, 0.3);
+  animation: hero-hologram-float 7s ease-in-out infinite;
+}
+@keyframes hero-hologram-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-10px); }
+}
+@media (max-width: 760px) {
+  .hero-hologram-img { width: 128px; height: 128px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .hero-hologram-img { animation: none; }
+}
 .hero-copy { max-width: 820px; margin: 0 auto; text-align: center; }
 .hero h1 { font-size: clamp(2.4rem, 6vw, 4.2rem); font-weight: 800; }
 .hero .lede { font-size: clamp(1.02rem, 2vw, 1.25rem); color: var(--ink-dim); max-width: 680px; margin: 18px auto 30px; }

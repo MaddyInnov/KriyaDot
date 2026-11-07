@@ -6,7 +6,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>KriyaDot — your own AI agent team, on your machine and your cloud</title>
 <meta name="description" content="KriyaDot is the open-source, local-first AI agent platform: a team of governed specialist bots in one Universal Chat, running on your machine and in your own cloud — never on our servers.">
-<link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+<link rel="icon" href="assets/logo.png" type="image/png">
 <script>
   // Theme bootstrap (runs before first paint): a saved choice wins,
   // otherwise follow the OS. Kept inline so there is no flash of the
@@ -29,7 +29,7 @@
 <header class="nav" id="top">
   <div class="nav-inner">
     <a class="brand" href="#top" aria-label="KriyaDot home">
-      <img class="brand-logo" src="assets/logo.svg" alt="" width="34" height="34">
+      <img class="brand-logo" src="assets/logo-256.png" alt="" width="34" height="34">
       <span class="brand-name">KriyaDot</span>
     </a>
     <nav class="nav-links" aria-label="Sections">
@@ -58,6 +58,9 @@
 <section class="hero" id="hero">
   <div class="hero-glow" aria-hidden="true"></div>
   <div class="wrap hero-inner">
+    <div class="hero-hologram">
+      <img class="hero-hologram-img" src="assets/logo.png" width="512" height="512" alt="KriyaDot hologram — a face woven from cyan and violet light-lines, with golden eyes">
+    </div>
     <div class="hero-copy">
       <p class="kicker">Open source · Apache-2.0 · Local-first</p>
       <h1>Your own AI agent team — <span class="grad">on your machine, in your cloud.</span></h1>
@@ -88,17 +91,17 @@
         <p>One sign-in creates your KriyaDot account. This website remembers just two things: who you are, and the address of your workspace — so any device can find its way back to it.</p>
       </li>
       <li>
-        <h3>Connect your Lightning account</h3>
-        <p>Lightning AI is where your cloud workspace will live. It uses the same Google login, so connecting is a single tap — no new password, no keys to copy around.</p>
+        <h3>Connect your own cloud host</h3>
+        <p>Your cloud workspace lives on a cloud host or server you control. Connect it once with its account ID and API key — stored encrypted in your vault — so KriyaDot can deploy there on your behalf.</p>
       </li>
       <li>
         <h3>Your workspace deploys to <em>your</em> cloud</h3>
-        <p>KriyaDot deploys into your Lightning account and your bots run there — on your cloud, under your account, billed (if at all) by Lightning to you. Not on our servers, ever.</p>
+        <p>KriyaDot deploys into your cloud host and your bots run there — on your cloud, under your account, billed (if at all) by your host provider to you. Not on our servers, ever.</p>
       </li>
     </ol>
     <div class="note-card">
-      <h3>The honest free-tier note</h3>
-      <p>Lightning's free tier genuinely works with KriyaDot: your workspace stays reachable and self-healing — it sleeps when idle and wakes when you visit. If you want it uninterrupted and always on, that comes with your own Lightning plan, paid by you directly to Lightning. We would rather tell you that up front than surprise you later.</p>
+      <h3>The honest note on sleeping hosts</h3>
+      <p>Some host plans sleep when idle to save resources: your workspace stays reachable, but the first visit after a quiet spell can carry a short wake delay while the host starts back up. An always-on plan removes that delay. We would rather tell you that up front than surprise you later.</p>
     </div>
   </div>
 </section>
@@ -200,7 +203,7 @@
       <div class="arch-arrow" aria-hidden="true">→<span>direct</span></div>
       <div class="arch-box arch-box-own">
         <h3>🏠 Your instance</h3>
-        <p>Your KriyaDot workspace — in your Lightning cloud, or on your own machine. Your bots, your data, your rules.</p>
+        <p>Your KriyaDot workspace — in your own cloud, or on your own machine. Your bots, your data, your rules.</p>
       </div>
     </div>
     <div class="note-card">
@@ -275,16 +278,9 @@
       </article>
       <article class="card price-card">
         <h3>☁️ Cloud workspace</h3>
-        <p class="price-big">Your Lightning plan</p>
-        <p>Your cloud workspace runs in <strong>your own Lightning AI account</strong>, on one of Lightning's own tiers:</p>
-        <ul class="tier-list">
-          <li>Free</li>
-          <li>Pro</li>
-          <li>Teams</li>
-          <li>Enterprise</li>
-        </ul>
-        <p>You pay Lightning directly, at Lightning's prices — we never mark it up and never see your bill.</p>
-        <a class="btn btn-ghost" href="https://lightning.ai/pricing" target="_blank" rel="noopener">See Lightning's pricing</a>
+        <p class="price-big">Cloud, on your terms</p>
+        <p>Your cloud workspace runs on a host <strong>you</strong> control — a cloud server or provider account in your own name.</p>
+        <p>You pay that host provider (if at all) directly, at their prices — KriyaDot never marks it up and never sees the bill.</p>
       </article>
     </div>
     <p class="dl-note">Platform note: KriyaDot charges no subscription today. If platform tiers are ever introduced, they will be announced openly before anything changes — existing local use stays free and open source regardless.</p>
@@ -314,7 +310,7 @@
 <footer class="footer">
   <div class="wrap footer-inner">
     <div class="footer-brand">
-      <span class="footer-brand-row"><img class="brand-logo" src="assets/logo.svg" alt="" width="30" height="30"><strong>KriyaDot</strong></span>
+      <span class="footer-brand-row"><img class="brand-logo" src="assets/logo-256.png" alt="" width="30" height="30"><strong>KriyaDot</strong></span>
       <p>Your own AI agent team — local-first, governed, open source.</p>
     </div>
     <nav aria-label="Footer">
