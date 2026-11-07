@@ -184,18 +184,21 @@
   0%, 100% { filter: brightness(1); box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.35), 0 0 14px rgba(34, 211, 238, 0.24), 0 0 22px rgba(139, 92, 246, 0.18); }
   50% { filter: brightness(1.07); box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.5), 0 0 22px rgba(34, 211, 238, 0.4), 0 0 36px rgba(139, 92, 246, 0.32); }
 }
-.pet-image.pet-mood-idle .pet-image-img { animation: pet-img-breathe 3.2s ease-in-out infinite; }
+.pet-image.pet-mood-idle .pet-image-img,
+.pet-hologram.pet-mood-idle .holo-img { animation: pet-img-breathe 3.2s ease-in-out infinite; }
 
 @keyframes pet-img-shimmer {
   0%, 100% { filter: brightness(1) hue-rotate(0deg); }
   50% { filter: brightness(1.13) hue-rotate(10deg); }
 }
-.pet-image.pet-mood-thinking .pet-image-img {
+.pet-image.pet-mood-thinking .pet-image-img,
+.pet-hologram.pet-mood-thinking .holo-img {
   animation: pet-img-shimmer 2.6s ease-in-out infinite;
   box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.5), 0 0 24px rgba(167, 139, 250, 0.45);
 }
 
-.pet-image.pet-mood-working .pet-image-img {
+.pet-image.pet-mood-working .pet-image-img,
+.pet-hologram.pet-mood-working .holo-img {
   filter: brightness(1.14) saturate(1.12);
   box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.55), 0 0 26px rgba(34, 211, 238, 0.45),
     0 0 40px rgba(139, 92, 246, 0.3);
@@ -205,33 +208,275 @@
   0%, 100% { filter: brightness(1); }
   50% { filter: brightness(1.22); }
 }
-.pet-image.pet-mood-speaking .pet-image-img {
+.pet-image.pet-mood-speaking .pet-image-img,
+.pet-hologram.pet-mood-speaking .holo-img {
   animation: pet-img-pulse 0.9s ease-in-out infinite;
   box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.55), 0 0 28px rgba(34, 211, 238, 0.5),
     0 0 44px rgba(139, 92, 246, 0.36);
 }
 
-.pet-image.pet-mood-happy .pet-image-img {
+.pet-image.pet-mood-happy .pet-image-img,
+.pet-hologram.pet-mood-happy .holo-img {
   filter: brightness(1.12) saturate(1.15) sepia(0.22);
   box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.5), 0 0 26px rgba(251, 191, 36, 0.35),
     0 0 40px rgba(139, 92, 246, 0.28);
 }
 
-.pet-image.pet-mood-celebrating .pet-image-img {
+.pet-image.pet-mood-celebrating .pet-image-img,
+.pet-hologram.pet-mood-celebrating .holo-img {
   filter: brightness(1.16) saturate(1.18);
   box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.6), 0 0 30px rgba(34, 211, 238, 0.5),
     0 0 48px rgba(139, 92, 246, 0.4);
 }
 
-.pet-image.pet-mood-error .pet-image-img {
+.pet-image.pet-mood-error .pet-image-img,
+.pet-hologram.pet-mood-error .holo-img {
   filter: saturate(0.35) brightness(0.94) sepia(0.35) hue-rotate(-38deg);
   box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.55), 0 0 22px rgba(248, 113, 113, 0.4);
 }
 
-.pet-image.pet-mood-sleeping .pet-image-img {
+.pet-image.pet-mood-sleeping .pet-image-img,
+.pet-hologram.pet-mood-sleeping .holo-img {
   filter: brightness(0.6) saturate(0.55);
   box-shadow: 0 0 0 1px rgba(100, 116, 139, 0.4), 0 0 10px rgba(100, 116, 139, 0.25);
 }
+
+/* ---- hologram (layered 2D) ------------------------------------------
+   The flagship KriyaDot pet (Hologram.tsx, .pet-hologram) in its 2D
+   presentation: the portrait lives in a clipped circular disc and pure
+   CSS layers orbit / shimmer around it. The shared container motion
+   (pet-bob / pet-think / pet-work / pet-nod / pet-celebrate on .pet-inner
+   via .pet-mood-*) and the portrait glow/filter treatments (the
+   .pet-image rules above, extended to .holo-img) apply unchanged — this
+   section only adds the hologram layers and their mood modulation.
+   Unlike .pet-image, the hologram inner keeps overflow VISIBLE: the ring
+   and particles orbit OUTSIDE the disc edge; only .holo-disc clips. */
+
+.pet-hologram {
+  overflow: visible;
+  --holo-orbit-scale: 1;
+  --holo-ring-dur: 14s;
+}
+.pet-hologram.pet-mood-thinking { --holo-orbit-scale: 0.62; --holo-ring-dur: 8s; }
+.pet-hologram.pet-mood-working { --holo-orbit-scale: 0.48; --holo-ring-dur: 5s; }
+.pet-hologram.pet-mood-sleeping { --holo-orbit-scale: 1.6; }
+.pet-hologram.pet-mood-celebrating { --holo-orbit-scale: 0.8; }
+
+.pet-hologram .pet-inner {
+  position: relative;
+  overflow: visible;
+}
+
+/* Portrait disc: circular crop; the img keeps the shared glow shadows
+   via .pet-image-img + the extended .pet-hologram mood rules above. */
+.holo-disc {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  overflow: hidden;
+}
+.holo-img { border-radius: 50%; }
+
+/* Orbit ring: conic arc segments masked down to a thin rim band,
+   rotating around the disc. Brighter in thinking / working (and faster
+   via --holo-ring-dur on the mood classes above). */
+.holo-ring {
+  position: absolute;
+  inset: -4%;
+  border-radius: 50%;
+  pointer-events: none;
+  opacity: 0.75;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    rgba(34, 211, 238, 0.9) 42deg,
+    transparent 96deg,
+    transparent 178deg,
+    rgba(167, 139, 250, 0.75) 228deg,
+    transparent 282deg
+  );
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2px));
+  animation: holo-ring-spin var(--holo-ring-dur) linear infinite;
+}
+@keyframes holo-ring-spin {
+  to { transform: rotate(360deg); }
+}
+.pet-hologram.pet-mood-thinking .holo-ring,
+.pet-hologram.pet-mood-working .holo-ring {
+  opacity: 1;
+  filter: brightness(1.3);
+}
+.pet-hologram.pet-mood-sleeping .holo-ring { opacity: 0.35; }
+
+/* Gold particle field: the layer sits slightly OUTSIDE the disc so the
+   dots orbit beyond its edge. Each .holo-p is a full-size layer rotating
+   around the centre (holo-orbit); its ::before dot rides the top rim.
+   Per-particle --dur / --d / --s come from inline styles in Hologram.tsx;
+   moods rescale every duration at once via --holo-orbit-scale. */
+.holo-particles {
+  position: absolute;
+  inset: -7%;
+  pointer-events: none;
+}
+@keyframes holo-orbit {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.holo-p {
+  position: absolute;
+  inset: 0;
+  animation: holo-orbit calc(var(--dur, 9s) * var(--holo-orbit-scale, 1)) linear infinite;
+  animation-delay: var(--d, 0s);
+}
+.holo-p:nth-child(3n) { animation-direction: reverse; }
+.holo-p::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: var(--s, 4px);
+  height: var(--s, 4px);
+  margin-left: calc(var(--s, 4px) / -2);
+  border-radius: 50%;
+  background: radial-gradient(circle, #fde68a 0%, #f59e0b 55%, rgba(245, 158, 11, 0) 100%);
+  box-shadow: 0 0 6px 2px rgba(251, 191, 36, 0.55);
+}
+.pet-hologram.pet-mood-sleeping .holo-p { opacity: 0.45; }
+
+/* Celebrating: the whole particle field bursts outward and settles,
+   synced to the shared 2.4s pet-celebrate window. */
+@keyframes holo-burst {
+  0% { transform: scale(1); opacity: 1; }
+  35% { transform: scale(1.35); opacity: 1; }
+  70% { transform: scale(1.12); opacity: 0.9; }
+  100% { transform: scale(1); opacity: 1; }
+}
+.pet-hologram.pet-mood-celebrating .holo-particles {
+  animation: holo-burst 2.4s ease-in-out infinite;
+}
+
+/* Error: particles shift red and the disc + ring flicker (the disc img
+   itself takes the red-shift filter from the extended error rule above). */
+.pet-hologram.pet-mood-error .holo-p::before {
+  background: radial-gradient(circle, #fecaca 0%, #ef4444 55%, rgba(239, 68, 68, 0) 100%);
+  box-shadow: 0 0 6px 2px rgba(248, 113, 113, 0.55);
+}
+@keyframes holo-flicker {
+  0%, 100% { opacity: 1; }
+  25% { opacity: 0.55; }
+  55% { opacity: 0.85; }
+  80% { opacity: 0.4; }
+}
+.pet-hologram.pet-mood-error .holo-disc { animation: holo-flicker 0.45s steps(2, end) 3; }
+.pet-hologram.pet-mood-error .holo-ring {
+  animation: holo-ring-spin var(--holo-ring-dur) linear infinite, holo-flicker 0.45s steps(2, end) 3;
+}
+
+/* Sheen: fine scanlines plus a highlight band sweeping the disc
+   (screen blend). Stronger and quicker while thinking / speaking. */
+.holo-sheen {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  overflow: hidden;
+  pointer-events: none;
+  opacity: 0.5;
+  mix-blend-mode: screen;
+  background: linear-gradient(
+    115deg,
+    transparent 30%,
+    rgba(255, 255, 255, 0.16) 48%,
+    rgba(103, 232, 249, 0.12) 52%,
+    transparent 68%
+  );
+  background-size: 250% 250%;
+  animation: holo-shimmer 5.5s ease-in-out infinite;
+}
+.holo-sheen::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(255, 255, 255, 0.05) 0,
+    rgba(255, 255, 255, 0.05) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+}
+@keyframes holo-shimmer {
+  0% { background-position: 120% 0; }
+  55%, 100% { background-position: -120% 0; }
+}
+.pet-hologram.pet-mood-thinking .holo-sheen,
+.pet-hologram.pet-mood-speaking .holo-sheen {
+  opacity: 0.9;
+  animation-duration: 3.2s;
+}
+
+/* Speaking EQ: three light bars along the disc's lower rim, pulsing at
+   speech cadence (pet-sound-arc-pulse timing). Light only — no mouth. */
+.holo-eq {
+  position: absolute;
+  left: 50%;
+  bottom: 5%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: flex-end;
+  gap: 18%;
+  width: 32%;
+  height: 13%;
+  opacity: 0;
+  transition: opacity 0.25s ease;
+  pointer-events: none;
+}
+.holo-eq i {
+  flex: 1;
+  border-radius: 999px;
+  background: linear-gradient(180deg, rgba(165, 243, 252, 0.95), rgba(34, 211, 238, 0.55));
+  box-shadow: 0 0 5px rgba(34, 211, 238, 0.6);
+  opacity: 0.3;
+}
+.holo-eq i:nth-child(1) { height: 55%; }
+.holo-eq i:nth-child(2) { height: 100%; }
+.holo-eq i:nth-child(3) { height: 70%; }
+.pet-hologram.pet-mood-speaking .holo-eq { opacity: 1; }
+.pet-hologram.pet-mood-speaking .holo-eq i { animation: pet-sound-arc-pulse 0.64s ease-in-out infinite; }
+.pet-hologram.pet-mood-speaking .holo-eq i:nth-child(2) { animation-delay: 0.12s; }
+.pet-hologram.pet-mood-speaking .holo-eq i:nth-child(3) { animation-delay: 0.24s; }
+
+/* Sleeping motes: three soft dust dots drifting up off the disc
+   (pet-z-float pattern, slower). Hidden unless sleeping. */
+.holo-motes {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.holo-motes i {
+  position: absolute;
+  bottom: 16%;
+  width: 7%;
+  height: 7%;
+  min-width: 2px;
+  min-height: 2px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(226, 232, 240, 0.9) 0%, rgba(148, 163, 184, 0) 70%);
+  opacity: 0;
+}
+.holo-motes i:nth-child(1) { left: 28%; }
+.holo-motes i:nth-child(2) { left: 48%; bottom: 10%; }
+.holo-motes i:nth-child(3) { left: 66%; }
+.pet-hologram.pet-mood-sleeping .holo-motes { opacity: 1; }
+@keyframes holo-mote-rise {
+  0% { transform: translateY(0); opacity: 0; }
+  25% { opacity: 0.9; }
+  100% { transform: translateY(-14px); opacity: 0; }
+}
+.pet-hologram.pet-mood-sleeping .holo-motes i { animation: holo-mote-rise 3.4s ease-in-out infinite; }
+.pet-hologram.pet-mood-sleeping .holo-motes i:nth-child(2) { animation-delay: 0.7s; }
+.pet-hologram.pet-mood-sleeping .holo-motes i:nth-child(3) { animation-delay: 1.4s; }
 
 /* ---- brand mark ------------------------------------------------------ */
 
@@ -250,9 +495,19 @@
   .pet .pet-talk-mouth,
   .pet .pet-sound-arc,
   .pet .fx-celebrating,
-  .pet .pet-image-img {
+  .pet .pet-image-img,
+  .pet .holo-ring,
+  .pet .holo-p,
+  .pet .holo-particles,
+  .pet .holo-sheen,
+  .pet .holo-disc,
+  .pet .holo-eq i,
+  .pet .holo-motes i {
     animation: none !important;
   }
+  /* Hologram layers stay visible but still: the ring keeps its static
+     arcs and the particles freeze spread around the rim via --i. */
+  .pet .holo-p { transform: rotate(calc(var(--i, 0) * 30deg)); }
   /* Static speaking mouth / celebration marks stay visible, just still. */
   .pet-mood-thinking .fx-thought,
   .pet-mood-happy .fx-happy,

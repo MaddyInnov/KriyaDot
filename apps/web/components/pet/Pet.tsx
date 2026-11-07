@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // <Pet> — renders a companion pet with a mood-driven animation.
-// - Image pets (kriyadot / voxel / droplet, see IMAGE_PETS in lib/pet.ts)
+// - kriyadot (the flagship Hologram) routes to <Hologram> (Hologram.tsx):
+//   a layered 2D presentation (portrait disc + orbit ring, gold particles,
+//   sheen, speaking EQ arcs, sleeping motes — all pure DOM/CSS) or the
+//   interactive Hologram3D canvas when variant="3d", or variant="auto"
+//   with 3D enabled and size >= 64.
+// - The other image pets (voxel / droplet, see IMAGE_PETS in lib/pet.ts)
 //   render a portrait <img> at EVERY size and variant — never SVG, never
 //   the 3D canvas. Mood is expressed through CSS glow/filter treatments on
 //   the image wrapper (pet.css, .pet-image / .pet-mood-*), never by faking
@@ -17,6 +22,7 @@ import React from 'react';
 import dynamic from 'next/dynamic';
 import { imagePetDef, petDef, type PetId, type PetMood } from '../../lib/pet';
 import { PET_ART } from './art';
+import { Hologram } from './Hologram';
 import { is3DEnabled } from '../three/ClayScene';
 
 const LazyPet3D = dynamic(() => import('./Pet3D').then((m) => m.Pet3D), { ssr: false });
@@ -35,7 +41,9 @@ export interface PetProps {
    * Rendering variant: '2d' forces the classic SVG, '3d' forces the
    * interactive 3D pet, 'auto' (default) picks 3D when 3D is enabled and
    * the size is large enough to be worth a canvas (>= 64px).
-   * Ignored for image pets, which always render their portrait image.
+   * kriyadot honours it via <Hologram> ('2d' = layered 2D, '3d'/'auto' =
+   * Hologram3D); ignored for voxel / droplet, which always render their
+   * portrait image.
    */
   variant?: 'auto' | '2d' | '3d';
   /** Disable pointer interactivity on the 3D pet. */
@@ -56,6 +64,22 @@ export function Pet({
 }: PetProps) {
   const name = petDef(pet).name;
   const ariaLabel = label ?? `${name} the companion pet (${mood})`;
+
+  // The flagship hologram gets its own layered renderer (2D layers or
+  // Hologram3D) — routed BEFORE the generic image branch below.
+  if (pet === 'kriyadot') {
+    return (
+      <Hologram
+        size={size}
+        mood={mood}
+        className={className}
+        label={ariaLabel}
+        variant={variant}
+        interactive={interactive}
+        onDoubleClick={onDoubleClick}
+      />
+    );
+  }
 
   // Image pets: portrait <img> at all sizes/variants (hero, avatars,
   // picker, overlay, work panel all flow through this one branch).

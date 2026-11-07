@@ -32,6 +32,9 @@ const MOODS: PetMood[] = [
 
 const SVG_PETS = PETS.filter((p) => !isImagePet(p.id));
 const IMAGE_PETS = PETS.filter((p) => isImagePet(p.id));
+// voxel/droplet keep the bare-<img> image branch; kriyadot (the Hologram)
+// routes to its dedicated layered renderer — see its own describe below.
+const BARE_IMAGE_PETS = IMAGE_PETS.filter((p) => p.id !== 'kriyadot');
 
 describe('roster', () => {
   it('has 8 companions: 3 image pets + 5 drawn pets', () => {
@@ -59,7 +62,7 @@ describe('Pet render (drawn pets)', () => {
 });
 
 describe('Pet render (image pets)', () => {
-  for (const p of IMAGE_PETS) {
+  for (const p of BARE_IMAGE_PETS) {
     const def = imagePetDef(p.id)!;
 
     it(`renders ${p.id} as an <img> with its brand src and mood class, never SVG`, () => {
@@ -132,7 +135,7 @@ describe('Pet speaking / celebrating moods (2D art)', () => {
     });
   }
 
-  for (const p of IMAGE_PETS) {
+  for (const p of BARE_IMAGE_PETS) {
     it(`${p.id} expresses speaking/celebrating via mood class + image only (no fake mouth)`, () => {
       const speaking = renderToStaticMarkup(<Pet pet={p.id} size={48} mood="speaking" variant="2d" />);
       expect(speaking).toContain('pet-mood-speaking');
@@ -145,6 +148,78 @@ describe('Pet speaking / celebrating moods (2D art)', () => {
       expect(celebrating).not.toContain('fx-celebrating');
     });
   }
+});
+
+describe('Hologram renderer (2D layered)', () => {
+  const def = imagePetDef('kriyadot')!;
+
+  function holoParticleCount(html: string): number {
+    return (html.match(/<i[^>]*class="holo-p(?:\s|")/g) ?? []).length;
+  }
+
+  for (const mood of MOODS) {
+    it(`renders the layered hologram for mood="${mood}"`, () => {
+      const html = renderToStaticMarkup(<Pet pet="kriyadot" size={48} mood={mood} variant="2d" />);
+      expect(html).toContain('pet-hologram');
+      expect(html).toContain('pet-frame-circle');
+      expect(html).toContain(`pet-mood-${mood}`);
+      expect(html).toContain('data-pet="kriyadot"');
+      expect(html).toContain(`data-mood="${mood}"`);
+      expect(html).toContain('holo-disc');
+      expect(html).toContain('holo-ring');
+      expect(html).toContain('holo-particles');
+      expect(holoParticleCount(html)).toBeGreaterThanOrEqual(8);
+      expect(html).toContain('holo-sheen');
+      expect(html).toContain('<img');
+      expect(html).not.toContain('<canvas');
+    });
+  }
+
+  it('uses the small portrait src at 48px', () => {
+    const html = renderToStaticMarkup(<Pet pet="kriyadot" size={48} mood="idle" variant="2d" />);
+    expect(html).toContain(`src="${def.srcSmall}"`);
+    expect(def.srcSmall).toBe('/brand/hologram-avatar-256.png');
+  });
+
+  it('uses the full portrait src at 140px, and variant="2d" forces 2D even at hero size', () => {
+    const html = renderToStaticMarkup(<Pet pet="kriyadot" size={140} mood="idle" variant="2d" />);
+    expect(html).toContain(`src="${def.src}"`);
+    expect(def.src).toBe('/brand/hologram-avatar.png');
+    expect(html).toContain('holo-disc');
+    expect(html).not.toContain('<canvas');
+  });
+
+  it('speaking is light behaviour: holo-eq arcs, no fake mouth, no SVG', () => {
+    const html = renderToStaticMarkup(<Pet pet="kriyadot" size={48} mood="speaking" variant="2d" />);
+    expect(html).toContain('pet-mood-speaking');
+    expect(html).toContain('data-mood="speaking"');
+    expect(html).toContain('holo-eq');
+    expect(html).not.toContain('pet-talk-mouth');
+    expect(html).not.toContain('pet-sound-arc');
+    expect(html).not.toContain('<svg');
+  });
+
+  it('sleeping renders the holo-motes layer', () => {
+    const html = renderToStaticMarkup(<Pet pet="kriyadot" size={48} mood="sleeping" variant="2d" />);
+    expect(html).toContain('pet-mood-sleeping');
+    expect(html).toContain('holo-motes');
+  });
+
+  it('stays 2D layered at size < 64 with variant="auto" (no canvas)', () => {
+    const html = renderToStaticMarkup(<Pet pet="kriyadot" size={32} mood="idle" variant="auto" />);
+    expect(html).toContain('pet-hologram');
+    expect(html).toContain('holo-disc');
+    expect(html).not.toContain('<canvas');
+  });
+
+  it('variant="3d" takes the 3D path: no portrait <img> in static markup', () => {
+    // Hologram3D is lazy-loaded (next/dynamic, ssr:false), so static markup
+    // renders its loading fallback / nothing canvas-like — never require a
+    // <canvas> here, only that the 2D portrait branch was not taken.
+    const html = renderToStaticMarkup(<Pet pet="kriyadot" size={140} mood="idle" variant="3d" />);
+    expect(html).not.toContain('<img');
+    expect(html).not.toContain('holo-disc');
+  });
 });
 
 describe('BrandPet / BrandMark (brand is always the Hologram)', () => {

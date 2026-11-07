@@ -33,7 +33,7 @@ export function PetPicker() {
               onClick={() => setPet(p.id)}
               title={p.blurb}
             >
-              <Pet pet={p.id} size={76} mood={selected ? 'happy' : 'idle'} label={`${p.name} preview`} />
+              <Pet pet={p.id} size={76} mood={selected ? 'happy' : 'idle'} label={`${p.name} preview`} variant="2d" />
               <span className="pet-name">{p.name}</span>
               <span className="pet-tag">{p.tagline}</span>
             </button>
