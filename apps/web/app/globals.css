@@ -5440,11 +5440,18 @@ html[data-ux='simple'] .chat-layout .msg.assistant.streaming {
   background: var(--red-soft);
 }
 
-/* --- Empty hero: greeting + suggestions centered, composer mid-screen --- */
+/* --- Empty hero: greeting + suggestions centered in the free area above,
+ * composer pinned to the bottom like standard chat apps (2026-11-09,
+ * supersedes the 2026-10-30 mid-screen composer). The messages area keeps
+ * its flex: 1 growth so it absorbs all free space ABOVE the composer;
+ * the hero centers inside it via justify-content. The composer wrap gets
+ * NO auto margin — an auto bottom margin here is what used to push the
+ * leftover space below the composer and leave a dead void under it. --- */
 .chat-main.chat-empty-hero .chat-messages {
-  flex: 0 1 auto;
-  overflow: visible;
-  justify-content: center;
+  /* safe center: when the hero is taller than the free area (short /
+   * narrow screens), it top-aligns and scrolls instead of clipping its
+   * top edge above the scroll origin. */
+  justify-content: safe center;
   padding-bottom: 8px;
 }
 
@@ -5454,7 +5461,6 @@ html[data-ux='simple'] .chat-layout .msg.assistant.streaming {
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
   padding-top: 4px;
-  margin-bottom: auto;
 }
 
 .chat-main.chat-empty-hero .composer-footer {

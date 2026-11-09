@@ -6,11 +6,12 @@
 // highlightApp prop (from a card's "Automate it") filters/highlights the
 // recipes that need that app.
 //
-// Layout: each card is a full-height flex column — a small eyebrow row
+// Layout: each card is a content-height flex column — a small eyebrow row
 // carries the trigger label ABOVE the title (they never share a row, so a
 // long recipe name wraps cleanly instead of squeezing against a pill),
-// dependency chips wrap, and the Create action is pinned to the card
-// bottom (margin-top:auto) so buttons align across a grid row. Category
+// dependency chips wrap, and the Create action sits directly below the
+// content (cards hug their content; no equal-height row stretch —
+// 2026-11-09). Category
 // chips filter client-side via starterCategory (API field + slug
 // fallback); a highlight resets the category filter to All.
 
