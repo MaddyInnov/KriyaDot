@@ -8,6 +8,14 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+// Statically imported so single-file binaries (bun --compile) carry the
+// profile library even though import.meta.url no longer points at a real
+// directory. (v0.2.0-alpha crashed at boot on exactly this: the loader only
+// read from disk, the compiled sidecar's virtual bundle filesystem has no
+// such file, and the throw took the whole API down.) The filesystem copy
+// still wins when present, so editing the JSON on a dev machine takes
+// effect without a rebuild — same pattern as providers/catalog.ts.
+import bundledProfiles from './profiles-data/subagent-profiles.json' with { type: 'json' };
 export interface SubagentProfile { id: string; name: string; specialty: string; description: string; systemPrompt: string; suggestedTools: string[]; }
 let cache: SubagentProfile[] | null = null;
 export function parseSubagentProfiles(raw: unknown): SubagentProfile[] {
@@ -21,6 +29,24 @@ export function parseSubagentProfiles(raw: unknown): SubagentProfile[] {
   }
   return out;
 }
+/**
+ * Core resolution, exported for tests: first readable filesystem candidate
+ * wins (dev machines), then the bundled copy (single-file binaries), then
+ * FAIL-SOFT — an empty library with a loud warning. This must never throw:
+ * a missing data file is not worth a dead API (v0.2.0-alpha boot crash).
+ */
+export function resolveSubagentProfiles(candidates: string[], bundled: unknown): SubagentProfile[] {
+  for (const cand of candidates) {
+    try { return parseSubagentProfiles(JSON.parse(readFileSync(cand, 'utf8'))); } catch { /* try next */ }
+  }
+  try { return parseSubagentProfiles(bundled); } catch { /* fail soft below */ }
+  console.warn(
+    '[subagent-profiles] WARNING: subagent-profiles.json not found on disk and no usable bundled copy — ' +
+    'starting with an EMPTY sub-agent profile library. Delegation to built-in specialist profiles will be unavailable.',
+  );
+  return [];
+}
+
 export function loadSubagentProfiles(): SubagentProfile[] {
   if (cache) return cache;
   const here = dirname(fileURLToPath(import.meta.url));
@@ -28,10 +54,16 @@ export function loadSubagentProfiles(): SubagentProfile[] {
   // alongside both by living in src/profiles-data and referenced relative
   // to src layout; fallback walks to src/profiles-data. (Directory is NOT
   // named "data": the repo sync tooling skips any directory called data.)
-  for (const cand of [join(here, 'profiles-data', 'subagent-profiles.json'), join(here, '..', 'src', 'profiles-data', 'subagent-profiles.json')]) {
-    try { cache = parseSubagentProfiles(JSON.parse(readFileSync(cand, 'utf8'))); return cache; } catch { /* try next */ }
-  }
-  throw new Error('subagent-profiles.json not found');
+  cache = resolveSubagentProfiles(
+    [join(here, 'profiles-data', 'subagent-profiles.json'), join(here, '..', 'src', 'profiles-data', 'subagent-profiles.json')],
+    bundledProfiles,
+  );
+  return cache;
+}
+
+/** For tests: drop the cached profiles so a later load re-resolves. */
+export function resetSubagentProfilesCache(): void {
+  cache = null;
 }
 export class SubagentProfileRegistry {
   private readonly byId: Map<string, SubagentProfile>;

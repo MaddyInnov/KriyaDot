@@ -22,6 +22,7 @@ import {
   type ShellInjectionGate,
   type ShellInjectionRunner,
 } from '@mvp/agent-runtime';
+import { SEED_FILES } from './generated/seed.js';
 
 const COMMANDS_FILE = 'slash-commands.json';
 
@@ -59,32 +60,50 @@ function seedCommandsPaths(): string[] {
   ];
 }
 
+/** Parse + validate one slash-commands JSON document. Empty map on any defect. */
+export function parseSlashCommands(raw: string): SlashCommandMap {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (typeof parsed !== 'object' || parsed === null) return {};
+    const out: SlashCommandMap = {};
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (/^[a-z0-9-]{1,32}$/.test(k) && typeof v === 'object' && v !== null) {
+        const c = v as Record<string, unknown>;
+        if (typeof c.prompt === 'string' && c.prompt.length > 0 && c.prompt.length <= 8000) {
+          out[k] = {
+            description: typeof c.description === 'string' ? c.description.slice(0, 200) : '',
+            prompt: c.prompt,
+            ...(typeof c.agent === 'string' && c.agent ? { agent: c.agent.slice(0, 100) } : {}),
+            ...(typeof c.model === 'string' && c.model ? { model: c.model.slice(0, 100) } : {}),
+            ...(c.subtask === true ? { subtask: true } : {}),
+          };
+        }
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 export function loadSlashCommands(dataDir: string): SlashCommandMap {  // Try the data dir first, then fall back to the seed file (shipped defaults).
   const candidates = [commandsPath(dataDir), ...seedCommandsPaths()];
   for (const p of candidates) {
     try {
-      const raw = fs.readFileSync(p, 'utf-8');
-      const parsed = JSON.parse(raw) as unknown;
-      if (typeof parsed !== 'object' || parsed === null) continue;
-      const out: SlashCommandMap = {};
-      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-        if (/^[a-z0-9-]{1,32}$/.test(k) && typeof v === 'object' && v !== null) {
-          const c = v as Record<string, unknown>;
-          if (typeof c.prompt === 'string' && c.prompt.length > 0 && c.prompt.length <= 8000) {
-            out[k] = {
-              description: typeof c.description === 'string' ? c.description.slice(0, 200) : '',
-              prompt: c.prompt,
-              ...(typeof c.agent === 'string' && c.agent ? { agent: c.agent.slice(0, 100) } : {}),
-              ...(typeof c.model === 'string' && c.model ? { model: c.model.slice(0, 100) } : {}),
-              ...(c.subtask === true ? { subtask: true } : {}),
-            };
-          }
-        }
-      }
+      const out = parseSlashCommands(fs.readFileSync(p, 'utf-8'));
       if (Object.keys(out).length > 0) return out;
     } catch {
       continue;
     }
+  }
+  // Single-file binaries (bun --compile): the seed paths above resolve into
+  // the virtual bundle filesystem, which has no seed/ directory — fall back
+  // to the embedded seed copy (scripts/embed-seed.mjs) so the shipped
+  // default commands survive in the installed app. Fail-soft: {} on defect.
+  const embedded = SEED_FILES[COMMANDS_FILE];
+  if (embedded) {
+    const out = parseSlashCommands(embedded);
+    if (Object.keys(out).length > 0) return out;
   }
   return {};
 }
