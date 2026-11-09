@@ -80,10 +80,14 @@ import {
   classifyProviderError,
   computeResumeAtMs,
   currentUsageWarning,
+  decideKeylessFallback,
+  isBridgeOrAgentProviderId,
+  ProviderSelectionRefusedError,
   resolveFailoverTarget,
   usageWarningFromSnapshot,
   type UsageWarning,
 } from './failover.js';
+import { CliDriverError } from './providers/cli-driver.js';
 import { getRateLimit } from './providers/rate-limit.js';
 import { TurnStateRegistry } from './turn-state.js';
 import { BotTurnScheduler } from './turn-scheduler.js';
@@ -404,7 +408,19 @@ export interface RunTurnOptions {
    */
   conversationId?: string;
   providerId?: string;
-  model?: string;  /**
+  model?: string;
+  /**
+   * Selection integrity: true when providerId/model came from an
+   * EXPLICIT user selection (the chat model picker's per-turn pick or a
+   * per-bot pinned model), as opposed to bot defaults / Auto routing.
+   * An explicit selection is honored or refused loudly
+   * (ProviderSelectionRefusedError) — never silently substituted with
+   * the free lane. Hosts set the selected* fields to the raw pick (a
+   * part the user didn't pick stays undefined).
+   */
+  explicitSelection?: boolean;
+  selectedProviderId?: string;
+  selectedModel?: string;  /**
    * Task type for smart model routing (Phase 3). Only consulted when no
    * model is pinned at the call site or on the bot — then the router picks
    * the cheapest capable model for this task type. Defaults to 'chat'.
@@ -1662,11 +1678,22 @@ ${record.priorContext ?? ''}`;
         if (!isProviderConfigError(err)) throw err;
         const fb = await resolveViableKeylessProvider({ toolUse: (opts.bot.tools?.length ?? 0) > 0 });
         if (!fb) throw err;
+        // Selection integrity: the keyless lane may only answer when it
+        // IS what the user picked, or when the user picked nothing. An
+        // explicit pick the lane doesn't honor is refused loudly — the
+        // lane is never called (see failover.ts decideKeylessFallback).
+        const decision = decideKeylessFallback({
+          explicitSelection: opts.explicitSelection === true,
+          selectedProviderId: opts.selectedProviderId,
+          selectedModel: opts.selectedModel,
+          resolvedProviderId: providerId,
+          constructionError: err,
+          lane: { providerId: fb.providerId, model: fb.model, laneName: fb.lane.id, limitsNote: fb.lane.limitsNote },
+        });
+        if (decision.action === 'refuse') throw decision.refusal;
         provider = fb.provider;
         this.providerCache.set(fb.providerId, fb.provider);
-        keylessNotice =
-          `No API key is configured for "${providerId}", so this turn is running on the free built-in lane "${fb.lane.id}" (${fb.providerId}/${fb.model}). ${fb.lane.limitsNote} ` +
-          'Add a provider key in Providers settings for full speed and your own quota.';
+        if (decision.action === 'run-with-notice') keylessNotice = decision.notice;
         providerId = fb.providerId;
         model = fb.model;
       }
@@ -2651,6 +2678,22 @@ ${record.priorContext ?? ''}`;
           turn = await doChat(provider, model);
           llmStep?.end({ ok: true });
         } catch (err) {
+          // Selection integrity: when the user EXPLICITLY picked a
+          // subscription bridge / agent CLI and its driver fails, the
+          // turn is refused loudly — it never fails over to a different
+          // provider behind the picker's back. The refusal carries the
+          // driver's own one-sentence summary as the reason.
+          if (
+            opts.explicitSelection === true &&
+            (err instanceof CliDriverError || isBridgeOrAgentProviderId(providerId))
+          ) {
+            llmStep?.end({ ok: false, errorKind: 'selection-refused' });
+            throw new ProviderSelectionRefusedError({
+              providerId: opts.selectedProviderId ?? providerId,
+              model: opts.selectedModel ?? model,
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          }
           // AI failover (W1): a hard usage-limit / quota failure switches
           // the turn to the backup provider/model ONCE and retries this
           // call. Transient 429s never reach here as failover triggers —

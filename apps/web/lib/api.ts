@@ -639,8 +639,15 @@ async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
   if (!res.ok) {
     let detail = '';
     try {
-      const body = (await res.json()) as { error?: string };
-      detail = body.error ?? '';
+      const body = (await res.json()) as { error?: string; detail?: string };
+      // The API puts the plain-words, actionable reason in `detail`
+      // (e.g. a bridge probe's "not signed in — run …" message). Show it:
+      // the bare `error` alone ("Failed to connect bridge") tells the
+      // user nothing, which is how "API 400: Failed to connect bridge"
+      // reached the field with the actual reason dropped.
+      detail = body.detail && body.detail !== body.error
+        ? `${body.error ? `${body.error} — ` : ''}${body.detail}`
+        : (body.error ?? '');
     } catch {
       // ignore
     }
@@ -1674,6 +1681,8 @@ export interface CliLoginStatus {
   signedIn: boolean;
   accountHint?: string;
   expired?: boolean;
+  /** Plain-words warning: a same-named program exists but isn't this CLI. */
+  namesakeWarning?: string;
 }
 
 export interface CliSessionInfo {
@@ -1687,8 +1696,25 @@ export function getCliAuthStatus(): Promise<{ ok: boolean; clis: CliLoginStatus[
   return apiJson('/api/cli-auth/status');
 }
 
-export function startCliLogin(cliId: string): Promise<{ ok: boolean; loginId: string; url: string }> {
+export function startCliLogin(
+  cliId: string,
+): Promise<{ ok: boolean; loginId: string; url: string; acceptsCode?: boolean }> {
   return apiJson(`/api/cli-auth/${encodeURIComponent(cliId)}/login`, { method: 'POST' });
+}
+
+/**
+ * Paste-code sign-in flows (Claude Code): hand the code the browser page
+ * showed to the waiting CLI process. The code is never stored client-side.
+ */
+export function submitCliLoginCode(cliId: string, loginId: string, code: string): Promise<{ ok: boolean }> {
+  return apiJson(
+    `/api/cli-auth/${encodeURIComponent(cliId)}/login/${encodeURIComponent(loginId)}/code`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+    },
+  );
 }
 
 export function pollCliLogin(

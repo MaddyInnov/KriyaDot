@@ -40,9 +40,41 @@ function plantCodexCredentials(home: string, key = 'sk-test-codex-key'): void {
   writeFileSync(join(home, '.codex', 'auth.json'), JSON.stringify({ OPENAI_API_KEY: key }));
 }
 
+/**
+ * Plant a fake CLI that answers `--version` the way the REAL CLI does —
+ * identity verification probes exactly that, so a silent stub would (by
+ * design) be classified as a namesake, not as the CLI.
+ */
 function plantCli(binDir: string, name: string): void {
+  const versionLine =
+    name === 'claude'
+      ? '2.0.0 (Claude Code)'
+      : name === 'codex'
+        ? 'codex-cli 0.0.0-test'
+        : name === 'opencode'
+          ? '0.0.0-test'
+          : `${name} 0.0.0-test`;
   const p = join(binDir, name);
-  writeFileSync(p, '#!/bin/sh\nexit 0\n');
+  writeFileSync(
+    p,
+    `#!/bin/sh\nif [ "$1" = "--version" ]; then echo ${JSON.stringify(versionLine)}; fi\nexit 0\n`,
+  );
+  chmodSync(p, 0o755);
+}
+
+/** Fake Codex CLI for chat turns: identity-correct --version, JSONL otherwise. */
+function plantCodexChatFake(binDir: string, jsonl: string): void {
+  const p = join(binDir, 'codex');
+  writeFileSync(
+    p,
+    [
+      '#!/bin/sh',
+      'if [ "$1" = "--version" ]; then echo "codex-cli 0.0.0-test"; exit 0; fi',
+      'if [ "$1" = "debug" ]; then exit 0; fi',
+      `printf '%b' ${JSON.stringify(jsonl)}`,
+      '',
+    ].join('\n'),
+  );
   chmodSync(p, 0o755);
 }
 
@@ -228,9 +260,8 @@ describe('bridged chat turn', () => {
     // driver speaks the CLI's `--json` JSONL event stream.
     plantCodexCredentials(fakeHome, 'sk-codex-chat');
     grantBridgeConsent('codex');
-    plantCliOutput(
+    plantCodexChatFake(
       fakeBin,
-      'codex',
       [
         JSON.stringify({ type: 'thread.started', thread_id: 'thread-test-1' }),
         JSON.stringify({ type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: 'yo' } }),

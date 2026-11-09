@@ -73,6 +73,11 @@ function sanitizeOptions(input: unknown): ModelOptions {
   return out;
 }
 
+/** Read one bot's persisted selection (undefined when the bot has none). */
+export function getBotModelSelection(dataDir: string, botId: string): BotModelSelection | undefined {
+  return readFile(dataDir)[botId];
+}
+
 /**
  * Apply persisted model selections onto in-memory bot configs (call at boot).
  */

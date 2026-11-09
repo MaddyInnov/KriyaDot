@@ -2,8 +2,9 @@
 // In-app subscription sign-in for native CLI drivers (OpenMausBot parity).
 //
 //   GET  /api/cli-auth/status                    → { ok, clis: CliLoginStatus[] }
-//   POST /api/cli-auth/:cliId/login              → { ok, loginId, url } (waits ≤60s for the URL)
+//   POST /api/cli-auth/:cliId/login              → { ok, loginId, url, acceptsCode } (waits ≤60s for the URL)
 //   GET  /api/cli-auth/:cliId/login/:loginId     → { ok, status, reason? }
+//   POST /api/cli-auth/:cliId/login/:loginId/code → { ok } (paste-code flows: hand the browser-shown code to the waiting CLI)
 //   POST /api/cli-auth/:cliId/login/:loginId/cancel → { ok }
 //   GET  /api/cli-auth/:cliId/sessions           → { ok, sessions: CliSessionInfo[] }
 //
@@ -63,6 +64,7 @@ export function createCliAuthRouter(): Router {
           signedIn: c.signedIn,
           ...(c.accountHint ? { accountHint: c.accountHint } : {}),
           ...(c.expired !== undefined ? { expired: c.expired } : {}),
+          ...(c.namesakeWarning ? { namesakeWarning: c.namesakeWarning } : {}),
         })),
       });
     } catch (err) {
@@ -92,7 +94,10 @@ export function createCliAuthRouter(): Router {
     try {
       const url = await tracked.login.url;
       tracked.url = url;
-      res.json({ ok: true, loginId, url });
+      // acceptsCode: paste-code flows (Claude Code) — after authorizing,
+      // the browser page shows a code the UI collects and POSTs to the
+      // /code endpoint below.
+      res.json({ ok: true, loginId, url, acceptsCode: tracked.login.submitCode !== undefined });
     } catch (err) {
       tracked.status = 'failed';
       tracked.reason = err instanceof Error ? err.message : String(err);
@@ -124,6 +129,31 @@ export function createCliAuthRouter(): Router {
       ...(tracked.url ? { url: tracked.url } : {}),
       ...(tracked.reason ? { reason: tracked.reason } : {}),
     });
+  });
+
+  router.post('/:cliId/login/:loginId/code', (req, res) => {
+    const tracked = logins.get(keyOf(req.params.cliId, req.params.loginId));
+    if (!tracked) {
+      res.status(404).json(errorBody('Unknown or expired login id.'));
+      return;
+    }
+    if (tracked.status !== 'waiting') {
+      res.status(409).json(errorBody('This login is no longer waiting for a code.'));
+      return;
+    }
+    if (!tracked.login.submitCode) {
+      res.status(400).json(errorBody('This sign-in does not take a code — finish it in the browser page it opened.'));
+      return;
+    }
+    const code = (req.body as { code?: unknown } | undefined)?.code;
+    // The code is a one-time secret the user pasted: validate shape only,
+    // hand it straight to the waiting CLI process, never log or store it.
+    if (typeof code !== 'string' || code.trim().length === 0 || code.length > 512) {
+      res.status(400).json(errorBody('A non-empty code is required.'));
+      return;
+    }
+    tracked.login.submitCode(code);
+    res.json({ ok: true });
   });
 
   router.post('/:cliId/login/:loginId/cancel', (req, res) => {

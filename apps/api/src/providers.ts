@@ -386,7 +386,13 @@ export function connectBridge(bridgeId: string): void {
   if (!id) throw new Error(`Unknown bridge "${bridgeId}". Expected one of "claude", "codex", "opencode".`);
   const probe = bridgeConnectable(id);
   if (!probe.ok) {
-    throw new Error(probe.reason ?? 'Bridge is not connectable on this machine.');
+    // The probe reason is plain-words and actionable; the machine code
+    // rides along so the route can return it and the UI can branch.
+    const failure = new Error(probe.reason ?? 'Bridge is not connectable on this machine.') as Error & {
+      bridgeCode?: string;
+    };
+    failure.bridgeCode = probe.code;
+    throw failure;
   }
   grantBridgeConsent(id);
   console.log(`[providers] bridge "${id}" connected (consent granted, token stays in memory only)`);
@@ -466,7 +472,13 @@ async function resolveModels(providerId: string): Promise<ModelInfo[]> {
   // which have no catalog) and a key is present; catalog fallback otherwise.
   const wantLive = preset?.liveModels === true || preset?.id.startsWith('custom-') === true;
   if (wantLive && isConfigured(providerId)) {
-    // For CLI bridges (codex/opencode), try the CLI's native model list first.
+    // CLI bridges (connected state): prefer the CLI's own model list
+    // (identity-verified + cached in the runtime); when the CLI doesn't
+    // expose one (Claude Code) or enumeration fails, use the curated
+    // catalog list for the bridge. NEVER the constructed provider's
+    // listModels(): the native driver's returns exactly ONE entry (its
+    // construction model), which is why a connected ChatGPT subscription
+    // showed only "codex/gpt-5" in the picker.
     if (preset?.bridge) {
       try {
         const { getBridgeModels } = await import('@mvp/agent-runtime/dist/providers/cli-bridge.js');
@@ -479,8 +491,9 @@ async function resolveModels(providerId: string): Promise<ModelInfo[]> {
           }));
         }
       } catch {
-        // fall through to provider listModels
+        // fall through to the curated catalog list
       }
+      return catalogModels;
     }
     try {
       const live = await createProvider(providerId).listModels();

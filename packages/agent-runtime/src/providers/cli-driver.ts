@@ -47,6 +47,32 @@ import {
   parseAgentProviderId,
   untrustedCliPrefix,
 } from './agent-cli.js';
+import {
+  bridgeNamesakeMessage,
+  resolveVerifiedCliExecutable,
+  spawnCliProcess,
+  summarizeCliFailure,
+  type CliBridgeId,
+} from './cli-bridge.js';
+
+/**
+ * A native CLI driver failure (nonzero exit, namesake binary, blocked
+ * command). The runtime recognizes this class: when the user explicitly
+ * selected the model, a driver failure is REFUSED loudly instead of
+ * silently failing over to a different provider.
+ */
+export class CliDriverError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CliDriverError';
+  }
+}
+
+/** Native-driver cli ids that are also subscription bridges. */
+const DRIVER_BRIDGE_IDS: Record<string, CliBridgeId> = {
+  'claude-code': 'claude',
+  codex: 'codex',
+};
 import { isCatastrophicCommand } from '../tools/builtin.js';
 import {
   CliLazyMcpBridge,
@@ -648,11 +674,15 @@ function defaultSpawn(
   args: string[],
   opts: { signal?: AbortSignal; env?: Record<string, string> },
 ): ReturnType<SpawnFn> {
-  const child = spawn(command, args, {
+  // spawnCliProcess applies the Windows batch-shim rule (npm CLIs are
+  // .cmd files; they run through the shell with Node's argument escaping
+  // — the args carry the user's prompt, so they are never hand-joined
+  // into a command string). Otherwise no shell: the CLI authenticates
+  // with its own login.
+  const child = spawnCliProcess(command, args, {
     stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
-    // No shell: the CLI authenticates with its own login. An explicit env
-    // is only supplied for per-engine home isolation (engine-homes.ts).
+    // An explicit env is only supplied for per-engine home isolation
+    // (engine-homes.ts).
     ...(opts.env ? { env: opts.env } : {}),
   });
   const done = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
@@ -1009,14 +1039,20 @@ export class NativeCliDriver implements LLMProvider {
 
     const content = state.finalText || state.text.text;
     if (exit.code !== 0 && !content) {
-      const errText = stderrText.trim().slice(0, MAX_STDERR_CHARS);
       const how = exit.code !== null && exit.code !== undefined
         ? `exited with code ${exit.code}`
         : `was killed by signal ${exit.signal ?? '?'}`;
-      throw new Error(
-        `Native CLI driver "${this.command}" ${how}` +
-          (errText ? `: ${errText}` : ' and produced no output.') +
-          ' The CLI handles its own auth — sign in via Settings → Providers → Sign in.',
+      // The full stderr goes to the server log ONLY. The user-facing error
+      // is a one-sentence summary: raw CLI stderr can be a multi-KB stack
+      // trace (a broken Python namesake dumped its whole traceback into a
+      // chat card in the field) and must never reach the UI verbatim.
+      if (stderrText.trim()) {
+        console.warn(`[cli-driver] ${this.cliId} failed (${how}); stderr follows:\n${stderrText.trim().slice(0, MAX_STDERR_CHARS)}`);
+      }
+      const label = this.cliId === 'claude-code' ? 'Claude Code' : this.cliId === 'codex' ? 'Codex' : this.cliId;
+      const summary = summarizeCliFailure({ cliLabel: `The ${label} CLI`, how, stderr: stderrText });
+      throw new CliDriverError(
+        `${summary} The CLI handles its own auth — sign in via Settings → Providers → Sign in.`,
       );
     }
 
@@ -1059,6 +1095,24 @@ export function createNativeCliDriver(
   }
   if (!hasNativeDriver(parsed.cliId)) return null;
   if (!opts.command) {
+    // Bridge CLIs (claude/codex): resolve to an IDENTITY-VERIFIED
+    // executable. A same-named unrelated program (a Python tool named
+    // `codex` shipped in the field) must never be spawned — and a real
+    // CLI later on PATH must win over a namesake earlier on PATH.
+    const bridgeId = DRIVER_BRIDGE_IDS[parsed.cliId];
+    if (bridgeId) {
+      const resolution = resolveVerifiedCliExecutable(bridgeId);
+      if (resolution.path) {
+        return new NativeCliDriver({ cliId: parsed.cliId, model: parsed.model, ...opts, command: resolution.path });
+      }
+      if (resolution.namesake) {
+        throw new CliDriverError(bridgeNamesakeMessage(bridgeId, resolution.namesake));
+      }
+      throw new Error(
+        `Agent CLI "${parsed.cliId}" is not installed or not on PATH. ` +
+          `Install it and sign in (Settings → Providers → Sign in) — KriyaDot uses the CLI's own login.`,
+      );
+    }
     const [detection] = detectAgentClis().filter((d) => d.id === parsed.cliId);
     if (!detection?.installed) {
       throw new Error(

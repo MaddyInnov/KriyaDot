@@ -147,6 +147,8 @@ export interface PolicySimulateBody {
 export interface ApiError {
   error: string;
   detail?: string;
+  /** Machine-readable failure code (e.g. bridge probe states) for UI branching. */
+  code?: string;
 }
 
 // Re-exports so route handlers have a single import surface.

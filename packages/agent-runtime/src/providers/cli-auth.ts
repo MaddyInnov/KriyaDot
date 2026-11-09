@@ -6,9 +6,15 @@
  * file — the user never pastes tokens anywhere.
  *
  * Security contract (hard rules):
- * - The login child is spawned WITHOUT a shell. Its stdout is scanned ONLY
- *   for an `https://` URL (the OAuth authorize URL); everything else is
- *   discarded. The buffer is capped and dropped when the flow ends.
+ * - The login child is spawned from an argv array, never a hand-built
+ *   shell string (the one Windows exception: .cmd/.bat shims go through
+ *   the shell via spawnCliProcess, which relies on Node's own argument
+ *   escaping — the login args are fixed literals anyway). The executable
+ *   is identity-verified first: a same-named impostor program is never
+ *   spawned. Its stdout is
+ *   scanned ONLY for an `https://` URL (the OAuth authorize URL);
+ *   everything else is discarded. The buffer is capped and dropped when
+ *   the flow ends.
  * - Completion is detected by credential-file SHAPE (a usable token parses),
  *   never by reading token bytes into JS strings that could leak. Status
  *   and login results carry booleans and redacted hints only.
@@ -18,14 +24,19 @@
  *   OAuth dance.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
-import { accessSync, constants, existsSync, readFileSync, statSync } from 'node:fs';
+import type { ChildProcess } from 'node:child_process';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import {
   bridgeAccountHint,
   bridgeHasUsableToken,
+  bridgeNamesakeMessage,
   bridgeTokenExpiry,
+  CLI_BRIDGE_META,
+  resolveCliExecutable,
+  resolveVerifiedCliExecutable,
+  spawnCliProcess,
   type CliBridgeId,
 } from './cli-bridge.js';
 
@@ -69,7 +80,10 @@ const COPILOT_CRED_REL = join('.config', 'gh', 'hosts.yml');
 
 export interface CliLoginStatus {
   cliId: CliAuthId;
-  /** The CLI executable was found on PATH. */
+  /**
+   * The REAL CLI was found (identity-verified for the bridge CLIs: a
+   * same-named unrelated program does not count as present).
+   */
   cliPresent: boolean;
   /** The CLI's credential file exists. */
   credentialsPresent: boolean;
@@ -79,6 +93,12 @@ export interface CliLoginStatus {
   accountHint?: string;
   /** True when the stored credential carries a past expiry timestamp. */
   expired?: boolean;
+  /**
+   * Plain-words warning when a program carries this CLI's name but is not
+   * the real CLI (e.g. a Python tool named `codex`). cliPresent is false
+   * in that state; this explains why and how to fix it.
+   */
+  namesakeWarning?: string;
 }
 
 export interface LoginResult {
@@ -92,12 +112,28 @@ export interface ActiveLogin {
   /** Resolves when the credential file becomes valid (or the flow fails). */
   done: Promise<LoginResult>;
   cancel: () => void;
+  /**
+   * Paste-code flows only (Claude Code `claude auth login`): hand the code
+   * the user copied from the browser page to the waiting CLI process.
+   * Present only when this login accepts a code. The code is written to
+   * the child's stdin and never logged or stored.
+   */
+  submitCode?: (code: string) => void;
 }
 
 export interface SpawnHandle {
   child: ChildProcess;
+  stdin?: NodeJS.WritableStream | null;
   stdout?: NodeJS.ReadableStream | null;
   stderr?: NodeJS.ReadableStream | null;
+}
+
+/** Outcome of resolving a CLI name to an executable we may spawn. */
+export interface CliResolution {
+  /** Absolute path of the verified executable, when one was found. */
+  path?: string;
+  /** Plain-words namesake warning (a same-named impostor was found instead). */
+  namesakeWarning?: string;
 }
 
 export interface CliAuthDeps {
@@ -107,6 +143,10 @@ export interface CliAuthDeps {
   fileExists?: (path: string) => boolean;
   fileMtimeMs?: (path: string) => number | undefined;
   readText?: (path: string) => string | undefined;
+  /** Platform override (tests). Defaults to process.platform. */
+  platform?: NodeJS.Platform;
+  /** CLI resolution override (tests). Defaults to identity-verified resolution. */
+  resolveCli?: (id: CliAuthId) => CliResolution;
   /** How long to wait for the OAuth URL (default 60s). */
   urlTimeoutMs?: number;
   /** How long to poll for credential completion (default 10 min). */
@@ -127,7 +167,11 @@ const CLI_COMMANDS: Record<CliAuthId, string> = {
 /**
  * Args that trigger the CLI's browser-OAuth login. These start the CLI's OWN
  * flow (it prints an authorize URL and waits); KriyaDot only watches.
- * - claude: a bare `claude` starts the interactive login when unauthenticated.
+ * - claude: `claude auth login` — the dedicated sign-in command. It works
+ *   on a plain pipe (prints the authorize URL, then reads the code the
+ *   page shows back from stdin: a paste-code flow). A bare `claude` starts
+ *   the interactive TUI instead, which prints NOTHING on a pipe — that was
+ *   the old behaviour and it could never complete in-app.
  * - codex: `codex login` manages login (prints the device/browser URL).
  * - opencode: `opencode auth login` (best-effort; the opencode CLI surface varies).
  * - antigravity: bare `agy` runs the first-run Google sign-in walkthrough;
@@ -135,7 +179,7 @@ const CLI_COMMANDS: Record<CliAuthId, string> = {
  *   a browser (documented `agy` behavior).
  */
 const LOGIN_ARGS: Record<CliAuthId, string[]> = {
-  claude: [],
+  claude: ['auth', 'login'],
   codex: ['login'],
   opencode: ['auth', 'login'],
   antigravity: [],
@@ -145,8 +189,9 @@ const LOGIN_ARGS: Record<CliAuthId, string[]> = {
 
 /** Command that reports login status without starting a flow (when available). */
 const STATUS_COMMAND: Record<CliAuthId, string[] | null> = {
-  // No status subcommand; fall back to credential-file shape.
-  claude: null,
+  // `claude auth status` prints JSON ({"loggedIn": true, "email": …}) and
+  // exits 1 when signed out — the output is parsed either way.
+  claude: ['auth', 'status'],
   // `codex login status` prints "Not logged in" or account info.
   codex: ['login', 'status'],
   opencode: null,
@@ -160,29 +205,24 @@ const URL_RE = /https?:\/\/[^\s"'<>]+/;
 const MAX_STDOUT_BYTES = 64 * 1024;
 
 function defaultHomeDir(): string {
+  // Mirrors cli-bridge.ts: on win32 a POSIX-style $HOME (MSYS/git-bash)
+  // must not produce a garbage join — fall back to homedir() there.
   const override = process.env.HOME;
-  if (override && override.length > 0) return override;
+  if (override && override.length > 0) {
+    if (process.platform !== 'win32') return override;
+    if (/^[a-zA-Z]:[\\/]/.test(override) || override.startsWith('\\\\')) return override;
+  }
   return homedir();
 }
 
-function executableOnPath(command: string, pathDirs: string[]): boolean {
-  const candidates = process.platform === 'win32' ? [`${command}.exe`, `${command}.cmd`, command] : [command];
-  for (const dir of pathDirs) {
-    for (const candidate of candidates) {
-      try {
-        accessSync(join(dir, candidate), constants.X_OK);
-        return true;
-      } catch {
-        // keep looking
-      }
-    }
-  }
-  return false;
-}
-
-function defaultSpawn(command: string, args: string[]): SpawnHandle {
-  const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-  return { child, stdout: child.stdout, stderr: child.stderr };
+function defaultSpawn(command: string, args: string[], platform: NodeJS.Platform): SpawnHandle {
+  // spawnCliProcess applies the Windows batch-shim rule: npm-installed
+  // CLIs are .cmd files, which CreateProcess cannot run directly — the
+  // spawn goes through the shell with Node's argument escaping. stdin is
+  // a pipe so paste-code login flows (Claude Code) can receive the code
+  // the user copies from the browser page.
+  const child = spawnCliProcess(command, args, { stdio: ['pipe', 'pipe', 'pipe'], platform });
+  return { child, stdin: child.stdin, stdout: child.stdout, stderr: child.stderr };
 }
 
 /** Redact anything token-shaped before a string leaves this module. */
@@ -198,6 +238,9 @@ export class CliAuthManager {
   private readonly homeDir: string;
   private readonly pathDirs: string[];
   private readonly spawnFn: (command: string, args: string[]) => SpawnHandle;
+  private readonly usingDefaultSpawn: boolean;
+  private readonly platform: NodeJS.Platform;
+  private readonly resolveCliFn: ((id: CliAuthId) => CliResolution) | undefined;
   private readonly fileExists: (path: string) => boolean;
   private readonly fileMtimeMs: (path: string) => number | undefined;
   private readonly readText: (path: string) => string | undefined;
@@ -209,7 +252,10 @@ export class CliAuthManager {
   constructor(deps: CliAuthDeps = {}) {
     this.homeDir = deps.homeDir ?? defaultHomeDir();
     this.pathDirs = deps.pathDirs ?? (process.env.PATH ?? '').split(delimiter).filter((d) => d.length > 0);
-    this.spawnFn = deps.spawnFn ?? defaultSpawn;
+    this.platform = deps.platform ?? process.platform;
+    this.usingDefaultSpawn = deps.spawnFn === undefined;
+    this.spawnFn = deps.spawnFn ?? ((command, args) => defaultSpawn(command, args, this.platform));
+    this.resolveCliFn = deps.resolveCli;
     this.fileExists =
       deps.fileExists ?? ((p) => { try { return existsSync(p); } catch { return false; } });
     this.fileMtimeMs =
@@ -222,6 +268,35 @@ export class CliAuthManager {
     this.loginTimeoutMs = deps.loginTimeoutMs ?? 600_000;
     this.pollIntervalMs = deps.pollIntervalMs ?? 2000;
     this.now = deps.now ?? (() => Date.now());
+  }
+
+  /**
+   * Resolve a CLI name to a spawnable executable. Bridge CLIs are
+   * identity-verified (a same-named impostor resolves to a namesake
+   * warning, never to a path); the other CLIs resolve by name on PATH.
+   */
+  private resolveCli(id: CliAuthId): CliResolution {
+    if (this.resolveCliFn) return this.resolveCliFn(id);
+    const opts = { homeDir: this.homeDir, pathDirs: this.pathDirs, platform: this.platform };
+    if (isBridgeId(id)) {
+      const res = resolveVerifiedCliExecutable(toBridgeId(id), opts);
+      if (res.path) return { path: res.path };
+      if (res.namesake) return { namesakeWarning: bridgeNamesakeMessage(toBridgeId(id), res.namesake) };
+      return {};
+    }
+    const found = resolveCliExecutable(CLI_COMMANDS[id], opts);
+    return found ? { path: found } : {};
+  }
+
+  /**
+   * The command string handed to spawnFn: the verified absolute path in
+   * production (so a real CLI later on PATH wins over a namesake earlier
+   * on PATH); the bare name when a caller injected its own spawnFn (test
+   * doubles own resolution there).
+   */
+  private spawnCommand(id: CliAuthId): string {
+    if (!this.usingDefaultSpawn) return CLI_COMMANDS[id];
+    return this.resolveCli(id).path ?? CLI_COMMANDS[id];
   }
 
   private credentialsPath(id: CliAuthId): string {
@@ -270,12 +345,14 @@ export class CliAuthManager {
   }
 
   cliPresent(id: CliAuthId): boolean {
-    return executableOnPath(CLI_COMMANDS[id], this.pathDirs);
+    return this.resolveCli(id).path !== undefined;
   }
 
   /** Sign-in status. Never returns token bytes. */
   async getStatus(id: CliAuthId): Promise<CliLoginStatus> {
-    const cliPresent = this.cliPresent(id);
+    const resolution = this.resolveCli(id);
+    const cliPresent = resolution.path !== undefined;
+    const namesakeWarning = resolution.namesakeWarning;
     const credPath = this.credentialsPath(id);
     const credentialsPresent = this.fileExists(credPath);
 
@@ -284,8 +361,23 @@ export class CliAuthManager {
     if (statusArgs && cliPresent) {
       const out = await this.runStatusCommand(id, statusArgs);
       if (out !== undefined) {
-        const { signedIn, accountHint } = parseCodexLoginStatus(out);
-        return { cliId: id, cliPresent, credentialsPresent, signedIn, accountHint };
+        if (id === 'claude') {
+          const parsed = parseClaudeAuthStatus(out);
+          if (parsed) {
+            return {
+              cliId: id,
+              cliPresent,
+              credentialsPresent,
+              signedIn: parsed.signedIn,
+              ...(parsed.accountHint ? { accountHint: parsed.accountHint } : {}),
+              ...(namesakeWarning ? { namesakeWarning } : {}),
+            };
+          }
+          // Unparsable output (older CLI?) — fall through to file shape.
+        } else {
+          const { signedIn, accountHint } = parseCodexLoginStatus(out);
+          return { cliId: id, cliPresent, credentialsPresent, signedIn, accountHint, ...(namesakeWarning ? { namesakeWarning } : {}) };
+        }
       }
       // Status command failed — fall through to the file-shape probe.
     }
@@ -302,14 +394,22 @@ export class CliAuthManager {
       expired = expiry !== undefined ? expiry <= this.now() : undefined;
       accountHint = bridgeAccountHint(toBridgeId(id), this.homeDir);
     }
-    return { cliId: id, cliPresent, credentialsPresent, signedIn, ...(expired !== undefined ? { expired } : {}), ...(accountHint ? { accountHint } : {}) };
+    return {
+      cliId: id,
+      cliPresent,
+      credentialsPresent,
+      signedIn,
+      ...(expired !== undefined ? { expired } : {}),
+      ...(accountHint ? { accountHint } : {}),
+      ...(namesakeWarning ? { namesakeWarning } : {}),
+    };
   }
 
   private runStatusCommand(id: CliAuthId, args: string[]): Promise<string | undefined> {
     return new Promise((resolve) => {
       let handle: SpawnHandle;
       try {
-        handle = this.spawnFn(CLI_COMMANDS[id], args);
+        handle = this.spawnFn(this.spawnCommand(id), args);
       } catch {
         resolve(undefined);
         return;
@@ -344,20 +444,46 @@ export class CliAuthManager {
    * browser; no tokens are ever pasted or displayed.
    */
   startLogin(id: CliAuthId): ActiveLogin {
+    const failedEarly = (reason: string): ActiveLogin => ({
+      url: Promise.reject(new Error(reason)),
+      done: Promise.resolve({ ok: false, reason }),
+      cancel: () => undefined,
+    });
+
+    // Preflight resolution. NEVER spawn a namesake: if resolution
+    // positively identified the only program carrying this CLI's name as
+    // a different tool, say so in plain words instead of running a
+    // stranger's binary. (With the default resolution + an injected
+    // spawnFn — the unit-test setup — a nonexistent fake PATH yields no
+    // candidates and no namesake, so test doubles are unaffected.) A
+    // bridge CLI that isn't installed at all also fails fast with the
+    // install hint rather than a raw spawn ENOENT (default spawn only:
+    // an injected spawnFn owns its own world).
+    {
+      const resolution = this.resolveCli(id);
+      if (resolution.namesakeWarning) return failedEarly(resolution.namesakeWarning);
+      if (this.usingDefaultSpawn && !resolution.path && isBridgeId(id)) {
+        const meta = CLI_BRIDGE_META[toBridgeId(id)];
+        return failedEarly(
+          `${meta.label} doesn't seem to be installed on this machine. ` +
+            `Install it (${meta.installCommand}), then try signing in again.`,
+        );
+      }
+    }
+
     const credPath = this.credentialsPath(id);
     const beforeMtime = this.fileMtimeMs(credPath);
     const beforeValid = this.hasUsableCredential(id);
+    const signInHint = isBridgeId(id)
+      ? CLI_BRIDGE_META[toBridgeId(id)].signInCommand
+      : CLI_COMMANDS[id];
 
     let handle: SpawnHandle;
     try {
-      handle = this.spawnFn(CLI_COMMANDS[id], LOGIN_ARGS[id]);
+      handle = this.spawnFn(this.spawnCommand(id), LOGIN_ARGS[id]);
     } catch (err) {
       const reason = `Could not start the ${CLI_COMMANDS[id]} login: ${err instanceof Error ? err.message : String(err)}`;
-      return {
-        url: Promise.reject(new Error(reason)),
-        done: Promise.resolve({ ok: false, reason }),
-        cancel: () => undefined,
-      };
+      return failedEarly(reason);
     }
 
     let urlResolve!: (url: string) => void;
@@ -383,7 +509,7 @@ export class CliAuthManager {
         urlReject(
           new Error(
             `The ${CLI_COMMANDS[id]} login did not print an authorize URL within ${Math.round(this.urlTimeoutMs / 1000)}s. ` +
-              `Sign in once in your terminal (${CLI_COMMANDS[id]}), then retry.`,
+              `Sign in once in your terminal (\`${signInHint}\`), then retry.`,
           ),
         );
         killChild(handle);
@@ -414,11 +540,30 @@ export class CliAuthManager {
         urlReject(
           new Error(
             `The ${CLI_COMMANDS[id]} login exited before printing an authorize URL. ` +
-              `Sign in once in your terminal (${CLI_COMMANDS[id]}), then retry.`,
+              `Sign in once in your terminal (\`${signInHint}\`), then retry.`,
           ),
         );
       }
     });
+
+    // Paste-code flow (Claude Code): after the user authorizes in the
+    // browser, the page shows a one-time code; the CLI is waiting to read
+    // it from stdin. The code is written once, never logged or stored.
+    let codeSubmitted = false;
+    const submitCode =
+      id === 'claude'
+        ? (code: string): void => {
+            if (codeSubmitted || cancelled) return;
+            const trimmed = code.trim();
+            if (!trimmed) return;
+            codeSubmitted = true;
+            try {
+              handle.stdin?.write(`${trimmed}\n`);
+            } catch {
+              // pipe already closed — completion polling will time out honestly
+            }
+          }
+        : undefined;
 
     const kill = killChild;
 
@@ -461,8 +606,36 @@ export class CliAuthManager {
         stdoutBuf = '';
         kill(handle);
       },
+      ...(submitCode ? { submitCode } : {}),
     };
   }
+}
+
+/**
+ * Parse `claude auth status` output: JSON of the shape
+ * {"loggedIn": true, "authMethod": "claude.ai", "email": "you@example.com"}.
+ * Returns undefined when the output is not that JSON (older CLI builds) so
+ * the caller falls back to the credential-file shape probe. The email is
+ * surfaced only as a redacted, length-capped account hint.
+ */
+export function parseClaudeAuthStatus(
+  output: string,
+): { signedIn: boolean; accountHint?: string } | undefined {
+  const text = output.trim();
+  if (!text) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return undefined;
+  const obj = parsed as Record<string, unknown>;
+  if (typeof obj.loggedIn !== 'boolean') return undefined;
+  if (!obj.loggedIn) return { signedIn: false };
+  const rawEmail = typeof obj.email === 'string' ? obj.email : undefined;
+  const hint = rawEmail ? redactTokenish(rawEmail).slice(0, 120) : undefined;
+  return { signedIn: true, ...(hint ? { accountHint: hint } : {}) };
 }
 
 /**

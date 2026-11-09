@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   cancelCliLogin,
   connectBridge,
@@ -14,6 +14,7 @@ import {
   removeProviderKey,
   saveProviderKey,
   startCliLogin,
+  submitCliLoginCode,
 } from '../../lib/api';
 import type { CliLoginStatus, ModelsCatalogInfo, ProviderInfo, RateLimitSnapshot } from '../../lib/api';
 import { formatResetIn, formatTokens } from '../../lib/usage';
@@ -61,6 +62,23 @@ function RateLimitLine({ rateLimit }: { rateLimit: RateLimitSnapshot | null }) {
   );
 }
 
+/** Display names + terminal sign-in commands per bridge CLI. */
+const CLI_LABELS: Record<string, string> = {
+  claude: 'Claude Code',
+  codex: 'Codex CLI',
+  opencode: 'OpenCode CLI',
+};
+
+const CLI_SIGNIN_COMMANDS: Record<string, string> = {
+  claude: 'claude auth login',
+  codex: 'codex login',
+  opencode: 'opencode auth login',
+};
+
+function cliLabelFor(bridge?: string): string {
+  return (bridge && CLI_LABELS[bridge]) || 'CLI';
+}
+
 function BridgeCard({
   p,
   models,
@@ -82,7 +100,7 @@ function BridgeCard({
   onDisconnect: (p: ProviderInfo) => void;
   onSignIn: (p: ProviderInfo) => void;
 }) {
-  const cliLabel = p.bridge === 'claude' ? 'Claude Code' : 'Codex CLI';
+  const cliLabel = cliLabelFor(p.bridge);
   const signedIn = authStatus?.signedIn === true;
   return (
     <div className="card">
@@ -140,7 +158,12 @@ function BridgeCard({
           </button>
         )}
       </div>
-      {authStatus && !signedIn && (
+      {authStatus?.namesakeWarning && (
+        <div className="warn-box" style={{ marginTop: 8 }}>
+          {authStatus.namesakeWarning}
+        </div>
+      )}
+      {authStatus && !signedIn && !authStatus.namesakeWarning && (
         <p className="small muted" style={{ marginTop: 8 }}>
           {authStatus.cliPresent
             ? 'Not signed in. Sign in here (browser OAuth — nothing to paste) or once in your terminal.'
@@ -167,6 +190,11 @@ function CliSignInModal({
   const [url, setUrl] = useState('');
   const [reason, setReason] = useState('');
   const [loginId, setLoginId] = useState('');
+  // Paste-code flows (Claude Code): the browser page shows a one-time
+  // code after authorizing; the CLI waits to receive it via stdin.
+  const [acceptsCode, setAcceptsCode] = useState(false);
+  const [code, setCode] = useState('');
+  const [codeState, setCodeState] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
 
   useEffect(() => {
     let cancelled = false;
@@ -180,6 +208,7 @@ function CliSignInModal({
         }
         setLoginId(started.loginId);
         setUrl(started.url);
+        setAcceptsCode(started.acceptsCode === true);
         setPhase('waiting');
         timer = setInterval(async () => {
           try {
@@ -224,6 +253,20 @@ function CliSignInModal({
     onClose();
   };
 
+  const submitCode = async () => {
+    if (!loginId || !code.trim()) return;
+    setCodeState('sending');
+    try {
+      await submitCliLoginCode(cliId, loginId, code.trim());
+      setCode('');
+      setCodeState('sent');
+    } catch {
+      setCodeState('error');
+    }
+  };
+
+  const signInCommand = CLI_SIGNIN_COMMANDS[cliId] ?? cliId;
+
   return (
     <div className="modal-overlay" onClick={cancel}>
       <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 520 }}>
@@ -233,7 +276,7 @@ function CliSignInModal({
           <>
             <div className="error-box">{reason}</div>
             <p className="small muted">
-              Fallback: sign in once in your terminal (<span className="mono">{cliId === 'claude' ? 'claude' : 'codex'}</span>),
+              Fallback: sign in once in your terminal (<span className="mono">{signInCommand}</span>),
               then use “Connect” above.
             </p>
           </>
@@ -241,8 +284,9 @@ function CliSignInModal({
         {(phase === 'waiting' || phase === 'done') && (
           <>
             <p className="small">
-              Complete the sign-in in your browser. Nothing to paste — this page detects
-              when the login finishes.
+              {acceptsCode
+                ? 'Open the login page and authorize. The page then shows a one-time code — paste it below and this sign-in completes.'
+                : 'Complete the sign-in in your browser. Nothing to paste — this page detects when the login finishes.'}
             </p>
             <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
               <button
@@ -256,6 +300,48 @@ function CliSignInModal({
               </button>
             </div>
             <p className="small muted mono" style={{ marginTop: 8, wordBreak: 'break-all' }}>{url}</p>
+            {acceptsCode && phase === 'waiting' && (
+              <div style={{ marginTop: 10 }}>
+                <label className="label" htmlFor="cli-login-code">
+                  Code from the login page
+                </label>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input
+                    id="cli-login-code"
+                    className="input mono"
+                    autoComplete="off"
+                    placeholder="Paste the code here"
+                    value={code}
+                    onChange={(e) => {
+                      setCode(e.target.value);
+                      setCodeState('idle');
+                    }}
+                  />
+                  <button
+                    className="btn btn-primary btn-sm"
+                    disabled={!code.trim() || codeState === 'sending'}
+                    onClick={() => void submitCode()}
+                  >
+                    {codeState === 'sending' ? 'Sending…' : 'Submit code'}
+                  </button>
+                </div>
+                {codeState === 'sent' && (
+                  <p className="small muted" style={{ marginTop: 6 }}>
+                    Code sent — finishing the sign-in…
+                  </p>
+                )}
+                {codeState === 'error' && (
+                  <p className="small" style={{ marginTop: 6, color: '#b91c1c' }}>
+                    That code could not be sent. Check it and try again, or use the terminal
+                    fallback below.
+                  </p>
+                )}
+                <p className="small muted" style={{ marginTop: 6 }}>
+                  Terminal fallback: run <span className="mono">{signInCommand}</span> in your
+                  terminal instead, then use “Connect” above.
+                </p>
+              </div>
+            )}
             {phase === 'waiting' ? (
               <p className="small muted" style={{ marginTop: 8 }}>
                 <span className="spinner" /> Waiting for you to finish signing in…
@@ -310,6 +396,11 @@ export default function ProvidersPage() {
   // In-app CLI sign-in status (OpenMausBot parity).
   const [cliAuth, setCliAuth] = useState<CliLoginStatus[]>([]);
   const [signInFor, setSignInFor] = useState<ProviderInfo | null>(null);
+  // API keys picker: search text + the provider whose config dialog is
+  // open (42 full cards were an endless scroll — the list is compact now
+  // and the existing form opens in a dialog on select).
+  const [keySearch, setKeySearch] = useState('');
+  const [keyDialogId, setKeyDialogId] = useState<string | null>(null);
   // models.dev catalog cache (OpenMausBot parity P1 #23): manual refresh only.
   const [catalogInfo, setCatalogInfo] = useState<ModelsCatalogInfo | null>(null);
   const [refreshingCatalog, setRefreshingCatalog] = useState(false);
@@ -365,11 +456,12 @@ export default function ProvidersPage() {
     void refresh();
   }, [refresh]);
 
-  const save = async (p: ProviderInfo) => {
+  /** Returns true when the key was saved (the config dialog closes then). */
+  const save = async (p: ProviderInfo): Promise<boolean> => {
     const apiKey = (keys[p.id] ?? '').trim();
     if (!apiKey) {
       setError('API key is required.');
-      return;
+      return false;
     }
     let parsedHeaders: Record<string, string> | undefined;
     const rawHeaders = (headers[p.id] ?? '').trim();
@@ -382,7 +474,7 @@ export default function ProvidersPage() {
         parsedHeaders = parsed as Record<string, string>;
       } catch (err) {
         setError(`Invalid headers JSON: ${err instanceof Error ? err.message : String(err)}`);
-        return;
+        return false;
       }
     }
     // Templated presets: every endpoint field is required on first save;
@@ -396,7 +488,7 @@ export default function ProvidersPage() {
         if (v) templateValues[field.name] = v;
         else if (!p.configured) {
           setError(`${p.name} needs its ${field.label} to build the endpoint — enter it together with the API key.`);
-          return;
+          return false;
         }
       }
       if (Object.keys(templateValues).length === 0) templateValues = undefined;
@@ -409,14 +501,17 @@ export default function ProvidersPage() {
       setKeys((s) => ({ ...s, [p.id]: '' }));
       setNotice(`Key saved for ${p.name}.`);
       await refresh();
+      return true;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      return false;
     } finally {
       setSaving('');
     }
   };
 
-  const remove = async (p: ProviderInfo) => {
+  /** Returns true when the key was removed (the config dialog closes then). */
+  const remove = async (p: ProviderInfo): Promise<boolean> => {
     setSaving(p.id);
     setError('');
     setNotice('');
@@ -424,8 +519,10 @@ export default function ProvidersPage() {
       await removeProviderKey(p.id);
       setNotice(`Key removed for ${p.name}.`);
       await refresh();
+      return true;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      return false;
     } finally {
       setSaving('');
     }
@@ -469,6 +566,148 @@ export default function ProvidersPage() {
   const localProviders = providers.filter((p) => p.local);
   const keyProviders = providers.filter((p) => !p.bridge && !p.local);
   const bridgeProviders = providers.filter((p) => p.bridge && p.detected);
+
+  // API keys picker derivations: configured providers first (they're the
+  // ones a returning user is looking for), then alphabetical; the search
+  // filters by display name or provider id.
+  const keyQuery = keySearch.trim().toLowerCase();
+  const sortedKeyProviders = [...keyProviders].sort(
+    (a, b) => Number(b.configured) - Number(a.configured) || a.name.localeCompare(b.name),
+  );
+  const filteredKeyProviders = keyQuery
+    ? sortedKeyProviders.filter(
+        (p) => p.name.toLowerCase().includes(keyQuery) || p.id.toLowerCase().includes(keyQuery),
+      )
+    : sortedKeyProviders;
+  const configuredKeyCount = keyProviders.filter((p) => p.configured).length;
+  const keyDialogProvider = keyDialogId
+    ? (providers.find((p) => p.id === keyDialogId) ?? null)
+    : null;
+
+  /**
+   * The per-provider key configuration form — the exact fields the full
+   * cards used to render inline for all 42 providers (models line, notes,
+   * template fields, API key, base URL, headers, Save/Remove). It now
+   * renders once, inside the dialog of the provider the user selected.
+   * Save/Remove close the dialog on success via onDone.
+   */
+  const renderKeyForm = (p: ProviderInfo, onDone?: () => void) => (
+    <>
+      <p className="small muted">
+        {shownModels(p).length > 0
+          ? `Models: ${shownModels(p).map((m) => modelLabel(m.id, m.free)).join(', ')}`
+          : freeOnly
+            ? 'No free models on this provider.'
+            : 'No catalog models.'}
+      </p>
+      {p.notes && <p className="small muted">{p.notes}</p>}
+      {keylessLaneFor(p) && (
+        <p className="small muted">
+          <strong>{keylessLaneFor(p)!.label}.</strong> {keylessLaneFor(p)!.note}
+          {keylessLaneFor(p)!.byokOnly && ' Pollinations is shown only as a bring-your-own-key provider — paste your own key below.'}
+        </p>
+      )}
+      <RateLimitLine rateLimit={p.rateLimit} />
+      {p.templateFields && p.templateFields.length > 0 && (
+        <>
+          <div className="grid-2">
+            {p.templateFields.map((field) => (
+              <div className="field" key={field.name}>
+                <label className="label" htmlFor={`tpl-${p.id}-${field.name}`}>
+                  {field.label}
+                </label>
+                <input
+                  id={`tpl-${p.id}-${field.name}`}
+                  className="input mono"
+                  autoComplete="off"
+                  placeholder={p.configured ? '•••••••• (saved)' : field.hint}
+                  value={templateVals[p.id]?.[field.name] ?? ''}
+                  onChange={(e) =>
+                    setTemplateVals((s) => ({
+                      ...s,
+                      [p.id]: { ...(s[p.id] ?? {}), [field.name]: e.target.value },
+                    }))
+                  }
+                />
+              </div>
+            ))}
+          </div>
+          {p.baseUrlTemplate && (
+            <p className="small muted mono" style={{ marginTop: 4 }}>
+              Endpoint: {p.baseUrlTemplate}
+            </p>
+          )}
+        </>
+      )}
+      <div className="grid-2">
+        <div className="field">
+          <label className="label" htmlFor={`key-${p.id}`}>
+            API key
+          </label>
+          <input
+            id={`key-${p.id}`}
+            className="input mono"
+            type="password"
+            autoComplete="off"
+            placeholder={p.configured ? '•••••••• (saved)' : 'paste key'}
+            value={keys[p.id] ?? ''}
+            onChange={(e) => setKeys((s) => ({ ...s, [p.id]: e.target.value }))}
+          />
+        </div>
+        <div className="field">
+          <label className="label" htmlFor={`base-${p.id}`}>
+            Base URL override (optional)
+          </label>
+          <input
+            id={`base-${p.id}`}
+            className="input mono"
+            placeholder="https://…"
+            value={baseUrls[p.id] ?? ''}
+            onChange={(e) => setBaseUrls((s) => ({ ...s, [p.id]: e.target.value }))}
+          />
+        </div>
+      </div>
+      <div className="field">
+        <label className="label" htmlFor={`headers-${p.id}`}>
+          Extra headers JSON (optional, for custom endpoints)
+        </label>
+        <textarea
+          id={`headers-${p.id}`}
+          className="textarea"
+          rows={2}
+          placeholder='{"X-Custom": "value"}'
+          value={headers[p.id] ?? ''}
+          onChange={(e) => setHeaders((s) => ({ ...s, [p.id]: e.target.value }))}
+        />
+      </div>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <button
+          className="btn btn-primary btn-sm"
+          disabled={saving === p.id}
+          onClick={() => {
+            void (async () => {
+              if (await save(p)) onDone?.();
+            })();
+          }}
+        >
+          {saving === p.id ? 'Saving…' : 'Save'}
+        </button>
+        {p.configured && (
+          <button
+            className="btn btn-danger btn-sm"
+            disabled={saving === p.id}
+            onClick={() => {
+              void (async () => {
+                if (await remove(p)) onDone?.();
+              })();
+            }}
+          >
+            Remove
+          </button>
+        )}
+      </div>
+    </>
+  );
 
   return (
     <div>
@@ -544,7 +783,7 @@ export default function ProvidersPage() {
       )}
       {signInFor?.bridge && (
         <CliSignInModal
-          cliLabel={signInFor.bridge === 'claude' ? 'Claude Code' : 'Codex CLI'}
+          cliLabel={cliLabelFor(signInFor.bridge)}
           cliId={signInFor.bridge}
           onClose={() => setSignInFor(null)}
           onDone={() => {
@@ -638,124 +877,79 @@ export default function ProvidersPage() {
       <h2 className="page-sub" style={{ marginTop: 24 }}>
         API keys
       </h2>
-      {keyProviders.map((p) => (
-        <div key={p.id} className="card">
-          <div className="row-between">
-            <div>
-              <strong>{p.name}</strong>{' '}
-              <span className={`chip ${p.configured ? 'green' : 'gray'}`}>
-                {p.configured ? 'configured' : 'no key'}
-              </span>
-            </div>
-            <span className="small muted mono">{p.id}</span>
-          </div>
-          <p className="small muted">
-            {shownModels(p).length > 0
-              ? `Models: ${shownModels(p).map((m) => modelLabel(m.id, m.free)).join(', ')}`
-              : freeOnly
-                ? 'No free models on this provider.'
-                : 'No catalog models.'}
-          </p>
-          {p.notes && <p className="small muted">{p.notes}</p>}
-          {keylessLaneFor(p) && (
-            <p className="small muted">
-              <strong>{keylessLaneFor(p)!.label}.</strong> {keylessLaneFor(p)!.note}
-              {keylessLaneFor(p)!.byokOnly && ' Pollinations is shown only as a bring-your-own-key provider — paste your own key below.'}
-            </p>
-          )}
-          <RateLimitLine rateLimit={p.rateLimit} />
-          {p.templateFields && p.templateFields.length > 0 && (
-            <>
-              <div className="grid-2">
-                {p.templateFields.map((field) => (
-                  <div className="field" key={field.name}>
-                    <label className="label" htmlFor={`tpl-${p.id}-${field.name}`}>
-                      {field.label}
-                    </label>
-                    <input
-                      id={`tpl-${p.id}-${field.name}`}
-                      className="input mono"
-                      autoComplete="off"
-                      placeholder={p.configured ? '•••••••• (saved)' : field.hint}
-                      value={templateVals[p.id]?.[field.name] ?? ''}
-                      onChange={(e) =>
-                        setTemplateVals((s) => ({
-                          ...s,
-                          [p.id]: { ...(s[p.id] ?? {}), [field.name]: e.target.value },
-                        }))
-                      }
-                    />
-                  </div>
-                ))}
+      <p className="small muted">
+        {keyProviders.length} providers — {configuredKeyCount} with a key saved. Search, then
+        select a provider to open its key settings.
+      </p>
+      <div className="field" style={{ maxWidth: 420 }}>
+        <label className="label" htmlFor="provider-search">
+          Search providers
+        </label>
+        <input
+          id="provider-search"
+          className="input"
+          type="search"
+          autoComplete="off"
+          placeholder="Search by name or id — e.g. groq"
+          value={keySearch}
+          onChange={(e) => setKeySearch(e.target.value)}
+        />
+      </div>
+      <div data-testid="provider-picker-list">
+        {filteredKeyProviders.map((p) => (
+          <div
+            key={p.id}
+            className="card"
+            role="button"
+            tabIndex={0}
+            aria-label={`Configure ${p.name}`}
+            style={{ cursor: 'pointer', padding: '10px 14px', marginBottom: 8 }}
+            onClick={() => setKeyDialogId(p.id)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                setKeyDialogId(p.id);
+              }
+            }}
+          >
+            <div className="row-between">
+              <div>
+                <strong>{p.name}</strong>{' '}
+                <span className={`chip ${p.configured ? 'green' : 'gray'}`}>
+                  {p.configured ? 'key set' : 'no key'}
+                </span>
               </div>
-              {p.baseUrlTemplate && (
-                <p className="small muted mono" style={{ marginTop: 4 }}>
-                  Endpoint: {p.baseUrlTemplate}
-                </p>
-              )}
-            </>
-          )}
-          <div className="grid-2">
-            <div className="field">
-              <label className="label" htmlFor={`key-${p.id}`}>
-                API key
-              </label>
-              <input
-                id={`key-${p.id}`}
-                className="input mono"
-                type="password"
-                autoComplete="off"
-                placeholder={p.configured ? '•••••••• (saved)' : 'paste key'}
-                value={keys[p.id] ?? ''}
-                onChange={(e) => setKeys((s) => ({ ...s, [p.id]: e.target.value }))}
-              />
-            </div>
-            <div className="field">
-              <label className="label" htmlFor={`base-${p.id}`}>
-                Base URL override (optional)
-              </label>
-              <input
-                id={`base-${p.id}`}
-                className="input mono"
-                placeholder="https://…"
-                value={baseUrls[p.id] ?? ''}
-                onChange={(e) => setBaseUrls((s) => ({ ...s, [p.id]: e.target.value }))}
-              />
+              <span className="small muted mono">{p.id}</span>
             </div>
           </div>
-          <div className="field">
-            <label className="label" htmlFor={`headers-${p.id}`}>
-              Extra headers JSON (optional, for custom endpoints)
-            </label>
-            <textarea
-              id={`headers-${p.id}`}
-              className="textarea"
-              rows={2}
-              placeholder='{"X-Custom": "value"}'
-              value={headers[p.id] ?? ''}
-              onChange={(e) => setHeaders((s) => ({ ...s, [p.id]: e.target.value }))}
-            />
-          </div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button
-              className="btn btn-primary btn-sm"
-              disabled={saving === p.id}
-              onClick={() => void save(p)}
-            >
-              {saving === p.id ? 'Saving…' : 'Save'}
-            </button>
-            {p.configured && (
-              <button
-                className="btn btn-danger btn-sm"
-                disabled={saving === p.id}
-                onClick={() => void remove(p)}
-              >
-                Remove
+        ))}
+        {filteredKeyProviders.length === 0 && keyProviders.length > 0 && (
+          <p className="muted">No providers match “{keySearch}”.</p>
+        )}
+      </div>
+      {keyDialogProvider && (
+        <div className="modal-overlay" onClick={() => setKeyDialogId(null)}>
+          <div
+            className="modal"
+            role="dialog"
+            aria-label={`Configure ${keyDialogProvider.name}`}
+            onClick={(e) => e.stopPropagation()}
+            style={{ maxWidth: 640 }}
+          >
+            <div className="row-between">
+              <h3 style={{ margin: 0 }}>{keyDialogProvider.name}</h3>
+              <span className="small muted mono">{keyDialogProvider.id}</span>
+            </div>
+            {error && <div className="error-box" style={{ marginTop: 8 }}>{error}</div>}
+            {renderKeyForm(keyDialogProvider, () => setKeyDialogId(null))}
+            <div style={{ display: 'flex', gap: 8, marginTop: 12, justifyContent: 'flex-end' }}>
+              <button className="btn btn-sm" onClick={() => setKeyDialogId(null)}>
+                Close
               </button>
-            )}
+            </div>
           </div>
         </div>
-      ))}
+      )}
       {providers.length === 0 && !error && <p className="muted">Loading providers…</p>}
 
       <ChannelsPanel />

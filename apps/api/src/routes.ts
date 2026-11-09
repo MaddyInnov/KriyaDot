@@ -152,7 +152,7 @@ import { OnBehalfOfLedger } from '@mvp/agent-runtime';
 import { TieredMemoryStore } from '@mvp/agent-runtime';
 import { PERSONAS, MBTI_TYPES, QUIZ_QUESTIONS, scoreQuiz, resolvePersona } from '@mvp/agent-runtime';
 import { saveBotPersona } from './bot-personas.js';
-import { saveBotModel } from './bot-models.js';
+import { getBotModelSelection, saveBotModel } from './bot-models.js';
 // Phase 4: marketplace + billing + tenancy/vault + protocols/voice + muse modules.
 import { registerMarketplaceRoutes } from './marketplace.js';
 import { registerBillingRoutes } from './billing.js';
@@ -2373,11 +2373,39 @@ export function createRouter(deps: RouteDeps): express.Router {
         } catch {
           conversationMode = undefined;
         }
+        // Selection integrity (2026-11-09): what counts as an EXPLICIT
+        // user selection for this turn — the request body's provider/model
+        // (the chat picker's per-turn pick; queued turns preserved theirs
+        // at enqueue time), or a concrete model pinned on this bot via
+        // the bot-models overlay (the picker's persisted choice). 'auto'
+        // pins, space overrides and auto-routing are routing, not picks;
+        // vision-upgraded turns route to a vision model by design and
+        // are not selection-bound.
+        let explicitPick: { providerId?: string; model?: string } | undefined;
+        if (turnOpts.providerId || turnOpts.model) {
+          explicitPick = { providerId: turnOpts.providerId, model: turnOpts.model };
+        } else {
+          try {
+            const pin = getBotModelSelection(config.dataDir, bot.id)?.model;
+            if (pin && pin !== AUTO_MODEL_SENTINEL) explicitPick = { model: pin };
+          } catch {
+            explicitPick = undefined;
+          }
+        }
+        const selectionFields =
+          explicitPick && !visionProviderId && !visionModelOverride
+            ? {
+                explicitSelection: true as const,
+                selectedProviderId: explicitPick.providerId,
+                selectedModel: explicitPick.model,
+              }
+            : {};
         // One turn attempt; resolves true when the attempt produced an
         // assistant reply (streamed tokens or completion tokens).
         const executeTurn = async (): Promise<boolean> => {
           turnUsage = await agentRuntime.runTurn({
           bot: turnBot,
+          ...selectionFields,
           // CA-21: `kriyadot run --bare` — skip all auto-discovery
           // (skills/MCP auto-activation + memory/context injection).
           ...(body.bare === true ? { bare: true } : {}),
@@ -3155,7 +3183,14 @@ export function createRouter(deps: RouteDeps): express.Router {
       connectBridge(req.params.bridgeId);
       res.json({ ok: true });
     } catch (err) {
-      res.status(400).json(errorBody('Failed to connect bridge', err instanceof Error ? err.message : String(err)));
+      // The detail is the probe's plain-words reason (not installed / not
+      // signed in / namesake CLI …) and `code` its machine state — the UI
+      // shows the detail, never the bare "Failed to connect bridge".
+      const bridgeCode = (err as { bridgeCode?: string } | null)?.bridgeCode;
+      res.status(400).json({
+        ...errorBody('Failed to connect bridge', err instanceof Error ? err.message : String(err)),
+        ...(bridgeCode ? { code: bridgeCode } : {}),
+      });
     }
   });
 

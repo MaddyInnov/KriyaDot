@@ -5630,3 +5630,23 @@ html[data-ux='simple'] .chat-layout .msg.assistant.streaming {
     max-height: 240px;
   }
 }
+
+/* Modal dialogs (providers page sign-in + provider key dialogs).
+   These classes were referenced but never defined, which left the
+   dialogs rendering as unstyled in-flow blocks at the page bottom. */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(4, 6, 12, 0.66);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  z-index: 1200;
+}
+
+.modal-card {
+  max-height: 88vh;
+  overflow-y: auto;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
+}

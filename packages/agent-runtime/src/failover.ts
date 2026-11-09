@@ -438,3 +438,135 @@ export class ProviderHealthTracker {
 }
 /** Process-wide tracker used by the runtime. */
 export const providerHealth = new ProviderHealthTracker();
+
+// ---------------------------------------------------------------------------
+// Selection integrity (2026-11-09, field reports): an EXPLICIT model
+// selection (the chat model picker's per-turn pick, or a per-bot pinned
+// model) must be HONORED or REFUSED LOUDLY — never silently substituted
+// with the free lane. Silent fallback remains correct only when the user
+// made no explicit selection (bot defaults / Auto routing).
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown when a turn cannot honor the user's explicit provider/model
+ * selection. The message is user-facing: it names the selection, says why
+ * it couldn't run, and states that nothing was sent to a different model.
+ * The API layer maps it to a refusal error event; it is never a fallback
+ * trigger.
+ */
+export class ProviderSelectionRefusedError extends Error {
+  readonly providerId: string;
+  readonly model?: string;
+  readonly reason: string;
+
+  constructor(args: { providerId: string; model?: string; reason: string }) {
+    super(
+      `You picked ${describeSelection(args.providerId, args.model)}, but it couldn't run — ` +
+        `${args.reason.endsWith('.') ? args.reason : `${args.reason}.`} ` +
+        'Nothing was sent to a different model. Fix it in Settings → Providers, or pick ' +
+        '"Use the free lane instead" in the model picker and send again.',
+    );
+    this.name = 'ProviderSelectionRefusedError';
+    this.providerId = args.providerId;
+    this.model = args.model;
+    this.reason = args.reason;
+  }
+}
+
+/** Human label for a selection: `Groq · gpt-oss-120b` (ids when unnamed). */
+export function describeSelection(providerId: string, model?: string): string {
+  const preset = getProviderPreset(providerId);
+  const providerName = preset?.name ?? providerId;
+  if (!model) return providerName;
+  const modelName = preset?.models?.find((m) => m.id === model)?.name ?? model;
+  return `${providerName} · ${modelName}`;
+}
+
+/** Subscription bridges and agent-CLI providers run local CLI logins. */
+export function isBridgeOrAgentProviderId(providerId: string): boolean {
+  if (providerId.startsWith('agent/')) return true;
+  return getProviderPreset(providerId)?.bridge !== undefined;
+}
+
+/**
+ * Does running on `laneProviderId/laneModel` HONOR the explicit
+ * selection? A part the user didn't pick doesn't constrain the match (a
+ * model-only pick is honored by that model on any provider; a
+ * provider-only pick by that provider with any model). A combined
+ * "provider/model" id also counts.
+ */
+export function selectionMatchesLane(args: {
+  selectedProviderId?: string;
+  selectedModel?: string;
+  laneProviderId: string;
+  laneModel: string;
+}): boolean {
+  const { selectedProviderId, selectedModel, laneProviderId, laneModel } = args;
+  const combined = selectedModel === `${laneProviderId}/${laneModel}`;
+  if (combined) return true;
+  const providerOk = !selectedProviderId || selectedProviderId === laneProviderId;
+  const modelOk = !selectedModel || selectedModel === laneModel;
+  return providerOk && modelOk;
+}
+
+/** Short plain-words reason from a provider construction (config) error. */
+export function reasonFromConfigError(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  const missing = /^Missing ([A-Z0-9_]+):/.exec(msg);
+  if (missing) return `no API key is configured for it (the ${missing[1]} key is missing)`;
+  if (/base URL|endpoint/i.test(msg)) return 'its endpoint is not configured yet';
+  const firstSentence = msg.split(/(?<=\.)\s/)[0] ?? msg;
+  return firstSentence.length > 180 ? `${firstSentence.slice(0, 177)}…` : firstSentence;
+}
+
+export type KeylessFallbackDecision =
+  | { action: 'run-silent' }
+  | { action: 'run-with-notice'; notice: string }
+  | { action: 'refuse'; refusal: ProviderSelectionRefusedError };
+
+/**
+ * Decide what the zero-setup keyless fallback may do when the resolved
+ * provider cannot be constructed (no key configured):
+ * - explicit selection honored by the lane itself → run, NO notice
+ *   (running on the picked lane is the plan, not a fallback — the
+ *   Universal+Coder field case: picker on OVH while the routed bot's
+ *   default groq is keyless);
+ * - explicit selection NOT honored → refuse loudly, no lane call;
+ * - no explicit selection (bot default) → run on the lane with a notice
+ *   that says plainly the BOT'S DEFAULT has no key (never implying the
+ *   user picked the default).
+ */
+export function decideKeylessFallback(args: {
+  explicitSelection: boolean;
+  selectedProviderId?: string;
+  selectedModel?: string;
+  resolvedProviderId: string;
+  constructionError: unknown;
+  lane: { providerId: string; model: string; laneName: string; limitsNote: string };
+}): KeylessFallbackDecision {
+  const { lane } = args;
+  if (args.explicitSelection) {
+    const honored = selectionMatchesLane({
+      selectedProviderId: args.selectedProviderId,
+      selectedModel: args.selectedModel,
+      laneProviderId: lane.providerId,
+      laneModel: lane.model,
+    });
+    if (honored) return { action: 'run-silent' };
+    return {
+      action: 'refuse',
+      refusal: new ProviderSelectionRefusedError({
+        providerId: args.selectedProviderId ?? args.resolvedProviderId,
+        model: args.selectedModel,
+        reason: reasonFromConfigError(args.constructionError),
+      }),
+    };
+  }
+  return {
+    action: 'run-with-notice',
+    notice:
+      `This bot's default provider "${args.resolvedProviderId}" has no API key configured, so this turn is ` +
+      `running on the free built-in lane "${lane.laneName}" (${lane.providerId}/${lane.model}). ${lane.limitsNote} ` +
+      'Add a provider key in Providers settings for full speed and your own quota.',
+  };
+}

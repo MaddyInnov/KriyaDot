@@ -37,6 +37,19 @@ import { spawn } from 'node:child_process';
 import { accessSync, constants } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import type { ChatMessage, LLMProvider, ModelInfo, TokenUsage, ToolDefinition } from '../types.js';
+import {
+  bridgeNamesakeMessage,
+  resolveVerifiedCliExecutable,
+  spawnCliProcess,
+  summarizeCliFailure,
+  type CliBridgeId,
+} from './cli-bridge.js';
+
+/** Agent-CLI ids whose command is also a subscription bridge CLI. */
+const AGENT_CLI_BRIDGE_IDS: Record<string, CliBridgeId> = {
+  'claude-code': 'claude',
+  codex: 'codex',
+};
 
 /** Well-known agent CLI ids. Custom ids can be registered at runtime. */
 export type AgentCliId = 'claude-code' | 'codex' | 'gemini' | 'pi' | 'grok';
@@ -149,11 +162,13 @@ export interface AgentCliDetection {
 }
 
 function commandOnPath(command: string, pathDirs: string[]): boolean {
-  const candidates = process.platform === 'win32' ? [`${command}.exe`, `${command}.cmd`, command] : [command];
+  const candidates = process.platform === 'win32' ? [`${command}.exe`, `${command}.cmd`, `${command}.bat`, command] : [command];
   for (const dir of pathDirs) {
     for (const candidate of candidates) {
       try {
-        accessSync(join(dir, candidate), constants.X_OK);
+        // Windows has no execute bit — existence is the only check (see
+        // cli-bridge.ts for why X_OK silently misfires there).
+        accessSync(join(dir, candidate), process.platform === 'win32' ? constants.F_OK : constants.X_OK);
         return true;
       } catch {
         // keep looking
@@ -261,14 +276,12 @@ function runCli(command: string, args: string[], timeoutMs: number, signal?: Abo
   return new Promise((resolve, reject) => {
     let child;
     try {
-      // shell: false — prompt text travels as argv, never through a shell.
-      // No secrets are added to the child's environment; the CLI uses its
-      // own login. process.env is inherited untouched (we add nothing).
-      child = spawn(command, args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true,
-        timeout: timeoutMs,
-      });
+      // Prompt text travels as argv, never through a hand-built shell
+      // string. spawnCliProcess applies the Windows batch-shim rule for
+      // .cmd/.bat targets (through the shell, with Node's own argument
+      // escaping). No secrets are added to the child's environment; the
+      // CLI uses its own login. process.env is inherited untouched.
+      child = spawnCliProcess(command, args, { stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs });
     } catch (err) {
       reject(new Error(`agent CLI spawn failed for "${command}": ${(err as Error).message}`));
       return;
@@ -308,11 +321,15 @@ function runCli(command: string, args: string[], timeoutMs: number, signal?: Abo
         resolve(out);
         return;
       }
-      const errText = stderr.trim().slice(0, MAX_STDERR_CHARS);
+      // Full stderr to the server log only; the rejection carries a
+      // one-sentence summary (raw stderr can be a multi-KB stack trace).
+      if (stderr.trim()) {
+        console.warn(`[agent-cli] ${command} failed; stderr follows:\n${stderr.trim().slice(0, MAX_STDERR_CHARS)}`);
+      }
+      const how = `exited with code ${code ?? `signal ${sig ?? '?'}`}`;
       reject(
         new Error(
-          `agent CLI "${command}" exited with code ${code ?? `signal ${sig ?? '?'}`}` +
-            (errText ? `: ${errText}` : ' and produced no output.') +
+          summarizeCliFailure({ cliLabel: `The agent CLI "${command}"`, how, stderr }) +
             ' The CLI handles its own auth — sign in once in the CLI itself.',
         ),
       );
@@ -353,6 +370,20 @@ export function createAgentCliProvider(
     throw new Error(`Unknown agent CLI "${parsed.cliId}". Known CLIs: ${known}.`);
   }
   if (!opts.command) {
+    // Bridge CLIs (claude/codex): identity-verified resolution, exactly
+    // like the native driver — never spawn a same-named impostor.
+    const bridgeId = AGENT_CLI_BRIDGE_IDS[parsed.cliId];
+    if (bridgeId) {
+      const resolution = resolveVerifiedCliExecutable(bridgeId);
+      if (resolution.path) {
+        return new AgentCliProvider({ cliId: parsed.cliId, model: parsed.model, ...opts, command: resolution.path });
+      }
+      if (resolution.namesake) throw new Error(bridgeNamesakeMessage(bridgeId, resolution.namesake));
+      throw new Error(
+        `Agent CLI "${spec.command}" (${parsed.cliId}) is not installed or not on PATH. ` +
+          `Install it and sign in once — KriyaDot uses the CLI's own login and never sees your credentials.`,
+      );
+    }
     const [detection] = detectAgentClis().filter((d) => d.id === parsed.cliId);
     if (!detection?.installed) {
       throw new Error(
