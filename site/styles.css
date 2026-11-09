@@ -20,7 +20,9 @@ html[data-theme='light'] {
   --ink-dim: #57534a;
   --ink-faint: #6f6a5e;
   --accent-from: #6d3fc4;
-  --accent-to: #b678e0;
+  /* #9951cf (was #b678e0): white --accent-ink on the old pale stop was only
+     3.11:1; the deepened stop keeps >= 4.5:1 across the whole --grad. */
+  --accent-to: #9951cf;
   --accent: #6d3fc4;
   --accent-hover: #5a30ae;
   --accent-soft: #f0e9fb;
@@ -52,7 +54,9 @@ html[data-theme='dark'] {
   --ink: #f1efff;
   --ink-dim: #b3b0d8;
   --ink-faint: #9d99c4;
-  --accent-from: #8b5cf6;
+  /* #9370f7 (was #8b5cf6): --accent-ink #12122b on the old stop was only
+     4.32:1; the lightened stop keeps >= 4.5:1 across the whole --grad. */
+  --accent-from: #9370f7;
   --accent-to: #d8b4fe;
   --accent: #a78bfa;
   --accent-hover: #c4b5fd;
@@ -248,7 +252,11 @@ html[data-theme='dark'] .hero-shot .shot-light { display: none; }
 }
 .card h3 { font-size: 1.12rem; }
 .card p { color: var(--ink-dim); font-size: 0.96rem; margin-bottom: 0; }
-.card a { color: var(--accent); }
+/* :not(.btn) matters: a bare ".card a" (0,1,1) outranks .btn-primary /
+   .btn-ghost (0,1,0) and repainted every card button with --accent — in the
+   dark theme that is #a78bfa on the violet --grad, ~1.0:1 (invisible labels
+   on the download buttons, 2026-11-09). Buttons keep their own ink. */
+.card a:not(.btn) { color: var(--accent); }
 
 /* ---------- steps (how it works + docs) ---------- */
 .steps { list-style: none; margin: 0 0 26px; padding: 0; counter-reset: step; display: grid; gap: 18px; }
