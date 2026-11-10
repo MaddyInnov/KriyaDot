@@ -141,6 +141,8 @@ import {
   createRequestCredentialTool,
   OnBehalfOfLedger,
 } from '@mvp/agent-runtime';
+import { createPcAccessRouter } from './pc-access-routes.js';
+import { PcAccessStore } from '@mvp/agent-runtime';
 import { createMemoryUpkeepRouter, startMemoryUpkeep, aboutMeContext } from './memory-upkeep-routes.js';
 import { createMemoryIngestionRouter } from './memory-ingestion-routes.js';
 import { startMemoryIngestionScheduler } from './memory-ingestion.js';
@@ -1278,6 +1280,13 @@ async function boot(): Promise<void> {
   const credentialProposalStore = new CredentialProposalStore(config.dataDir);
   toolRegistry.set('request_credential', createRequestCredentialTool());
 
+  // Approval-gated PC file access (2026-11-10): persisted folder grants +
+  // just-in-time request cards. read_file / list_folder reach granted PC
+  // folders through the host wired below; grants are created only by the
+  // user (Settings → Permissions → PC file access, or an "always" card
+  // approval) — never by a bot.
+  const pcAccessStore = new PcAccessStore(config.dataDir);
+
   // W13 observability: one shared span/trace store (<dataDir>/spans.db).
   // The runtime auto-instruments provider + tool choke points into it;
   // the observability routes serve the same store to Activity → Runs.
@@ -1463,6 +1472,24 @@ async function boot(): Promise<void> {
       const card = credentialProposalStore.propose(input);
       const ok = await credentialProposalStore.awaitDecision(card.id);
       return ok ? { ok: true } : { ok: false, reason: 'The user did not provide the credential (denied or expired).' };
+    },
+  });
+
+  // PC file access host: the file tools consult this host for granted
+  // folders; an ungranted path mints a request card in the approvals
+  // inbox and the tool call pauses until the user decides (allow once /
+  // always allow / deny — timeout and expiry fail closed as 'denied').
+  agentRuntime.setPcAccessHost({
+    grantedRoots: (botId) => pcAccessStore.grantsForBot(botId),
+    isOnceAllowed: (sessionId, canonicalPath) => pcAccessStore.isOnceAllowed(sessionId, canonicalPath),
+    requestAccess: async (input) => {
+      const card = pcAccessStore.requestAccess(input);
+      governance.audit('pc-access.requested', {
+        actor: input.botId,
+        sessionId: input.sessionId,
+        detail: { cardId: card.id, botId: input.botId, folder: card.folder, action: card.action, filePath: card.filePath },
+      });
+      return pcAccessStore.awaitOutcome(card.id);
     },
   });
 
@@ -4454,6 +4481,25 @@ async function boot(): Promise<void> {
     }
   }, 60_000);
   if (typeof credentialProposalSweep.unref === 'function') credentialProposalSweep.unref();
+
+  // PC file access: grant management + just-in-time request cards.
+  app.use(
+    '/api',
+    createPcAccessRouter({
+      store: pcAccessStore,
+      audit: (action, fields) => governance.audit(action, fields),
+      botIds: () => seed.bots.map((b) => b.id),
+    }),
+  );
+  const pcAccessSweep = setInterval(() => {
+    try {
+      const expired = pcAccessStore.expireStale();
+      for (const id of expired) governance.audit('pc-access.request_expired', { detail: { cardId: id } });
+    } catch {
+      // Sweeps must never break the server.
+    }
+  }, 60_000);
+  if (typeof pcAccessSweep.unref === 'function') pcAccessSweep.unref();
 
   // Sentinel health scanner (OpenMausBot parity): GET /api/health/detail.
   app.use(

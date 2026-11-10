@@ -18,7 +18,10 @@ export const DENYLIST_COMMAND_RE = /\brm\s+-rf\s+\/$|mkfs|\bdd\b[^;&|]*\bof=\/de
  *
  * - `defaultEffect` is 'require-approval': any tool with no matching rule
  *   must be approved by a human (nothing auto-runs blind).
- * - Read-only tools (read_file, web_search, web_fetch) auto-allow.
+ * - Read-only tools (read_file, list_folder, web_search, web_fetch) auto-allow.
+ *   list_folder/read_file stay safe to auto-allow because confinement is
+ *   enforced inside the tools: workspace fence + user-granted PC folders
+ *   with just-in-time approval for anything ungranted (pc-access).
  * - MCP tools (`mcp:<server>:<tool>`, legacy `mcp:<tool>`) REQUIRE APPROVAL:
  *   MCP servers are untrusted third parties. A server that exposes write,
  *   network, or command tools is NOT trusted by policy — every call pauses
@@ -32,7 +35,7 @@ export const DEFAULT_POLICY: Policy = {
   rules: [
     {
       id: 'allow-reads',
-      toolPattern: '^(read_file|web_search|web_fetch|read_skill|git_status|git_diff)$',
+      toolPattern: '^(read_file|list_folder|web_search|web_fetch|read_skill|git_status|git_diff)$',
       actionClass: 'read',
       effect: 'allow',
       reason: 'Read-only tools are safe to auto-allow',

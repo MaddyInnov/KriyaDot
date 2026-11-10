@@ -49,6 +49,7 @@ import {
 } from './mcp-apps.js';
 import type { ProvenanceNote } from './provenance.js';
 import type { CredentialProposer } from './credential-proposals.js';
+import type { PcAccessHost } from './pc-access.js';
 import {
   PEER_ORIGIN_INSTRUCTION,
   defusePeerText,
@@ -814,6 +815,7 @@ export class AgentRuntime {
   private readonly contextProviders: TurnContextProvider[] = [];
   private defaultSpendCapGateFactory: ((botId: string) => SpendCapGate) | null = null;
   private credentialProposer: CredentialProposer | null = null;
+  private pcAccessHost: PcAccessHost | null = null;
   /**
    * Live turn state (W8a): what each busy bot is doing right now.
    * Updated as turns progress; entries clear on turn end/error. The
@@ -999,6 +1001,16 @@ export class AgentRuntime {
    */
   setCredentialProposer(proposer: CredentialProposer | null): void {
     this.credentialProposer = proposer;
+  }
+
+  /**
+   * Host wiring: PC file access (approval-gated PC folders). When set,
+   * read_file / list_folder can reach user-granted folders outside the
+   * workspace and raise just-in-time request cards for ungranted ones.
+   * Covers every runTurn caller. Null restores the workspace fence.
+   */
+  setPcAccessHost(host: PcAccessHost | null): void {
+    this.pcAccessHost = host;
   }
 
   /**
@@ -1826,6 +1838,7 @@ ${record.priorContext ?? ''}`;
       conversationId: opts.conversationId ?? sessionId,
       signal: opts.signal,
       credentialProposer: this.credentialProposer ?? undefined,
+      pcAccess: this.pcAccessHost ?? undefined,
       widget: widgetCoordinator
         ? {
             // W7: questions are addressed to the bot's owner person.

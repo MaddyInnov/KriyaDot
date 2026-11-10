@@ -104,6 +104,7 @@ export * from './self-update.js';
 export * from './team-markdown.js';
 export * from './memory-upkeep.js';
 export * from './credential-proposals.js';
+export * from './pc-access.js';
 export * from './routing-decisions.js';
 export * from './failover.js';
 export * from './turn-state.js';

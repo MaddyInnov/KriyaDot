@@ -1205,6 +1205,84 @@ export async function decideCredentialProposal(
   return res.card;
 }
 
+// ---- PC file access (approval-gated PC folders) ----------------------------
+
+export interface PcFolderGrant {
+  id: string;
+  /** Canonical absolute folder path. */
+  path: string;
+  /** 'all' = every bot; otherwise the single bot id. */
+  scope: string;
+  readOnly: boolean;
+  createdAt: number;
+  createdVia: 'settings' | 'approval';
+}
+
+export interface PcSpecialFolder {
+  name: 'desktop' | 'documents' | 'downloads' | 'home';
+  path: string | null;
+  exists: boolean;
+}
+
+export interface PcAccessRequest {
+  id: string;
+  botId: string;
+  sessionId: string;
+  folder: string;
+  action: 'list' | 'read';
+  filePath: string | null;
+  status: 'pending' | 'allowed-once' | 'always-allowed' | 'denied' | 'expired';
+  createdAt: number;
+  expiresAt: number | null;
+  decidedAt: number | null;
+}
+
+export async function getPcGrants(): Promise<PcFolderGrant[]> {
+  const res = await apiJson<{ ok: boolean; grants: PcFolderGrant[] }>('/api/pc-access/grants');
+  return res.grants;
+}
+
+export async function addPcGrant(body: {
+  path?: string;
+  specialFolder?: string;
+  scope?: string;
+}): Promise<PcFolderGrant> {
+  const res = await apiJson<{ ok: boolean; grant: PcFolderGrant }>('/api/pc-access/grants', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+  return res.grant;
+}
+
+export async function revokePcGrant(id: string): Promise<void> {
+  await apiJson(`/api/pc-access/grants/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+export async function getPcSpecialFolders(): Promise<PcSpecialFolder[]> {
+  const res = await apiJson<{ ok: boolean; folders: PcSpecialFolder[] }>(
+    '/api/pc-access/special-folders',
+  );
+  return res.folders;
+}
+
+/** Just-in-time PC access request cards (approvals inbox). */
+export async function getPcAccessRequests(status?: string): Promise<PcAccessRequest[]> {
+  const q = status ? `?status=${encodeURIComponent(status)}` : '';
+  const res = await apiJson<{ ok: boolean; cards: PcAccessRequest[] }>(`/api/pc-access/requests${q}`);
+  return res.cards;
+}
+
+export async function decidePcAccessRequest(
+  id: string,
+  decision: 'allow-once' | 'always' | 'deny',
+): Promise<PcAccessRequest> {
+  const res = await apiJson<{ ok: boolean; card: PcAccessRequest }>(
+    `/api/pc-access/requests/${encodeURIComponent(id)}`,
+    { method: 'POST', body: JSON.stringify({ decision }) },
+  );
+  return res.card;
+}
+
 export async function getPeerApprovals(status?: string): Promise<PeerApprovalCard[]> {
   const q = status ? `?status=${encodeURIComponent(status)}` : '';
   const res = await apiJson<{ ok: boolean; cards: PeerApprovalCard[] }>(`/api/peer-approvals${q}`);

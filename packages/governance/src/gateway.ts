@@ -188,6 +188,7 @@ export const AUDIT_PRUNE_EVERY_INSERTS = 1_000;
 export class GovernanceGateway {
   private static readonly READ_TOOLS = new Set([
     'read_file',
+    'list_folder',
     'web_search',
     'web_fetch',
     'list_dir',

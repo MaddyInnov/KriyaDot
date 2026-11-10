@@ -28,7 +28,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
   { href: '/providers', label: 'Providers & models', hint: 'API keys plus Claude Code, Codex & OpenCode CLI logins' },
   { href: '/messaging', label: 'Messaging', hint: 'WhatsApp, Telegram, Slack & Discord channels' },
   { href: '/usage', label: 'Usage & costs', hint: 'Tokens, spend and budgets' },
-  { href: '/permissions', label: 'Permissions', hint: 'What bots may do without asking first' },
+  { href: '/permissions', label: 'Permissions', hint: 'What bots may do without asking first · PC folder access' },
   { href: '/preferences', label: 'Preferences', hint: 'Companion, accent, privacy, local models, updates' },
   { href: '/more', label: 'Modules hub', hint: 'Feed, Goals, Research, Knowledge Base & the User Guide' },
 ];

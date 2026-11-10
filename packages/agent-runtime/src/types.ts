@@ -10,6 +10,8 @@ import type { WidgetAnswer, WidgetHost, WidgetPayload } from './widgets.js';
 export type { WidgetAnswer, WidgetHost, WidgetPayload };
 import type { CredentialProposer } from './credential-proposals.js';
 export type { CredentialProposer };
+import type { PcAccessHost } from './pc-access.js';
+export type { PcAccessHost };
 import type { ExecutionPolicyConfig } from './execution-policy.js';
 export type { ExecutionPolicyConfig };
 import type { HookConfigEntry } from './hooks.js';
@@ -311,6 +313,13 @@ export interface ToolContext {
    * Set by the runtime from its credential proposer (host-wired).
    */
   credentialProposer?: CredentialProposer;
+  /**
+   * PC file access host (approval-gated PC folders, pc-access.ts). When
+   * set, the file tools (read_file / list_folder) can reach user-granted
+   * PC folders outside the workspace and raise just-in-time request cards
+   * for ungranted ones. Unset → file tools stay workspace-fenced.
+   */
+  pcAccess?: PcAccessHost;
 }
 
 export interface ToolDefinition {

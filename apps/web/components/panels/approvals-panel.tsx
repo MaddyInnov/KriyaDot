@@ -12,11 +12,13 @@ import {
   revokePeerGrant,
   getCredentialProposals,
   decideCredentialProposal,
+  getPcAccessRequests,
+  decidePcAccessRequest,
   getWatchItems,
   dismissWatchItem,
   draftWatchItem,
 } from '../../lib/api';
-import type { ApprovalRecord, PeerApprovalCard, PeerGrant, PeerDecision, CredentialProposal, WatchItem } from '../../lib/api';
+import type { ApprovalRecord, PeerApprovalCard, PeerGrant, PeerDecision, CredentialProposal, PcAccessRequest, WatchItem } from '../../lib/api';
 import { BulkBar, ShortcutHelp, useActivityShortcuts, type TriageHandlers } from '../activity/triage';
 import { PeerOriginSecurityNote } from '../provenance-chip';
 
@@ -53,6 +55,8 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
   const [peerGrants, setPeerGrants] = useState<PeerGrant[]>([]);
   // --- Credential proposal cards (a bot needs a secret it doesn't have) ---
   const [credPending, setCredPending] = useState<CredentialProposal[]>([]);
+  // --- PC file access cards (a bot wants to list/read an ungranted folder) ---
+  const [pcPending, setPcPending] = useState<PcAccessRequest[]>([]);
   // --- Watch items (W5): proactive account watching "needs you" entries ---
   const [watchNew, setWatchNew] = useState<WatchItem[]>([]);
   const [watchActioned, setWatchActioned] = useState<WatchItem[]>([]);
@@ -73,13 +77,14 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
 
   const refresh = useCallback(async () => {
     try {
-      const [p, all, pp, ppAll, grants, creds, wNew, wActioned] = await Promise.all([
+      const [p, all, pp, ppAll, grants, creds, pcReqs, wNew, wActioned] = await Promise.all([
         getApprovals('pending'),
         getApprovals(),
         getPeerApprovals('pending'),
         getPeerApprovals(),
         getPeerGrants(),
         getCredentialProposals('pending'),
+        getPcAccessRequests('pending').catch(() => [] as PcAccessRequest[]),
         getWatchItems('new').catch(() => [] as WatchItem[]),
         getWatchItems('actioned').catch(() => [] as WatchItem[]),
       ]);
@@ -89,6 +94,7 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
       setPeerDecided(ppAll.filter((c) => c.status !== 'pending').slice(0, 20));
       setPeerGrants(grants);
       setCredPending(creds);
+      setPcPending(pcReqs);
       setWatchNew(wNew);
       setWatchActioned(wActioned.slice(0, 10));
       setError('');
@@ -588,6 +594,16 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
         refresh={refresh}
       />
 
+      {/* --- PC file access cards: a bot wants a folder outside the
+          workspace. Allow once = this session; Always = a standing
+          read-only grant for that bot only; Deny fails the call closed. - */}
+      <PcAccessRequestsSection
+        cards={pcPending}
+        acting={acting}
+        setActing={setActing}
+        refresh={refresh}
+      />
+
       {/* --- Peer grants ------------------------------------------------- */}
       <div className="row-between mt">
         <h3 className="mt0">Peer grants ({peerGrants.length})</h3>
@@ -747,6 +763,94 @@ function CredentialProposalsSection({
             >
               Deny
             </button>
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}
+
+function PcAccessRequestsSection({
+  cards,
+  acting,
+  setActing,
+  refresh,
+}: {
+  cards: PcAccessRequest[];
+  acting: string;
+  setActing: (s: string) => void;
+  refresh: () => Promise<void>;
+}) {
+  if (cards.length === 0) return null;
+
+  const decide = async (id: string, decision: 'allow-once' | 'always' | 'deny') => {
+    setActing(id);
+    try {
+      await decidePcAccessRequest(id, decision);
+      await refresh();
+    } finally {
+      setActing('');
+    }
+  };
+
+  return (
+    <>
+      <div className="row-between mt">
+        <h3 className="mt0">PC folder access ({cards.length})</h3>
+        <span className="small muted" title="A bot asked for a folder outside the workspace. Read-only: listing and reading only — nothing can be changed through these grants.">
+          bot → your folders · read-only · 15-min expiry
+        </span>
+      </div>
+      {cards.map((c) => (
+        <div key={c.id} className="card triage-item" style={{ borderLeft: '3px solid var(--warn, #c90)' }}>
+          <div className="row-between">
+            <div>
+              <span className="chip" title="PC file access request">📁 pc access</span>{' '}
+              <strong>{c.botId}</strong>{' '}
+              <span className="small muted">
+                wants to {c.action === 'read' ? 'read a file in' : 'list'} this folder:
+              </span>
+              <div>
+                <code>{c.folder}</code>
+              </div>
+              {c.action === 'read' && c.filePath && (
+                <div className="small muted">
+                  file: <code>{c.filePath}</code>
+                </div>
+              )}
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              className="btn btn-sm btn-primary"
+              disabled={acting === c.id}
+              onClick={() => void decide(c.id, 'allow-once')}
+              title="Allow this folder for the rest of this chat session only"
+            >
+              Allow once
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm"
+              disabled={acting === c.id}
+              onClick={() => void decide(c.id, 'always')}
+              title="Create a standing read-only grant for this folder — for this bot only. Manage it in Settings → Permissions → PC file access."
+            >
+              Always allow this folder
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm"
+              disabled={acting === c.id}
+              onClick={() => void decide(c.id, 'deny')}
+            >
+              Deny
+            </button>
+          </div>
+          <div className="small muted" style={{ marginTop: 6 }}>
+            “Always” grants this folder to {c.botId} only (read-only) — revoke it any time in
+            Settings → Permissions → PC file access.
           </div>
         </div>
       ))}

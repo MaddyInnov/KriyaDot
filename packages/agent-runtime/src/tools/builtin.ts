@@ -9,6 +9,7 @@ import { validateWidgetPayload } from '../widgets.js';
 import { executeInPersistentSandbox, executeSandboxedCommand, sandboxBackend } from './sandbox.js';
 import { formatHashedLines } from './line-hash.js';
 import { semanticMisuseHint } from '../tool-hints.js';
+import { listFolderTool, resolvePcReadableFile } from './pc-files.js';
 import { resolveWorkspaceDir, type WorkspaceSource } from '../workspaces.js';
 import type { LspManager } from '../lsp/manager.js';
 import { runPostEditPipeline } from './coding.js';
@@ -73,12 +74,15 @@ function readFileTool(workspaceDir: WorkspaceSource): ToolDefinition {
     name: 'read_file',
     description:
       'Read a UTF-8 text file inside the workspace. Path is relative to the workspace root. ' +
+      'An absolute path outside the workspace also works when the file sits in a PC folder ' +
+      'the user granted this bot (Settings → Permissions → PC file access); for an ungranted ' +
+      'folder the user gets an approval card and the call waits for their choice. ' +
       'Set withHashes=true to get every line prefixed with a stable hash identifier ' +
       '(`123#a3f9c2: content`) — quote those hashes in edit range mode for stale-safe edits.',
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Workspace-relative file path' },
+        path: { type: 'string', description: 'Workspace-relative file path, or an absolute path in a granted PC folder' },
         withHashes: {
           type: 'boolean',
           description: 'Return lines as `lineNo#hash: content` with stable per-line content hashes (#184)',
@@ -88,7 +92,16 @@ function readFileTool(workspaceDir: WorkspaceSource): ToolDefinition {
       additionalProperties: false,
     },
     handler: async (args, ctx) => {
-      const file = confine(resolveWorkspaceDir(workspaceDir, ctx), String(args.path));
+      const raw = String(args.path);
+      let file: string;
+      try {
+        file = confine(resolveWorkspaceDir(workspaceDir, ctx), raw);
+      } catch (err) {
+        // Outside the workspace: fall back to approval-gated PC access
+        // (granted folders / just-in-time approval card). Relative paths
+        // and hosts without a PC-access host rethrow the original error.
+        file = await resolvePcReadableFile(ctx, raw, err);
+      }
       const content = readFileSync(file, 'utf8');
       return args.withHashes === true ? formatHashedLines(content) : content;
     },
@@ -534,6 +547,7 @@ export function createBuiltInTools(
   return [
     readFileTool(workspaceDir),
     writeFileTool(workspaceDir, opts.lspManager),
+    listFolderTool(workspaceDir),
     runCommandTool(workspaceDir),
     webSearchTool(opts),
     webFetchTool(),
