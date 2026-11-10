@@ -264,8 +264,18 @@ export default function WorkflowsPage() {
 
   return (
     <div>
-      <h1 className="page-title">Workflows</h1>
-      <p className="page-sub dc-compact-sub">Registered workflow definitions and their runs.</p>
+      <div className="row-between" style={{ flexWrap: 'wrap', gap: 8 }}>
+        <div>
+          <h1 className="page-title">Workflows</h1>
+          <p className="page-sub dc-compact-sub">
+            Registered workflow definitions and their runs. Draw a new one on the graph canvas;
+            scheduled Routines live inside each bot (Bots → open a bot → Routines tab).
+          </p>
+        </div>
+        <Link className="btn btn-primary" href="/workflows/canvas">
+          Open workflow canvas →
+        </Link>
+      </div>
       {error && <div className="error-box">{error}</div>}
 
       <div className="tabs" role="tablist" aria-label="Workflows sections">

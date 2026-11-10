@@ -86,6 +86,22 @@ vi.mock('../../../lib/api', () => ({
 }));
 
 describe('guide page', () => {
+  it('renders the "Where is everything" feature map with exact deep links', async () => {
+    render(<GuidePage />);
+    const map = await screen.findByTestId('guide-feature-map');
+    expect(map).toBeInTheDocument();
+    // The flagship buried surfaces are all named…
+    expect(screen.getByText(/Workflow canvas — the n8n-style graph editor/)).toBeInTheDocument();
+    expect(screen.getByText(/Routines & scheduled automations/)).toBeInTheDocument();
+    expect(screen.getByText(/Connected Apps — Notion/)).toBeInTheDocument();
+    expect(screen.getByText(/Pages — Notion-like documents/)).toBeInTheDocument();
+    // …and the canvas entry links straight at its route.
+    const links = Array.from(map.querySelectorAll('a'));
+    expect(links.some((a) => a.getAttribute('href') === '/workflows/canvas')).toBe(true);
+    expect(links.some((a) => a.getAttribute('href') === '/pages')).toBe(true);
+    expect(links.some((a) => a.getAttribute('href') === '/modules/kb')).toBe(true);
+  });
+
   it('renders articles grouped by theme', async () => {
     render(<GuidePage />);
     expect(await screen.findByText('Getting started')).toBeInTheDocument();

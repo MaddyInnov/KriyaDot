@@ -11,6 +11,8 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { authedFetch } from '../../../lib/api';
 import { GuideTour } from '../../../components/guide/tour';
+import { openSettings } from '../../../components/settings/settings-window';
+import { FEATURE_MAP } from '../../../components/guide/feature-map';
 
 interface DeepLink {
   label: string;
@@ -156,6 +158,36 @@ export default function GuidePage() {
       {error && <div className="error-box">{error}</div>}
 
       <GuideTour key={tourKey} forceOpen={tourKey > 0} />
+
+      <div className="card mt" data-testid="guide-feature-map">
+        <strong>Where is everything?</strong>
+        <p className="small muted mt">
+          KriyaDot has six top-level destinations, so some flagship features live a click or two
+          deep. This map names the exact place each capability lives — buttons go straight there.
+        </p>
+        <div className="grid-2 mt">
+          {FEATURE_MAP.map((f) => (
+            <div className="card" key={f.name}>
+              <strong className="small">{f.name}</strong>
+              <p className="small muted mt">{f.where}</p>
+              <div className="mt">
+                {f.settingsSection ? (
+                  <button
+                    className="btn btn-sm btn-primary"
+                    onClick={() => openSettings(f.settingsSection)}
+                  >
+                    Open in Settings →
+                  </button>
+                ) : (
+                  <Link className="btn btn-sm btn-primary" href={f.href ?? '/'}>
+                    Open →
+                  </Link>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
 
       <div className="card mt">
         <strong>How do I…?</strong>

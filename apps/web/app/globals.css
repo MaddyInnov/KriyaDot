@@ -5650,3 +5650,144 @@ html[data-ux='simple'] .chat-layout .msg.assistant.streaming {
   overflow-y: auto;
   box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
 }
+
+/* Settings window (2026-11-10): a large modal hosting the existing
+   settings pages. Builds on .modal-overlay/.modal-card above; theme
+   variables (--surface/--border/--text) keep all five themes correct.
+   On narrow screens it becomes a full-screen sheet. */
+.settings-window-overlay {
+  z-index: 1300;
+}
+.settings-window {
+  width: min(1120px, 96vw);
+  height: min(780px, 92vh);
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+}
+.settings-window-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.settings-window-title {
+  display: block;
+  font-size: 17px;
+}
+.settings-window-active {
+  display: block;
+  margin-top: 2px;
+}
+.settings-window-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+.settings-window-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.settings-window-nav {
+  width: 232px;
+  flex: none;
+  overflow-y: auto;
+  padding: 10px;
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.settings-window-navlink {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 9px;
+  border: none;
+  border-radius: 10px;
+  background: none;
+  color: var(--text-2);
+  cursor: pointer;
+  text-decoration: none;
+  font: inherit;
+}
+.settings-window-navlink:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.settings-window-navlink.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.settings-window-navlabel {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13.5px;
+  font-weight: 650;
+}
+.settings-window-navhint {
+  display: block;
+  margin-top: 1px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.35;
+  color: var(--text-3, var(--text-2));
+}
+.settings-window-navsep {
+  border-top: 1px solid var(--border);
+  margin: 8px 4px 4px;
+}
+.settings-window-navnote {
+  margin: 2px 9px 4px;
+}
+.settings-window-content {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 16px;
+}
+@media (max-width: 640px) {
+  .settings-window-overlay {
+    padding: 0;
+  }
+  .settings-window {
+    width: 100vw;
+    height: 100dvh;
+    max-height: 100dvh;
+    border: none;
+    border-radius: 0;
+  }
+  .settings-window-body {
+    flex-direction: column;
+  }
+  .settings-window-nav {
+    width: 100%;
+    flex: none;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+  .settings-window-navlink {
+    width: auto;
+    flex: none;
+  }
+  .settings-window-navhint,
+  .settings-window-navsep,
+  .settings-window-navnote,
+  .settings-window-navlink.as-link {
+    display: none;
+  }
+}

@@ -32,8 +32,10 @@ export default function WorkspacePage() {
     <div>
       <h1 className="page-title">Workspace</h1>
       <p className="page-sub">
-        Notes, tasks, files and device control in one surface.{' '}
-        <a href="/workspace/library">Open the Library →</a>
+        Notes, tasks, files, memory and device control in one surface.{' '}
+        <a href="/workspace/library">Open the Library →</a>{' '}
+        <a href="/pages">Pages (Notion-like documents) →</a>{' '}
+        <a href="/knowledge">Knowledge →</a>
       </p>
       <div className="tabs" role="tablist" aria-label="Workspace sections">
         {TABS.map((t) => (

@@ -35,6 +35,7 @@ import { CollapseChevron } from '../collapse';
 import { LanguageSwitcher, useI18n } from '../../lib/i18n';
 import { BrandPet } from '../pet/BrandPet';
 import { PauseControl } from '../pause-control';
+import { openSettings } from '../settings/settings-window';
 import { UpdateBadge } from '../update-badge';
 
 function icon(children: React.ReactNode) {
@@ -58,6 +59,9 @@ function icon(children: React.ReactNode) {
 interface Dest {
   href: string;
   label: string;
+  /** One-line "what actually lives here" hint — several destinations
+   *  hold more than their name suggests (2026-11-10 findability pass). */
+  hint: string;
   match: (p: string) => boolean;
   icon: React.ReactNode;
 }
@@ -67,12 +71,14 @@ function getDests(t: (key: string) => string): Dest[] {
     {
       href: '/',
       label: t('nav.chat'),
+      hint: 'Universal + bot conversations',
       match: (p) => p === '/',
       icon: icon(<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />),
     },
     {
       href: '/bots',
       label: t('nav.bots'),
+      hint: 'Routines & memory live inside each bot',
       match: (p) => p.startsWith('/bots'),
       icon: icon(
         <>
@@ -84,6 +90,7 @@ function getDests(t: (key: string) => string): Dest[] {
     {
       href: '/workflows',
       label: t('nav.workflows'),
+      hint: 'Graph canvas, runs & n8n import',
       match: (p) => p.startsWith('/workflows'),
       icon: icon(
         <>
@@ -97,6 +104,7 @@ function getDests(t: (key: string) => string): Dest[] {
     {
       href: '/marketplace',
       label: t('nav.marketplace'),
+      hint: 'Bots, skills, plugins & workflows',
       match: (p) => p.startsWith('/marketplace'),
       icon: icon(
         <>
@@ -110,6 +118,7 @@ function getDests(t: (key: string) => string): Dest[] {
     {
       href: '/workspace',
       label: t('nav.workspace'),
+      hint: 'Notes, tasks, files, pages, knowledge & memory',
       match: (p) =>
         p.startsWith('/workspace') ||
         p.startsWith('/notes') ||
@@ -121,6 +130,7 @@ function getDests(t: (key: string) => string): Dest[] {
     {
       href: '/activity',
       label: t('nav.activity'),
+      hint: 'Approvals, runs, audit, costs & health',
       match: (p) => p.startsWith('/activity') || p.startsWith('/approvals') || p.startsWith('/audit'),
       icon: icon(<path d="M22 12h-4l-3 9L9 3l-3 9H2" />),
     },
@@ -132,16 +142,6 @@ const MORE_LINKS = [
   { href: '/pages', label: 'Pages' },
   { href: '/terminal', label: 'Terminal' },
   { href: '/teams', label: 'Teams' },
-];
-
-const SETTINGS_LINKS = [
-  { href: '/accounts', label: 'Connected Apps' },
-  { href: '/providers', label: 'Providers & models' },
-  { href: '/messaging', label: 'Messaging' },
-  { href: '/usage', label: 'Usage & costs' },
-  { href: '/permissions', label: 'Permissions' },
-  { href: '/preferences', label: 'Preferences' },
-  { href: '/more', label: 'Modules hub' },
 ];
 
 const WS_ALL = '__all__';
@@ -513,7 +513,10 @@ export default function AppSidebar() {
               onClick={() => setOpen(false)}
             >
               <span className="sb-nav-icon">{d.icon}</span>
-              <span>{d.label}</span>
+              <span className="sb-nav-text">
+                <span>{d.label}</span>
+                <span className="sb-nav-hint">{d.hint}</span>
+              </span>
             </Link>
           ))}
         </nav>
@@ -683,35 +686,55 @@ export default function AppSidebar() {
               </button>
             </div>
           </div>
+          {/* Settings opens as a window over the current page (2026-11-10)
+              instead of an expanding sidebar link list — the hosted
+              surfaces are the same settings pages, in a modal. */}
+          <button
+            type="button"
+            className="sb-settings-toggle"
+            aria-label="Open Settings in a window"
+            title="Open Settings in a window"
+            onClick={() => {
+              openSettings();
+              setOpen(false);
+            }}
+          >
+            <span>Settings</span>
+            <span aria-hidden="true">⧉</span>
+          </button>
           <button
             className="sb-settings-toggle"
             aria-expanded={settingsOpen}
             onClick={() => setSettingsOpen((v) => !v)}
           >
-            <span>Settings &amp; more</span>
+            <span>More destinations</span>
             <span aria-hidden="true">{settingsOpen ? '▾' : '▸'}</span>
           </button>
           {settingsOpen && (
             <div className="sb-settings">
-              {SETTINGS_LINKS.map((s) => (
-                <Link key={s.href} href={s.href} className="sb-settings-link" onClick={() => setOpen(false)}>
-                  {s.label}
-                  {s.href === '/preferences' && <UpdateBadge />}
-                </Link>
-              ))}
-              <div className="sb-settings-sep" />
               {MORE_LINKS.map((s) => (
                 <Link key={s.href} href={s.href} className="sb-settings-link" onClick={() => setOpen(false)}>
                   {s.label}
                 </Link>
               ))}
+              <Link href="/more/guide" className="sb-settings-link" onClick={() => setOpen(false)}>
+                User Guide — where is everything
+              </Link>
               <div className="sb-settings-sep" />
               <div className="sb-lang">
                 <LanguageSwitcher />
               </div>
             </div>
           )}
-          <Link href="/accounts" className="sb-account" onClick={() => setOpen(false)}>
+          <button
+            type="button"
+            className="sb-account"
+            aria-label="Open account and Connected Apps settings"
+            onClick={() => {
+              openSettings('/accounts');
+              setOpen(false);
+            }}
+          >
             <span className="sb-account-dot" aria-hidden="true">
               ◎
             </span>
@@ -719,7 +742,7 @@ export default function AppSidebar() {
               <span className="sb-account-name">Account</span>
               <span className="sb-account-sub">api: {apiBase}</span>
             </span>
-          </Link>
+          </button>
           <p className="sb-copyright">© 2026 Ashutosh Sahoo · KriyaDot</p>
           {/* Rail mode: the only footer content left visible — expand back
               to full, or hide the sidebar entirely (collapse pass). */}

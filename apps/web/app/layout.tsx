@@ -10,6 +10,7 @@ import 'katex/dist/katex.min.css';
 import './declutter.css';
 import './collapse.css';
 import AppSidebar from '../components/shell/app-sidebar';
+import SettingsWindowHost from '../components/settings/settings-window';
 import PwaInstallBanner from '../components/pwa-install';
 import RemoteScreenBanner from '../components/remote-screen-banner';
 import { PausedBanner } from '../components/pause-control';
@@ -74,6 +75,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         </div>
         <PwaInstallBanner />
         <RemoteScreenBanner />
+        <SettingsWindowHost />
         </BrandProvider>
         </I18nProvider>
       </body>

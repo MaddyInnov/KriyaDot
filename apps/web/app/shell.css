@@ -329,9 +329,32 @@
   align-items: center;
   gap: 9px;
   padding: 7px 9px;
+  border: none;
   border-radius: 10px;
+  background: none;
   color: var(--text);
   text-decoration: none;
+  font: inherit;
+  text-align: left;
+  width: 100%;
+  cursor: pointer;
+}
+/* Destination hints (findability pass): the small "what lives here"
+   line under each nav label in full sidebar mode; rail mode hides it. */
+.sb-nav-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.sb-nav-hint {
+  font-size: 10.5px;
+  font-weight: 500;
+  line-height: 1.3;
+  color: var(--text-3);
+  white-space: normal;
+}
+.app-sidebar.kd-rail .sb-nav-hint {
+  display: none;
 }
 .sb-account:hover {
   background: var(--surface-2);
