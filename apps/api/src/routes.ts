@@ -23,6 +23,8 @@ import { EgressGate } from '@mvp/governance';
 import type { TieredItem } from '@mvp/governance';
 import type { WorkflowRun, WorkflowRunner } from '@mvp/workflows';
 import { createHealthScoring, registerHealthRoutes } from './health-routes.js';
+import type { ResourceGuard } from './resource-guard.js';
+import { registerSelfMonitorRoutes } from './resource-guard-routes.js';
 import { registerObservabilityRoutes } from './observability-routes.js';
 import { registerPetStateRoutes } from './pet-state.js';
 import { registerOmniRoutes } from './omni-routes.js';
@@ -287,6 +289,13 @@ export interface RouteDeps {
   turnAbortRegistry?: Map<string, { controller: AbortController; botId: string; startedAt: number }>;
   /** Run health scores + metric samples (features #2/#5). */
   runHealth: RunHealthStore;
+  /**
+   * Resource guard + self-monitoring (B3). Optional — when the host
+   * supplies a guard, the /api/health/self + /api/health/resource-guard
+   * routes are registered; without one the surface is simply absent
+   * (same pattern as spanStore below).
+   */
+  resourceGuard?: ResourceGuard;
   /**
    * W13 observability: span/trace store (Activity → Runs). Optional —
    * when absent the /api/observability/* routes are not registered.
@@ -3404,6 +3413,22 @@ export function createRouter(deps: RouteDeps): express.Router {
   // with the run records; terminal runs/turns also append metric samples
   // that feed the 7-day regression detector.
   registerHealthRoutes(router, { workflowRunner, runHealth });
+
+  // ---- Self-monitoring (B3): the resource guard's snapshot of this
+  // process (uptime, memory trend, event-loop lag, live counts, guard
+  // state) on the same /api/health surface; Activity → Health renders it.
+  // Counters come from registries this router already owns.
+  if (deps.resourceGuard) {
+    registerSelfMonitorRoutes(router, {
+      guard: deps.resourceGuard,
+      dataDir: config.dataDir,
+      counts: () => ({
+        activeTurns: activeTurns.size,
+        runningWorkflowRuns: workflowRunner.listRuns().filter((r) => r.status === 'running').length,
+        pendingApprovals: governance.listApprovals('pending').length,
+      }),
+    });
+  }
 
   // ---- W13 observability: recorded runs, span waterfall data, tags,
   // per-bot outcome analytics (Activity → Runs + Usage outcomes section).

@@ -69,6 +69,15 @@ export interface InvokeOptions {
   timeoutMs?: number;
   /** Host environment to scrub from (defaults to process.env). */
   hostEnv?: NodeJS.ProcessEnv;
+  /**
+   * A9: values for the manifest's declared `secrets` names, resolved by
+   * the host from its secret store at invocation time (the PluginManager's
+   * resolveSecret hook builds this map). Injected into the child env
+   * under the declared names — and ONLY those names; a value in this map
+   * whose name the manifest did not declare is dropped. Secret values
+   * never appear in the package, the manifest, or persisted state.
+   */
+  secretValues?: Record<string, string>;
   /** Called once per invocation with the sandbox report for the spawn
    *  (backend, whether confinement was actually applied, network
    *  posture) so hosts can log/surface enforcement honestly. */
@@ -76,7 +85,12 @@ export interface InvokeOptions {
 }
 
 /** Build the scrubbed child environment for a plugin invocation. */
-export function buildPluginEnv(manifest: PluginManifest, dir: string, hostEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function buildPluginEnv(
+  manifest: PluginManifest,
+  dir: string,
+  hostEnv: NodeJS.ProcessEnv = process.env,
+  secretValues: Record<string, string> = {},
+): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   // Platform minimum: PATH so shebang-less spawns and child tooling work;
   // SystemRoot on Windows is required by Node itself.
@@ -84,6 +98,12 @@ export function buildPluginEnv(manifest: PluginManifest, dir: string, hostEnv: N
   if (process.platform === 'win32' && hostEnv.SystemRoot) env.SystemRoot = hostEnv.SystemRoot;
   for (const name of manifest.permissions?.env ?? []) {
     if (hostEnv[name] !== undefined) env[name] = hostEnv[name];
+  }
+  // Declared secrets, resolved by the host: only names the manifest
+  // declared in `secrets` are injected, and they win over plain env
+  // inheritance (a declared secret is a deliberate credential hand-off).
+  for (const name of manifest.secrets ?? []) {
+    if (typeof secretValues[name] === 'string') env[name] = secretValues[name];
   }
   env.PLUGIN_ID = manifest.id;
   env.PLUGIN_DIR = dir;
@@ -114,7 +134,7 @@ async function spawnTarget(
   return spawnPluginChild(command, args, {
     dir: target.dir,
     manifest: target.manifest,
-    env: buildPluginEnv(target.manifest, target.dir, opts.hostEnv),
+    env: buildPluginEnv(target.manifest, target.dir, opts.hostEnv, opts.secretValues ?? {}),
     ...(opts.hostEnv ? { hostEnv: opts.hostEnv } : {}),
   });
 }

@@ -74,7 +74,11 @@ describe('PluginManager install lifecycle', () => {
 
   it('installs from a zip built in-test and from a URL via injected fetch', async () => {
     const dir = dataDir();
-    const mgr = new PluginManager({ dataDir: dir, approveInstall: approveAll });
+    // A9: these zips are UNSIGNED packages, so installation goes through
+    // the explicit untrusted-install approval (refused without it — see
+    // package.test.ts). The materialization behaviour under test is
+    // unchanged from the pre-A9 flow.
+    const mgr = new PluginManager({ dataDir: dir, approveInstall: approveAll, approveUntrustedInstall: () => true });
     const { readFileSync, readdirSync } = await import('node:fs');
     // Build a zip of demo-hook from its real files.
     const hookDir = demo('demo-hook');
@@ -84,10 +88,13 @@ describe('PluginManager install lifecycle', () => {
     writeFileSync(zipPath, zip);
     const fromZip = await mgr.install({ type: 'zip', path: zipPath });
     expect(fromZip.id).toBe('demo-hook');
+    // A9: the unverified provenance is recorded on the install, permanently.
+    expect(fromZip.signature.status).toBe('unsigned');
 
     const urlMgr = new PluginManager({
       dataDir: dataDir(),
       approveInstall: approveAll,
+      approveUntrustedInstall: () => true,
       fetchFn: async (url: string) => {
         expect(url).toBe('https://example.invalid/demo-hook.zip');
         return { ok: true, status: 200, arrayBuffer: async () => zip.buffer.slice(zip.byteOffset, zip.byteOffset + zip.byteLength) as ArrayBuffer };

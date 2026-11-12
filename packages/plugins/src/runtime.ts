@@ -259,6 +259,51 @@ export function pluginSkillDescriptor(target: PluginRuntimeTarget): PluginSkillD
 }
 
 // ---------------------------------------------------------------------------
+// Declarative providers (A9)
+// ---------------------------------------------------------------------------
+
+/**
+ * A manifest-only provider declaration, resolved for the host's provider
+ * registry. The host turns this into a provider preset with the built-in
+ * OpenAI-compatible driver (see @mvp/agent-runtime catalog registration);
+ * this package stays driver-free — it only carries the declaration.
+ */
+export interface DeclarativeProviderDescriptor {
+  pluginId: string;
+  providerId: string;
+  /** Display name for the picker (declaration's displayName or plugin name). */
+  name: string;
+  baseUrl: string;
+  /** Secret NAME holding the API key (never a value), when one is required. */
+  apiKeyEnv?: string;
+  apiKeyRequired: boolean;
+  liveModels: boolean;
+  models: Array<{ id: string; name: string; default?: boolean }>;
+}
+
+/** Resolve an installed provider plugin's declaration into a registry descriptor. */
+export function pluginProviderDescriptor(target: PluginRuntimeTarget): DeclarativeProviderDescriptor {
+  const spec = target.manifest.provider;
+  if (!spec || !target.manifest.kinds.includes('provider')) {
+    throw new Error(`plugin "${target.manifest.id}" is not a declarative provider plugin`);
+  }
+  return {
+    pluginId: target.manifest.id,
+    providerId: spec.providerId,
+    name: spec.displayName ?? target.manifest.name,
+    baseUrl: spec.baseUrl,
+    ...(spec.apiKeyEnv ? { apiKeyEnv: spec.apiKeyEnv } : {}),
+    apiKeyRequired: spec.apiKeyRequired !== false,
+    liveModels: spec.liveModels !== false,
+    models: (spec.models ?? []).map((m) => ({
+      id: m.id,
+      name: m.name ?? m.id,
+      ...(m.default ? { default: true } : {}),
+    })),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // UI
 // ---------------------------------------------------------------------------
 

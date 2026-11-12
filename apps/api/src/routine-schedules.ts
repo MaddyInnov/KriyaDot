@@ -1098,6 +1098,16 @@ export interface RoutineSchedulerDeps {
   /** Called at the end of every tick (host: flush deferred notices, digests). */
   onSchedulerTick?: (now: number) => void;
   /**
+   * Resource-guard shed gate (B3): consulted before a NEW scheduled fire
+   * starts (and before a limit-reset resume is claimed). While the guard
+   * is shedding, the occurrence is recorded as missed with the guard's
+   * reason and nothing starts; resumes stay pending for the next tick.
+   * Runs already in flight are never consulted or touched, and manual
+   * runNow/retry bypass the gate on purpose — a user explicitly asking
+   * for a run outranks background load-shedding.
+   */
+  optionalWorkGate?: (routine: BotRoutine) => { allowed: boolean; reason?: string };
+  /**
    * Idle triggers (Octomind parity): the bot's last turn-activity time
    * (UTC ms), or undefined when the bot has never been active. Without
    * this source, idle schedules simply never fire.
@@ -1251,6 +1261,11 @@ export class RoutineScheduler {
       }
       if (this.deps.shouldExecute && !this.deps.shouldExecute(routine)) continue;
       if (routine.schedule?.overlap === 'skip' && this.inFlight.has(routine.id)) continue;
+      // Resource guard (B3): while shedding, leave the resume pending —
+      // do not claim or cancel it; it fires on a later tick once the
+      // guard clears.
+      const gate = this.deps.optionalWorkGate?.(routine);
+      if (gate && !gate.allowed) continue;
       if (!store.claim(resume.id)) continue;
       try {
         await this.fireResume(routine, resume);
@@ -1537,6 +1552,16 @@ export class RoutineScheduler {
   }
 
   private async fire(routine: BotRoutine, at: number, opts?: { catchUp?: boolean }): Promise<void> {
+    // Resource guard (B3): every scheduled path (time grid, startup,
+    // idle, catch-up backfill) funnels through fire(), so the shed gate
+    // lives here exactly once. A shed occurrence is recorded as missed
+    // with the guard's measured reason; in-flight runs are unaffected
+    // because the gate is only consulted before a start.
+    const gate = this.deps.optionalWorkGate?.(routine);
+    if (gate && !gate.allowed) {
+      this.recordMissed(routine, at, gate.reason ?? 'shed by the resource guard');
+      return;
+    }
     const { agentRuntime, getBots } = this.deps;
     const bot = getBots().find((b) => b.id === routine.botId);
     if (!bot) {

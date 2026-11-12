@@ -175,12 +175,76 @@ export function resetCatalogCache(): void {
 export function listProviderPresets(): ProviderPreset[] {
   const presets = Object.values(loadCatalog().providers);
   if (isDemoMockEnabled()) presets.push(DEMO_PRESET);
+  presets.push(...[...pluginProviderPresets.values()].map((e) => e.preset));
   return presets;
 }
 
 export function getProviderPreset(id: string): ProviderPreset | undefined {
   if (id === DEMO_PRESET.id && isDemoMockEnabled()) return DEMO_PRESET;
-  return loadCatalog().providers[id];
+  return loadCatalog().providers[id] ?? pluginProviderPresets.get(id)?.preset;
+}
+
+// ---------------------------------------------------------------------------
+// A9: declarative provider plugins — runtime-registered presets.
+//
+// A manifest-only plugin package (kind "provider" in @mvp/plugins) declares
+// an OpenAI-compatible provider; the API host registers its preset here
+// when the plugin is installed/enabled and unregisters it on
+// uninstall/disable, so the provider appears in / disappears from the
+// registry, the picker (listProviders iterates listProviderPresets) and
+// createProvider with NO restart. The driver is the built-in
+// OpenAI-compatible one — the package contributes no code.
+//
+// Registration is fail-closed against shadowing: a plugin preset may not
+// take an id the static catalog, the demo preset, or the `custom-*` BYO
+// synthesis already owns, and may not replace another plugin's preset.
+// The API key is resolved through the ordinary credential chain
+// (resolveApiKey: environment → .env files → providers.local.json) under
+// the declaration's envKey — the package declares the NAME only.
+// ---------------------------------------------------------------------------
+
+const pluginProviderPresets = new Map<string, { preset: ProviderPreset; pluginId: string }>();
+
+/** Register (or refresh) one plugin-contributed provider preset. `pluginId` is the owning plugin — only it may refresh or remove the preset. */
+export function registerPluginProviderPreset(
+  preset: ProviderPreset,
+  pluginId: string,
+): { ok: true } | { ok: false; reason: string } {
+  if (loadCatalog().providers[preset.id]) {
+    return { ok: false, reason: `provider id "${preset.id}" is owned by the built-in catalog` };
+  }
+  if (preset.id === DEMO_PRESET.id) {
+    return { ok: false, reason: `provider id "${preset.id}" is reserved` };
+  }
+  if (CUSTOM_ID_PATTERN.test(preset.id)) {
+    return { ok: false, reason: `provider id "${preset.id}" collides with the custom-* BYO namespace` };
+  }
+  const existing = pluginProviderPresets.get(preset.id);
+  if (existing && existing.pluginId !== pluginId) {
+    return { ok: false, reason: `provider id "${preset.id}" is already registered by plugin "${existing.pluginId}"` };
+  }
+  pluginProviderPresets.set(preset.id, { preset, pluginId });
+  return { ok: true };
+}
+
+/** Remove a plugin-contributed preset (plugin uninstalled/disabled). Returns true when one was removed. */
+export function unregisterPluginProviderPreset(providerId: string): boolean {
+  return pluginProviderPresets.delete(providerId);
+}
+
+/** All currently registered plugin-contributed presets. */
+export function listPluginProviderPresets(): ProviderPreset[] {
+  return [...pluginProviderPresets.values()].map((e) => e.preset);
+}
+
+/** All plugin-contributed registrations with their owning plugin id (host sync diffs on this). */
+export function listPluginProviderRegistrations(): Array<{ preset: ProviderPreset; pluginId: string }> {
+  return [...pluginProviderPresets.values()].map((e) => ({ preset: e.preset, pluginId: e.pluginId }));
+}
+
+/** For tests: drop every plugin-contributed preset. */
+export function clearPluginProviderPresets(): void {
+  pluginProviderPresets.clear();
 }
 
 /**
@@ -244,7 +308,7 @@ export function getCustomProviderPreset(providerId: string): ProviderPreset | un
   };
 }
 
-/** Catalog preset first, synthesized custom preset second. */
+/** Catalog preset first, plugin-contributed preset second, synthesized custom preset last. */
 function resolvePreset(providerId: string): ProviderPreset | undefined {
   return getProviderPreset(providerId) ?? getCustomProviderPreset(providerId);
 }

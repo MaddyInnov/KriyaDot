@@ -57,7 +57,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
-import { WorktreeManager } from '@mvp/agent-runtime';
+import { WorktreeManager, GIT_NOT_INSTALLED_MESSAGE } from '@mvp/agent-runtime';
 import type { BotConfig } from '@mvp/agent-runtime';
 import { validateWorkflowStructure, type WorkflowDefinition } from '@mvp/workflows';
 import { TaskStore, taskBlockersSatisfied, type Task, type TaskMissionStage } from './tasks.js';
@@ -340,6 +340,14 @@ export class MissionStore {
 
 function git(cwd: string, args: string[]): string {
   const r = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: 60_000 });
+  // B4 backstop (same seam as worktrees.ts): a missing git binary is
+  // ENOENT with status=null; without this branch the mission blocked
+  // with the cryptic "git add failed: exit null". The blocked evidence
+  // now carries the plain-words message (the pipeline's first git
+  // contact is WorktreeManager, which throws the same constant).
+  if ((r.error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
+    throw new Error(GIT_NOT_INSTALLED_MESSAGE);
+  }
   if (r.status !== 0) {
     throw new Error(`git ${args[0]} failed: ${(r.stderr || r.stdout || `exit ${r.status}`).trim().slice(0, 500)}`);
   }

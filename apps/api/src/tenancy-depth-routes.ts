@@ -29,6 +29,19 @@
 // env KRIYADOT_TENANCY_JWT_SECRET) whose sub/orgId claims scope the call,
 // an SSO session token, or the loopback owner (whose `x-user-id` header
 // may assert a local profile). The header alone never authenticates.
+//
+// B2 — multi-user Pro gate (see license.ts for the full rationale; same
+// flag, same default OFF, same refusal body as tenancy.ts). Gated here,
+// precisely the membership/role-expanding writes this router offers:
+// creating a role template, inviting from a template, creating a group,
+// and adding a member to a group. NOT gated: reads, group grants,
+// resource audience, and quotas/usage — those configure resources and
+// per-user limits rather than expanding who is in an org, and gating
+// them is a separate packaging decision if it is ever wanted. The gate
+// runs AFTER this router's role gate, so unauthenticated / non-admin
+// callers keep their existing 401/403 and the license is only evaluated
+// for an otherwise-authorised admin action. When the flag is OFF the
+// evaluation returns before any license load — behaviour is unchanged.
 
 import { join } from 'node:path';
 import express, { type Router } from 'express';
@@ -42,6 +55,7 @@ import {
   type Role,
 } from '@mvp/tenancy';
 import { resolvePrincipal, type PrincipalContext } from './principal.js';
+import { evaluateMultiUserGate, sendMultiUserProRefusal, type RequireFeatureDeps } from './license.js';
 
 export interface TenancyDepthDeps {
   dataDir?: string;
@@ -49,6 +63,12 @@ export interface TenancyDepthDeps {
   jwtSecret?: string;
   loopbackToken?: string;
   audit?: (action: string, fields: { actor?: string; detail?: unknown }) => void;
+  /**
+   * B2 gate injection (tests / embedding hosts). Defaults to the
+   * standard env + embedded-DEV-key license path; the production wiring
+   * in index.ts passes nothing and gets that default.
+   */
+  licenseGate?: RequireFeatureDeps;
 }
 
 function err(res: express.Response, status: number, message: string): void {
@@ -86,9 +106,20 @@ export function createTenancyDepthRouter(deps: TenancyDepthDeps): Router {
     return { orgId, userId, role: membership.role };
   }
 
+  // B2 Pro gate (see header): true = proceed; false = the shared
+  // 403 'multi_user_requires_pro' refusal has already been sent.
+  const licenseGate: RequireFeatureDeps = deps.licenseGate ?? {};
+  function refuseUnlessPro(res: express.Response): boolean {
+    const evaluation = evaluateMultiUserGate(licenseGate);
+    if (evaluation.allowed) return true;
+    sendMultiUserProRefusal(res, evaluation);
+    return false;
+  }
+
   router.post('/orgs/:id/role-templates', (req, res) => {
     const ctx = gate(req, res, 'admin');
     if (!ctx) return;
+    if (!refuseUnlessPro(res)) return;
     const body = (req.body ?? {}) as { name?: unknown; role?: unknown; permissions?: unknown };
     if (!isRole(body.role)) return err(res, 400, 'role must be owner|admin|member|viewer');
     try {
@@ -108,6 +139,7 @@ export function createTenancyDepthRouter(deps: TenancyDepthDeps): Router {
   router.post('/orgs/:id/invites/from-template', (req, res) => {
     const ctx = gate(req, res, 'admin');
     if (!ctx) return;
+    if (!refuseUnlessPro(res)) return;
     const body = (req.body ?? {}) as { email?: unknown; template?: unknown };
     const tpl = extras.getRoleTemplateByName(ctx.orgId, String(body.template ?? ''));
     if (!tpl) return err(res, 404, 'unknown role template');
@@ -122,6 +154,7 @@ export function createTenancyDepthRouter(deps: TenancyDepthDeps): Router {
   router.post('/orgs/:id/groups', (req, res) => {
     const ctx = gate(req, res, 'admin');
     if (!ctx) return;
+    if (!refuseUnlessPro(res)) return;
     const body = (req.body ?? {}) as { name?: unknown; memberIds?: unknown };
     try {
       const group = extras.createGroup(ctx.orgId, String(body.name ?? ''), Array.isArray(body.memberIds) ? (body.memberIds as string[]) : []);
@@ -139,6 +172,7 @@ export function createTenancyDepthRouter(deps: TenancyDepthDeps): Router {
   router.post('/orgs/:id/groups/:groupId/members', (req, res) => {
     const ctx = gate(req, res, 'admin');
     if (!ctx) return;
+    if (!refuseUnlessPro(res)) return;
     const group = extras.getGroup(req.params.groupId);
     if (!group || group.orgId !== ctx.orgId) return err(res, 404, 'unknown group');
     const body = (req.body ?? {}) as { userId?: unknown };

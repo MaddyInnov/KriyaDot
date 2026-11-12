@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 export * from './manifest.js';
+export * from './package.js';
 export * from './zip.js';
 export * from './rpc.js';
 export * from './plugin-sandbox.js';

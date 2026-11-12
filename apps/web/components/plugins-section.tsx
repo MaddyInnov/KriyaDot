@@ -22,12 +22,35 @@ interface InstalledPluginDto {
   kinds: string[];
   permissions: { network?: boolean; env?: string[]; fs?: { read?: string[]; write?: string[] } };
   ui?: { dir: string; title: string };
+  publisher?: string;
+  secrets?: string[];
+  /** A9 signature provenance: only "verified" means a trusted publisher signed these exact bytes. */
+  signature?: { status: string; keyId?: string };
+  provider?: { providerId: string; baseUrl: string };
   enabled: boolean;
   installedAt: number;
   sourceType: string;
 }
 
-type InstallSource = 'dir' | 'zip' | 'url';
+type InstallSource = 'dir' | 'zip' | 'package' | 'url';
+
+/** A9: the honest one-line signature label for a plugin card. */
+function signatureLabel(p: InstalledPluginDto): string {
+  switch (p.signature?.status) {
+    case 'verified':
+      return `Signature: verified (trusted publisher key ${p.signature?.keyId ?? ''}) — origin proven, behaviour still governed by approval + sandbox`;
+    case 'unsigned':
+      return 'Signature: UNSIGNED — installed via the explicit untrusted-install approval';
+    case 'untrusted-key':
+      return 'Signature: signed by an UNTRUSTED publisher key — installed via the explicit untrusted-install approval';
+    case 'invalid':
+      return 'Signature: INVALID at install — installed via the explicit untrusted-install approval';
+    case 'local-directory':
+      return 'Signature: local directory install (no package signature)';
+    default:
+      return 'Signature: not recorded (installed before signature provenance)';
+  }
+}
 
 const api = (path: string, init?: RequestInit): Promise<unknown> =>
   authedFetch(path, init).then(async (res) => {
@@ -116,12 +139,20 @@ export default function PluginsSection(): React.JSX.Element {
     <section aria-label="Plugins">
       <h2>Plugins</h2>
       <p>
-        Third-party plugins extend KriyaDot with tools, hooks, skills, channels, and UI panels. Installs are
-        approval-gated on the server; executable plugins run as short-lived stdio processes with a scrubbed
-        environment, confined by the host kernel sandbox (Landlock on Linux, Seatbelt on macOS) to their own
-        directory plus any filesystem paths they declare in their manifest, with network access only if they
-        declare it. On a host without a kernel sandbox backend, a plugin whose declared permissions are
-        restrictive will refuse to run rather than run unconfined.
+        Third-party plugins extend KriyaDot with tools, hooks, skills, channels, UI panels, and declarative
+        providers. Installs are approval-gated on the server; executable plugins run as short-lived stdio
+        processes with a scrubbed environment, confined by the host kernel sandbox (Landlock on Linux,
+        Seatbelt on macOS) to their own directory plus any filesystem paths they declare in their manifest,
+        with network access only if they declare it. On a host without a kernel sandbox backend (including
+        Windows, which has no backend), a plugin whose declared permissions are restrictive will refuse to
+        run rather than run unconfined.
+      </p>
+      <p>
+        Signed packages (.kdpkg) are verified at install against trusted publisher keys: a verified
+        signature proves the package came from that publisher unmodified — it does NOT prove the plugin is
+        safe; approval and the sandbox remain the behaviour controls. Unsigned or unverifiable packages are
+        refused unless you explicitly approve an untrusted install, and such plugins stay labelled
+        unverified below, permanently. Installing takes effect immediately — no restart.
       </p>
 
       {error ? <p role="alert" style={{ color: 'crimson' }}>{error}</p> : null}
@@ -133,6 +164,7 @@ export default function PluginsSection(): React.JSX.Element {
           <select value={source} onChange={(e) => setSource(e.target.value as InstallSource)}>
             <option value="dir">Local directory</option>
             <option value="zip">.zip file</option>
+            <option value="package">Signed package (.kdpkg)</option>
             <option value="url">URL</option>
           </select>
         </label>
@@ -169,7 +201,10 @@ export default function PluginsSection(): React.JSX.Element {
                 {plugin.permissions.env?.length ? ` · Env: ${plugin.permissions.env.join(', ')}` : ''}
                 {plugin.permissions.fs?.read?.length ? ` · FS read: ${plugin.permissions.fs.read.join(', ')}` : ''}
                 {plugin.permissions.fs?.write?.length ? ` · FS write: ${plugin.permissions.fs.write.join(', ')}` : ''}
+                {plugin.secrets?.length ? ` · Secrets (names only): ${plugin.secrets.join(', ')}` : ''}
+                {plugin.provider ? ` · Provider: ${plugin.provider.providerId} → ${plugin.provider.baseUrl}` : ''}
               </p>
+              <p style={{ margin: '0.25rem 0', fontSize: '0.85em' }}>{signatureLabel(plugin)}</p>
               <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
                 <button type="button" onClick={() => void toggle(plugin)} disabled={busy === plugin.id}>
                   {plugin.enabled ? 'Disable' : 'Enable'}

@@ -58,6 +58,28 @@ export interface WorktreeInfo {
 
 const BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
 
+/**
+ * B4 first-run backstop — plain words for the "git binary is missing"
+ * case. WHY: every git spawn in this file (and in apps/api missions.ts)
+ * used to surface a missing git as `git rev-parse failed: exit null`
+ * (spawnSync sets status=null + error=ENOENT when the binary cannot be
+ * executed at all), which reads like a KriyaDot bug in exactly the
+ * first-run situation the B4 installer hook tries to prevent (Git
+ * install declined / offline / winget-less machine). The installer is
+ * best-effort, so this message is the honest floor: name the tool, say
+ * what needs it, point at git-scm.com. Keep the wording identical in
+ * missions.ts (it imports this constant).
+ */
+export const GIT_NOT_INSTALLED_MESSAGE =
+  'Git is not installed (or not on PATH). KriyaDot missions and worktrees need Git — ' +
+  'install Git for Windows from https://git-scm.com/download/win, then restart KriyaDot.';
+
+/** True when a `git` binary can be executed at all (missing vs broken are distinguished by callers via git()). */
+export function isGitAvailable(): boolean {
+  const r = spawnSync('git', ['--version'], { encoding: 'utf8', timeout: 10_000 });
+  return !r.error && r.status === 0;
+}
+
 function randomSuffix(): string {
   return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -72,6 +94,12 @@ export class WorktreeManager {
 
   private git(repoPath: string, args: string[], opts: { allowFailure?: boolean } = {}): string {
     const r = spawnSync('git', ['-C', repoPath, ...args], { encoding: 'utf8', timeout: 60_000 });
+    // ENOENT = the git binary itself could not be executed. That is a
+    // different failure from "git ran and said no", and it must never be
+    // swallowed by allowFailure into a misleading success/failure.
+    if ((r.error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
+      throw new Error(GIT_NOT_INSTALLED_MESSAGE);
+    }
     if (r.status !== 0 && !opts.allowFailure) {
       const detail = (r.stderr || r.stdout || `exit ${r.status}`).trim().slice(0, 500);
       throw new Error(`git ${args[0]} failed: ${detail}`);
@@ -80,6 +108,10 @@ export class WorktreeManager {
   }
 
   isGitRepo(path: string): boolean {
+    // A missing git binary must NOT be reported as "not a git repo":
+    // that misdiagnosis is the cryptic first-run failure B4 removes.
+    // (Probing a real non-repo with git present still returns false.)
+    if (!isGitAvailable()) throw new Error(GIT_NOT_INSTALLED_MESSAGE);
     try {
       return this.git(path, ['rev-parse', '--is-inside-work-tree']).trim() === 'true';
     } catch {

@@ -7,7 +7,7 @@ import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
-import { WorktreeManager, createWorktreeTools } from '../src/worktrees.js';
+import { WorktreeManager, createWorktreeTools, isGitAvailable, GIT_NOT_INSTALLED_MESSAGE } from '../src/worktrees.js';
 
 function git(cwd: string, ...args: string[]): void {
   const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
@@ -57,6 +57,28 @@ describe('WorktreeManager', () => {
   it('refuses a non-git repo', () => {
     const mgr = new WorktreeManager(join(base, 'wts'));
     expect(() => mgr.create(join(base, 'repo', 'nothing-here'), { branch: 'x' })).toThrow(/not a git repo/);
+  });
+
+  // B4 backstop: with no git binary reachable, the failure must say
+  // "Git is not installed" in plain words -- NOT "not a git repo" and
+  // NOT the raw spawn artifact "exit null". Simulated by pointing PATH
+  // at an empty dir for the duration of the probe (restored in finally;
+  // the real-git tests in this file run before/after with a sane PATH).
+  it('says plainly that Git is not installed when the git binary is missing', () => {
+    const mgr = new WorktreeManager(join(base, 'wts'));
+    const emptyBin = join(base, 'empty-bin');
+    mkdirSync(emptyBin, { recursive: true });
+    const oldPath = process.env.PATH;
+    process.env.PATH = emptyBin;
+    try {
+      expect(isGitAvailable()).toBe(false);
+      expect(() => mgr.isGitRepo(repo)).toThrow(GIT_NOT_INSTALLED_MESSAGE);
+      expect(() => mgr.create(repo, { branch: 'x' })).toThrow(/Git is not installed/);
+      expect(() => mgr.create(repo, { branch: 'x' })).not.toThrow(/not a git repo/);
+    } finally {
+      process.env.PATH = oldPath;
+    }
+    expect(isGitAvailable()).toBe(true);
   });
 
   it('refuses to remove a dirty worktree without force, allows with force', () => {

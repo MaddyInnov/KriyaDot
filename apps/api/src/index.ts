@@ -158,6 +158,7 @@ import {
   INTERRUPTED_NOTE,
 } from './crash-recovery.js';
 import { createSentinelRouter, startSentinel } from './sentinel.js';
+import { NodePressureSampler, ResourceGuard, loadResourceGuardSettings } from './resource-guard.js';
 import { createWidgetRouter, sweepWidgets } from './widget-routes.js';
 import { WidgetCoordinator, WidgetStore } from '@mvp/agent-runtime';
 import { createRouter } from './routes.js';
@@ -1776,10 +1777,16 @@ async function boot(): Promise<void> {
   // Plugin system (Octop §2.4): third-party plugins (tool/skill/hook/UI/
   // channel kinds). Installs are deny-by-default: the approve hook mints a
   // governance approval and only an explicit human approval installs.
-  const { PluginManager } = await import('@mvp/plugins');
+  const { PluginManager, PluginTrustStore } = await import('@mvp/plugins');
   const { buildPluginTools, registerPluginHooks, registerPluginChannels } = await import('./plugin-routes.js');
+  const { syncPluginProviders } = await import('./plugin-providers.js');
+  // A9: publisher keys the user has explicitly trusted (durable, in the
+  // data dir beside the plugin state). Adding one is a deliberate trust
+  // action via /api/plugins/trust — never a side effect of an install.
+  const pluginTrustStore = new PluginTrustStore(`${config.dataDir}/plugin-trust.json`);
   const pluginManager = new PluginManager({
     dataDir: config.dataDir,
+    trustStore: pluginTrustStore,
     approveInstall: async (manifest, source) => {
       try {
         const approvalId = governance.requestApproval(
@@ -1793,11 +1800,48 @@ async function boot(): Promise<void> {
         return false;
       }
     },
+    // A9: the ONLY path for a package whose signature is not verified.
+    // The governance payload states the status in plain words — this is
+    // an "install UNSIGNED software" decision, never a routine approval,
+    // and the installed record keeps the unverified label permanently.
+    approveUntrustedInstall: async (manifest, source) => {
+      try {
+        const approvalId = governance.requestApproval(
+          'plugin_install_untrusted',
+          {
+            warning:
+              `This plugin package is NOT signature-verified (status: ${source.signature.status}). ` +
+              'Signing proves origin, not behaviour — install only if you trust where this file came from. ' +
+              'The plugin will be labelled with this unverified status permanently.',
+            plugin: manifest.name,
+            version: manifest.version,
+            kinds: manifest.kinds,
+            signatureStatus: source.signature.status,
+            signingKeyId: source.signature.keyId ?? null,
+            source,
+          },
+          { botId: 'system', sessionId: 'plugin-install', actor: 'user' },
+        );
+        const decision = await governance.awaitDecision(approvalId, 180_000);
+        return decision === 'approved';
+      } catch {
+        return false;
+      }
+    },
+    // A9: declared plugin secrets resolve from the host environment at
+    // invocation time (provider keys saved via the Providers page are
+    // injected into the environment by the providers module). Values are
+    // handed to the manager per call and never persisted by it.
+    resolveSecret: (name) => process.env[name],
   });
   await pluginManager.loadAll();
   for (const tool of await buildPluginTools(pluginManager)) {
     if (!toolRegistry.has(tool.name)) toolRegistry.set(tool.name, tool);
   }
+  // A9: declarative provider plugins installed in a previous session
+  // re-enter the provider registry at boot (hot installs sync live via
+  // the plugin router's mutation hook).
+  syncPluginProviders(pluginManager);
   registerPluginHooks(pluginManager, hookBus);
   registerPluginChannels(pluginManager);
   // Connector + social tools (OMB §1.20 / Octop §2.x mop-up): X, Postiz,
@@ -2309,6 +2353,20 @@ async function boot(): Promise<void> {
     | undefined;
   const { RoutineScheduler } = await import('./routine-schedules.js');
   const { renderRoutinePrompt } = await import('./webhooks.js');
+  // Resource guard (B3): platform-neutral pressure guard — samples RSS /
+  // event-loop lag / data-dir disk, audits soft pressure, and sheds NEW
+  // optional work at hard pressure (never touches in-flight work, never
+  // terminates the process). Monitoring on by default; thresholds and
+  // the on/off + shed switches live in resource-guard-settings.json /
+  // KRIYADOT_RESOURCE_GUARD* env (see resource-guard.ts). Its snapshot
+  // feeds /api/health/self (registered via createRouter below) and the
+  // A14 doctor command.
+  const resourceGuard = new ResourceGuard({
+    settings: loadResourceGuardSettings(config.dataDir),
+    sampler: new NodePressureSampler(config.dataDir),
+    audit: (action, fields) => governance.audit(action, fields),
+  });
+  resourceGuard.start();
   const routineScheduler = new RoutineScheduler({
     routineStore,
     runStore: routineRunStore,
@@ -2357,6 +2415,10 @@ async function boot(): Promise<void> {
       }
     },
     isPaused,
+    // Resource guard (B3): while the guard sheds, scheduled fires are
+    // recorded as missed with the guard's reason instead of starting;
+    // limit-reset resumes stay pending. Manual run-now is NOT gated.
+    optionalWorkGate: (routine) => resourceGuard.checkOptionalWork(`routine:${routine.id}`),
     // Idle triggers (Octomind parity): last message activity per bot
     // from the runtime's session store.
     lastBotActivityAt: (botId) => agentRuntime.lastBotActivityAt(botId),
@@ -3650,6 +3712,9 @@ async function boot(): Promise<void> {
       // turns through this very registry (routes.ts uses it as its
       // activeTurns map when provided).
       turnAbortRegistry,
+      // Resource guard (B3): registers /api/health/self +
+      // /api/health/resource-guard on the main router.
+      resourceGuard,
       // Per-session /role + /skill overlays (session commands write,
       // the chat route applies them per turn).
       sessionOverlays,
@@ -5151,8 +5216,30 @@ async function boot(): Promise<void> {
   // Plugin system (Octop §2.4): marketplace/admin surface for the manager
   // constructed with the tool registrations above.
   {
-    const { createPluginRouter } = await import('./plugin-routes.js');
-    app.use('/api', createPluginRouter({ manager: pluginManager, audit: (action, fields) => governance.audit(action, fields) }));
+    const { createPluginRouter, buildPluginTools: buildPluginToolsLive } = await import('./plugin-routes.js');
+    app.use(
+      '/api',
+      createPluginRouter({
+        manager: pluginManager,
+        trustStore: pluginTrustStore,
+        // A9 hot install: when a plugin is installed/uninstalled/toggled
+        // on this RUNNING server, refresh the chat tool registry's
+        // plugin:* entries so the change is live without a restart (the
+        // router syncs the provider registry itself). Hook/channel
+        // registrations made at boot are NOT re-registered here — a
+        // hot-installed hook/channel plugin joins those buses on the
+        // next boot; its tools and provider are live immediately.
+        onPluginsChanged: async () => {
+          for (const name of [...toolRegistry.keys()]) {
+            if (name.startsWith('plugin:')) toolRegistry.delete(name);
+          }
+          for (const tool of await buildPluginToolsLive(pluginManager)) {
+            if (!toolRegistry.has(tool.name)) toolRegistry.set(tool.name, tool);
+          }
+        },
+        audit: (action, fields) => governance.audit(action, fields),
+      }),
+    );
   }
   // Enterprise SSO + login captcha (Octop §2.5): OIDC/LDAP/captcha surface.
   // Mounted under /api/auth/sso (loopback-exempt: pre-auth by design).
@@ -5803,6 +5890,11 @@ async function boot(): Promise<void> {
     }
     try {
       routineScheduler.stop();
+    } catch {
+      // ignore
+    }
+    try {
+      resourceGuard.close();
     } catch {
       // ignore
     }

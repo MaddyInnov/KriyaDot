@@ -37,12 +37,16 @@ import {
   PluginInstallDenied,
   PluginManifestError,
   PluginNotFoundError,
+  PluginSignatureError,
   ZipError,
+  pluginKeyId,
   pluginSandboxStatusSync,
   type InstalledPlugin,
   type PluginInstallSource,
   type PluginManager,
+  type PluginTrustStore,
 } from '@mvp/plugins';
+import { syncPluginProviders } from './plugin-providers.js';
 import type { HookBus, HookEventName, ToolDefinition } from '@mvp/agent-runtime';
 import { registerMessageProvider } from './messaging.js';
 import * as hooksConfig from './hooks-config.js';
@@ -58,6 +62,15 @@ function errorBody(error: string, detail?: string): ApiError {
 
 export interface PluginRouterDeps {
   manager: PluginManager;
+  /** A9: the user's publisher trust store, when the host configured one (enables the /plugins/trust routes). */
+  trustStore?: PluginTrustStore;
+  /**
+   * A9: called after any install/uninstall/enable/disable mutation so the
+   * host can re-sync mirrored state (the API's chat tool registry — the
+   * provider registry is synced by this router itself). Best-effort: a
+   * throwing hook is logged, never fails the mutation.
+   */
+  onPluginsChanged?: () => void | Promise<void>;
   audit?: (
     action: string,
     fields: { actor?: string; sessionId?: string; decision?: string; detail?: unknown },
@@ -73,6 +86,15 @@ export function serializeInstalledPlugin(p: InstalledPlugin): Record<string, unk
     kinds: p.manifest.kinds,
     permissions: p.manifest.permissions ?? {},
     ...(p.manifest.ui ? { ui: p.manifest.ui } : {}),
+    ...(p.manifest.publisher ? { publisher: p.manifest.publisher } : {}),
+    // A9: declared secret NAMES (never values) + signature provenance.
+    // `signature.status` is the label the UI must show verbatim: only
+    // "verified" means a trusted publisher signed these exact bytes, and
+    // even that proves origin, not behaviour (OPEN-2 sandbox is the
+    // behaviour control).
+    ...(p.manifest.secrets ? { secrets: p.manifest.secrets } : {}),
+    signature: p.signature ?? { status: 'unrecorded' },
+    ...(p.manifest.provider ? { provider: p.manifest.provider } : {}),
     enabled: p.enabled,
     installedAt: p.installedAt,
     sourceType: p.source.type,
@@ -90,7 +112,7 @@ function mapError(err: unknown, res: express.Response, action: string): void {
     res.status(404).json(errorBody(message));
     return;
   }
-  if (err instanceof PluginApprovalRequired || err instanceof PluginInstallDenied) {
+  if (err instanceof PluginApprovalRequired || err instanceof PluginInstallDenied || err instanceof PluginSignatureError) {
     res.status(403).json(errorBody(message));
     return;
   }
@@ -133,6 +155,24 @@ export function createPluginRouter(deps: PluginRouterDeps): Router {
   const { manager } = deps;
   const audit = deps.audit ?? (() => {});
 
+  // A9 hot-install bookkeeping: after every mutation, re-sync the
+  // provider registry from the manager's live records and notify the
+  // host (tool registry mirror). Both are best-effort mirrors — the
+  // manager itself is already live, so a mirror failure must not fail
+  // the mutation that already succeeded.
+  const afterMutation = async (): Promise<void> => {
+    try {
+      syncPluginProviders(manager);
+    } catch (err) {
+      console.warn(`[plugins] provider sync failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    try {
+      await deps.onPluginsChanged?.();
+    } catch (err) {
+      console.warn(`[plugins] onPluginsChanged failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
   router.get('/plugins', (_req, res) => {
     // OPEN-2: surface the host's plugin-sandbox capability honestly.
     // `backend` names the kernel backend for this platform; enforcement
@@ -140,6 +180,18 @@ export function createPluginRouter(deps: PluginRouterDeps): Router {
     // be enforced on this host is refused at invoke time, never run
     // unconfined (see @mvp/plugins plugin-sandbox.ts).
     res.json({ ok: true, sandbox: pluginSandboxStatusSync(), plugins: manager.list().map(serializeInstalledPlugin) });
+  });
+
+  // A9: publisher trust listing. Registered BEFORE /plugins/:id so the
+  // literal "trust" segment wins over the :id parameter.
+  router.get('/plugins/trust', (_req, res) => {
+    res.json({
+      ok: true,
+      trustedKeys: manager
+        .trustedKeys()
+        .map((publicKey) => ({ keyId: pluginKeyId(publicKey), publicKey })),
+      userKeys: deps.trustStore ? deps.trustStore.list() : [],
+    });
   });
 
   router.get('/plugins/:id', (req, res) => {
@@ -166,49 +218,96 @@ export function createPluginRouter(deps: PluginRouterDeps): Router {
     const body = (req.body ?? {}) as { source?: unknown; path?: unknown; url?: unknown };
     const sourceKind = body.source;
     const path = typeof body.path === 'string' ? body.path : typeof body.url === 'string' ? body.url : '';
-    if (sourceKind !== 'dir' && sourceKind !== 'zip' && sourceKind !== 'url') {
-      res.status(400).json(errorBody('source must be one of: dir, zip, url'));
+    if (sourceKind !== 'dir' && sourceKind !== 'zip' && sourceKind !== 'package' && sourceKind !== 'url') {
+      res.status(400).json(errorBody('source must be one of: dir, zip, package, url'));
       return;
     }
     if (!path) {
-      res.status(400).json(errorBody('path is required (directory path, zip path, or URL for source "url")'));
+      res.status(400).json(errorBody('path is required (directory path, zip/.kdpkg path, or URL for source "url")'));
       return;
     }
     const source: PluginInstallSource =
       sourceKind === 'url' ? { type: 'url', url: path } : { type: sourceKind, path };
     try {
       const rec = await manager.install(source);
-      audit('plugin.installed', { actor: actorOf(req), decision: 'installed', detail: { id: rec.id, source: sourceKind } });
+      audit('plugin.installed', {
+        actor: actorOf(req),
+        decision: 'installed',
+        detail: { id: rec.id, source: sourceKind, signature: rec.signature.status },
+      });
+      await afterMutation();
       res.status(201).json({ ok: true, plugin: serializeInstalledPlugin(rec) });
     } catch (err) {
       mapError(err, res, 'install plugin');
     }
   });
 
-  router.delete('/plugins/:id', (req, res) => {
+  router.delete('/plugins/:id', async (req, res) => {
     try {
       manager.uninstall(req.params.id);
       audit('plugin.uninstalled', { actor: actorOf(req), detail: { id: req.params.id } });
+      await afterMutation();
       res.json({ ok: true, deleted: req.params.id });
     } catch (err) {
       mapError(err, res, 'uninstall plugin');
     }
   });
 
-  router.post('/plugins/:id/enable', (req, res) => {
+  // A9 publisher trust mutations (the GET lives above /plugins/:id so
+  // "trust" is not swallowed by the :id parameter). ADDING a key is a
+  // durable trust decision (future packages from that key verify), so it
+  // is audit-logged like every other trust action. Removing a key stops
+  // future installs from that publisher verifying; installed plugins are
+  // unaffected.
+  router.post('/plugins/trust', (req, res) => {
+    if (!deps.trustStore) {
+      res.status(501).json(errorBody('no publisher trust store is configured on this host'));
+      return;
+    }
+    const body = (req.body ?? {}) as { publicKey?: unknown; label?: unknown };
+    if (typeof body.publicKey !== 'string' || typeof body.label !== 'string' || !body.label.trim()) {
+      res.status(400).json(errorBody('publicKey (SPKI base64) and a non-empty label are required'));
+      return;
+    }
+    try {
+      const record = deps.trustStore.add(body.publicKey, body.label.trim().slice(0, 120));
+      audit('plugin.publisher_trusted', { actor: actorOf(req), decision: 'trusted', detail: { keyId: record.keyId } });
+      res.status(201).json({ ok: true, trusted: record });
+    } catch (err) {
+      res.status(400).json(errorBody(err instanceof Error ? err.message : String(err)));
+    }
+  });
+
+  router.delete('/plugins/trust/:keyId', (req, res) => {
+    if (!deps.trustStore) {
+      res.status(501).json(errorBody('no publisher trust store is configured on this host'));
+      return;
+    }
+    const removed = deps.trustStore.remove(req.params.keyId);
+    if (!removed) {
+      res.status(404).json(errorBody(`trusted key not found: ${req.params.keyId}`));
+      return;
+    }
+    audit('plugin.publisher_untrusted', { actor: actorOf(req), decision: 'untrusted', detail: { keyId: req.params.keyId } });
+    res.json({ ok: true, removed: req.params.keyId });
+  });
+
+  router.post('/plugins/:id/enable', async (req, res) => {
     try {
       const rec = manager.setEnabled(req.params.id, true);
       audit('plugin.enabled', { actor: actorOf(req), decision: 'enabled', detail: { id: rec.id } });
+      await afterMutation();
       res.json({ ok: true, plugin: serializeInstalledPlugin(rec) });
     } catch (err) {
       mapError(err, res, 'enable plugin');
     }
   });
 
-  router.post('/plugins/:id/disable', (req, res) => {
+  router.post('/plugins/:id/disable', async (req, res) => {
     try {
       const rec = manager.setEnabled(req.params.id, false);
       audit('plugin.disabled', { actor: actorOf(req), decision: 'disabled', detail: { id: rec.id } });
+      await afterMutation();
       res.json({ ok: true, plugin: serializeInstalledPlugin(rec) });
     } catch (err) {
       mapError(err, res, 'disable plugin');
