@@ -384,7 +384,16 @@ function collectStrings(value: unknown, out: string[] = []): string[] {
 
 /** Local Luhn scan (mirrors the billing guard) for serialized payloads. */
 function containsCardPattern(text: string): boolean {
-  const candidates = text.match(/(?:\d[ -]?){12,18}\d/g) ?? [];
+  // UUID-shaped tokens are stripped first: an intent id like
+  // pur_54482874-1851-460b-a92c-… has 15 digits across its dashes whose
+  // Luhn sum passes by chance ~1 run in 36 (CI run 182 flake, 2026-11-12).
+  // An id the API itself mints is not card data; a real card number is
+  // never written in 8-4-4-4-12 grouping, so this cannot hide one.
+  const stripped = text.replace(
+    /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi,
+    '',
+  );
+  const candidates = stripped.match(/(?:\d[ -]?){12,18}\d/g) ?? [];
   for (const c of candidates) {
     const digits = c.replace(/[ -]/g, '');
     if (!/^\d{13,19}$/.test(digits)) continue;
