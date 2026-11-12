@@ -12,8 +12,21 @@
 // Rollback is best-effort: the previously downloaded installer is kept in
 // <dataDir>/updates/ so it can be re-run manually. There is no automatic
 // health-check-and-revert; that is documented honestly in the UI.
+//
+// A14: an offer exists ONLY when the release carries an Ed25519-signed
+// manifest (update-manifest.ts, same conventions as A9/licence) that
+// verifies against the built-in release key. Unsigned / tampered /
+// unknown-key manifests fail closed: no offer, no badge, just an
+// audit/log line via deps.onManifestRejected — never a user-facing
+// error, because a bad signature is an attack-or-corruption signal.
 
 import { createHash } from 'node:crypto';
+import {
+  RELEASE_MANIFEST_ASSET_NAME,
+  resolveUpdateManifestKeys,
+  verifyReleaseManifest,
+  type ReleaseManifestStatus,
+} from './update-manifest.js';
 import { createWriteStream, existsSync } from 'node:fs';
 import { mkdir, rename, stat, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -74,6 +87,18 @@ export interface UpdateStatus {
   previousInstaller: string | null;
   platform: string;
   arch: string;
+  /**
+   * A14: signature state of the manifest behind the current offer —
+   * 'verified' when an offer is showing, the rejection status when the
+   * last check was blocked, null before any check found a candidate.
+   */
+  manifestStatus: ReleaseManifestStatus | null;
+  /**
+   * A14: set when a newer release was found but its offer was blocked
+   * by manifest verification (fail closed). The tag + plain reason are
+   * for logs/doctor — the UI keeps showing "no update" either way.
+   */
+  blockedOffer: { tag: string; status: ReleaseManifestStatus; reason: string } | null;
 }
 
 export interface UpdateSettings {
@@ -209,6 +234,18 @@ export interface SelfUpdateDeps {
   onProgress?: (e: UpdateProgressEvent) => void;
   /** Skip auto-check timer (tests). */
   noAutoCheck?: boolean;
+  /**
+   * A14: extra trusted manifest-signing keys (SPKI base64) beyond the
+   * built-in release key + KRIYADOT_UPDATE_TRUSTED_KEYS env — key
+   * rotation and tests. Verification never trusts a presented key.
+   */
+  manifestPublicKeys?: readonly string[];
+  /**
+   * A14: called once per blocked offer (unsigned / invalid /
+   * untrusted-key manifest). The host wires this to its audit trail +
+   * log; it must never throw into the check path.
+   */
+  onManifestRejected?: (info: { tag: string; status: ReleaseManifestStatus; reason: string }) => void;
 }
 
 interface PersistedState {
@@ -246,6 +283,12 @@ export class SelfUpdateManager {
   private settings: UpdateSettings = { ...DEFAULT_SETTINGS };
   private timer: ReturnType<typeof setInterval> | null = null;
   private downloadAbort: AbortController | null = null;
+  private readonly manifestKeys: string[];
+  private readonly onManifestRejected?: SelfUpdateDeps['onManifestRejected'];
+  private manifestStatus: ReleaseManifestStatus | null = null;
+  private blockedOffer: UpdateStatus['blockedOffer'] = null;
+  /** SHA-256 of the chosen asset from the VERIFIED manifest, if listed. */
+  private manifestAssetSha256: string | null = null;
 
   constructor(deps: SelfUpdateDeps) {
     this.dataDir = deps.dataDir;
@@ -257,6 +300,8 @@ export class SelfUpdateManager {
     this.spawnFn = deps.spawn;
     this.exitFn = deps.exit ?? ((code) => process.exit(code));
     this.onProgress = deps.onProgress;
+    this.manifestKeys = resolveUpdateManifestKeys(deps.manifestPublicKeys ?? []);
+    this.onManifestRejected = deps.onManifestRejected;
     void this.loadState();
     void this.loadSettings().then(() => {
       if (!deps.noAutoCheck) this.startAutoCheck();
@@ -339,6 +384,8 @@ export class SelfUpdateManager {
       previousInstaller: this.previousInstaller,
       platform: this.platform,
       arch: this.arch,
+      manifestStatus: this.manifestStatus,
+      blockedOffer: this.blockedOffer,
     };
   }
 
@@ -431,17 +478,43 @@ export class SelfUpdateManager {
         this.latest = null;
         this.asset = null;
         this.state = 'idle';
+        this.blockedOffer = null;
+        this.manifestStatus = null;
+        this.manifestAssetSha256 = null;
       } else {
-        this.latest = {
-          tag: best.tag,
-          name: best.name,
-          body: best.body,
-          publishedAt: best.publishedAt,
-          prerelease: best.prerelease,
-          htmlUrl: best.htmlUrl,
-        };
-        this.asset = selectAssetForPlatform(best._assets ?? [], this.platform, this.arch);
-        this.state = 'available';
+        // A14: verify the signed release manifest BEFORE the offer
+        // exists. Anything short of `verified` fails closed below.
+        const gate = await this.verifyReleaseOffer(best);
+        if (!gate.ok) {
+          this.latest = null;
+          this.asset = null;
+          this.state = 'idle';
+          this.manifestStatus = gate.status;
+          this.manifestAssetSha256 = null;
+          this.blockedOffer = { tag: best.tag, status: gate.status, reason: gate.reason };
+          try {
+            this.onManifestRejected?.({ tag: best.tag, status: gate.status, reason: gate.reason });
+          } catch {
+            // Observability must never break the check path.
+          }
+        } else {
+          this.latest = {
+            tag: best.tag,
+            name: best.name,
+            body: best.body,
+            publishedAt: best.publishedAt,
+            prerelease: best.prerelease,
+            htmlUrl: best.htmlUrl,
+          };
+          this.asset = selectAssetForPlatform(best._assets ?? [], this.platform, this.arch);
+          this.state = 'available';
+          this.manifestStatus = 'verified';
+          this.blockedOffer = null;
+          this.manifestAssetSha256 =
+            this.asset != null
+              ? (gate.payload.assets.find((a) => a.name === this.asset!.name)?.sha256.toLowerCase() ?? null)
+              : null;
+        }
       }
       await this.saveState();
     } catch (err) {
@@ -449,6 +522,78 @@ export class SelfUpdateManager {
       this.lastError = err instanceof Error ? err.message : String(err);
     }
     return this.getStatus();
+  }
+
+  // -- A14: signed-manifest gate --------------------------------------------
+
+  /**
+   * Fetch + verify the release manifest asset for a candidate release.
+   * Returns ok only for a `verified` manifest whose tag matches the
+   * release AND whose asset list agrees with the GitHub asset list on
+   * the platform asset's size (a signed manifest describing different
+   * bytes than the feed offers is not an offer). A missing manifest
+   * asset is `unsigned` — pre-A14 releases simply make no offer.
+   */
+  private async verifyReleaseOffer(best: ReleaseInfo & { _assets?: ReleaseAsset[] }): Promise<
+    | { ok: true; payload: import('./update-manifest.js').ReleaseManifestPayload }
+    | { ok: false; status: ReleaseManifestStatus; reason: string }
+  > {
+    const assets = best._assets ?? [];
+    const manifestAsset = assets.find((a) => a.name === RELEASE_MANIFEST_ASSET_NAME);
+    if (!manifestAsset) {
+      return { ok: false, status: 'unsigned', reason: `release ${best.tag} carries no signed release manifest` };
+    }
+    let raw: unknown;
+    try {
+      const res = await this.fetchFn(manifestAsset.browser_download_url, {
+        headers: { 'User-Agent': 'KriyaDot-Updater' },
+      });
+      if (!res.ok) {
+        return { ok: false, status: 'invalid', reason: `release manifest fetch failed with status ${res.status}` };
+      }
+      raw = JSON.parse(await res.text()) as unknown;
+    } catch (err) {
+      return {
+        ok: false,
+        status: 'invalid',
+        reason: `release manifest could not be read (${err instanceof Error ? err.message : String(err)})`,
+      };
+    }
+    const verification = verifyReleaseManifest(raw, this.manifestKeys);
+    if (verification.status !== 'verified' || !verification.payload) {
+      return {
+        ok: false,
+        status: verification.status,
+        reason: verification.reason ?? `release manifest status: ${verification.status}`,
+      };
+    }
+    const payload = verification.payload;
+    if (payload.tag !== best.tag) {
+      return {
+        ok: false,
+        status: 'invalid',
+        reason: `signed manifest is for ${payload.tag}, not the offered release ${best.tag}`,
+      };
+    }
+    const chosen = selectAssetForPlatform(assets, this.platform, this.arch);
+    if (chosen) {
+      const listed = payload.assets.find((a) => a.name === chosen.name);
+      if (!listed) {
+        return {
+          ok: false,
+          status: 'invalid',
+          reason: `signed manifest does not list the offered asset ${chosen.name}`,
+        };
+      }
+      if (listed.size !== chosen.size) {
+        return {
+          ok: false,
+          status: 'invalid',
+          reason: `signed manifest size for ${chosen.name} (${listed.size}) disagrees with the release feed (${chosen.size})`,
+        };
+      }
+    }
+    return { ok: true, payload };
   }
 
   // -- download (explicit consent only) -------------------------------------
@@ -502,6 +647,18 @@ export class SelfUpdateManager {
         throw new Error(
           `Downloaded size ${st.size} does not match expected ${total} — discarding.`,
         );
+      }
+      // A14: when the verified manifest listed this asset's SHA-256,
+      // that signed digest is authoritative (the unsigned .sha256
+      // sidecar check below stays as a second, best-effort opinion).
+      if (this.manifestAssetSha256) {
+        const hash = createHash('sha256');
+        const { createReadStream } = await import('node:fs');
+        await pipeline(createReadStream(tmp), hash);
+        const actual = hash.digest('hex');
+        if (actual !== this.manifestAssetSha256) {
+          throw new Error('SHA-256 of the download does not match the signed release manifest — discarding.');
+        }
       }
       await this.verifyChecksumIfAvailable(asset, tmp);
       await rename(tmp, dest);
@@ -621,6 +778,9 @@ export class SelfUpdateManager {
     this.downloadedPath = null;
     this.downloadedBytes = 0;
     this.lastError = null;
+    this.manifestStatus = null;
+    this.blockedOffer = null;
+    this.manifestAssetSha256 = null;
   }
 }
 

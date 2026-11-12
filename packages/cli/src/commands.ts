@@ -35,6 +35,7 @@ import {
 } from './completion.js';
 import type { DynamicNames } from './completion.js';
 import { runTapCommand } from './tap-commands.js';
+import { runDoctorCommand, runServiceCommand } from './service-commands.js';
 import { runBridgeCommand } from './bridge-commands.js';
 import { runLearningCommand } from './learning-commands.js';
 import { runWorkflowCommand } from './workflow-commands.js';
@@ -1185,6 +1186,10 @@ export async function runCommand(p: ParsedArgs, deps: CommandDeps): Promise<numb
         return await doDaemon(deps, p);
       case 'serve':
         return await doServe(deps, p);
+      case 'doctor':
+        return await runDoctorCommand(deps, p);
+      case 'service':
+        return await runServiceCommand(deps, p);
       case 'models':
         return await doModels(deps, p);
       case 'mcp':

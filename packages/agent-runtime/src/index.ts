@@ -108,6 +108,7 @@ export * from './worktrees.js';
 export * from './fusion.js';
 export * from './evals.js';
 export * from './self-update.js';
+export * from './update-manifest.js';
 export * from './team-markdown.js';
 export * from './memory-upkeep.js';
 export * from './memory-pipeline.js';

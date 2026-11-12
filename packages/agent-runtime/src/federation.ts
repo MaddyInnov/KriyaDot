@@ -48,7 +48,7 @@ import { dirname } from 'node:path';
 // Types
 // ---------------------------------------------------------------------------
 
-export type FederationCapability = 'chat' | 'workspace-read';
+export type FederationCapability = 'chat' | 'workspace-read' | 'fleet' | 'mission-dispatch';
 
 export interface TunnelPolicy {
   /** Local bot ids exposed to this peer as "experts". Empty = none. */

@@ -112,6 +112,7 @@ import {
   FileStandingRuleStore,
 } from '@mvp/agent-runtime';
 import { createSelfUpdateRouter } from './self-update-routes.js';
+import { createDoctorRouter } from './doctor-routes.js';
 import { IdleAutoUpdater, SelfUpdateManager } from '@mvp/agent-runtime';
 import { createFusionRouter, shutdownFusionRuns } from './fusion-routes.js';
 import { FusionRunStore } from './fusion.js';
@@ -4597,6 +4598,18 @@ async function boot(): Promise<void> {
   const updater = new SelfUpdateManager({
     dataDir: config.dataDir,
     currentVersion: process.env.KRIYADOT_VERSION ?? '0.1.0',
+    // A14: a blocked update offer (unsigned/invalid/untrusted manifest)
+    // is an audit + log event only — never a user-facing error.
+    onManifestRejected: (info) => {
+      console.warn(
+        `[updates] update offer blocked: release ${info.tag} manifest ${info.status} — ${info.reason}`,
+      );
+      try {
+        governance.audit('update.manifest_rejected', { actor: 'system', detail: { ...info } });
+      } catch {
+        // Audit must never break the updater.
+      }
+    },
   });
   // W12: "Apply updates when idle" (default OFF in update settings). The
   // idle applier polls every 30s and applies a pending update only after
@@ -4619,6 +4632,20 @@ async function boot(): Promise<void> {
   });
   idleUpdater.start();
   app.use('/api/updates', createSelfUpdateRouter(updater, { idleUpdater }));
+
+  // Doctor (A14): one-shot operations health report — the same checks
+  // the `kriyadot doctor` CLI verb renders, over B3's snapshot seam,
+  // A8/A2 bridge identity, provider presence, PC grants, sandbox and
+  // resource-guard state. Read-only: doctor reports, never fixes.
+  app.use(
+    '/api/doctor',
+    createDoctorRouter({
+      dataDir: config.dataDir,
+      guard: resourceGuard,
+      pcAccessStore,
+      counts: () => ({ activeTurns: agentRuntime.turnStates.size }),
+    }),
+  );
 
   // Open-at-login (W12d): file-based OS autostart entry managed from
   // Settings. The exec path defaults to this server process; desktop

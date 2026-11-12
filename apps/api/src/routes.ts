@@ -110,6 +110,13 @@ import {
   createRuntimeBotRunner,
   registerMissionRoutes,
 } from './missions.js';
+// A15: fleet registry + cross-machine dispatch/transfer (fleet.ts). The
+// federation service here loads the SAME identity store file the
+// federation router in index.ts uses (<dataDir>/federation.json) — one
+// identity per data dir, whichever module opens it first.
+import { FederationService } from '@mvp/agent-runtime/dist/federation.js';
+import { BRIDGE_ACCOUNT_BRIDGES } from '@mvp/agent-runtime';
+import { FleetCoordinator, FleetRegistry, detectCapabilities, registerFleetRoutes } from './fleet.js';
 import { registerPagesRoutes } from './pages.js';
 import { registerPagePublicationRoutes } from './public-pages.js';
 import { registerBackgroundRunRoutes, registerSessionShareRoutes } from './session-share.js';
@@ -3742,6 +3749,56 @@ export function createRouter(deps: RouteDeps): express.Router {
       service: missionService,
       dispatcher: missionDispatcher,
       missionStore,
+    });
+
+    // A15: multi-machine fleet on the federation identity (fleet.ts).
+    // Registry + coordinator share the A5 mission service/stores above,
+    // so dispatched/transferred missions land on the same board, and the
+    // transcript seam is the durable SessionStore. Inbound fleet routes
+    // live under /federation/inbound/fleet/* — already loopback-exempt
+    // (signature-authenticated) via loopback-auth.ts. NOTE: this creates
+    // a second FederationService over the same store file as index.ts's
+    // federation router; both load the one persisted identity, but each
+    // keeps its own replay guard — acceptable for v1 (guards are
+    // per-process safety nets, and both processes are the same host).
+    const fleetFederation = new FederationService({
+      storePath: join(config.dataDir, 'federation.json'),
+      name: 'KriyaDot',
+      publicUrl: process.env.KRIYADOT_FEDERATION_URL,
+    });
+    const fleetRegistry = new FleetRegistry(config.dataDir);
+    const fleetCoordinator = new FleetCoordinator({
+      federation: fleetFederation,
+      registry: fleetRegistry,
+      missionService,
+      missionStore,
+      taskStore: missionTaskStore,
+      displayName: 'KriyaDot',
+      version: '0.1.0',
+      capabilities: detectCapabilities({ bridges: [...BRIDGE_ACCOUNT_BRIDGES] }),
+      worktreeRoot: join(config.workspaceDir, '.worktrees'),
+      transcripts: {
+        list: (sessionId) =>
+          agentRuntime.sessionStore.listThreadMessages(sessionId).map((m) => ({ role: m.role, content: m.content })),
+        append: (sessionId, messages) => {
+          for (const m of messages) {
+            agentRuntime.sessionStore.appendMessage(sessionId, {
+              role: m.role as 'user' | 'assistant' | 'system' | 'tool',
+              content: m.content,
+            });
+          }
+        },
+      },
+      audit: (action, fields) =>
+        governance.audit(action, {
+          actor: 'fleet',
+          detail: fields,
+        }),
+    });
+    registerFleetRoutes(router, {
+      federation: fleetFederation,
+      coordinator: fleetCoordinator,
+      registry: fleetRegistry,
     });
   }
 

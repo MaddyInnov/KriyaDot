@@ -25,6 +25,7 @@ import { SessionAnalyzePanel } from '../../components/activity/session-analyze-p
 import { UnifiedStatusPanel } from '../../components/activity/unified-status-panel';
 import { WorkPanel } from '../../components/activity/work-panel';
 import { PermissionsSummary } from '../../components/activity/permissions-summary';
+import { FleetPanel } from '../../components/activity/fleet-panel';
 
 const TABS = [
   { id: 'work', label: 'Work', pro: false },
@@ -42,6 +43,7 @@ const TABS = [
   { id: 'routing', label: 'Routing', pro: false },
   { id: 'recovery', label: 'Recovery', pro: false },
   { id: 'health', label: 'Health', pro: false },
+  { id: 'fleet', label: 'Fleet', pro: false },
   { id: 'services', label: 'Services', pro: false },
   { id: 'cost', label: 'Cost', pro: true },
   { id: 'audit', label: 'Audit log', pro: false },
@@ -64,6 +66,7 @@ const MORE_IDS: TabId[] = [
   'routing',
   'recovery',
   'health',
+  'fleet',
   'services',
   'cost',
   'audit',
@@ -187,6 +190,7 @@ export default function ActivityPage() {
             {activeTab === "routing" && <RoutingPanel />}
             {activeTab === "recovery" && <RecoveryPanel />}
             {activeTab === "health" && <HealthPanel />}
+            {activeTab === "fleet" && <FleetPanel />}
             {activeTab === "services" && <ServicesPanel />}
             {activeTab === "cost" && <CostPanel />}
             {activeTab === "audit" && <AuditPanel hideHeader />}

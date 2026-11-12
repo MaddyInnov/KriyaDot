@@ -199,7 +199,10 @@ function cleanPolicy(input: unknown): Partial<TunnelPolicy> {
     out.exposedBotIds = p.exposedBotIds.filter((x): x is string => typeof x === 'string').slice(0, 200);
   }
   if (Array.isArray(p.capabilities)) {
-    out.capabilities = p.capabilities.filter((x): x is 'chat' | 'workspace-read' => x === 'chat' || x === 'workspace-read');
+    out.capabilities = p.capabilities.filter(
+      (x): x is 'chat' | 'workspace-read' | 'fleet' | 'mission-dispatch' =>
+        x === 'chat' || x === 'workspace-read' || x === 'fleet' || x === 'mission-dispatch',
+    );
   }
   if (typeof p.rateCapPerMinute === 'number' && Number.isFinite(p.rateCapPerMinute)) {
     out.rateCapPerMinute = Math.max(1, Math.min(10_000, Math.floor(p.rateCapPerMinute)));

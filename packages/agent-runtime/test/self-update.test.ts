@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -12,6 +13,39 @@ import {
   SelfUpdateManager,
   type ReleaseAsset,
 } from '../src/self-update.js';
+import {
+  createSignedReleaseManifest,
+  generateReleaseKeyPair,
+  RELEASE_MANIFEST_ASSET_NAME,
+} from '../src/update-manifest.js';
+
+// A14: offers require a verified signed manifest. The fixtures below sign
+// every release with a test keypair and serve the manifest asset, so the
+// pre-A14 flow tests keep their intent under the new gate. The gate's own
+// behaviour (unsigned / tampered / untrusted) is covered in
+// update-manifest-a14.test.ts.
+export const TEST_RELEASE_KEYS = generateReleaseKeyPair();
+
+export function sha256Hex(data: string | Buffer): string {
+  return createHash('sha256').update(data).digest('hex');
+}
+
+/** Manifest asset + signed text for a release, in the fixture's shape. */
+export function signedManifestFixture(
+  tag: string,
+  assets: ReleaseAsset[],
+  hashes: Record<string, string> = {},
+): { asset: ReleaseAsset; text: string; url: string } {
+  const url = `https://dl/manifest/${encodeURIComponent(tag)}`;
+  const manifest = createSignedReleaseManifest(
+    tag,
+    assets.map((a) => ({ name: a.name, size: a.size, sha256: hashes[a.name] ?? sha256Hex(`bytes-of-${a.name}`) })),
+    TEST_RELEASE_KEYS,
+    { createdAt: 1_700_000_000_000 },
+  );
+  const text = JSON.stringify(manifest);
+  return { asset: { name: RELEASE_MANIFEST_ASSET_NAME, size: text.length, browser_download_url: url }, text, url };
+}
 
 describe('parseVersion / compareVersions', () => {
   it('compares plain semver', () => {
@@ -114,10 +148,28 @@ function ghRelease(tag: string, assets: ReleaseAsset[], extra: Record<string, un
   };
 }
 
-function makeFetch(releases: unknown[]) {
+/**
+ * Serve raw ghRelease() objects as SIGNED releases: each gains a manifest
+ * asset, and the manifest URL serves the signed manifest text. Returns
+ * the fetch plus the (transformed) release list it serves.
+ */
+function makeFetch(rawReleases: Array<ReturnType<typeof ghRelease>>) {
   const calls: string[] = [];
+  const manifestByUrl = new Map<string, string>();
+  const releases = rawReleases.map((r) => {
+    const assets = (r.assets ?? []) as ReleaseAsset[];
+    if (r.draft) return r;
+    const fx = signedManifestFixture(String(r.tag_name), assets);
+    manifestByUrl.set(fx.url, fx.text);
+    return { ...r, assets: [...assets, fx.asset] };
+  });
   const fn = (async (url: string | URL | Request) => {
-    calls.push(String(url));
+    const u = String(url);
+    calls.push(u);
+    const text = manifestByUrl.get(u);
+    if (text !== undefined) {
+      return { ok: true, status: 200, json: async () => JSON.parse(text), text: async () => text, body: null };
+    }
     return {
       ok: true,
       status: 200,
@@ -138,7 +190,7 @@ afterEach(() => {
 });
 
 function makeManager(opts: {
-  releases?: unknown[];
+  releases?: Array<ReturnType<typeof ghRelease>>;
   fetchImpl?: typeof fetch;
   platform?: string;
   arch?: string;
@@ -149,6 +201,7 @@ function makeManager(opts: {
     : makeFetch(opts.releases ?? []);
   const spawned: Array<{ cmd: string; args: string[] }> = [];
   const exited: number[] = [];
+  const rejected: Array<{ tag: string; status: string; reason: string }> = [];
   const manager = new SelfUpdateManager({
     dataDir: dir,
     currentVersion: opts.currentVersion ?? '0.1.0-alpha',
@@ -156,6 +209,8 @@ function makeManager(opts: {
     platform: opts.platform ?? 'linux',
     arch: opts.arch ?? 'x64',
     noAutoCheck: true,
+    manifestPublicKeys: [TEST_RELEASE_KEYS.publicKey],
+    onManifestRejected: (info) => rejected.push(info),
     spawn: ((cmd: string, args: string[]) => {
       spawned.push({ cmd, args });
       return { unref: () => undefined } as unknown as never;
@@ -164,7 +219,7 @@ function makeManager(opts: {
       exited.push(code);
     },
   });
-  return { manager, calls, spawned, exited };
+  return { manager, calls, spawned, exited, rejected };
 }
 
 const LINUX_ASSETS: ReleaseAsset[] = [
@@ -223,8 +278,11 @@ describe('SelfUpdateManager.checkNow', () => {
   it('never downloads during a check', async () => {
     const { manager, calls } = makeManager({ releases: [ghRelease('v0.1.1', LINUX_ASSETS)] });
     await manager.checkNow();
-    // Only the releases API was hit — no asset URL.
-    expect(calls).toEqual(['https://api.github.com/repos/MaddyInnov/KriyaDot/releases']);
+    // The releases API plus (A14) the signed manifest were fetched — the
+    // installer asset itself is never downloaded during a check.
+    expect(calls[0]).toBe('https://api.github.com/repos/MaddyInnov/KriyaDot/releases');
+    expect(calls).toContain('https://dl/manifest/v0.1.1');
+    expect(calls).not.toContain('https://dl/appimage');
   });
 });
 
@@ -250,6 +308,9 @@ describe('download + install (linux)', () => {
       browser_download_url: 'https://dl/appimage',
     };
     const progress: number[] = [];
+    // A14: the release carries a manifest signed over the REAL payload hash.
+    const fx = signedManifestFixture('v0.1.1', [asset], { [asset.name]: sha256Hex(payload) });
+    const release = ghRelease('v0.1.1', [asset, fx.asset]);
     const fetchImpl = (async (url: string | URL | Request) => {
       const u = String(url);
       if (u === 'https://dl/appimage') {
@@ -261,7 +322,10 @@ describe('download + install (linux)', () => {
         });
         return { ok: true, status: 200, body: stream, json: async () => [], text: async () => '' };
       }
-      return { ok: true, status: 200, json: async () => [ghRelease('v0.1.1', [asset])], text: async () => '' };
+      if (u === fx.url) {
+        return { ok: true, status: 200, body: null, json: async () => JSON.parse(fx.text), text: async () => fx.text };
+      }
+      return { ok: true, status: 200, json: async () => [release], text: async () => '' };
     }) as unknown as typeof fetch;
 
     const { fn } = { fn: fetchImpl };
@@ -274,6 +338,7 @@ describe('download + install (linux)', () => {
       platform: 'linux',
       arch: 'x64',
       noAutoCheck: true,
+      manifestPublicKeys: [TEST_RELEASE_KEYS.publicKey],
       onProgress: (e) => progress.push(e.progress),
       spawn: ((cmd: string, args: string[]) => {
         spawned.push({ cmd, args });
@@ -305,6 +370,8 @@ describe('download + install (linux)', () => {
       size: 9999, // lies
       browser_download_url: 'https://dl/appimage',
     };
+    const fx = signedManifestFixture('v0.1.1', [asset]);
+    const release = ghRelease('v0.1.1', [asset, fx.asset]);
     const fetchImpl = (async (url: string | URL | Request) => {
       const u = String(url);
       if (u === 'https://dl/appimage') {
@@ -316,7 +383,10 @@ describe('download + install (linux)', () => {
         });
         return { ok: true, status: 200, body: stream, json: async () => [], text: async () => '' };
       }
-      return { ok: true, status: 200, json: async () => [ghRelease('v0.1.1', [asset])], text: async () => '' };
+      if (u === fx.url) {
+        return { ok: true, status: 200, body: null, json: async () => JSON.parse(fx.text), text: async () => fx.text };
+      }
+      return { ok: true, status: 200, json: async () => [release], text: async () => '' };
     }) as unknown as typeof fetch;
     const { manager } = makeManager({ fetchImpl, platform: 'linux', arch: 'x64' });
     // Rebuild with the lying asset via releases list (makeManager already

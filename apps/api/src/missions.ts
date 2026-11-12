@@ -65,6 +65,9 @@ import { TaskStore, taskBlockersSatisfied, type Task, type TaskMissionStage } fr
 export type MissionStage = TaskMissionStage;
 export type ReviewIndependence = 'cross-model' | 'same-model';
 export type MissionProvenance = 'manual' | 'dispatcher';
+/** A15: where a mission executes. 'local' = this machine (the A5 default);
+ * 'fleet' = dispatched over federation to a peer machine (fleet.ts). */
+export type MissionPlacement = 'local' | 'fleet';
 
 export interface MissionBotIdentity {
   botId: string;
@@ -86,6 +89,33 @@ export interface Mission {
   reviewer: MissionBotIdentity;
   stage: MissionStage;
   provenance: MissionProvenance;
+  /** A15: execution placement. Absent on pre-A15 records = 'local'. */
+  placement?: MissionPlacement;
+  /** A15: instance that asked for the work (the origin), when different. */
+  originInstanceId?: string;
+  /** A15: instance the work actually ran / is running on (provenance). */
+  executedOnInstanceId?: string;
+  executedOnName?: string;
+  /** A15: the mission id on the executing machine, for fleet-dispatched
+   * mirror records kept on the origin's board. */
+  remoteMissionId?: string;
+  /** A15 resume-by-transfer: set on a mission RECEIVED by transfer. The
+   * mission is never presented as natively run on the receiver. */
+  transferredFromInstanceId?: string;
+  transferredFromName?: string;
+  transferredAt?: number;
+  /** Stage the mission had reached on the origin when it transferred. */
+  stageAtTransfer?: MissionStage;
+  /** How the code state arrived: 'branch' (receiver had the branch),
+   * 'diff' (diff applied in a fresh worktree, resume at review), or
+   * 'transcript-only' (no code state; worker re-runs with the transcript
+   * as context). See fleet.ts for the honest per-mode semantics. */
+  transferMode?: 'branch' | 'diff' | 'transcript-only';
+  /** Number of session-transcript messages that travelled with the transfer. */
+  transferredTranscriptCount?: number;
+  /** Internal: when 'review', execute() skips the worker step because the
+   * worktree already carries the transferred, committed work. */
+  resumeFromStage?: 'review';
   worktreePath?: string;
   reviewIndependence?: ReviewIndependence;
   review?: { verdict: 'approve' | 'reject'; text: string; provider: string; model: string };
@@ -107,6 +137,19 @@ export interface CreateMissionInput {
   workerBotId?: string;
   reviewerBotId?: string;
   provenance?: MissionProvenance;
+  /** A15 fleet fields (see Mission). Set by fleet.ts, never by HTTP bodies. */
+  placement?: MissionPlacement;
+  originInstanceId?: string;
+  executedOnInstanceId?: string;
+  executedOnName?: string;
+  remoteMissionId?: string;
+  transferredFromInstanceId?: string;
+  transferredFromName?: string;
+  transferredAt?: number;
+  stageAtTransfer?: MissionStage;
+  transferMode?: 'branch' | 'diff' | 'transcript-only';
+  transferredTranscriptCount?: number;
+  resumeFromStage?: 'review';
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +440,24 @@ export class MissionService {
       reviewer: this.identity(reviewerBotId),
       stage: 'queued',
       provenance: input.provenance ?? 'manual',
+      ...(input.placement ? { placement: input.placement } : {}),
+      ...(input.originInstanceId ? { originInstanceId: input.originInstanceId } : {}),
+      ...(input.executedOnInstanceId ? { executedOnInstanceId: input.executedOnInstanceId } : {}),
+      ...(input.executedOnName ? { executedOnName: input.executedOnName } : {}),
+      ...(input.remoteMissionId ? { remoteMissionId: input.remoteMissionId } : {}),
+      ...(input.transferredFromInstanceId
+        ? {
+            transferredFromInstanceId: input.transferredFromInstanceId,
+            ...(input.transferredFromName ? { transferredFromName: input.transferredFromName } : {}),
+            ...(input.transferredAt ? { transferredAt: input.transferredAt } : {}),
+            ...(input.stageAtTransfer ? { stageAtTransfer: input.stageAtTransfer } : {}),
+            ...(input.transferMode ? { transferMode: input.transferMode } : {}),
+            ...(typeof input.transferredTranscriptCount === 'number'
+              ? { transferredTranscriptCount: input.transferredTranscriptCount }
+              : {}),
+            ...(input.resumeFromStage ? { resumeFromStage: input.resumeFromStage } : {}),
+          }
+        : {}),
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
@@ -489,37 +550,61 @@ export class MissionService {
     mission = this.setStage(mission, 'working', { worktreePath });
     this.audit('mission.worktree_created', mission, { worktreePath, branch: mission.branch });
 
-    // (2) Worker bot run in the worktree.
+    // A15 resume-by-transfer: a mission received with resumeFromStage
+    // 'review' already carries committed work in its worktree (the
+    // transferred diff, applied + committed by fleet.ts). The worker
+    // step is skipped — re-running it would destroy the provenance of
+    // the transferred work — and the pipeline continues at review.
+    const resumeAtReview = mission.resumeFromStage === 'review';
     let workerResult: MissionBotRunResult;
-    try {
-      workerResult = await this.deps.botRunner({
-        missionId: mission.id,
-        taskId: mission.taskId,
-        role: 'worker',
-        botId: mission.worker.botId,
-        provider: mission.worker.provider,
-        model: mission.worker.model,
-        prompt: `Implement this task in the current worktree:\n\n${task.title}\n${task.notes ?? ''}`.trim(),
-        worktreePath,
-      });
-    } catch (err) {
-      return this.block(mission, `worker run failed: ${errMessage(err)}`, { worktreePath });
-    }
-
-    // Commit whatever the worker produced so the diff/merge are real.
-    try {
-      git(worktreePath, ['add', '-A']);
-      const dirty = git(worktreePath, ['status', '--porcelain']).trim();
-      if (!dirty) {
-        return this.block(mission, 'worker produced no changes in the worktree', { worktreePath });
+    if (resumeAtReview) {
+      let ahead = '';
+      try {
+        ahead = git(worktreePath, ['log', `${mission.targetBranch}..HEAD`, '--oneline']).trim();
+      } catch (err) {
+        return this.block(mission, `transferred worktree check failed: ${errMessage(err)}`, { worktreePath });
       }
-      git(worktreePath, [
-        '-c', 'user.email=mission@kriyadot.local',
-        '-c', 'user.name=KriyaDot Mission',
-        'commit', '-m', `mission: ${task.title}`.slice(0, 200),
-      ]);
-    } catch (err) {
-      return this.block(mission, `committing worker changes failed: ${errMessage(err)}`, { worktreePath });
+      if (!ahead) {
+        return this.block(mission, 'transferred mission has no committed work ahead of the target branch', {
+          worktreePath,
+        });
+      }
+      // Review independence is measured against the ORIGINAL worker's
+      // recorded identity for transferred missions.
+      workerResult = { text: '(transferred work; worker ran on the origin machine)', provider: mission.worker.provider, model: mission.worker.model };
+      this.audit('mission.resumed_at_review', mission, { worktreePath, transferredFrom: mission.transferredFromInstanceId });
+    } else {
+      // (2) Worker bot run in the worktree.
+      try {
+        workerResult = await this.deps.botRunner({
+          missionId: mission.id,
+          taskId: mission.taskId,
+          role: 'worker',
+          botId: mission.worker.botId,
+          provider: mission.worker.provider,
+          model: mission.worker.model,
+          prompt: `Implement this task in the current worktree:\n\n${task.title}\n${task.notes ?? ''}`.trim(),
+          worktreePath,
+        });
+      } catch (err) {
+        return this.block(mission, `worker run failed: ${errMessage(err)}`, { worktreePath });
+      }
+
+      // Commit whatever the worker produced so the diff/merge are real.
+      try {
+        git(worktreePath, ['add', '-A']);
+        const dirty = git(worktreePath, ['status', '--porcelain']).trim();
+        if (!dirty) {
+          return this.block(mission, 'worker produced no changes in the worktree', { worktreePath });
+        }
+        git(worktreePath, [
+          '-c', 'user.email=mission@kriyadot.local',
+          '-c', 'user.name=KriyaDot Mission',
+          'commit', '-m', `mission: ${task.title}`.slice(0, 200),
+        ]);
+      } catch (err) {
+        return this.block(mission, `committing worker changes failed: ${errMessage(err)}`, { worktreePath });
+      }
     }
 
     // (3) Cross-model review of the diff.

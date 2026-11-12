@@ -211,6 +211,12 @@ export function validateCommand(p: ParsedArgs): string | null {
       return usage('kriyadot tap <init|install|validate>.');
     case 'serve':
       return null;
+    case 'doctor':
+      if (p.subcommand === '') return null;
+      return usage('kriyadot doctor [--json].');
+    case 'service':
+      if (['install', 'uninstall', 'status'].includes(p.subcommand)) return null;
+      return usage('kriyadot service <install|uninstall|status> [--apply].');
     case 'models':
     case 'mcp':
       if (p.subcommand === 'list') return null;
