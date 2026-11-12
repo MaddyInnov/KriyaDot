@@ -32,6 +32,7 @@ import {
   bridgeAccountHint,
   bridgeHasUsableToken,
   bridgeNamesakeMessage,
+  bridgePinnedMessage,
   bridgeTokenExpiry,
   CLI_BRIDGE_META,
   resolveCliExecutable,
@@ -281,6 +282,11 @@ export class CliAuthManager {
     if (isBridgeId(id)) {
       const res = resolveVerifiedCliExecutable(toBridgeId(id), opts);
       if (res.path) return { path: res.path };
+      // A8: a failed user pin speaks before the generic namesake warning —
+      // the user set that path deliberately, so say what is wrong with it.
+      if (res.pinned && res.pinned.status !== 'verified') {
+        return { namesakeWarning: bridgePinnedMessage(toBridgeId(id), res.pinned) };
+      }
       if (res.namesake) return { namesakeWarning: bridgeNamesakeMessage(toBridgeId(id), res.namesake) };
       return {};
     }

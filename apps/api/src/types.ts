@@ -100,6 +100,10 @@ export interface ProviderInfo {
   detected?: boolean;
   /** Bridge only: the user granted Connect consent (token readable in memory). */
   connected?: boolean;
+  /** A8, bridge only: the user's pinned CLI path ('' or absent = auto-detect). */
+  cliPath?: string;
+  /** A8, bridge only: plain-words reason the pinned CLI path cannot be used, when it cannot. */
+  cliPathError?: string;
   /**
    * Local provider (Ollama): runs on the user's own machine, no API key
    * ever required. The UI shows a "Local" badge instead of a key field.

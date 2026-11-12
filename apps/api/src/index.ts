@@ -100,6 +100,7 @@ import { createAgentDetectRouter } from './agent-detect-routes.js';
 import { createCliAuthRouter } from './cli-auth-routes.js';
 import { createAgentImportRouter } from './agent-import-routes.js';
 import { createAnalyticsRouter } from './analytics-routes.js';
+import { createEgressJournalRouter } from './egress-routes.js';
 import { createLocalLlmRouter } from './local-llm-routes.js';
 import { LocalLlmManager } from '@mvp/agent-runtime';
 import {
@@ -4360,6 +4361,9 @@ async function boot(): Promise<void> {
   app.use('/api/cli-auth', createCliAuthRouter());
   // Opt-in product analytics (off by default; local-first privacy posture).
   app.use('/api/analytics', createAnalyticsRouter({ dataDir: config.dataDir }));
+  // Opt-in egress journal (A13, off by default): per-run proxy journaling
+  // for the sandboxed command path only — NOT the API server's own traffic.
+  app.use('/api/egress-journal', createEgressJournalRouter({ dataDir: config.dataDir }));
   // Managed local LLM (Atomic Agent parity): zero-config llama.cpp binary +
   // model management + local server lifecycle. Created once and shared with
   // the shutdown path below.

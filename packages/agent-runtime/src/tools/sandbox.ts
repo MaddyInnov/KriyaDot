@@ -44,6 +44,13 @@ import {
   runInSeatbelt,
   seatbeltAvailable,
 } from './sandbox-kernel.js';
+import {
+  EGRESS_JOURNAL_LABEL,
+  journalEgressUnavailable,
+  startEgressProxy,
+  type EgressJournalSink,
+  type EgressProxyHandle,
+} from './egress-proxy.js';
 
 export interface SandboxCommandOptions {
   /** Kill the command after this many ms (default 60_000). */
@@ -70,6 +77,31 @@ export interface SandboxCommandOptions {
    * env `SANDBOX_STRICT=1`.
    */
   strict?: boolean;
+  /**
+   * Per-mission egress journal (A13, opt-in — callers pass this ONLY
+   * when the feature is enabled): a per-run localhost forward proxy is
+   * started for local backends (host / Landlock / Seatbelt) and its env
+   * is injected into the child. Container (Docker) and cloud (E2B)
+   * backends cannot reach a localhost proxy, so for them journaling is
+   * reported 'unavailable' and NO proxy env is set — never fake
+   * coverage. A proxy that fails to start likewise degrades to
+   * 'unavailable': the command still runs (fail the journal, not the
+   * mission). This NEVER changes backend selection or the host opt-out
+   * semantics above.
+   */
+  egressJournal?: {
+    runId: string;
+    sink: EgressJournalSink;
+    /** Test seam: bind the proxy to a fixed port (default ephemeral). */
+    port?: number;
+  };
+  /**
+   * Extra environment variables for LOCAL child processes (host +
+   * kernel backends). Internal plumbing: executeSandboxedCommand sets
+   * this from the egress proxy; direct callers may use it for their own
+   * per-run env. Container/cloud backends ignore it.
+   */
+  childEnv?: Record<string, string>;
 }
 
 export interface SandboxCommandResult {
@@ -87,6 +119,16 @@ export interface SandboxCommandResult {
    * fallback). Callers should pass this through to result metadata.
    */
   warning?: string;
+  /**
+   * Egress journal (A13) outcome for this run: 'on' = a per-run proxy
+   * journaled the sandboxed path's connections (host:port only —
+   * "Visible, not confined": bypass traffic is NOT covered);
+   * 'unavailable' = journaling was requested but could not be provided
+   * (see egressNote); 'off'/absent = the feature is disabled.
+   */
+  egressJournal?: 'on' | 'unavailable' | 'off';
+  /** Human-readable egress note, always carrying the honest limits. */
+  egressNote?: string;
 }
 
 export type SandboxBackend = 'e2b' | 'docker' | 'landlock' | 'seatbelt' | 'host' | 'none';
@@ -458,7 +500,12 @@ async function runOnHost(cmd: string, opts: SandboxCommandOptions): Promise<Sand
   const maxBytes = resolveMaxOutputBytes(opts.maxOutputBytes);
   const cwd = opts.workspaceDir ?? process.cwd();
   return new Promise<SandboxCommandResult>((resolve, reject) => {
-    const child = spawn('sh', ['-c', cmd], { cwd, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const child = spawn('sh', ['-c', cmd], {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      ...(opts.childEnv ? { env: { ...process.env, ...opts.childEnv } } : {}),
+    });
     const out: Buffer[] = [];
     const err: Buffer[] = [];
     let outBytes = 0;
@@ -519,6 +566,58 @@ function noBackendError(): Error {
  * No network access inside the sandbox unless `opts.network` is true.
  */
 export async function executeSandboxedCommand(
+  cmd: string,
+  opts: SandboxCommandOptions = {},
+): Promise<SandboxCommandResult> {
+  // A13 egress journal: set up the per-run proxy BEFORE dispatch. Only
+  // local backends (host / Landlock / Seatbelt — including the 'none'
+  // probe path, which resolves to kernel or host) can reach a localhost
+  // proxy; Docker/E2B run elsewhere, so for them journaling is honestly
+  // 'unavailable' and no proxy env is set. Setup failure degrades the
+  // same way: fail the journal, never the mission.
+  if (!opts.egressJournal) return executeSandboxedCommandInner(cmd, opts);
+  const { runId, sink } = opts.egressJournal;
+  const backend = sandboxBackend();
+  const localBackend = backend === 'host' || backend === 'landlock' || backend === 'seatbelt' || backend === 'none';
+  if (!localBackend) {
+    const egressNote =
+      `Egress journal unavailable for the ${backend} sandbox backend (a localhost proxy is unreachable from there). ` +
+      `${EGRESS_JOURNAL_LABEL}: this run's network destinations were not recorded.`;
+    console.warn(`[egress] ${egressNote}`);
+    journalEgressUnavailable(sink, runId);
+    const res = await executeSandboxedCommandInner(cmd, opts);
+    return { ...res, egressJournal: 'unavailable', egressNote };
+  }
+  let proxy: EgressProxyHandle;
+  try {
+    proxy = await startEgressProxy({ runId, sink, ...(opts.egressJournal.port ? { port: opts.egressJournal.port } : {}) });
+  } catch (err) {
+    const egressNote =
+      `Egress journal unavailable: the per-run proxy failed to start (${err instanceof Error ? err.message : String(err)}). ` +
+      `The command ran WITHOUT proxy env; its network destinations were not recorded.`;
+    console.warn(`[egress] ${egressNote}`);
+    journalEgressUnavailable(sink, runId);
+    const res = await executeSandboxedCommandInner(cmd, opts);
+    return { ...res, egressJournal: 'unavailable', egressNote };
+  }
+  try {
+    const res = await executeSandboxedCommandInner(cmd, {
+      ...opts,
+      childEnv: { ...(opts.childEnv ?? {}), ...proxy.env },
+    });
+    return {
+      ...res,
+      egressJournal: 'on',
+      egressNote:
+        `Egress journaling was on for this sandboxed command (host:port only). ${EGRESS_JOURNAL_LABEL}: ` +
+        'traffic that bypasses the proxy is not covered.',
+    };
+  } finally {
+    await proxy.close().catch(() => undefined);
+  }
+}
+
+async function executeSandboxedCommandInner(
   cmd: string,
   opts: SandboxCommandOptions = {},
 ): Promise<SandboxCommandResult> {

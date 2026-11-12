@@ -4,6 +4,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   cancelCliLogin,
+  clearBridgeCliPath,
   connectBridge,
   disconnectBridge,
   getCliAuthStatus,
@@ -13,6 +14,7 @@ import {
   refreshModelsCatalog,
   removeProviderKey,
   saveProviderKey,
+  setBridgeCliPath,
   startCliLogin,
   submitCliLoginCode,
 } from '../../lib/api';
@@ -88,6 +90,8 @@ function BridgeCard({
   onConnect,
   onDisconnect,
   onSignIn,
+  onSaveCliPath,
+  onClearCliPath,
 }: {
   p: ProviderInfo;
   /** Model ids to display (already filtered by the "Free only" toggle). */
@@ -99,9 +103,17 @@ function BridgeCard({
   onConnect: (p: ProviderInfo) => void;
   onDisconnect: (p: ProviderInfo) => void;
   onSignIn: (p: ProviderInfo) => void;
+  onSaveCliPath: (p: ProviderInfo, path: string) => void;
+  onClearCliPath: (p: ProviderInfo) => void;
 }) {
   const cliLabel = cliLabelFor(p.bridge);
   const signedIn = authStatus?.signedIn === true;
+  // A8: pinned CLI path draft, seeded from the saved pin. Kept in sync
+  // when the saved value changes underneath (save/clear round-trips).
+  const [cliPathDraft, setCliPathDraft] = useState(p.cliPath ?? '');
+  useEffect(() => {
+    setCliPathDraft(p.cliPath ?? '');
+  }, [p.cliPath]);
   return (
     <div className="card">
       <div className="row-between">
@@ -158,6 +170,46 @@ function BridgeCard({
           </button>
         )}
       </div>
+      <div className="field" style={{ marginTop: 8 }}>
+        <label className="label" htmlFor={`cli-path-${p.id}`}>
+          CLI path
+        </label>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <input
+            id={`cli-path-${p.id}`}
+            className="input mono"
+            autoComplete="off"
+            placeholder="Leave empty to auto-detect"
+            value={cliPathDraft}
+            onChange={(e) => setCliPathDraft(e.target.value)}
+          />
+          <button
+            className="btn btn-sm"
+            disabled={saving === p.id || cliPathDraft.trim() === (p.cliPath ?? '')}
+            onClick={() => onSaveCliPath(p, cliPathDraft.trim())}
+          >
+            Save path
+          </button>
+          {(p.cliPath ?? '') !== '' && (
+            <button
+              className="btn btn-sm"
+              disabled={saving === p.id}
+              onClick={() => onClearCliPath(p)}
+            >
+              Clear
+            </button>
+          )}
+        </div>
+        <p className="small muted" style={{ marginTop: 4 }}>
+          Leave empty to auto-detect. A pinned path is only a location hint — the program
+          there is still checked to be the real {cliLabel} before anything runs it.
+        </p>
+      </div>
+      {p.cliPathError && (
+        <div className="warn-box" style={{ marginTop: 8 }}>
+          {p.cliPathError}
+        </div>
+      )}
       {authStatus?.namesakeWarning && (
         <div className="warn-box" style={{ marginTop: 8 }}>
           {authStatus.namesakeWarning}
@@ -560,12 +612,54 @@ export default function ProvidersPage() {
     }
   };
 
+  const saveCliPath = async (p: ProviderInfo, path: string) => {
+    if (!p.bridge) return;
+    setSaving(p.id);
+    setError('');
+    setNotice('');
+    try {
+      const status = await setBridgeCliPath(p.bridge, path);
+      if (status.cliPathError) {
+        setError(status.cliPathError);
+      } else {
+        setNotice(
+          status.cliPath
+            ? `${p.name} CLI path pinned to ${status.cliPath}.`
+            : `${p.name} CLI path cleared — auto-detect is back on.`,
+        );
+      }
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving('');
+    }
+  };
+
+  const clearCliPath = async (p: ProviderInfo) => {
+    if (!p.bridge) return;
+    setSaving(p.id);
+    setError('');
+    setNotice('');
+    try {
+      await clearBridgeCliPath(p.bridge);
+      setNotice(`${p.name} CLI path cleared — auto-detect is back on.`);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving('');
+    }
+  };
+
   // Bridge providers (Claude/Codex subscriptions) are only surfaced when the
   // CLI or its credential file is detected on this machine.
   // Local providers (Ollama) need no key — they get their own section.
   const localProviders = providers.filter((p) => p.local);
   const keyProviders = providers.filter((p) => !p.bridge && !p.local);
-  const bridgeProviders = providers.filter((p) => p.bridge && p.detected);
+  // A8: a bridge with a pinned CLI path stays visible even when
+  // auto-detection finds nothing — the pin (and its error) must be fixable.
+  const bridgeProviders = providers.filter((p) => p.bridge && (p.detected || p.cliPath));
 
   // API keys picker derivations: configured providers first (they're the
   // ones a returning user is looking for), then alphabetical; the search
@@ -777,6 +871,8 @@ export default function ProvidersPage() {
               onConnect={connect}
               onDisconnect={disconnect}
               onSignIn={(bp) => setSignInFor(bp)}
+              onSaveCliPath={(bp, path) => void saveCliPath(bp, path)}
+              onClearCliPath={(bp) => void clearCliPath(bp)}
             />
           ))}
         </>

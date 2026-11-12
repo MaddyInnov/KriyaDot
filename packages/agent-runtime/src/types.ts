@@ -12,6 +12,8 @@ import type { CredentialProposer } from './credential-proposals.js';
 export type { CredentialProposer };
 import type { PcAccessHost } from './pc-access.js';
 export type { PcAccessHost };
+import type { EgressJournalSink } from './tools/egress-proxy.js';
+export type { EgressJournalSink };
 import type { ExecutionPolicyConfig } from './execution-policy.js';
 export type { ExecutionPolicyConfig };
 import type { HookConfigEntry } from './hooks.js';
@@ -320,6 +322,20 @@ export interface ToolContext {
    * for ungranted ones. Unset → file tools stay workspace-fenced.
    */
   pcAccess?: PcAccessHost;
+  /**
+   * Per-mission egress journal (A13): the host/runtime-supplied journal
+   * sink for this turn. `run_command` passes it to the sandbox layer
+   * ONLY when the egress-journal setting is enabled (default OFF); the
+   * sandbox then runs a per-run localhost proxy and journals host:port
+   * per connection into the audit/Activity store. Unset → no journaling
+   * is possible and the tool reports it unavailable when enabled.
+   * "Visible, not confined" — see tools/egress-proxy.ts.
+   */
+  egressJournal?: {
+    /** Run/mission id journal entries attribute to (defaults to sessionId). */
+    runId?: string;
+    sink: EgressJournalSink;
+  };
 }
 
 export interface ToolDefinition {

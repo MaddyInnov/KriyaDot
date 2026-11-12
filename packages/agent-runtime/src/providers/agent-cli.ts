@@ -38,7 +38,7 @@ import { accessSync, constants } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import type { ChatMessage, LLMProvider, ModelInfo, TokenUsage, ToolDefinition } from '../types.js';
 import {
-  bridgeNamesakeMessage,
+  bridgeResolutionFailureMessage,
   resolveVerifiedCliExecutable,
   spawnCliProcess,
   summarizeCliFailure,
@@ -378,7 +378,7 @@ export function createAgentCliProvider(
       if (resolution.path) {
         return new AgentCliProvider({ cliId: parsed.cliId, model: parsed.model, ...opts, command: resolution.path });
       }
-      if (resolution.namesake) throw new Error(bridgeNamesakeMessage(bridgeId, resolution.namesake));
+      if (resolution.namesake) throw new Error(bridgeResolutionFailureMessage(bridgeId, resolution));
       throw new Error(
         `Agent CLI "${spec.command}" (${parsed.cliId}) is not installed or not on PATH. ` +
           `Install it and sign in once — KriyaDot uses the CLI's own login and never sees your credentials.`,

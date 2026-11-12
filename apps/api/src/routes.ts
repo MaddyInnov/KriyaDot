@@ -146,6 +146,7 @@ import { citationsFromPack, type MemoryCitation } from './memory-citations.js';
 import { AUTO_MODEL_SENTINEL, recordAutoModelDecision, resolveAutoModel } from './model-auto.js';
 import { createMemoryFabricRouter } from './memory-fabric-routes.js';
 import { createMemoryUpkeepRouter } from './memory-upkeep-routes.js';
+import { createMemoryProposalsRouter } from './memory-proposals-routes.js';
 import { createCrashRecoveryRouter } from './crash-recovery.js';
 import type { TurnTracker } from './crash-recovery.js';
 import { OnBehalfOfLedger } from '@mvp/agent-runtime';
@@ -200,6 +201,7 @@ import {
   listProviders,
   removeProviderKey,
   saveProviderKey,
+  setStoredCliPathPin,
   syncProviderKeysToEnv,
 } from './providers.js';
 import type {
@@ -1331,6 +1333,20 @@ export function createRouter(deps: RouteDeps): express.Router {
       getBotById: (id: string) => bots.find((b) => b.id === id),
       // CA-37: incognito sessions never distill into long-term memory.
       allowsMemoryWrite: (sessionId) => agentRuntime.sessionAllowsMemoryWrite(sessionId),
+    }),
+  );
+
+  // ---- Memory pipeline (A10): rule proposals inbox + synthesis trigger.
+  // Decide/synthesize require a verified principal (OPEN-1) — approval
+  // mints standing instructions, so it is a user-only action.
+  router.use(
+    '/memory',
+    createMemoryProposalsRouter({
+      tieredMemoryStore,
+      getBots: () => bots.map((b) => ({ id: b.id })),
+      getBotById: (id: string) => bots.find((b) => b.id === id),
+      principalContext: { dataDir: config.dataDir },
+      audit: (action, fields) => governance.audit(action, fields),
     }),
   );
 
@@ -3204,6 +3220,29 @@ export function createRouter(deps: RouteDeps): express.Router {
       res.json({ ok: true });
     } catch (err) {
       res.status(500).json(errorBody('Failed to disconnect bridge', err instanceof Error ? err.message : String(err)));
+    }
+  });
+
+  // A8: user-pinnable CLI path per bridge. PUT { path } sets it (empty
+  // string clears back to auto-detect); DELETE clears it. The response
+  // carries the live status, including the plain-words reason when the
+  // pinned binary is missing or fails identity verification.
+  router.put('/providers/bridges/:bridgeId/cli-path', (req, res) => {
+    try {
+      const body = (req.body ?? {}) as { path?: unknown };
+      const status = setStoredCliPathPin(config.dataDir, req.params.bridgeId, body.path ?? '');
+      res.json({ ok: true, ...status });
+    } catch (err) {
+      res.status(400).json(errorBody('Failed to set CLI path', err instanceof Error ? err.message : String(err)));
+    }
+  });
+
+  router.delete('/providers/bridges/:bridgeId/cli-path', (req, res) => {
+    try {
+      const status = setStoredCliPathPin(config.dataDir, req.params.bridgeId, '');
+      res.json({ ok: true, ...status });
+    } catch (err) {
+      res.status(400).json(errorBody('Failed to clear CLI path', err instanceof Error ? err.message : String(err)));
     }
   });
 

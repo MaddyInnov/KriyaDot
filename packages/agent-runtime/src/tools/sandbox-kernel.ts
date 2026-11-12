@@ -317,6 +317,8 @@ async function runConfined(
       cwd,
       stdio: [opts.stdin !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       windowsHide: true,
+      // A13: per-run child env (e.g. egress proxy vars) for local runs.
+      ...(opts.childEnv ? { env: { ...process.env, ...opts.childEnv } } : {}),
     });
     if (opts.stdin !== undefined) {
       child.stdin?.on('error', () => {});

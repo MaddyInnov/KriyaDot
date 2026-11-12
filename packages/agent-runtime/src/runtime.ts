@@ -1839,6 +1839,21 @@ ${record.priorContext ?? ''}`;
       signal: opts.signal,
       credentialProposer: this.credentialProposer ?? undefined,
       pcAccess: this.pcAccessHost ?? undefined,
+      // A13 egress journal: tools receive a sink that lands per-connection
+      // host:port entries in the SAME audit/Activity store as tool calls
+      // (kind 'egress', this session as the run id). The sink is inert
+      // unless run_command's egress setting is enabled (default OFF).
+      egressJournal: {
+        runId: sessionId,
+        sink: (entry) => {
+          this.audit({
+            type: 'egress',
+            sessionId,
+            botId: opts.bot.id,
+            detail: { ...entry, label: 'Visible, not confined', scope: 'sandboxed-command-path-only' },
+          });
+        },
+      },
       widget: widgetCoordinator
         ? {
             // W7: questions are addressed to the bot's owner person.

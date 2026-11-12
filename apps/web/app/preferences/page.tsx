@@ -7,6 +7,7 @@ import { McpScopesPanel } from '../../components/panels/mcp-scopes-panel';
 import { McpOAuthPanel } from '../../components/panels/mcp-oauth-panel';
 import { DetectedAgentsPanel } from '../../components/panels/detected-agents-panel';
 import { AnalyticsPanel } from '../../components/panels/analytics-panel';
+import { EgressJournalPanel } from '../../components/panels/egress-journal-panel';
 import { LocalLlmPanel } from '../../components/panels/local-llm-panel';
 import { UpdatesPanel } from '../../components/panels/updates-panel';
 import { AutostartPanel } from '../../components/panels/autostart-panel';
@@ -235,6 +236,12 @@ export default function PreferencesPage() {
           prompts, or anything you typed.
         </p>
         <AnalyticsPanel />
+        <h3 style={{ marginTop: 20 }}>Network egress journal</h3>
+        <p className="muted small">
+          <strong>Visible, not confined.</strong> Optionally journal where sandboxed commands
+          connect (host and port only) into Activity. Traffic that bypasses the proxy is not covered.
+        </p>
+        <EgressJournalPanel />
       </section>
 
       <section className="card">

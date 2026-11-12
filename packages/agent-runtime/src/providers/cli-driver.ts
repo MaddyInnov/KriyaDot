@@ -48,7 +48,7 @@ import {
   untrustedCliPrefix,
 } from './agent-cli.js';
 import {
-  bridgeNamesakeMessage,
+  bridgeResolutionFailureMessage,
   resolveVerifiedCliExecutable,
   spawnCliProcess,
   summarizeCliFailure,
@@ -1106,7 +1106,7 @@ export function createNativeCliDriver(
         return new NativeCliDriver({ cliId: parsed.cliId, model: parsed.model, ...opts, command: resolution.path });
       }
       if (resolution.namesake) {
-        throw new CliDriverError(bridgeNamesakeMessage(bridgeId, resolution.namesake));
+        throw new CliDriverError(bridgeResolutionFailureMessage(bridgeId, resolution));
       }
       throw new Error(
         `Agent CLI "${parsed.cliId}" is not installed or not on PATH. ` +

@@ -61,6 +61,12 @@ vi.mock('../../lib/api', () => ({
     hoisted.runs += 1;
     return { ok: true, added: 3, skipped: 1 };
   },
+  // A10 proposals inbox: none pending in these explorer fixtures.
+  getRuleProposals: async () => ({ ok: true, botId: 'scout', status: 'pending', proposals: [] }),
+  decideRuleProposal: async () => ({ ok: true, proposal: {} }),
+  synthesizeRuleProposals: async () => ({ ok: true, botId: 'scout', created: [], skipped: 0, lane: 'none' }),
+  ruleScopeLabel: (scope: { kind: string; id?: string }) =>
+    scope.kind === 'global' ? 'Global' : `${scope.kind === 'agent' ? 'Agent' : 'Project'} · ${scope.id ?? ''}`,
 }));
 
 const ATOMS = [

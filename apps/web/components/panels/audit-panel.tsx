@@ -62,6 +62,11 @@ export function AuditPanel({ hideHeader = false }: { hideHeader?: boolean }) {
                 <td className="mono">{e.actor}</td>
                 <td className="mono">
                   {e.action}
+                  {e.action === 'egress' && (
+                    <span className="chip gray" style={{ marginLeft: 6 }} title="Per-connection host:port journal for a sandboxed command (A13). Visible, not confined: traffic that bypassed the proxy is not covered.">
+                      🌐 egress · visible, not confined
+                    </span>
+                  )}
                   {/failover|limit_reset|usage_warning|provider_limit/.test(e.action) && (
                     <span className="chip gray" style={{ marginLeft: 6 }} title="AI failover / provider limit event (W1)">
                       {e.action.includes('failover')

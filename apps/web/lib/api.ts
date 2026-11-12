@@ -490,12 +490,16 @@ export interface ProviderInfo {
   rateLimit: RateLimitSnapshot | null;
   /** Near-limit warning (W1): only when observed usage crosses the threshold; null otherwise / no data. */
   usageWarning?: { usedPercent: number; message: string; source: 'rate-limit' } | null;
-  /** Subscription/CLI bridge: 'claude' | 'codex'. Set only on bridge presets. */
-  bridge?: 'claude' | 'codex';
+  /** Subscription/CLI bridge: 'claude' | 'codex' | 'opencode'. Set only on bridge presets. */
+  bridge?: 'claude' | 'codex' | 'opencode';
   /** Bridge only: a matching CLI or credential file was detected on this machine. */
   detected?: boolean;
   /** Bridge only: Connect consent granted (token readable in memory). */
   connected?: boolean;
+  /** A8, bridge only: the user's pinned CLI path ('' or absent = auto-detect). */
+  cliPath?: string;
+  /** A8, bridge only: plain-words reason the pinned CLI path cannot be used, when it cannot. */
+  cliPathError?: string;
   /** Local provider (Ollama): on-machine, no API key ever required. */
   local?: boolean;
   /** Keyless-lane metadata (free-LLM stack): true when usable with NO api key. */
@@ -1750,6 +1754,30 @@ export function disconnectBridge(bridgeId: string): Promise<{ ok: boolean }> {
   });
 }
 
+/**
+ * A8: set a bridge's pinned CLI path (empty string clears it back to
+ * auto-detect). The response carries the live status — including
+ * `cliPathError` when the pinned binary is missing or not the real CLI.
+ */
+export function setBridgeCliPath(
+  bridgeId: string,
+  path: string,
+): Promise<{ ok: boolean; cliPath: string; cliPathError?: string }> {
+  return apiJson(`/api/providers/bridges/${encodeURIComponent(bridgeId)}/cli-path`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  });
+}
+
+export function clearBridgeCliPath(
+  bridgeId: string,
+): Promise<{ ok: boolean; cliPath: string; cliPathError?: string }> {
+  return apiJson(`/api/providers/bridges/${encodeURIComponent(bridgeId)}/cli-path`, {
+    method: 'DELETE',
+  });
+}
+
 // ---- Native CLI in-app sign-in (OpenMausBot parity) ------------------------
 
 export interface CliLoginStatus {
@@ -2878,6 +2906,8 @@ export interface MemoryUsedItem {
   fact: string;
   category: string;
   sourceTurn: string;
+  /** A10 (additive): 'rule' when the cited atom is a user-approved rule, else 'fact'. Absent on older servers. */
+  kind?: 'rule' | 'fact';
 }
 
 /** Auto-routing outcome for one turn: the model chosen and why. */
@@ -2973,6 +3003,8 @@ export interface MemoryAskCitation {
   fact: string;
   category?: string;
   sourceTurn?: string;
+  /** A10 (additive): 'rule' when the cited atom is a user-approved rule. */
+  kind?: 'rule' | 'fact';
 }
 
 export interface MemoryAskResult {
@@ -2990,6 +3022,64 @@ export const askMemory = (botId: string, question: string): Promise<MemoryAskRes
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ botId, question }),
+  });
+
+// ---- Memory rule proposals (A10) --------------------------------------------
+// Capture → synthesis → USER-APPROVED promotion. Synthesis writes pending
+// candidates; only a user decision (approve / edit-then-approve / dismiss)
+// makes one a standing rule. Scopes: global | agent (bot id) | project.
+
+export type RuleScopeKind = 'global' | 'agent' | 'project';
+
+export interface RuleProposalRecord {
+  id: string;
+  botId: string;
+  text: string;
+  scope: { kind: RuleScopeKind; id?: string };
+  sourceAtomIds: string[];
+  rationale?: string;
+  status: 'pending' | 'approved' | 'dismissed';
+  createdAt: number;
+  decidedAt?: number;
+  decidedBy?: string;
+  ruleAtomId?: string;
+}
+
+/** Human label for a proposal's scope. */
+export function ruleScopeLabel(scope: RuleProposalRecord['scope']): string {
+  if (scope.kind === 'global') return 'Global';
+  if (scope.kind === 'agent') return `Agent · ${scope.id ?? ''}`.trim();
+  return `Project · ${scope.id ?? ''}`.trim();
+}
+
+/** GET /api/memory/proposals?botId=&status=pending */
+export const getRuleProposals = (
+  botId: string,
+  status: 'pending' | 'approved' | 'dismissed' | 'all' = 'pending',
+): Promise<{ ok: boolean; botId: string; status: string; proposals: RuleProposalRecord[] }> =>
+  apiJson(`/api/memory/proposals?botId=${encodeURIComponent(botId)}&status=${encodeURIComponent(status)}`);
+
+/** POST /api/memory/proposals/synthesize { botId } — manual "synthesize now" (user-gated server-side). */
+export const synthesizeRuleProposals = (
+  botId: string,
+): Promise<{ ok: boolean; botId: string; created: RuleProposalRecord[]; skipped: number; lane: string }> =>
+  apiJson('/api/memory/proposals/synthesize', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ botId }),
+  });
+
+/** POST /api/memory/proposals/:id/decide { botId, action, text? } — user-only server-side. */
+export const decideRuleProposal = (
+  botId: string,
+  proposalId: string,
+  action: 'approve' | 'dismiss',
+  text?: string,
+): Promise<{ ok: boolean; proposal: RuleProposalRecord }> =>
+  apiJson(`/api/memory/proposals/${encodeURIComponent(proposalId)}/decide`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ botId, action, ...(text !== undefined ? { text } : {}) }),
   });
 
 // ---- Memory ingestion (OH-4) ------------------------------------------------

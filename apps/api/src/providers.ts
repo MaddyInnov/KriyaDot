@@ -20,8 +20,11 @@ import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import path from 'node:path';
 import {
   bridgeConnectable,
+  bridgePinnedMessage,
+  cliPathPinEnvName,
   createProvider,
   detectCliBridges,
+  effectiveCliPin,
   getCustomProviderPreset,
   getProviderPreset,
   getRateLimit,
@@ -31,7 +34,9 @@ import {
   listProviderPresets,
   resolveApiKey,
   resolveBaseUrl,
+  resolveVerifiedCliExecutable,
   revokeBridgeConsent,
+  setCliPathPin,
   templateFieldEnvName,
   usageWarningFromSnapshot,
 } from '@mvp/agent-runtime';
@@ -280,6 +285,9 @@ export function syncProviderKeysToEnv(dataDir: string): void {
   }
   if (toRemove.length > 0) uninjectEnvKeys(toRemove);
   for (const [k, v] of Object.entries(file)) injectEnvKey(k, v);
+  // A8: re-apply persisted CLI path pins to the runtime registry so the
+  // resolver honours them from boot (and after any settings change).
+  applyCliPathPins(dataDir);
 }
 
 /** Undo exactly what this module injected (never real user env vars). */
@@ -406,6 +414,97 @@ export function disconnectBridge(bridgeId: string): boolean {
   revokeBridgeConsent(id);
   if (was) console.log(`[providers] bridge "${id}" disconnected (consent revoked)`);
   return was;
+}
+
+// ---------------------------------------------------------------------------
+// A8: user-pinnable CLI paths. One optional path override per bridge,
+// persisted in the SAME encrypted settings store as provider keys
+// (providers.local.json, under the pin's env-mirror name, e.g.
+// KRIYADOT_CLI_PATH_CODEX) and applied LIVE: saving a pin pushes it into
+// the runtime's pin registry + env mirror immediately, and the resolver
+// reads the registry at resolve time — no restart. A pin is a location
+// hint only; the pinned binary still goes through identity verification.
+// ---------------------------------------------------------------------------
+
+/** All persisted CLI path pins (bridge id → path), empty entries omitted. */
+export function getStoredCliPathPins(dataDir: string): Partial<Record<CliBridgeId, string>> {
+  const file = readKeyFile(dataDir);
+  const out: Partial<Record<CliBridgeId, string>> = {};
+  for (const id of BRIDGE_IDS) {
+    const v = file[cliPathPinEnvName(id)];
+    if (typeof v === 'string' && v.trim().length > 0) out[id] = v.trim();
+  }
+  return out;
+}
+
+/**
+ * Re-apply the persisted pins to the runtime registry + env mirror.
+ * Called by syncProviderKeysToEnv() (boot + every key change) and after
+ * every pin write, so resolution always sees the current pins.
+ */
+export function applyCliPathPins(dataDir: string): void {
+  const pins = getStoredCliPathPins(dataDir);
+  for (const id of BRIDGE_IDS) {
+    const pin = pins[id];
+    setCliPathPin(id, pin);
+    const envName = cliPathPinEnvName(id);
+    if (pin) injectEnvKey(envName, pin);
+    else uninjectEnvKeys([envName]);
+  }
+}
+
+/**
+ * Live status of one bridge's pin: the stored path ('' = auto-detect)
+ * and, when a pin is set but unusable, the plain-words reason it fails
+ * (missing file / not the real CLI, quoting its first printed line with
+ * secrets redacted). Verification is probe-cached in the runtime, so
+ * asking on every providers listing is cheap for an unchanged file.
+ */
+export function cliPathStatusFor(
+  dataDir: string,
+  bridgeId: CliBridgeId,
+): { cliPath: string; cliPathError?: string } {
+  const stored = getStoredCliPathPins(dataDir)[bridgeId];
+  const pin = stored ?? effectiveCliPin(bridgeId);
+  if (!pin) return { cliPath: '' };
+  // Pass the pin explicitly so the status is right even before the boot
+  // sync has mirrored the stored pin into the runtime registry.
+  const resolution = resolveVerifiedCliExecutable(bridgeId, { pinnedPath: pin });
+  if (resolution.pinned && resolution.pinned.status !== 'verified') {
+    return { cliPath: pin, cliPathError: bridgePinnedMessage(bridgeId, resolution.pinned) };
+  }
+  return { cliPath: pin };
+}
+
+/**
+ * Set or clear (empty path) a bridge's pinned CLI path. Persisted in the
+ * encrypted settings store and applied live. Returns the new status.
+ * Throws on an unknown bridge id or a malformed path value.
+ */
+export function setStoredCliPathPin(
+  dataDir: string,
+  bridgeId: string,
+  rawPath: unknown,
+): { cliPath: string; cliPathError?: string } {
+  const id = asBridgeId(bridgeId);
+  if (!id) throw new Error(`Unknown bridge "${bridgeId}". Expected one of "claude", "codex", "opencode".`);
+  if (typeof rawPath !== 'string') throw new Error('CLI path must be a string (empty to clear).');
+  const value = rawPath.trim();
+  if (value.length > 1024 || /[\0\r\n]/.test(value)) {
+    throw new Error('CLI path is too long or contains invalid characters.');
+  }
+  const file = readKeyFile(dataDir);
+  const envName = cliPathPinEnvName(id);
+  if (value) file[envName] = value;
+  else delete file[envName];
+  writeKeyFile(dataDir, file);
+  applyCliPathPins(dataDir);
+  console.log(
+    value
+      ? `[providers] bridge "${id}" CLI path pinned to "${value}" (identity still verified)`
+      : `[providers] bridge "${id}" CLI path pin cleared (auto-detect)`,
+  );
+  return cliPathStatusFor(dataDir, id);
 }
 
 /** Remove a stored key. Returns true if anything was removed. */
@@ -556,6 +655,13 @@ export async function listProviders(dataDir: string): Promise<ProviderInfo[]> {
       info.bridge = preset.bridge;
       info.detected = detection?.detected ?? false;
       info.connected = isBridgeConnected(preset.bridge);
+      // A8: surface the user's pinned CLI path (and its plain failure
+      // reason when the pinned binary is missing or not the real CLI).
+      // A detected-by-pin bridge must list even when nothing is on PATH.
+      const pinStatus = cliPathStatusFor(dataDir, preset.bridge);
+      info.cliPath = pinStatus.cliPath;
+      if (pinStatus.cliPathError) info.cliPathError = pinStatus.cliPathError;
+      if (pinStatus.cliPath) info.detected = true;
     }
     infos.push(info);
   }

@@ -240,6 +240,97 @@ export interface AtomCard {
   archived?: boolean;
   /** Material-use credit (#78): how often this atom was actually used. */
   useCredit?: number;
+  /**
+   * A10 (Timon parity programme): true when this atom is an APPROVED RULE —
+   * a candidate distilled by synthesis and promoted ONLY by an explicit
+   * user decision (see memory-pipeline.ts / RuleProposal). Facts (the
+   * default, including every pre-A10 atom) have this absent/false. Rules
+   * are instructions, not observations, so they carry a scope and are
+   * cited distinctly (`kind: 'rule'` in the citation payload).
+   */
+  isRule?: boolean;
+  /** A10: scope kind of an approved rule. Absent on facts; absent on a rule = 'global'. */
+  ruleScopeKind?: RuleScopeKind;
+  /** A10: scope target id (agent/bot id for 'agent', project id for 'project'); absent for 'global'. */
+  ruleScopeId?: string;
+}
+
+/** A10: the three rule scopes. */
+export type RuleScopeKind = 'global' | 'agent' | 'project';
+
+/** A10: a rule's scope. `id` is required for 'agent'/'project', ignored for 'global'. */
+export interface RuleScope {
+  kind: RuleScopeKind;
+  id?: string;
+}
+
+/** A10: the context a rule is evaluated for at injection time. */
+export interface RuleContext {
+  /** The bot (agent) whose turn/spawn is being built. */
+  botId: string;
+  /** The current project/workspace id, when the turn runs inside one. */
+  projectId?: string;
+}
+
+const RULE_SCOPE_KINDS: ReadonlySet<string> = new Set(['global', 'agent', 'project']);
+
+/** A10: normalize untrusted scope input; anything unrecognized fails closed to 'global' ONLY when kind is absent, else throws. */
+export function normalizeRuleScope(input: unknown): RuleScope {
+  if (input === undefined || input === null) return { kind: 'global' };
+  if (typeof input !== 'object') throw new Error('rule scope must be an object { kind, id? }');
+  const o = input as { kind?: unknown; id?: unknown };
+  if (typeof o.kind !== 'string' || !RULE_SCOPE_KINDS.has(o.kind)) {
+    throw new Error(`Invalid rule scope kind "${String(o.kind)}": must be global | agent | project`);
+  }
+  const kind = o.kind as RuleScopeKind;
+  if (kind === 'global') return { kind };
+  if (typeof o.id !== 'string' || !o.id.trim()) {
+    throw new Error(`Rule scope "${kind}" requires a non-empty id`);
+  }
+  return { kind, id: o.id.trim() };
+}
+
+/** A10: does a rule scope apply in this context? Strict: project/agent rules fire ONLY on an exact id match. */
+export function ruleScopeApplies(scope: RuleScope, ctx: RuleContext): boolean {
+  if (scope.kind === 'global') return true;
+  if (scope.kind === 'agent') return typeof scope.id === 'string' && scope.id === ctx.botId;
+  // project
+  return typeof scope.id === 'string' && typeof ctx.projectId === 'string' && scope.id === ctx.projectId;
+}
+
+/** A10: the effective scope of an atom (facts and legacy atoms read as global). */
+export function atomRuleScope(atom: Pick<AtomCard, 'ruleScopeKind' | 'ruleScopeId'>): RuleScope {
+  const kind = atom.ruleScopeKind ?? 'global';
+  return atom.ruleScopeId ? { kind, id: atom.ruleScopeId } : { kind };
+}
+
+/** A10: does this atom, treated as a rule, apply in this context? */
+export function ruleAppliesToContext(atom: Pick<AtomCard, 'ruleScopeKind' | 'ruleScopeId'>, ctx: RuleContext): boolean {
+  return ruleScopeApplies(atomRuleScope(atom), ctx);
+}
+
+/** A10: lifecycle of a synthesized rule candidate. Nothing leaves 'pending' without a user decision. */
+export type RuleProposalStatus = 'pending' | 'approved' | 'dismissed';
+
+/** A10: one candidate rule in the proposals inbox. */
+export interface RuleProposal {
+  id: string;
+  botId: string;
+  /** The candidate rule text (the user may edit it at approval time). */
+  text: string;
+  scope: RuleScope;
+  /** Atoms the synthesis pass distilled this candidate from (its citations). */
+  sourceAtomIds: string[];
+  /** Why synthesis proposed it (recurrence / model rationale), when known. */
+  rationale?: string;
+  status: RuleProposalStatus;
+  createdAt: number;
+  /** Set when the user decided (approve/edit-approve/dismiss). */
+  decidedAt?: number;
+  /** The verified user id that decided (never a bot, never a client-asserted id alone). */
+  decidedBy?: string;
+  /** The approved rule atom's id (set on approval). */
+  ruleAtomId?: string;
 }
 
 /** The two grounded atom types (#75), modelled distinctly. */
@@ -579,6 +670,27 @@ const REFLECTION_COUNTER_TABLE = `
   );
 `;
 
+// A10: the proposals inbox. Synthesis writes ONLY here; a row becomes a
+// durable rule atom solely through decideRuleProposal with a user decision.
+const RULE_PROPOSAL_TABLE = `
+  CREATE TABLE IF NOT EXISTS memory_rule_proposals (
+    id TEXT PRIMARY KEY,
+    bot_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    text_norm TEXT NOT NULL,
+    scope_kind TEXT NOT NULL DEFAULT 'global',
+    scope_id TEXT,
+    source_atom_ids_json TEXT NOT NULL DEFAULT '[]',
+    rationale TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at INTEGER NOT NULL,
+    decided_at INTEGER,
+    decided_by TEXT,
+    rule_atom_id TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_memory_rule_proposals_bot ON memory_rule_proposals(bot_id, status);
+`;
+
 function normFact(fact: string): string {
   return fact.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
 }
@@ -867,6 +979,7 @@ export class TieredMemoryStore {
     this.db.exec(LINK_TABLE);
     this.db.exec(CONFLICT_TABLE);
     this.db.exec(REFLECTION_COUNTER_TABLE);
+    this.db.exec(RULE_PROPOSAL_TABLE);
     // Vector leg of hybrid recall: hash embedding per atom. Column added
     // idempotently so databases created before this feature keep working.
     const cols = this.db.prepare('PRAGMA table_info(memory_atoms)').all() as Array<{ name: string }>;
@@ -918,6 +1031,18 @@ export class TieredMemoryStore {
     }
     if (!atomCols.some((c) => c.name === 'use_credit')) {
       this.db.exec('ALTER TABLE memory_atoms ADD COLUMN use_credit INTEGER NOT NULL DEFAULT 0');
+    }
+    // A10: approved-rule marker + rule scope. Idempotent; NULL/0 reads back
+    // as a plain fact with global scope, so every pre-A10 atom migrates as
+    // a global-scope FACT with no behaviour change.
+    if (!atomCols.some((c) => c.name === 'is_rule')) {
+      this.db.exec('ALTER TABLE memory_atoms ADD COLUMN is_rule INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!atomCols.some((c) => c.name === 'rule_scope_kind')) {
+      this.db.exec('ALTER TABLE memory_atoms ADD COLUMN rule_scope_kind TEXT');
+    }
+    if (!atomCols.some((c) => c.name === 'rule_scope_id')) {
+      this.db.exec('ALTER TABLE memory_atoms ADD COLUMN rule_scope_id TEXT');
     }
     // Orientation store (#76): distinct from experience atoms —
     // key/value context overwritten in place, never accumulated.
@@ -1213,6 +1338,10 @@ export class TieredMemoryStore {
       roles?: string[];
       /** Evidence links incl. session:// citations (#79). */
       evidenceLinks?: string[];
+      /** A10: mark as an approved rule (only decideRuleProposal passes this). */
+      isRule?: boolean;
+      /** A10: rule scope (defaults to global for rules). */
+      ruleScope?: RuleScope;
     } = {},
   ): string {
     const factText = fact.fact.trim().slice(0, 500);
@@ -1222,17 +1351,21 @@ export class TieredMemoryStore {
     // different projects is two scoped atoms (that recurrence is exactly
     // what standing-global-rule detection looks for); within one scope
     // (including the legacy unscoped scope) it still dedupes to one.
+    // A10: dedupe also separates rules from facts — approving a rule whose
+    // text matches a captured fact must mint a RULE atom, not silently
+    // return the fact's id.
     const existing = this.db
-      .prepare('SELECT id FROM memory_atoms WHERE bot_id = ? AND fact_norm = ? AND project_id IS ? LIMIT 1')
-      .get(botId, factNorm, opts.projectId ?? null) as { id: string } | undefined;
+      .prepare('SELECT id FROM memory_atoms WHERE bot_id = ? AND fact_norm = ? AND project_id IS ? AND COALESCE(is_rule, 0) = ? LIMIT 1')
+      .get(botId, factNorm, opts.projectId ?? null, opts.isRule ? 1 : 0) as { id: string } | undefined;
     if (existing) return existing.id;
 
     const id = randomUUID();
     const entities = [...new Set(fact.entities.map((e) => e.trim()).filter(Boolean))].slice(0, 10);
     const category = normalizeCategory(opts.category ?? inferCategory(factText));
+    const ruleScope = opts.isRule ? normalizeRuleScope(opts.ruleScope ?? { kind: 'global' }) : null;
     this.db
       .prepare(
-        'INSERT INTO memory_atoms (id, bot_id, fact, fact_norm, entities_json, confidence, source_turn, created_at, tier, pinned, category, quote, quote_source, grounding, project_id, roles_json, evidence_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO memory_atoms (id, bot_id, fact, fact_norm, entities_json, confidence, source_turn, created_at, tier, pinned, category, quote, quote_source, grounding, project_id, roles_json, evidence_json, is_rule, rule_scope_kind, rule_scope_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         id,
@@ -1254,6 +1387,9 @@ export class TieredMemoryStore {
         opts.evidenceLinks && opts.evidenceLinks.length > 0
           ? JSON.stringify([...new Set(opts.evidenceLinks)])
           : null,
+        opts.isRule ? 1 : 0,
+        ruleScope ? ruleScope.kind : null,
+        ruleScope?.id ?? null,
       );
     this.indexAtomForSearch(botId, id, factText, entities);
     this.refreshEntityPages(botId, entities, id);
@@ -1647,6 +1783,7 @@ export class TieredMemoryStore {
         quote: string | null; quote_source: string | null;
         grounding: string | null; project_id: string | null; roles_json: string | null;
         evidence_json: string | null; archived: number | null; use_credit: number | null;
+        is_rule: number | null; rule_scope_kind: string | null; rule_scope_id: string | null;
       }>;
     return rows.map((r) => ({
       id: r.id,
@@ -1660,6 +1797,15 @@ export class TieredMemoryStore {
       pinned: (r.pinned ?? 0) === 1,
       category: normalizeCategory(r.category),
       active: (r.active ?? 1) === 1,
+      ...((r.is_rule ?? 0) === 1
+        ? {
+            isRule: true as const,
+            ruleScopeKind: (r.rule_scope_kind === 'agent' || r.rule_scope_kind === 'project'
+              ? r.rule_scope_kind
+              : 'global') as RuleScopeKind,
+            ...(r.rule_scope_id ? { ruleScopeId: r.rule_scope_id } : {}),
+          }
+        : {}),
       ...(r.quote ? { quote: r.quote } : {}),
       ...(r.quote_source ? { quoteSource: r.quote_source } : {}),
       ...(r.grounding === 'verbatim-quote' || r.grounding === 'experience-citation'
@@ -1696,6 +1842,184 @@ export class TieredMemoryStore {
       // link cleanup is best-effort
     }
     return res.changes > 0;
+  }
+
+  // ---- A10: rule proposals inbox + approved rules ---------------------------
+  //
+  // Synthesis (memory-pipeline.ts) writes candidates ONLY via
+  // createRuleProposal. Promotion is decideRuleProposal with an explicit
+  // user decision — there is deliberately no other code path that sets
+  // is_rule on an atom, so a bot (or captured text) can never promote
+  // itself into a standing instruction.
+
+  private static rowToRuleProposal(r: {
+    id: string; bot_id: string; text: string; scope_kind: string; scope_id: string | null;
+    source_atom_ids_json: string; rationale: string | null; status: string;
+    created_at: number; decided_at: number | null; decided_by: string | null; rule_atom_id: string | null;
+  }): RuleProposal {
+    return {
+      id: r.id,
+      botId: r.bot_id,
+      text: r.text,
+      scope: r.scope_id
+        ? { kind: (r.scope_kind === 'agent' || r.scope_kind === 'project' ? r.scope_kind : 'global') as RuleScopeKind, id: r.scope_id }
+        : { kind: (r.scope_kind === 'agent' || r.scope_kind === 'project' ? r.scope_kind : 'global') as RuleScopeKind },
+      sourceAtomIds: parseStringArray(r.source_atom_ids_json),
+      ...(r.rationale ? { rationale: r.rationale } : {}),
+      status: r.status === 'approved' || r.status === 'dismissed' ? r.status : 'pending',
+      createdAt: r.created_at,
+      ...(r.decided_at !== null ? { decidedAt: r.decided_at } : {}),
+      ...(r.decided_by ? { decidedBy: r.decided_by } : {}),
+      ...(r.rule_atom_id ? { ruleAtomId: r.rule_atom_id } : {}),
+    };
+  }
+
+  /** Create one pending candidate rule. Deduped against an identical pending candidate (returns its id). */
+  createRuleProposal(
+    botId: string,
+    input: { text: string; scope?: RuleScope; sourceAtomIds?: string[]; rationale?: string },
+  ): string {
+    const text = input.text.trim().slice(0, 500);
+    if (!text) throw new Error('rule proposal text must be non-empty');
+    const scope = normalizeRuleScope(input.scope ?? { kind: 'global' });
+    const textNorm = normFact(text);
+    const existing = this.db
+      .prepare(
+        "SELECT id FROM memory_rule_proposals WHERE bot_id = ? AND text_norm = ? AND status = 'pending' AND scope_kind = ? AND scope_id IS ? LIMIT 1",
+      )
+      .get(botId, textNorm, scope.kind, scope.id ?? null) as { id: string } | undefined;
+    if (existing) return existing.id;
+    const id = randomUUID();
+    this.db
+      .prepare(
+        `INSERT INTO memory_rule_proposals (id, bot_id, text, text_norm, scope_kind, scope_id, source_atom_ids_json, rationale, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+      )
+      .run(
+        id,
+        botId,
+        text,
+        textNorm,
+        scope.kind,
+        scope.id ?? null,
+        JSON.stringify([...new Set(input.sourceAtomIds ?? [])].slice(0, 50)),
+        input.rationale?.slice(0, 500) ?? null,
+        Date.now(),
+      );
+    return id;
+  }
+
+  /** List a bot's rule proposals, newest first; pending only unless a status (or 'all') is given. */
+  listRuleProposals(botId: string, status: RuleProposalStatus | 'all' = 'pending', limit = 200): RuleProposal[] {
+    const where = status === 'all' ? 'bot_id = ?' : 'bot_id = ? AND status = ?';
+    const args = status === 'all' ? [botId] : [botId, status];
+    const rows = this.db
+      .prepare(`SELECT * FROM memory_rule_proposals WHERE ${where} ORDER BY created_at DESC LIMIT ?`)
+      .all(...args, Math.min(Math.max(limit, 1), 1000)) as Array<Parameters<typeof TieredMemoryStore.rowToRuleProposal>[0]>;
+    return rows.map(TieredMemoryStore.rowToRuleProposal);
+  }
+
+  /** One proposal by id (undefined when unknown). */
+  getRuleProposal(botId: string, proposalId: string): RuleProposal | undefined {
+    const row = this.db
+      .prepare('SELECT * FROM memory_rule_proposals WHERE bot_id = ? AND id = ?')
+      .get(botId, proposalId) as Parameters<typeof TieredMemoryStore.rowToRuleProposal>[0] | undefined;
+    return row ? TieredMemoryStore.rowToRuleProposal(row) : undefined;
+  }
+
+  /**
+   * Decide a pending proposal — THE user-approval gate (A10). Callers (the
+   * API route) must have already established that the caller is the user
+   * via a verified principal; `decidedBy` records that verified identity.
+   * - approve: stores the proposal text as a pinned rule atom in scope.
+   * - approve with `editedText`: stores the EDITED text instead.
+   * - dismiss: the candidate is gone for good (synthesis dedupes against
+   *   dismissed texts, so a dismissed rule is not re-proposed verbatim).
+   * Throws on unknown or already-decided proposals (fail-closed).
+   */
+  decideRuleProposal(
+    botId: string,
+    proposalId: string,
+    decision: { action: 'approve' | 'dismiss'; editedText?: string; decidedBy: string },
+  ): RuleProposal {
+    const proposal = this.getRuleProposal(botId, proposalId);
+    if (!proposal) throw new Error(`Unknown rule proposal "${proposalId}"`);
+    if (!decision.decidedBy.trim()) throw new Error('decidedBy (the deciding user) is required');
+    if (proposal.status !== 'pending') throw new Error(`Rule proposal "${proposalId}" is already ${proposal.status}`);
+    const now = Date.now();
+    if (decision.action === 'dismiss') {
+      this.db
+        .prepare("UPDATE memory_rule_proposals SET status = 'dismissed', decided_at = ?, decided_by = ? WHERE bot_id = ? AND id = ?")
+        .run(now, decision.decidedBy, botId, proposalId);
+      return { ...proposal, status: 'dismissed', decidedAt: now, decidedBy: decision.decidedBy };
+    }
+    const finalText = (decision.editedText ?? proposal.text).trim().slice(0, 500);
+    if (!finalText) throw new Error('approved rule text must be non-empty');
+    const ruleAtomId = this.storeAtom(
+      botId,
+      { fact: finalText, entities: [], confidence: 1 },
+      `rule-proposal:${proposalId}`,
+      undefined,
+      {
+        category: 'preference',
+        pinned: true,
+        isRule: true,
+        ruleScope: proposal.scope,
+        ...(proposal.scope.kind === 'project' && proposal.scope.id ? { projectId: proposal.scope.id } : {}),
+        ...(proposal.sourceAtomIds.length > 0
+          ? { evidenceLinks: proposal.sourceAtomIds.map((id) => `atom://${id}`) }
+          : {}),
+      },
+    );
+    // Link the rule to its source atoms (audit trail; best-effort).
+    for (const src of proposal.sourceAtomIds) {
+      if (src === ruleAtomId) continue;
+      try {
+        this.createLink(botId, ruleAtomId, src, 'relates', 'user-approval');
+      } catch {
+        // source may have been forgotten since synthesis
+      }
+    }
+    this.db
+      .prepare("UPDATE memory_rule_proposals SET status = 'approved', decided_at = ?, decided_by = ?, rule_atom_id = ? WHERE bot_id = ? AND id = ?")
+      .run(now, decision.decidedBy, ruleAtomId, botId, proposalId);
+    return { ...proposal, status: 'approved', decidedAt: now, decidedBy: decision.decidedBy, ruleAtomId };
+  }
+
+  /** All approved rule atoms for a bot (any scope), newest first. */
+  listRuleAtoms(botId: string, limit = 500): AtomCard[] {
+    return this.getAtoms(botId, Math.min(Math.max(limit, 1), 5000)).filter((a) => a.isRule === true && !a.archived);
+  }
+
+  /**
+   * Approved rules that APPLY in this context (A10 scope matrix):
+   * global rules always; agent rules only for their bot; project rules
+   * only inside their project. This is the injection set for turn/spawn
+   * context — unapproved candidates are never in it by construction.
+   */
+  getApplicableRules(botId: string, ctx: { projectId?: string; maxTier?: PrivacyTier } = {}): AtomCard[] {
+    const maxTier = ctx.maxTier ?? 'cloud-ok';
+    return this.listRuleAtoms(botId).filter(
+      (a) => tierAtMost(a.tier, maxTier) && ruleAppliesToContext(a, { botId, projectId: ctx.projectId }),
+    );
+  }
+
+  /**
+   * Standing-rules context block for spawn/turn-start injection (A10):
+   * the applicable approved rules rendered as their own headed section.
+   * Empty string when no rule applies (hosts then omit the section).
+   */
+  buildRulesContext(botId: string, ctx: { projectId?: string; maxTier?: PrivacyTier; maxChars?: number } = {}): string {
+    const rules = this.getApplicableRules(botId, ctx);
+    if (rules.length === 0) return '';
+    const maxChars = ctx.maxChars ?? 4000;
+    let block = '# Standing rules (approved by the user — follow these)\n';
+    for (const rule of rules) {
+      const line = `- ${rule.fact}\n`;
+      if (block.length + line.length > maxChars) break;
+      block += line;
+    }
+    return block.trimEnd();
   }
 
   // ---- L3: entity pages -------------------------------------------------------
@@ -2101,6 +2425,11 @@ export class TieredMemoryStore {
       ...candidates.filter((a) => a.pinned),
       ...candidates.filter((a) => !a.pinned),
     ];
+    // A10: approved rules for this scope lead the pack — they are standing
+    // instructions, not query matches, so they are injected even when the
+    // query never lexically touches them. Scope is enforced strictly here
+    // (getApplicableRules), independent of the recall legs' scope filter.
+    candidates = this.prependApplicableRules(botId, candidates, opts);
     const atoms: AtomCard[] = [];
     let tokensUsed = 0;
     const seen = new Set<string>();
@@ -2130,6 +2459,36 @@ export class TieredMemoryStore {
       this.memoryPacks.delete(oldest);
     }
     return pack;
+  }
+
+  /**
+   * A10: applicable approved rules first, then the recalled candidates
+   * (deduped). Rule atoms that do NOT apply in this context are also
+   * REMOVED from the candidates: the legacy recall legs treat an absent
+   * scope as "see everything", which is fine for facts but wrong for
+   * rules — a project rule must never leak into a no-project turn just
+   * because it lexically matched the query. Fail-closed for rules.
+   */
+  private prependApplicableRules(
+    botId: string,
+    candidates: AtomCard[],
+    opts: { scope?: MemoryScope; maxTier?: PrivacyTier },
+  ): AtomCard[] {
+    let rules: AtomCard[] = [];
+    try {
+      rules = this.getApplicableRules(botId, {
+        projectId: opts.scope?.projectId,
+        ...(opts.maxTier ? { maxTier: opts.maxTier } : {}),
+      });
+    } catch {
+      rules = []; // rules must never break recall; the filter below still applies
+    }
+    const ruleIds = new Set(rules.map((r) => r.id));
+    // Applicable rules ride in `rules`; every rule atom is dropped from the
+    // recall candidates (applicable ones would duplicate, inapplicable
+    // ones must not leak).
+    const rest = candidates.filter((c) => !c.isRule && !ruleIds.has(c.id));
+    return [...rules, ...rest];
   }
 
   /** Fetch a previously built pack by id (undefined when evicted/unknown). */
@@ -2208,6 +2567,8 @@ export class TieredMemoryStore {
       ...candidates.filter((a) => a.pinned),
       ...candidates.filter((a) => !a.pinned),
     ];
+    // A10: approved rules for this scope lead the pack (see buildMemoryPack).
+    candidates = this.prependApplicableRules(botId, candidates, opts);
     const atoms: AtomCard[] = [];
     let tokensUsed = 0;
     const seen = new Set<string>();
@@ -2249,7 +2610,10 @@ export class TieredMemoryStore {
     if (pack.atoms.length === 0) return '';
     let block = '# What I remember (from past conversations)\n';
     for (const atom of pack.atoms) {
-      const line = `- ${atom.fact}\n`;
+      // A10: approved rules render with a "Rule:" marker so the model (and
+      // anyone reading the prompt) can tell standing instructions apart
+      // from recalled facts.
+      const line = atom.isRule ? `- Rule: ${atom.fact}\n` : `- ${atom.fact}\n`;
       if (block.length + line.length > maxChars) break;
       block += line;
     }

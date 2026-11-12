@@ -43,6 +43,7 @@ import {
   readAboutMe,
   runUpkeepPassWithLearning,
   syncAboutMeToOrientation,
+  synthesizeRuleProposals,
   tidyMemory,
   writeAboutMe,
 } from '@mvp/agent-runtime';
@@ -621,6 +622,18 @@ export function startMemoryUpkeep(deps: MemoryUpkeepSchedulerDeps): MemoryUpkeep
               rejected: r.learning.rejected,
             },
           });
+          // A10: the scheduled synthesis routine — distils captured facts
+          // into CANDIDATE rules in the proposals inbox (deterministic
+          // zero-model lane; the manual trigger in
+          // memory-proposals-routes.ts may add the model lane).
+          // Candidates stay proposals: only a user decision promotes.
+          const synth = await synthesizeRuleProposals(deps.tieredMemoryStore, bot.id, {});
+          if (synth.created.length > 0) {
+            deps.audit('memory.rule_synthesis', {
+              actor: 'system',
+              detail: { botId: bot.id, created: synth.created.length, lane: synth.lane },
+            });
+          }
         } catch {
           // upkeep must never break the server
         }

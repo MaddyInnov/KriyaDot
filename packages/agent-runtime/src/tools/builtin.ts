@@ -7,6 +7,7 @@ import type { ToolContext, ToolDefinition } from '../types.js';
 import type { ButtonsWidgetPayload, WidgetAnswer, WidgetHost } from '../widgets.js';
 import { validateWidgetPayload } from '../widgets.js';
 import { executeInPersistentSandbox, executeSandboxedCommand, sandboxBackend } from './sandbox.js';
+import { EGRESS_JOURNAL_LABEL, isEgressJournalEnabled } from './egress-proxy.js';
 import { formatHashedLines } from './line-hash.js';
 import { semanticMisuseHint } from '../tool-hints.js';
 import { listFolderTool, resolvePcReadableFile } from './pc-files.js';
@@ -158,6 +159,8 @@ function runCommandTool(workspaceDir: WorkspaceSource): ToolDefinition {
       'workspace as the writable root. Unsandboxed host execution happens ONLY on an explicit opt-out ' +
       '(SANDBOX_ALLOW_HOST=1 / SANDBOX_BACKEND=host) or as an availability fallback, and is flagged in ' +
       'the result (sandboxed:false + warning). ' +
+      'When the egress journal setting is on (Settings → Preferences → Privacy), local runs also route through a per-run ' +
+      'localhost proxy that journals host:port per connection ("Visible, not confined" — bypass traffic is not covered). ' +
       'Stdout/stderr are truncated to 8KB.',
     parameters: {
       type: 'object',
@@ -183,6 +186,26 @@ function runCommandTool(workspaceDir: WorkspaceSource): ToolDefinition {
       const withHint = <T extends Record<string, unknown>>(r: T): T =>
         hint ? { ...r, hint } : r;
       const wsDir = resolveWorkspaceDir(workspaceDir, ctx);
+      // A13 egress journal (opt-in, default OFF): when the setting is on
+      // AND the host wired a journal sink into the context, the sandbox
+      // layer runs this command behind a per-run localhost proxy and
+      // journals host:port per connection. No sink → no proxy env is set
+      // and the result says journaling was unavailable (never implied).
+      const egressWanted = isEgressJournalEnabled();
+      const egressJournal =
+        egressWanted && ctx?.egressJournal?.sink
+          ? { runId: ctx.egressJournal.runId ?? ctx.sessionId, sink: ctx.egressJournal.sink }
+          : undefined;
+      const egressFields: Record<string, unknown> = egressWanted
+        ? egressJournal
+          ? {}
+          : {
+              egressJournal: 'unavailable',
+              egressNote:
+                `Egress journaling is enabled but no journal sink is wired for this run, so no proxy env was set. ` +
+                `${EGRESS_JOURNAL_LABEL}: this run's network destinations were not recorded.`,
+            }
+        : { egressJournal: 'off' };
       // Persistent Dot environment: run inside the Dot's own long-lived E2B
       // sandbox instead of a fresh ephemeral one. Falls back to ephemeral on
       // connect failure (the sandbox may have expired).
@@ -200,6 +223,16 @@ function runCommandTool(workspaceDir: WorkspaceSource): ToolDefinition {
             stderr: truncate(result.stderr, MAX_OUTPUT_BYTES),
             sandboxed: true,
             backend: 'e2b-persistent',
+            // A remote persistent sandbox cannot reach a localhost
+            // proxy — egress journaling is unavailable there, honestly.
+            ...(egressWanted
+              ? {
+                  egressJournal: 'unavailable',
+                  egressNote:
+                    `Egress journal unavailable for the persistent E2B sandbox (a localhost proxy is unreachable from there). ` +
+                    `${EGRESS_JOURNAL_LABEL}: this run's network destinations were not recorded.`,
+                }
+              : egressFields),
           });
         } catch (err) {
           // Persistent sandbox gone (expired/killed) — fall through to
@@ -215,6 +248,7 @@ function runCommandTool(workspaceDir: WorkspaceSource): ToolDefinition {
         timeoutMs,
         maxOutputBytes: MAX_OUTPUT_BYTES * 4,
         workspaceDir: wsDir,
+        ...(egressJournal ? { egressJournal } : {}),
       });
       return withHint({
         exitCode: result.exitCode,
@@ -224,6 +258,8 @@ function runCommandTool(workspaceDir: WorkspaceSource): ToolDefinition {
         sandboxed: result.sandboxed ?? result.backend !== 'host',
         backend: result.backend ?? sandboxBackend(),
         ...(result.warning ? { warning: result.warning } : {}),
+        ...(result.egressJournal ? { egressJournal: result.egressJournal } : egressFields),
+        ...(result.egressNote ? { egressNote: result.egressNote } : egressFields.egressNote ? { egressNote: egressFields.egressNote } : {}),
       });
     },
   };

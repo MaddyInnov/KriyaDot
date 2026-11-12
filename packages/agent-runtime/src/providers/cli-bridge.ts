@@ -15,10 +15,29 @@
 //   it only reuses the single local user's own CLI logins, on their machine,
 //   with their explicit consent.
 
-import { accessSync, constants, existsSync, readFileSync, statSync } from 'node:fs';
+import { accessSync, constants, existsSync, readFileSync } from 'node:fs';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { homedir } from 'node:os';
 import { delimiter, join } from 'node:path';
+import {
+  CLI_IDENTITY_DECLARATIONS,
+  extractSemver,
+  getCachedIdentity,
+  getCliPathPin,
+  firstPrintedLine,
+  matchIdentity,
+  outputMatchesReject,
+  redactCliSecrets,
+  redactedFirstLine,
+  setCachedIdentity,
+  statForCache,
+  clearIdentityCache,
+} from './cli-identity.js';
+
+// NOTE: the cli-identity helpers (declarations, pins, safe matching,
+// redaction) are exported from the package root via cli-identity.js
+// (see index.ts) — they are intentionally not re-exported here, so the
+// root surface has exactly one source per name.
 
 export type CliBridgeId = 'claude' | 'codex' | 'opencode';
 
@@ -40,6 +59,14 @@ export interface DetectOptions {
   platform?: NodeJS.Platform;
   /** win32 APPDATA override (tests). Defaults to process.env.APPDATA. */
   appDataDir?: string;
+  /**
+   * A8: per-bridge user-pinned CLI paths (explicit per-call overrides).
+   * When a bridge has no entry here, the pin registry / env mirror in
+   * cli-identity.ts is consulted at resolve time.
+   */
+  cliPathPins?: Partial<Record<CliBridgeId, string>>;
+  /** A8: single-call pin override for the bridge being resolved. */
+  pinnedPath?: string;
 }
 
 /** Plain-language per-CLI facts used in user-facing state and error copy. */
@@ -174,9 +201,21 @@ const BRIDGE_PATHS: Record<CliBridgeId, { cli: string; credentialsRel: string }>
   opencode: { cli: 'opencode', credentialsRel: join('.local', 'share', 'opencode', 'auth.json') },
 };
 
-function detectOne(id: CliBridgeId, homeDir: string, pathDirs: string[], platform: NodeJS.Platform): BridgeDetection {
+function detectOne(
+  id: CliBridgeId,
+  homeDir: string,
+  pathDirs: string[],
+  platform: NodeJS.Platform,
+  opts: DetectOptions = {},
+): BridgeDetection {
   const spec = BRIDGE_PATHS[id];
-  const cliPresent = executableOnPath(spec.cli, pathDirs, platform);
+  let cliPresent = executableOnPath(spec.cli, pathDirs, platform);
+  if (!cliPresent) {
+    // A8: a user-pinned CLI path counts for detection even when the CLI
+    // is not on PATH at all — the pin is how the user told us where it is.
+    const pin = effectiveCliPin(id, opts);
+    if (pin && pinnedCliCandidates(pin, platform).length > 0) cliPresent = true;
+  }
   let credentialsPresent = false;
   try {
     credentialsPresent = existsSync(join(homeDir, spec.credentialsRel));
@@ -197,14 +236,48 @@ export function detectCliBridges(opts: DetectOptions = {}): BridgeDetection[] {
   const homeDir = opts.homeDir ?? defaultHomeDir();
   const pathDirs = effectiveCliPathDirs(opts);
   const platform = opts.platform ?? process.platform;
-  return (Object.keys(BRIDGE_PATHS) as CliBridgeId[]).map((id) => detectOne(id, homeDir, pathDirs, platform));
+  return (Object.keys(BRIDGE_PATHS) as CliBridgeId[]).map((id) => detectOne(id, homeDir, pathDirs, platform, opts));
 }
 
 export function detectCliBridge(id: CliBridgeId, opts: DetectOptions = {}): BridgeDetection {
   const homeDir = opts.homeDir ?? defaultHomeDir();
   const pathDirs = effectiveCliPathDirs(opts);
   const platform = opts.platform ?? process.platform;
-  return detectOne(id, homeDir, pathDirs, platform);
+  return detectOne(id, homeDir, pathDirs, platform, opts);
+}
+
+// ---------------------------------------------------------------------------
+// User-pinned CLI paths (A8 §5). A pin is a per-bridge location hint the
+// user sets in Settings → Providers. It is read at resolve time (the
+// registry in cli-identity.ts, fed by the API's persisted settings), so
+// changing it applies live with no restart. A pin is NOT a trust grant:
+// the pinned binary goes through the same identity probe, and if it fails
+// — or doesn't exist — resolution reports that plainly instead of
+// silently falling back to auto-detection.
+// ---------------------------------------------------------------------------
+
+/** The effective pin for a bridge under these options, if any. */
+export function effectiveCliPin(id: CliBridgeId, opts: DetectOptions = {}): string | undefined {
+  return getCliPathPin(id, { override: opts.pinnedPath ?? opts.cliPathPins?.[id] });
+}
+
+/**
+ * On-disk files a pinned path can mean, in resolution order. The pin
+ * itself wins when it exists; on win32 a pin typed without an extension
+ * also tries the standard `.exe` / `.cmd` / `.bat` forms in that exact
+ * location (pins accept Windows paths verbatim — no separator rewriting).
+ */
+export function pinnedCliCandidates(pin: string, platform: NodeJS.Platform = process.platform): string[] {
+  if (cliPathExists(pin, platform)) return [pin];
+  if (platform === 'win32' && !/\.(exe|cmd|bat)$/i.test(pin)) {
+    const found: string[] = [];
+    for (const ext of WIN32_CLI_EXTS) {
+      const candidate = `${pin}${ext}`;
+      if (cliPathExists(candidate, platform)) found.push(candidate);
+    }
+    return found;
+  }
+  return [];
 }
 
 // ---------------------------------------------------------------------------
@@ -213,34 +286,11 @@ export function detectCliBridge(id: CliBridgeId, opts: DetectOptions = {}): Brid
 // (a Python package's `codex` crashed with an import traceback in the
 // field). Before KriyaDot spawns a candidate or reports a bridge as
 // connectable, the candidate must answer `--version` like the real tool.
-// Probes are cached per path+mtime so repeated checks are free.
+// The patterns are DECLARED data (cli-identity.ts, A8 §1) consumed via
+// linear, length-capped matchers — never raw regexes over untrusted
+// output (A8 §3). Probes are cached per file by (path + size + mtime)
+// so repeated checks do not re-spawn the binary (A8 §2).
 // ---------------------------------------------------------------------------
-
-interface CliIdentitySpec {
-  versionArgs: string[];
-  /** Anchored against the first non-empty output line. */
-  versionPattern: RegExp;
-  /** Fallback probe when --version output is uninformative (opencode prints a bare semver). */
-  helpArgs?: string[];
-  helpPattern?: RegExp;
-}
-
-const CLI_IDENTITY: Record<CliBridgeId, CliIdentitySpec> = {
-  // Real output: "2.1.316 (Claude Code)".
-  claude: { versionArgs: ['--version'], versionPattern: /claude code/i },
-  // Real output: "codex-cli 0.142.0". Anchored: a namesake's crash output
-  // mentions "codex" in file paths, so an unanchored match is not enough.
-  codex: { versionArgs: ['--version'], versionPattern: /^codex-cli\b/i },
-  // Real --version prints a bare semver ("1.0.119"); --help names the tool.
-  opencode: {
-    versionArgs: ['--version'],
-    versionPattern: /^\d+\.\d+\.\d+/,
-    helpArgs: ['--help'],
-    helpPattern: /opencode/i,
-  },
-};
-
-const PYTHON_TRACEBACK_RE = /Traceback \(most recent call last\)|ModuleNotFoundError|ImportError/i;
 
 export interface CliIdentityResult {
   ok: boolean;
@@ -248,17 +298,20 @@ export interface CliIdentityResult {
   version?: string;
   /** Plain-language guess at what a rejected candidate actually is. */
   looksLike?: string;
+  /**
+   * The candidate's first printed line, secrets redacted and capped —
+   * set on refusals so the user can see what actually answered (A8 §4).
+   */
+  firstLine?: string;
 }
-
-const identityCache = new Map<string, { mtimeMs: number; result: CliIdentityResult }>();
 
 /** Test helper: drop cached identity probes. */
 export function resetCliIdentityCache(): void {
-  identityCache.clear();
+  clearIdentityCache();
 }
 
-function describeCandidate(executablePath: string, output: string): string | undefined {
-  if (PYTHON_TRACEBACK_RE.test(output) || /site-packages/i.test(executablePath) || /python/i.test(executablePath)) {
+function describeCandidate(executablePath: string, output: string, rejected: boolean): string | undefined {
+  if (rejected || /site-packages/i.test(executablePath) || /python/i.test(executablePath)) {
     return 'a Python program';
   }
   return undefined;
@@ -266,44 +319,70 @@ function describeCandidate(executablePath: string, output: string): string | und
 
 /**
  * Probe one candidate executable: does it answer like the real CLI?
- * Runs `<exe> --version` (plus `--help` where the spec defines one) with a
- * short timeout. Results are cached by path + file mtime.
+ * Runs the declared probe args (plus the declared help fallback where
+ * one exists) with a short timeout. Results are cached by
+ * (absolute path + file size + mtime): an unchanged file is never
+ * re-spawned; a replaced or touched file always re-probes.
  */
 export function probeCliIdentity(
   id: CliBridgeId,
   executablePath: string,
   opts: { platform?: NodeJS.Platform; timeoutMs?: number } = {},
 ): CliIdentityResult {
-  let mtimeMs = -1;
-  try {
-    mtimeMs = statSync(executablePath).mtimeMs;
-  } catch {
-    // stat failed — probe anyway, skip the cache.
+  const stat = statForCache(executablePath);
+  if (stat) {
+    const cached = getCachedIdentity<CliIdentityResult>(executablePath, stat.size, stat.mtimeMs);
+    if (cached) return cached;
   }
-  const cacheKey = executablePath;
-  const cached = identityCache.get(cacheKey);
-  if (cached && mtimeMs >= 0 && cached.mtimeMs === mtimeMs) return cached.result;
 
-  const spec = CLI_IDENTITY[id];
+  const decl = CLI_IDENTITY_DECLARATIONS[id];
   const timeoutMs = opts.timeoutMs ?? 5000;
-  const versionRun = runCliSync(executablePath, spec.versionArgs, { platform: opts.platform, timeoutMs });
-  const firstLine = versionRun.output.split('\n').map((l) => l.trim()).find((l) => l.length > 0) ?? '';
+  const versionRun = runCliSync(executablePath, decl.versionArgs, { platform: opts.platform, timeoutMs });
+  const rejected = outputMatchesReject(versionRun.output, decl.rejectIfOutputContains);
   let result: CliIdentityResult;
-  if (PYTHON_TRACEBACK_RE.test(versionRun.output)) {
-    result = { ok: false, looksLike: describeCandidate(executablePath, versionRun.output) };
-  } else if (spec.versionPattern.test(firstLine)) {
-    const version = /\d+\.\d+\.\d+(?:[-.+\w]*)?/.exec(firstLine)?.[0];
+  if (rejected) {
+    result = {
+      ok: false,
+      looksLike: describeCandidate(executablePath, versionRun.output, true),
+      firstLine: redactedFirstLine(versionRun.output),
+    };
+  } else if (matchIdentity(decl.versionMatch, versionRun.output)) {
+    const version = extractSemver(firstPrintedLine(versionRun.output));
     result = { ok: true, ...(version ? { version } : {}) };
-  } else if (spec.helpArgs && spec.helpPattern) {
-    const helpRun = runCliSync(executablePath, spec.helpArgs, { platform: opts.platform, timeoutMs });
-    result = spec.helpPattern.test(helpRun.output)
-      ? { ok: true }
-      : { ok: false, looksLike: describeCandidate(executablePath, helpRun.output) };
+  } else if (decl.helpArgs && decl.helpMatch) {
+    const helpRun = runCliSync(executablePath, decl.helpArgs, { platform: opts.platform, timeoutMs });
+    const helpRejected = outputMatchesReject(helpRun.output, decl.rejectIfOutputContains);
+    result =
+      !helpRejected && matchIdentity(decl.helpMatch, helpRun.output)
+        ? { ok: true }
+        : {
+            ok: false,
+            looksLike: describeCandidate(executablePath, helpRun.output, helpRejected),
+            firstLine: redactedFirstLine(versionRun.output) || redactedFirstLine(helpRun.output),
+          };
   } else {
-    result = { ok: false, looksLike: describeCandidate(executablePath, versionRun.output) };
+    result = {
+      ok: false,
+      looksLike: describeCandidate(executablePath, versionRun.output, false),
+      firstLine: redactedFirstLine(versionRun.output),
+    };
   }
-  if (mtimeMs >= 0) identityCache.set(cacheKey, { mtimeMs, result });
+  if (stat) setCachedIdentity(executablePath, stat.size, stat.mtimeMs, result);
   return result;
+}
+
+/** A8: outcome of resolving a user-pinned CLI path. */
+export interface PinnedCliResolution {
+  /** The pin exactly as the user set it. */
+  path: string;
+  status: 'verified' | 'not-found' | 'identity-failed';
+  /** The on-disk file the pin resolved to, when one exists. */
+  resolvedPath?: string;
+  /** Verified version string (status 'verified' only, when captured). */
+  version?: string;
+  looksLike?: string;
+  /** Redacted first printed line (status 'identity-failed', when printed). */
+  firstLine?: string;
 }
 
 export interface VerifiedCliResolution {
@@ -314,19 +393,68 @@ export interface VerifiedCliResolution {
   /** Every on-disk candidate, in resolution order. */
   candidates: string[];
   /** When candidates exist but none is the real CLI: the first namesake. */
-  namesake?: { path: string; looksLike?: string };
+  namesake?: { path: string; looksLike?: string; firstLine?: string };
+  /** A8: set whenever a user pin was in effect for this resolution. */
+  pinned?: PinnedCliResolution;
 }
 
 /**
- * Resolve a bridge CLI to a VERIFIED executable: enumerate every same-named
- * candidate in order and return the first that answers like the real tool.
- * A wrong-identity namesake earlier on PATH never shadows a real CLI later
- * on PATH, and a namesake alone resolves to `namesake`, never to `path`.
+ * Resolve a bridge CLI to a VERIFIED executable.
+ * - With a user pin in effect: the pin is the ONLY location considered.
+ *   It still must pass identity; a missing or wrong-identity pinned file
+ *   resolves to `pinned` (never to a PATH fallback), so the failure is
+ *   surfaced plainly instead of being silently papered over.
+ * - Without a pin: enumerate every same-named PATH candidate in order
+ *   and return the first that answers like the real tool. A wrong-identity
+ *   namesake earlier on PATH never shadows a real CLI later on PATH, and
+ *   a namesake alone resolves to `namesake`, never to `path`.
  */
 export function resolveVerifiedCliExecutable(
   id: CliBridgeId,
   opts: DetectOptions & { timeoutMs?: number } = {},
 ): VerifiedCliResolution {
+  const pin = effectiveCliPin(id, opts);
+  if (pin) {
+    const platform = opts.platform ?? process.platform;
+    const pinnedFiles = pinnedCliCandidates(pin, platform);
+    if (pinnedFiles.length === 0) {
+      return { candidates: [], pinned: { path: pin, status: 'not-found' } };
+    }
+    let firstFailure: CliIdentityResult | undefined;
+    let firstFailureFile: string | undefined;
+    for (const file of pinnedFiles) {
+      const probe = probeCliIdentity(id, file, { platform: opts.platform, timeoutMs: opts.timeoutMs });
+      if (probe.ok) {
+        return {
+          path: file,
+          ...(probe.version ? { version: probe.version } : {}),
+          candidates: pinnedFiles,
+          pinned: { path: pin, status: 'verified', resolvedPath: file, ...(probe.version ? { version: probe.version } : {}) },
+        };
+      }
+      firstFailure ??= probe;
+      firstFailureFile ??= file;
+    }
+    return {
+      candidates: pinnedFiles,
+      ...(firstFailureFile
+        ? {
+            namesake: {
+              path: firstFailureFile,
+              ...(firstFailure?.looksLike ? { looksLike: firstFailure.looksLike } : {}),
+              ...(firstFailure?.firstLine ? { firstLine: firstFailure.firstLine } : {}),
+            },
+          }
+        : {}),
+      pinned: {
+        path: pin,
+        status: 'identity-failed',
+        ...(firstFailureFile ? { resolvedPath: firstFailureFile } : {}),
+        ...(firstFailure?.looksLike ? { looksLike: firstFailure.looksLike } : {}),
+        ...(firstFailure?.firstLine ? { firstLine: firstFailure.firstLine } : {}),
+      },
+    };
+  }
   const candidates = enumerateCliCandidates(BRIDGE_PATHS[id].cli, opts);
   let namesake: VerifiedCliResolution['namesake'];
   for (const candidate of candidates) {
@@ -334,19 +462,59 @@ export function resolveVerifiedCliExecutable(
     if (probe.ok) {
       return { path: candidate, ...(probe.version ? { version: probe.version } : {}), candidates };
     }
-    namesake ??= { path: candidate, ...(probe.looksLike ? { looksLike: probe.looksLike } : {}) };
+    namesake ??= {
+      path: candidate,
+      ...(probe.looksLike ? { looksLike: probe.looksLike } : {}),
+      ...(probe.firstLine ? { firstLine: probe.firstLine } : {}),
+    };
   }
   return { candidates, ...(namesake ? { namesake } : {}) };
 }
 
 /** The plain-words sentence for "a program with this name exists, but it is not the real CLI". */
-export function bridgeNamesakeMessage(id: CliBridgeId, namesake: { path: string; looksLike?: string }): string {
+export function bridgeNamesakeMessage(
+  id: CliBridgeId,
+  namesake: { path: string; looksLike?: string; firstLine?: string },
+): string {
   const meta = CLI_BRIDGE_META[id];
   const name = BRIDGE_PATHS[id].cli;
   return (
     `Found a program named "${name}" on this machine, but it isn't ${meta.label}` +
     `${namesake.looksLike ? ` — it appears to be ${namesake.looksLike}` : ''}. ` +
+    `${namesake.firstLine ? `It printed: "${namesake.firstLine}". ` : ''}` +
     `Install the real ${meta.label} (${meta.installCommand}), then sign in with \`${meta.signInCommand}\`.`
+  );
+}
+
+/** The plain-words sentence for a pinned CLI path that cannot be used (A8 §5). */
+export function bridgePinnedMessage(id: CliBridgeId, pinned: PinnedCliResolution): string {
+  const meta = CLI_BRIDGE_META[id];
+  if (pinned.status === 'verified') return `Using your pinned ${meta.label} at ${pinned.path}.`;
+  if (pinned.status === 'not-found') {
+    return (
+      `Your pinned ${meta.label} path "${pinned.path}" doesn't point to a file on this machine. ` +
+      `Fix the path in Settings → Providers, or clear it to go back to auto-detection.`
+    );
+  }
+  return (
+    `Your pinned ${meta.label} path "${pinned.path}" was found, but the program there isn't ${meta.label}` +
+    `${pinned.looksLike ? ` — it appears to be ${pinned.looksLike}` : ''}. ` +
+    `${pinned.firstLine ? `It printed: "${pinned.firstLine}". ` : ''}` +
+    `A pinned path is only a location hint — it still has to be the real CLI. ` +
+    `Fix the path, or clear it in Settings → Providers to go back to auto-detection.`
+  );
+}
+
+/** The single failure sentence for a resolution: pinned failures speak first. */
+export function bridgeResolutionFailureMessage(id: CliBridgeId, resolution: VerifiedCliResolution): string {
+  if (resolution.pinned && resolution.pinned.status !== 'verified') {
+    return bridgePinnedMessage(id, resolution.pinned);
+  }
+  if (resolution.namesake) return bridgeNamesakeMessage(id, resolution.namesake);
+  const meta = CLI_BRIDGE_META[id];
+  return (
+    `${meta.label} is not installed or not on PATH. ` +
+    `Install it (${meta.installCommand}) and sign in (\`${meta.signInCommand}\`) — KriyaDot uses the CLI's own login.`
   );
 }
 
@@ -424,7 +592,9 @@ export function summarizeCliFailure(opts: {
   const pick = errorLine ?? lines[lines.length - 1];
   const head = `${opts.cliLabel} ${opts.how}`;
   if (!pick) return `${head} and produced no error output.`;
-  const clipped = pick.length > 180 ? `${pick.slice(0, 177)}…` : pick;
+  // A8 §4: a quoted line never leaves with credential-shaped text intact.
+  const redacted = redactCliSecrets(pick);
+  const clipped = redacted.length > 180 ? `${redacted.slice(0, 177)}…` : redacted;
   const summary = `${head}: ${clipped}`;
   return summary.length > maxChars ? `${summary.slice(0, maxChars - 1)}…` : summary;
 }
@@ -697,7 +867,9 @@ export type BridgeConnectFailureCode =
   | 'not-signed-in'
   | 'token-unusable'
   | 'namesake-cli'
-  | 'cli-missing';
+  | 'cli-missing'
+  /** A8: a user-pinned CLI path is set but missing or not the real CLI. */
+  | 'pinned-cli-invalid';
 
 export interface BridgeConnectableResult {
   ok: boolean;
@@ -723,12 +895,19 @@ export function bridgeConnectable(id: CliBridgeId, opts: DetectOptions = {}): Br
   const detection = detectCliBridge(id, opts);
   const tokenUsable = detection.credentialsPresent && bridgeHasUsableToken(id, opts.homeDir);
   // Claude's bridge talks HTTPS with the stored token — a usable login is
-  // sufficient; don't pay (or risk) a CLI probe for it.
-  if (tokenUsable && id === 'claude') return { ok: true };
+  // sufficient; don't pay (or risk) a CLI probe for it. A8 exception: when
+  // the user has pinned a CLI path, a broken pin is reported plainly even
+  // here — silently ignoring an explicit pin would hide a misconfiguration.
+  if (tokenUsable && id === 'claude' && !effectiveCliPin(id, opts)) return { ok: true };
   const resolution = resolveVerifiedCliExecutable(id, opts);
+  const pinnedFailure =
+    resolution.pinned && resolution.pinned.status !== 'verified' ? resolution.pinned : undefined;
 
   if (tokenUsable) {
     if (resolution.path) return { ok: true };
+    if (pinnedFailure) {
+      return { ok: false, code: 'pinned-cli-invalid', reason: bridgePinnedMessage(id, pinnedFailure) };
+    }
     if (resolution.namesake) {
       return {
         ok: false,
@@ -764,6 +943,10 @@ export function bridgeConnectable(id: CliBridgeId, opts: DetectOptions = {}): Br
         `${meta.label} is installed, but you're not signed in yet — there's no stored login to reuse. ` +
         `Use "Sign in to ${meta.label}" here, or open a terminal and run \`${meta.signInCommand}\`, finish signing in, then press Connect again.`,
     };
+  }
+
+  if (pinnedFailure) {
+    return { ok: false, code: 'pinned-cli-invalid', reason: bridgePinnedMessage(id, pinnedFailure) };
   }
 
   if (resolution.namesake) {
@@ -805,7 +988,10 @@ export function bridgeConnectable(id: CliBridgeId, opts: DetectOptions = {}): Br
 // machine) and the picker asks on every providers refresh. A non-empty
 // list is trusted for 5 minutes; an empty/failed one only 30s, so a CLI
 // fixed in the meantime shows up quickly without hammering a broken one.
-const bridgeModelsCache = new Map<CliBridgeId, { at: number; models: Array<{ id: string; name: string }> }>();
+const bridgeModelsCache = new Map<
+  CliBridgeId,
+  { at: number; models: Array<{ id: string; name: string }>; resolvedPath?: string }
+>();
 const BRIDGE_MODELS_TTL_MS = 5 * 60_000;
 const BRIDGE_MODELS_EMPTY_TTL_MS = 30_000;
 
@@ -817,14 +1003,17 @@ export function getBridgeModels(id: CliBridgeId, opts: DetectOptions = {}): Arra
   const spec = BRIDGE_PATHS[id];
   if (!spec) return [];
   if (id !== 'codex' && id !== 'opencode') return [];
+  // Resolve first (identity probes are cached per file, so this is cheap):
+  // the model cache is only valid for the SAME resolved binary — an A8 pin
+  // change or a PATH change must not serve the previous binary's models.
+  const resolution = resolveVerifiedCliExecutable(id, opts);
   const cached = bridgeModelsCache.get(id);
-  if (cached) {
+  if (cached && cached.resolvedPath === resolution.path) {
     const ttl = cached.models.length > 0 ? BRIDGE_MODELS_TTL_MS : BRIDGE_MODELS_EMPTY_TTL_MS;
     if (Date.now() - cached.at < ttl) return cached.models;
   }
-  const resolution = resolveVerifiedCliExecutable(id, opts);
   if (!resolution.path) {
-    bridgeModelsCache.set(id, { at: Date.now(), models: [] });
+    bridgeModelsCache.set(id, { at: Date.now(), models: [], resolvedPath: undefined });
     return [];
   }
 
@@ -844,7 +1033,7 @@ export function getBridgeModels(id: CliBridgeId, opts: DetectOptions = {}): Arra
         }
       }
     }
-    bridgeModelsCache.set(id, { at: Date.now(), models });
+    bridgeModelsCache.set(id, { at: Date.now(), models, resolvedPath: resolution.path });
     return models;
   }
   // opencode: lines of provider/model ids.
@@ -857,6 +1046,6 @@ export function getBridgeModels(id: CliBridgeId, opts: DetectOptions = {}): Arra
       }
     }
   }
-  bridgeModelsCache.set(id, { at: Date.now(), models });
+  bridgeModelsCache.set(id, { at: Date.now(), models, resolvedPath: resolution.path });
   return models;
 }

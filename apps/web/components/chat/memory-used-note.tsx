@@ -46,6 +46,12 @@ export function MemoryUsedNote({ items }: { items?: MemoryUsedItem[] | null }) {
               <li key={item.atomId} className="memory-used-item">
                 <span className="memory-used-fact">{memoryFactPreview(item.fact)}</span>
                 <span className="memory-used-meta">
+                  {/* A10: an approved RULE firing is cited distinctly from a recalled fact. */}
+                  {item.kind === 'rule' ? (
+                    <span className="chip memory-used-rule" title="A standing rule you approved shaped this turn">
+                      ⚖️ Rule
+                    </span>
+                  ) : null}
                   {item.category ? <span className="chip gray memory-used-cat">{item.category}</span> : null}
                   {item.sourceTurn ? <span className="memory-used-source">{item.sourceTurn}</span> : null}
                 </span>
