@@ -23,7 +23,7 @@
 
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import type { AgentRuntime, BotConfig } from '@mvp/agent-runtime';
+import type { AgentRuntime, BotConfig, ProvenanceNote } from '@mvp/agent-runtime';
 import { classifyProviderError } from '@mvp/agent-runtime';
 import type { BotRoutine } from './bot-routines.js';
 
@@ -55,6 +55,12 @@ export interface RoutineRun {
   recovered?: boolean;
   /** Total attempts made (1 = no retry). */
   attempts?: number;
+  /**
+   * B5: trigger audit context recorded at start (e.g. for webhook
+   * starts: source IP + payload SHAPE summary + trigger id). Metadata
+   * only — callers must never put payload values or secrets in here.
+   */
+  audit?: Record<string, unknown> | null;
 }
 
 export interface FailureStreak {
@@ -78,6 +84,7 @@ interface RunRow {
   created_at: number;
   recovered: number | null;
   attempts: number | null;
+  audit_json: string | null;
 }
 
 function rowToRun(r: RunRow): RoutineRun {
@@ -97,6 +104,15 @@ function rowToRun(r: RunRow): RoutineRun {
     createdAt: r.created_at,
     recovered: r.recovered === 1 ? true : undefined,
     attempts: r.attempts ?? undefined,
+    audit: (() => {
+      if (!r.audit_json) return undefined;
+      try {
+        const parsed = JSON.parse(r.audit_json) as Record<string, unknown>;
+        return parsed && typeof parsed === 'object' ? parsed : undefined;
+      } catch {
+        return undefined;
+      }
+    })(),
   };
 }
 
@@ -134,6 +150,9 @@ function openDb(dataDir: string): DatabaseSync {
   const runCols = db.prepare('PRAGMA table_info(routine_runs)').all() as unknown as Array<{ name: string }>;
   if (!runCols.some((c) => c.name === 'recovered')) db.exec('ALTER TABLE routine_runs ADD COLUMN recovered INTEGER');
   if (!runCols.some((c) => c.name === 'attempts')) db.exec('ALTER TABLE routine_runs ADD COLUMN attempts INTEGER');
+  // B5: per-run trigger audit context (source IP / payload summary for
+  // webhook starts). Nullable; older rows read back with no audit.
+  if (!runCols.some((c) => c.name === 'audit_json')) db.exec('ALTER TABLE routine_runs ADD COLUMN audit_json TEXT');
   return db;
 }
 
@@ -150,6 +169,8 @@ export class RoutineRunStore {
     routineName: string;
     trigger: RunTrigger;
     scheduledFor?: number | null;
+    /** B5: trigger audit context (metadata only — no payload values). */
+    audit?: Record<string, unknown> | null;
   }): RoutineRun {
     const now = Date.now();
     const run: RoutineRun = {
@@ -166,14 +187,18 @@ export class RoutineRunStore {
       tokens: null,
       costUsd: null,
       createdAt: now,
+      audit: input.audit ?? undefined,
     };
     this.db
       .prepare(
         `INSERT INTO routine_runs
-           (id, routine_id, routine_name, trigger, scheduled_for, status, created_at)
-         VALUES (?, ?, ?, ?, ?, 'queued', ?)`,
+           (id, routine_id, routine_name, trigger, scheduled_for, status, created_at, audit_json)
+         VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)`,
       )
-      .run(run.id, run.routineId, run.routineName, run.trigger, run.scheduledFor, run.createdAt);
+      .run(
+        run.id, run.routineId, run.routineName, run.trigger, run.scheduledFor, run.createdAt,
+        input.audit ? JSON.stringify(input.audit) : null,
+      );
     return run;
   }
 
@@ -392,6 +417,16 @@ export interface ExecuteRoutineRunOptions {
   /** Payload for default template rendering ({{payload}}/{{body}}). */
   payload?: unknown;
   sessionId?: string;
+  /**
+   * B5: provenance of the triggering input, forwarded to runTurn. The
+   * inbound-webhook ingress passes { origin: 'webhook', relayed: true }
+   * so the runtime consent rule applies — approvals on the turn always
+   * go to the human and can never be auto-approved. Unset = previous
+   * behavior (scheduler/manual paths).
+   */
+  provenance?: ProvenanceNote;
+  /** B5: trigger audit context stored on the run record (metadata only). */
+  audit?: Record<string, unknown> | null;
   /** External abort (e.g. HTTP disconnect). Linked to the run's controller. */
   signal?: AbortSignal;
   /** Called exactly once when the run reaches a terminal status. Never throws into the executor. */
@@ -454,6 +489,7 @@ export class RoutineRunExecutor {
       routineName: opts.routine.name,
       trigger: opts.trigger,
       scheduledFor: opts.scheduledFor ?? null,
+      audit: opts.audit ?? undefined,
     });
     const controller = new AbortController();
     if (opts.signal) {
@@ -575,6 +611,7 @@ export class RoutineRunExecutor {
           message: baseMessage,
           sessionId: opts.sessionId ?? opts.routine.sessionId ?? `routine_${opts.routine.id}`,
           taskType: 'chat',
+          ...(opts.provenance ? { provenance: opts.provenance } : {}),
           signal: attemptSignal,
           onEvent: (ev) => {
             if (ev.type === 'token' && typeof ev.content === 'string' && excerpt.length < OUTPUT_EXCERPT_LIMIT) {

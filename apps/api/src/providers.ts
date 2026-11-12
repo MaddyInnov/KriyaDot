@@ -23,8 +23,10 @@ import {
   bridgePinnedMessage,
   cliPathPinEnvName,
   createProvider,
+  DEFAULT_BRIDGE_ACCOUNT_ID,
   detectCliBridges,
   effectiveCliPin,
+  getBridgeCooldownRegistry,
   getCustomProviderPreset,
   getProviderPreset,
   getRateLimit,
@@ -32,6 +34,8 @@ import {
   isBridgeConnected,
   isFreeModel,
   listProviderPresets,
+  probeBridgeUsage,
+  resetBridgeUsageCache,
   resolveApiKey,
   resolveBaseUrl,
   resolveVerifiedCliExecutable,
@@ -406,6 +410,36 @@ export function connectBridge(bridgeId: string): void {
   console.log(`[providers] bridge "${id}" connected (consent granted, token stays in memory only)`);
 }
 
+/**
+ * A1 manual re-check: the user pressed "Re-check" on a cooled-down bridge
+ * account (Providers UI). Clears `exhausted` / `unavailable` cooldowns
+ * (a `rate_limit` window is the provider's and is NOT cleared early),
+ * drops the cached gauge, and re-probes usage fresh. Returns the fresh
+ * per-account state for the UI.
+ */
+export function recheckBridgeAccount(
+  dataDir: string,
+  bridgeId: string,
+  accountId: string = DEFAULT_BRIDGE_ACCOUNT_ID,
+): { accountId: string; cleared: boolean; utilisationPercent: number | null; resetAt: string | null; cooldown: { family: string; reason: string; until: string | null } | null } {
+  const id = asBridgeId(bridgeId);
+  if (!id) throw new Error(`Unknown bridge "${bridgeId}". Expected one of "claude", "codex", "opencode".`);
+  const registry = getBridgeCooldownRegistry(path.join(dataDir, 'bridge-state.json'));
+  const cleared = registry.recheck(id, accountId);
+  resetBridgeUsageCache();
+  const gauge = probeBridgeUsage(id, { accountId, fresh: true });
+  const entry = registry.get(id, accountId);
+  return {
+    accountId,
+    cleared,
+    utilisationPercent: gauge.utilisationPercent,
+    resetAt: gauge.resetAtMs !== null ? new Date(gauge.resetAtMs).toISOString() : null,
+    cooldown: entry
+      ? { family: entry.family, reason: entry.reason, until: entry.untilMs !== null ? new Date(entry.untilMs).toISOString() : null }
+      : null,
+  };
+}
+
 /** Disconnect a bridge: consent revoked; any in-memory token is dropped. */
 export function disconnectBridge(bridgeId: string): boolean {
   const id = asBridgeId(bridgeId);
@@ -655,6 +689,44 @@ export async function listProviders(dataDir: string): Promise<ProviderInfo[]> {
       info.bridge = preset.bridge;
       info.detected = detection?.detected ?? false;
       info.connected = isBridgeConnected(preset.bridge);
+      // A1: per-account usage gauge + cooldown state. The gauge is probed
+      // (and cached in the runtime) only when the bridge is detected — an
+      // absent CLI reports "usage unknown" without spawning anything. The
+      // cooldown registry is bound to <dataDir>/bridge-state.json, beside
+      // providers.local.json, on first use.
+      {
+        const registry = getBridgeCooldownRegistry(path.join(dataDir, 'bridge-state.json'));
+        const accountIds = [DEFAULT_BRIDGE_ACCOUNT_ID];
+        // A6 readiness: any account with cooldown state is surfaced too.
+        for (const e of registry.list()) {
+          if (e.bridgeId === preset.bridge && !accountIds.includes(e.accountId)) accountIds.push(e.accountId);
+        }
+        info.bridgeAccounts = accountIds.map((accountId) => {
+          const gauge = info.detected
+            ? probeBridgeUsage(preset.bridge!, { accountId })
+            : {
+                utilisationPercent: null,
+                resetAtMs: null,
+                source: 'cli-unavailable' as const,
+              };
+          const entry = registry.get(preset.bridge!, accountId);
+          return {
+            accountId,
+            usage: {
+              utilisationPercent: gauge.utilisationPercent,
+              resetAt: gauge.resetAtMs !== null ? new Date(gauge.resetAtMs).toISOString() : null,
+              source: gauge.source,
+            },
+            cooldown: entry
+              ? {
+                  family: entry.family,
+                  reason: entry.reason,
+                  until: entry.untilMs !== null ? new Date(entry.untilMs).toISOString() : null,
+                }
+              : null,
+          };
+        });
+      }
       // A8: surface the user's pinned CLI path (and its plain failure
       // reason when the pinned binary is missing or not the real CLI).
       // A detected-by-pin bridge must list even when nothing is on PATH.

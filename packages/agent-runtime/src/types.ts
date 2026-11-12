@@ -584,6 +584,15 @@ export interface BotConfig {
    */
   backupProvider?: string;
   backupModel?: string;
+  /**
+   * A1 selection backup: the ONLY backup an EXPLICIT user model selection
+   * may swap to when its backend dies mid-job on a quota/cooldown death
+   * (see providers/cli-swap.ts). Distinct from backupProvider above, which
+   * governs automatic/default routing. Unset → an explicit selection that
+   * dies is refused loudly (v0.2.2 selection integrity), never swapped.
+   */
+  selectionBackupProvider?: string;
+  selectionBackupModel?: string;
   /** Per-model inference options (reasoning effort, fast mode, etc.). */
   modelOptions?: ModelOptions;
   /**

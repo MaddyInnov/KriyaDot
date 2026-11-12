@@ -117,6 +117,10 @@ export function corsOriginFn(
  *   - /api/remote-screen   device-token auth on routes; the Android app uses
  *                           it for the approval-gated screen viewer
  *   - /api/hooks           HMAC-verified public webhook ingress (GitHub etc.)
+ *   - /api/webhooks/routine  B5 generic inbound routine webhooks: the
+ *                           per-trigger bearer token in the URL is the
+ *                           auth (SHA-256-hashed at rest, compared
+ *                           constant-time; see routine-webhook-inbound.ts)
  *   - /api/health          read-only status
  *   - /.well-known         public A2A agent-card discovery
  *   - /api/auth/bootstrap issues the token itself (Origin-gated, not token-
@@ -140,6 +144,7 @@ export const LOOPBACK_AUTH_EXEMPT_PATHS: string[] = [
   '/api/companion',
   '/api/remote-screen',
   '/api/hooks',
+  '/api/webhooks/routine',
   '/api/health',
   '/.well-known',
   '/api/auth/bootstrap',

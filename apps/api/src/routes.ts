@@ -199,6 +199,7 @@ import {
   disconnectBridge,
   isKnownProviderId,
   listProviders,
+  recheckBridgeAccount,
   removeProviderKey,
   saveProviderKey,
   setStoredCliPathPin,
@@ -3243,6 +3244,21 @@ export function createRouter(deps: RouteDeps): express.Router {
       res.json({ ok: true, ...status });
     } catch (err) {
       res.status(400).json(errorBody('Failed to clear CLI path', err instanceof Error ? err.message : String(err)));
+    }
+  });
+
+  // A1: manual re-check of a cooled-down bridge account. Clears an
+  // `exhausted` / `unavailable` cooldown (a `rate_limit` window is the
+  // provider's and stays), re-probes the usage gauge, and returns the
+  // fresh account state. Body: { accountId? } — 'default' when omitted.
+  router.post('/providers/bridges/:bridgeId/recheck', (req, res) => {
+    try {
+      const body = (req.body ?? {}) as { accountId?: unknown };
+      const accountId = typeof body.accountId === 'string' && body.accountId.trim() ? body.accountId.trim() : undefined;
+      const state = recheckBridgeAccount(config.dataDir, req.params.bridgeId, accountId);
+      res.json({ ok: true, ...state });
+    } catch (err) {
+      res.status(400).json(errorBody('Failed to re-check bridge account', err instanceof Error ? err.message : String(err)));
     }
   });
 

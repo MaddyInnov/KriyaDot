@@ -311,6 +311,215 @@ function TimezoneField({ value, onChange }: { value: string; onChange: (v: strin
   );
 }
 
+interface InboundWebhookTrigger {
+  id: string;
+  routineId: string;
+  enabled: boolean;
+  rateLimitPerHour: number;
+  createdAt: number;
+  rotatedAt: number | null;
+  lastFiredAt: number | null;
+}
+
+/**
+ * B5: generic inbound webhook trigger for one routine. Creating a
+ * trigger mints a per-trigger URL (POST /api/webhooks/routine/<token>)
+ * that starts the routine with the JSON body as its input. The token
+ * is shown ONCE (here, right after create/rotate) and stored only as
+ * a hash server-side, so existing triggers show the URL shape, not a
+ * usable URL.
+ */
+function WebhookTriggerSection({ routineId }: { routineId: string }) {
+  const [triggers, setTriggers] = useState<InboundWebhookTrigger[]>([]);
+  const [urlTemplate, setUrlTemplate] = useState('');
+  const [shownUrl, setShownUrl] = useState('');
+  const [rateLimit, setRateLimit] = useState('60');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [copied, setCopied] = useState(false);
+  const [confirmRotate, setConfirmRotate] = useState('');
+
+  const load = useCallback(async () => {
+    try {
+      const res = await api<{ triggers: InboundWebhookTrigger[]; urlTemplate: string }>(
+        `/api/routines/${encodeURIComponent(routineId)}/inbound-webhooks`,
+      );
+      setTriggers(res.triggers ?? []);
+      setUrlTemplate(res.urlTemplate ?? '');
+    } catch {
+      setTriggers([]);
+    }
+  }, [routineId]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const create = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const limit = Number(rateLimit);
+      const res = await api<{ trigger: InboundWebhookTrigger; url: string }>(
+        `/api/routines/${encodeURIComponent(routineId)}/inbound-webhooks`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(Number.isInteger(limit) && limit > 0 ? { rateLimitPerHour: limit } : {}),
+        },
+      );
+      setShownUrl(res.url);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Create failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggle = async (t: InboundWebhookTrigger) => {
+    setBusy(true);
+    setError('');
+    try {
+      await api(`/api/routines/${encodeURIComponent(routineId)}/inbound-webhooks/${encodeURIComponent(t.id)}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: !t.enabled }),
+      });
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Update failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const rotate = async (t: InboundWebhookTrigger) => {
+    setBusy(true);
+    setError('');
+    try {
+      const res = await api<{ url: string }>(
+        `/api/routines/${encodeURIComponent(routineId)}/inbound-webhooks/${encodeURIComponent(t.id)}/rotate`,
+        { method: 'POST' },
+      );
+      setShownUrl(res.url);
+      setConfirmRotate('');
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Rotate failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const revoke = async (t: InboundWebhookTrigger) => {
+    setBusy(true);
+    setError('');
+    try {
+      await api(`/api/routines/${encodeURIComponent(routineId)}/inbound-webhooks/${encodeURIComponent(t.id)}`, {
+        method: 'DELETE',
+      });
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Revoke failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="webhook-trigger-section">
+      <div className="deliveries-head">
+        <label className="field-label">Trigger — Webhook (inbound)</label>
+        <button type="button" className="btn-ghost small" onClick={() => void load()}>
+          Refresh
+        </button>
+      </div>
+      <p className="muted small">
+        Anyone with this URL can start this routine — treat it like a password. POST a JSON body
+        to the URL and it becomes the routine&apos;s input. The token is shown once when created
+        or rotated and is stored only as a hash; rotating or disabling takes effect immediately.
+        The URL reaches this instance only where the instance itself is reachable — no tunnel is
+        created for you.
+      </p>
+      {shownUrl && (
+        <>
+          <label className="field-label">
+            Webhook URL <span className="muted">— shown once, copy it now</span>
+          </label>
+          <div className="copy-row">
+            <code className="url-box">{shownUrl}</code>
+            <button
+              type="button"
+              className="btn-ghost"
+              onClick={() => copyText(shownUrl, () => { setCopied(true); setTimeout(() => setCopied(false), 1500); })}
+            >
+              {copied ? 'Copied ✓' : 'Copy'}
+            </button>
+          </div>
+        </>
+      )}
+      {!shownUrl && urlTemplate && triggers.length > 0 && (
+        <p className="muted small">
+          URL shape: <code className="mono">{urlTemplate}</code> — the token itself was shown
+          once at creation; rotate to get a new one.
+        </p>
+      )}
+      {error && <p className="error">{error}</p>}
+      {triggers.length === 0 ? (
+        <p className="muted small">No webhook trigger yet.</p>
+      ) : (
+        <ul>
+          {triggers.map((t) => (
+            <li key={t.id} className="small">
+              <span className={`routine-badge${t.enabled ? '' : ' paused'}`}>{t.enabled ? 'enabled' : 'disabled'}</span>{' '}
+              · limit {t.rateLimitPerHour}/hour
+              {' · '}created {new Date(t.createdAt).toLocaleString()}
+              {t.lastFiredAt ? ` · last fired ${new Date(t.lastFiredAt).toLocaleString()}` : ' · never fired'}
+              <button type="button" className="btn-ghost small" onClick={() => void toggle(t)} disabled={busy}>
+                {t.enabled ? 'Disable' : 'Enable'}
+              </button>
+              {confirmRotate === t.id ? (
+                <>
+                  <button type="button" className="btn-danger small" onClick={() => void rotate(t)} disabled={busy}>
+                    Confirm rotate — old URL dies now
+                  </button>
+                  <button type="button" className="btn-ghost small" onClick={() => setConfirmRotate('')}>
+                    Cancel
+                  </button>
+                </>
+              ) : (
+                <button type="button" className="btn-ghost small" onClick={() => setConfirmRotate(t.id)} disabled={busy}>
+                  Rotate
+                </button>
+              )}
+              <button type="button" className="btn-ghost small danger" onClick={() => void revoke(t)} disabled={busy}>
+                Revoke
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="sched-row">
+        <label className="field-label">
+          Rate limit (starts per hour)
+          <input
+            type="number"
+            className="text-input"
+            min={1}
+            max={10000}
+            value={rateLimit}
+            onChange={(e) => setRateLimit(e.target.value)}
+          />
+        </label>
+        <button type="button" className="btn-primary" onClick={() => void create()} disabled={busy}>
+          {busy ? 'Working…' : 'Create webhook URL'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function ScheduleBuilder({
   routineId,
   botId,
@@ -325,7 +534,10 @@ function ScheduleBuilder({
   onCancel: () => void;
 }) {
   void botId;
-  const [kind, setKind] = useState<RoutineSchedule['kind']>(initial?.kind ?? 'daily');
+  // 'webhook' (B5) is a trigger kind alongside the schedule kinds, but it
+  // is not a schedule: it is managed by WebhookTriggerSection, not saved
+  // through the schedule PATCH.
+  const [kind, setKind] = useState<RoutineSchedule['kind'] | 'webhook'>(initial?.kind ?? 'daily');
   const [timezone, setTimezone] = useState(initial?.timezone ?? 'Asia/Kolkata');
   const [overlap, setOverlap] = useState<'skip' | 'queue'>(initial?.overlap ?? 'skip');
   const [onceRunAt, setOnceRunAt] = useState(initial?.runAt?.slice(0, 16) ?? '');
@@ -384,6 +596,9 @@ function ScheduleBuilder({
   const evAccountOptions = evAccounts.filter((a) => a.toolkitSlug === evApp);
 
   const build = (): RoutineSchedule => {
+    if (kind === 'webhook') {
+      throw new Error('Webhook triggers are managed in the Webhook section, not as a schedule');
+    }
     const base = { timezone: timezone.trim(), enabled: initial?.enabled ?? true, overlap };
     let s: RoutineSchedule;
     switch (kind) {
@@ -509,20 +724,25 @@ function ScheduleBuilder({
       <div className="sched-row">
         <label className="field-label">
           Type
-          <select className="text-input" value={kind} onChange={(e) => setKind(e.target.value as RoutineSchedule['kind'])}>
+          <select className="text-input" value={kind} onChange={(e) => setKind(e.target.value as RoutineSchedule['kind'] | 'webhook')}>
             <option value="once">Once — a specific date &amp; time</option>
             <option value="daily">Daily — time + weekdays</option>
             <option value="cron">Cron — 5-field expression</option>
             <option value="interval">Interval — every N minutes</option>
             <option value="limit-reset">Limit reset — resume when the provider limit resets</option>
             <option value="event">Event — when something happens in a connected app</option>
+            <option value="webhook">Webhook — an external system POSTs to a URL</option>
           </select>
         </label>
-        <label className="field-label">
-          Timezone
-          <TimezoneField value={timezone} onChange={setTimezone} />
-        </label>
+        {kind !== 'webhook' && (
+          <label className="field-label">
+            Timezone
+            <TimezoneField value={timezone} onChange={setTimezone} />
+          </label>
+        )}
       </div>
+
+      {kind === 'webhook' && <WebhookTriggerSection routineId={routineId} />}
 
       {kind === 'once' && (
         <label className="field-label">
@@ -783,37 +1003,43 @@ function ScheduleBuilder({
         </>
       )}
 
-      <label className="field-label">
-        If a run is still going when the next one is due
-        <select className="text-input" value={overlap} onChange={(e) => setOverlap(e.target.value as 'skip' | 'queue')}>
-          <option value="skip">Skip the new run</option>
-          <option value="queue">Run it anyway (queue)</option>
-        </select>
-      </label>
+      {kind !== 'webhook' && (
+        <>
+          <label className="field-label">
+            If a run is still going when the next one is due
+            <select className="text-input" value={overlap} onChange={(e) => setOverlap(e.target.value as 'skip' | 'queue')}>
+              <option value="skip">Skip the new run</option>
+              <option value="queue">Run it anyway (queue)</option>
+            </select>
+          </label>
 
-      <label className="check-row">
-        <input type="checkbox" checked={catchUp} onChange={(e) => setCatchUp(e.target.checked)} />
-        Catch up missed runs after downtime <span className="muted">(runs the 3 most recent missed occurrences)</span>
-      </label>
-      <label className="field-label">
-        Auto-pause the schedule after N consecutive failures
-        <input
-          type="number"
-          className="text-input"
-          min={1}
-          max={20}
-          value={streakLimit}
-          onChange={(e) => setStreakLimit(e.target.value)}
-        />
-      </label>
+          <label className="check-row">
+            <input type="checkbox" checked={catchUp} onChange={(e) => setCatchUp(e.target.checked)} />
+            Catch up missed runs after downtime <span className="muted">(runs the 3 most recent missed occurrences)</span>
+          </label>
+          <label className="field-label">
+            Auto-pause the schedule after N consecutive failures
+            <input
+              type="number"
+              className="text-input"
+              min={1}
+              max={20}
+              value={streakLimit}
+              onChange={(e) => setStreakLimit(e.target.value)}
+            />
+          </label>
+        </>
+      )}
 
       {error && <p className="error">{error}</p>}
       <div className="sched-actions">
-        <button type="button" className="btn-primary" onClick={() => void onSave()} disabled={busy}>
-          {busy ? 'Saving…' : initial ? 'Update schedule' : 'Save schedule'}
-        </button>
+        {kind !== 'webhook' && (
+          <button type="button" className="btn-primary" onClick={() => void onSave()} disabled={busy}>
+            {busy ? 'Saving…' : initial ? 'Update schedule' : 'Save schedule'}
+          </button>
+        )}
         <button type="button" className="btn-ghost" onClick={onCancel} disabled={busy}>
-          Cancel
+          {kind === 'webhook' ? 'Done' : 'Cancel'}
         </button>
       </div>
     </div>
@@ -1432,6 +1658,8 @@ function RoutineRow({ routine, botId, onChanged }: { routine: Routine; botId: st
           {busy && !hook && <p className="muted">Loading…</p>}
           {error && <p className="error">{error}</p>}
           <ScheduleSection routine={routine} onChanged={onChanged} />
+          <hr className="section-sep" />
+          <WebhookTriggerSection routineId={routine.id} />
           <hr className="section-sep" />
           <RoutineAnchorSection
             routine={routine}

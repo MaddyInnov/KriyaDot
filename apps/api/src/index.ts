@@ -144,6 +144,9 @@ import {
 } from '@mvp/agent-runtime';
 import { createPcAccessRouter } from './pc-access-routes.js';
 import { PcAccessStore } from '@mvp/agent-runtime';
+import { createBrokerRouter } from './broker-routes.js';
+import { BrokerStore, GITHUB_BROKER_VAULT_NAME, SecretsBroker } from '@mvp/agent-runtime';
+import { registerBrokerTool } from '@mvp/agent-runtime/dist/tools/broker.js';
 import { createMemoryUpkeepRouter, startMemoryUpkeep, aboutMeContext } from './memory-upkeep-routes.js';
 import { createMemoryIngestionRouter } from './memory-ingestion-routes.js';
 import { startMemoryIngestionScheduler } from './memory-ingestion.js';
@@ -196,6 +199,12 @@ import { createBotSetupRouter } from './bot-setup-routes.js';
 import { registerRoutineRoutes } from './bot-routines.js';
 import { createRoutineWebhookRouter } from './webhooks.js';
 import { RoutineHookStore, WebhookDeliveryWorker, createPublicHookRouter } from './routine-hooks.js';
+import {
+  RoutineInboundWebhookStore,
+  createRoutineInboundWebhookRouter,
+  inboundWebhookBodyErrorHandler,
+  registerRoutineInboundWebhookRoutes,
+} from './routine-webhook-inbound.js';
 import { createWorkflowN8nRouter } from './workflow-n8n.js';
 import {
   interconnectionPolicyRules,
@@ -1288,6 +1297,63 @@ async function boot(): Promise<void> {
   // approval) — never by a bot.
   const pcAccessStore = new PcAccessStore(config.dataDir);
 
+  // Secrets broker (A12): the app holds brokered credentials (GitHub
+  // first) in the vault and performs catalogue actions itself via the
+  // broker_action tool — the credential value never enters the bot's
+  // context. Per-run grants are raised as request cards through the
+  // approval host below; standing grants are Settings-only (broker
+  // routes). Journal entries fan out to the governance audit so broker
+  // activity is visible in Activity.
+  const brokerStore = new BrokerStore(config.dataDir);
+  const secretsBroker = new SecretsBroker({
+    store: brokerStore,
+    getCredential: (identity) => {
+      if (identity !== 'github') return undefined;
+      try {
+        return new SecureVault(config.dataDir, 'default-user', 'secrets-broker').get(
+          GITHUB_BROKER_VAULT_NAME,
+        )?.value;
+      } catch {
+        return undefined;
+      }
+    },
+    approvalHost: {
+      requestGrant: async (input) => {
+        const card = brokerStore.requestGrant(input);
+        governance.audit('broker.grant_requested', {
+          actor: input.botId,
+          sessionId: input.sessionId,
+          toolName: 'broker_action',
+          detail: {
+            cardId: card.id,
+            botId: input.botId,
+            identity: input.identity,
+            actionClass: input.actionClass,
+            action: input.action,
+            resource: input.resource ?? null,
+          },
+        });
+        return brokerStore.awaitOutcome(card.id);
+      },
+    },
+    onJournal: (entry) => {
+      governance.audit(`broker.${entry.event}`, {
+        actor: entry.botId,
+        sessionId: entry.sessionId ?? undefined,
+        toolName: 'broker_action',
+        detail: {
+          identity: entry.identity,
+          action: entry.action,
+          actionClass: entry.actionClass,
+          resource: entry.resource,
+          argsHash: entry.argsHash,
+          outcome: entry.detail,
+        },
+      });
+    },
+  });
+  registerBrokerTool(toolRegistry, { broker: secretsBroker });
+
   // W13 observability: one shared span/trace store (<dataDir>/spans.db).
   // The runtime auto-instruments provider + tool choke points into it;
   // the observability routes serve the same store to Activity → Runs.
@@ -1878,6 +1944,27 @@ async function boot(): Promise<void> {
     agentRuntime,
     getBots: () => seed.bots,
     runExecutor: routineRunExecutor,
+  });
+  // B5: generic inbound webhook triggers — POST /api/webhooks/routine/<token>
+  // starts a routine with the JSON body as its trigger input. Tokens are
+  // stored SHA-256-hashed (shown once at create/rotate); management routes
+  // ride the authenticated routines router, the ingress router mounts on
+  // `app` before loopback auth below (the token is its auth, like
+  // /api/hooks' HMAC). Webhook starts go through the shared run executor
+  // with webhook provenance, so governance approvals still go to the
+  // human — the webhook never bypasses them.
+  const routineInboundWebhookStore = new RoutineInboundWebhookStore(config.dataDir);
+  registerRoutineInboundWebhookRoutes(routinesRouter, {
+    routineStore,
+    inboundStore: routineInboundWebhookStore,
+    getBaseUrls: () => ({ publicBaseUrl: config.publicBaseUrl, localPort: config.port }),
+  });
+  const routineInboundWebhookRouter = createRoutineInboundWebhookRouter({
+    routineStore,
+    inboundStore: routineInboundWebhookStore,
+    getBots: () => seed.bots,
+    runExecutor: routineRunExecutor,
+    audit: (action, fields) => governance.audit(action, fields),
   });
   // In-session schedule/monitor tools (Octomind parity): bots create
   // their own routines mid-conversation on this same store. The shared
@@ -2510,6 +2597,17 @@ async function boot(): Promise<void> {
   // external senders (GitHub etc.) need a tunnel (Tailscale/cloudflared/ngrok)
   // plus KRIYADOT_PUBLIC_URL; LAN senders use the local URL.
   app.use('/api/hooks', express.raw({ type: '*/*', limit: '64kb' }), routinePublicHookRouter);
+  // B5: generic inbound routine webhooks — same raw-body-before-auth
+  // treatment as /api/hooks: the per-trigger bearer token is the auth
+  // (loopback-exempt prefix '/api/webhooks/routine'), the body must be
+  // parsed raw so the 64 KiB cap and JSON-only check are this module's
+  // own, and oversize bodies become a JSON 413 via the error handler.
+  app.use(
+    '/api/webhooks/routine',
+    express.raw({ type: '*/*', limit: '64kb' }),
+    routineInboundWebhookRouter,
+    inboundWebhookBodyErrorHandler,
+  );
   // Loopback auth (C1): the API binds to 127.0.0.1, which any website in the
   // user's browser can reach. Enforce a per-boot bearer token on every route
   // except the exempt prefixes (companion/remote-screen have device-token
@@ -4504,6 +4602,27 @@ async function boot(): Promise<void> {
     }
   }, 60_000);
   if (typeof pcAccessSweep.unref === 'function') pcAccessSweep.unref();
+
+  // Secrets broker: identity connect (vault), standing grants, per-run
+  // grant cards, and the journal.
+  app.use(
+    '/api',
+    createBrokerRouter({
+      store: brokerStore,
+      vault: () => new SecureVault(config.dataDir, 'default-user', 'secrets-broker'),
+      audit: (action, fields) => governance.audit(action, fields),
+      botIds: () => seed.bots.map((b) => b.id),
+    }),
+  );
+  const brokerSweep = setInterval(() => {
+    try {
+      const expired = brokerStore.expireStale();
+      for (const id of expired) governance.audit('broker.request_expired', { detail: { cardId: id } });
+    } catch {
+      // Sweeps must never break the server.
+    }
+  }, 60_000);
+  if (typeof brokerSweep.unref === 'function') brokerSweep.unref();
 
   // Sentinel health scanner (OpenMausBot parity): GET /api/health/detail.
   app.use(

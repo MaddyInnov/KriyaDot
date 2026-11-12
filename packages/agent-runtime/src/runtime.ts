@@ -89,6 +89,19 @@ import {
   type UsageWarning,
 } from './failover.js';
 import { CliDriverError } from './providers/cli-driver.js';
+import {
+  BridgeCooldownRegistry,
+  cooldownSkipReason,
+  getBridgeCooldownRegistry,
+  isSterileBridgeContent,
+} from './providers/cli-cooldown.js';
+import {
+  bridgeAccountIdForBot,
+  bridgeIdForProviderId,
+  buildTranscriptReplayMessages,
+  decideBridgeSwap,
+  declaredSelectionBackup,
+} from './providers/cli-swap.js';
 import { getRateLimit } from './providers/rate-limit.js';
 import { TurnStateRegistry } from './turn-state.js';
 import { BotTurnScheduler } from './turn-scheduler.js';
@@ -268,6 +281,12 @@ export interface AgentRuntimeOptions {
    */
   backgroundRuns?: BackgroundRunRegistry;
   /**
+   * A1: bridge cooldown registry (quota gauges' companion state). The
+   * host binds the process-wide registry to <dataDir>/bridge-state.json;
+   * tests inject an isolated instance. Unset → the process-wide registry.
+   */
+  bridgeCooldowns?: BridgeCooldownRegistry;
+  /**
    * Session standing rules (closure #46): session- + bot-scoped rules
    * rendered into every turn's system context. Host-constructed (with a
    * file store when persistence across restarts is wanted). Unset → no
@@ -421,7 +440,16 @@ export interface RunTurnOptions {
    */
   explicitSelection?: boolean;
   selectedProviderId?: string;
-  selectedModel?: string;  /**
+  selectedModel?: string;
+  /**
+   * A1: per-turn override of the selection backup (see
+   * BotConfig.selectionBackupProvider). Only consulted when
+   * explicitSelection is true and the selected backend dies mid-job on a
+   * quota/cooldown death: the swap goes to EXACTLY this backup, with the
+   * transcript replayed. Absent (here and on the bot) → loud refusal.
+   */
+  selectionBackupProvider?: string;
+  selectionBackupModel?: string;  /**
    * Task type for smart model routing (Phase 3). Only consulted when no
    * model is pinned at the call site or on the bot — then the router picks
    * the cheapest capable model for this task type. Defaults to 'chat'.
@@ -782,6 +810,8 @@ export class AgentRuntime {
   private readonly retrospectiveSink?: AgentRuntimeOptions['retrospectiveSink'];
   /** Background specialist runs (Octomind parity). */
   readonly backgroundRuns: BackgroundRunRegistry;
+  /** A1: bridge cooldown registry consulted by resolution + swap logic. */
+  readonly bridgeCooldowns: BridgeCooldownRegistry;
   /** Session standing rules (#46), when the host supplied a store. */
   readonly standingRules?: SessionStandingRules;
   private readonly resolveBot?: AgentRuntimeOptions['resolveBot'];
@@ -923,6 +953,7 @@ export class AgentRuntime {
     this.embedder = opts.embedder ?? new TrigramEmbedder();
     this.retrospectiveSink = opts.retrospectiveSink;
     this.backgroundRuns = opts.backgroundRuns ?? new BackgroundRunRegistry();
+    this.bridgeCooldowns = opts.bridgeCooldowns ?? getBridgeCooldownRegistry();
     this.standingRules = opts.standingRules;
     this.resolveBot = opts.resolveBot;
     this.spawnGate = new SpawnConcurrencyGate(opts.spawnConcurrencyCap ?? 4);
@@ -2432,6 +2463,60 @@ ${record.priorContext ?? ''}`;
       });
     };
 
+    // A1 cooldown consult: a bridge backend in active cooldown is
+    // SKIPPED with the reason visible — never retried blindly. Auto
+    // routing starts the turn on the backup (transcript replay is
+    // implicit: the backup receives this turn's full message list);
+    // an explicit selection refuses loudly unless the user pre-declared
+    // a selection backup, which is then used exactly. A half-open
+    // breaker falls through and lets this turn be the probe.
+    {
+      const startBridge = bridgeIdForProviderId(providerId);
+      if (startBridge) {
+        const accountId = bridgeAccountIdForBot(opts.bot);
+        const check = this.bridgeCooldowns.check(startBridge, accountId);
+        if (check.active) {
+          const skipReason = cooldownSkipReason(this.bridgeCooldowns, startBridge, accountId) ?? check.reason ?? 'in cooldown';
+          if (opts.explicitSelection === true) {
+            const declared = declaredSelectionBackup(opts.bot, opts);
+            if (!declared || declared.providerId === providerId) {
+              throw new ProviderSelectionRefusedError({
+                providerId: opts.selectedProviderId ?? providerId,
+                model: opts.selectedModel ?? model,
+                reason: `${skipReason} — the selected backend was skipped, not retried, and no selection backup was pre-declared`,
+              });
+            }
+            const fromProvider = providerId;
+            const fromModel = model;
+            provider = opts.apiKeyOverride
+              ? createProvider(declared.providerId, { apiKey: opts.apiKeyOverride })
+              : this.resolveProvider(declared.providerId);
+            providerId = declared.providerId;
+            model = declared.modelId;
+            await emit({ type: 'failover', fromProvider, fromModel, toProvider: providerId, toModel: model, reason: 'bridge-cooldown', message: `${skipReason}; starting this turn on your pre-declared selection backup ${providerId}/${model}.` });
+            await emit({ type: 'notice', kind: 'failover', message: `${skipReason}; starting this turn on your pre-declared selection backup ${providerId}/${model}.` });
+          } else {
+            const t = resolveFailoverTarget({ bot: opts.bot, excludeProviderId: providerId });
+            const tBridge = t ? bridgeIdForProviderId(t.providerId) : undefined;
+            const tCooled = tBridge ? cooldownSkipReason(this.bridgeCooldowns, tBridge, accountId) : null;
+            if (t && !tCooled) {
+              const fromProvider = providerId;
+              const fromModel = model;
+              provider = opts.apiKeyOverride ? createProvider(t.providerId, { apiKey: opts.apiKeyOverride }) : this.resolveProvider(t.providerId);
+              await emit({ type: 'failover', fromProvider, fromModel, toProvider: t.providerId, toModel: t.modelId, reason: 'bridge-cooldown', message: `${skipReason}; starting this turn on the backup ${t.providerId}/${t.modelId}.` });
+              await emit({ type: 'notice', kind: 'failover', message: `${skipReason}; starting this turn on the backup ${t.providerId}/${t.modelId}.` });
+              providerId = t.providerId;
+              model = t.modelId;
+            } else {
+              throw new Error(
+                `${skipReason}; no usable backup is available${tCooled ? ` (backup also unavailable: ${tCooled})` : ''}. ` +
+                  `Wait for the reset, top up, or re-check the account in Settings → Providers.`,
+              );
+            }
+          }
+        }
+      }
+    }
     // Health-based failover (item 7b): an unhealthy primary starts the
     // turn on the backup until a success probes it healthy again.
     try {
@@ -2603,12 +2688,15 @@ ${record.priorContext ?? ''}`;
         const doChat = async (
           p: LLMProvider,
           mdl: string,
+          // A1: a mid-job swap hands the backup a transcript-replay list
+          // instead of the live one (see buildTranscriptReplayMessages).
+          msgs: ChatMessage[] = messages,
         ): Promise<Awaited<ReturnType<LLMProvider['chat']>>> => {
           const llmSpanId = spanStart('llm', `llm:${mdl}`, turnSpanId, {
-            input: { providerId: p.providerId, model: mdl, messages },
+            input: { providerId: p.providerId, model: mdl, messages: msgs },
           });
           try {
-            const result = await p.chat(messages, tools, {
+            const result = await p.chat(msgs, tools, {
             model: mdl,
             onToken: (t) => {
               if (mayReviseFinal) {
@@ -2706,29 +2794,23 @@ ${record.priorContext ?? ''}`;
           turn = await doChat(provider, model);
           llmStep?.end({ ok: true });
         } catch (err) {
-          // Selection integrity: when the user EXPLICITLY picked a
-          // subscription bridge / agent CLI and its driver fails, the
-          // turn is refused loudly — it never fails over to a different
-          // provider behind the picker's back. The refusal carries the
-          // driver's own one-sentence summary as the reason.
-          if (
-            opts.explicitSelection === true &&
-            (err instanceof CliDriverError || isBridgeOrAgentProviderId(providerId))
-          ) {
-            llmStep?.end({ ok: false, errorKind: 'selection-refused' });
-            throw new ProviderSelectionRefusedError({
-              providerId: opts.selectedProviderId ?? providerId,
-              model: opts.selectedModel ?? model,
-              reason: err instanceof Error ? err.message : String(err),
-            });
-          }
-          // AI failover (W1): a hard usage-limit / quota failure switches
-          // the turn to the backup provider/model ONCE and retries this
-          // call. Transient 429s never reach here as failover triggers —
-          // the drivers already retry them, and classification requires
-          // quota semantics. If the backup also limit-fails (or no target
-          // exists), the original error surfaces normally.
+          // A1 + selection integrity: classify first, remember bridge
+          // deaths in the cooldown registry, then decide — via
+          // decideBridgeSwap — whether this death may swap, must refuse
+          // loudly, or simply surfaces. The v0.2.2 law is preserved
+          // exactly: an EXPLICIT pick whose driver/bridge fails is
+          // refused loudly (never silently substituted); A1 adds the one
+          // sanctioned exception — a swap to the backup the user
+          // PRE-DECLARED for that selection, with transcript replay.
           const classified = classifyProviderError(err, { providerId });
+          const errText = err instanceof Error ? err.message : String(err);
+          const failedBridge = bridgeIdForProviderId(providerId);
+          const failedAccount = bridgeAccountIdForBot(opts.bot);
+          if (failedBridge) {
+            try {
+              this.bridgeCooldowns.recordFailure(failedBridge, failedAccount, err);
+            } catch { /* the registry must never break a turn */ }
+          }
           if (classified.usagePercent !== undefined && classified.usagePercent >= 80) {
             await emitUsageWarning({
               providerId,
@@ -2738,10 +2820,50 @@ ${record.priorContext ?? ''}`;
               message: `${providerId}: ${classified.usagePercent}% used`,
             });
           }
-          const target =
+          const autoResolved =
             (classified.isLimit || classified.isModelUnavailable) && !failoverUsed
               ? resolveFailoverTarget({ bot: opts.bot, excludeProviderId: providerId })
               : null;
+          const autoTarget = autoResolved
+            ? { providerId: autoResolved.providerId, modelId: autoResolved.modelId }
+            : null;
+          const autoBridge = autoTarget ? bridgeIdForProviderId(autoTarget.providerId) : undefined;
+          const autoCooldownReason = autoBridge
+            ? cooldownSkipReason(this.bridgeCooldowns, autoBridge, failedAccount)
+            : null;
+          const decision = decideBridgeSwap({
+            explicitSelection: opts.explicitSelection === true,
+            quotaDeath: classified.isLimit,
+            driverFailure: err instanceof CliDriverError || isBridgeOrAgentProviderId(providerId),
+            failedProviderId: providerId,
+            failedReason: classified.isLimit ? `usage limit / quota death: ${errText}` : errText,
+            declaredBackup: failoverUsed ? null : declaredSelectionBackup(opts.bot, opts),
+            autoTarget,
+            autoTargetCooldownReason: autoCooldownReason,
+          });
+          let target: { providerId: string; modelId: string; reason: string } | null = null;
+          if (decision.action === 'refuse') {
+            llmStep?.end({ ok: false, errorKind: 'selection-refused' });
+            throw new ProviderSelectionRefusedError({
+              providerId: opts.selectedProviderId ?? providerId,
+              model: opts.selectedModel ?? model,
+              reason: decision.reason,
+            });
+          }
+          if (decision.action === 'swap') {
+            target =
+              decision.via === 'declared-backup'
+                ? { ...decision.target, reason: 'pre-declared selection backup' }
+                : { ...decision.target, reason: autoResolved?.reason ?? 'auto failover' };
+          } else if (opts.explicitSelection !== true && classified.isModelUnavailable && autoTarget && !autoCooldownReason) {
+            // W1 quick fallback for a vanished model (not a quota death):
+            // unchanged auto behaviour.
+            target = { ...autoTarget, reason: autoResolved?.reason ?? 'model unavailable fallback' };
+          } else if (decision.action === 'fail' && decision.reason) {
+            // The auto target exists but is itself in cooldown: say so
+            // visibly instead of retrying either backend blindly.
+            await emit({ type: 'notice', kind: 'failover', message: `Backup not used: ${decision.reason}.` });
+          }
           if (!target) {
             llmStep?.end({ ok: false, errorKind: err instanceof Error ? err.name : 'Error' });
             if (classified.isLimit) {
@@ -2803,12 +2925,46 @@ ${record.priorContext ?? ''}`;
             await emit({ type: 'notice', kind: 'failover', message: noticeMsg });
           }
           tokenBuffer = null; // drop any partial tokens from the failed attempt
+          // A1 transcript replay: the backup receives the FULL
+          // transcript plus an in-band continuation note, so the job
+          // continues with context instead of restarting amnesiac. A
+          // backup CLI driver starts a fresh native session from this
+          // list (its session store is keyed per CLI), never resuming
+          // the dead backend's session.
+          const replayMessages = buildTranscriptReplayMessages(messages, {
+            fromProvider,
+            fromModel,
+            toProvider: target.providerId,
+            toModel: target.modelId,
+            reason: classified.isLimit ? `usage limit / quota death: ${errText}` : errText,
+          });
           try {
-            turn = await doChat(provider, model);
+            turn = await doChat(provider, model, replayMessages);
             llmStep?.end({ ok: true });
           } catch (backupErr) {
+            const backupBridge = bridgeIdForProviderId(target.providerId);
+            if (backupBridge) {
+              try {
+                this.bridgeCooldowns.recordFailure(backupBridge, failedAccount, backupErr);
+              } catch { /* the registry must never break a turn */ }
+            }
             llmStep?.end({ ok: false, errorKind: backupErr instanceof Error ? backupErr.name : 'Error' });
             throw backupErr;
+          }
+        }
+        // A1 circuit breaker bookkeeping: a bridge turn that completes
+        // with no content is sterile (counts toward `unavailable`); a
+        // content-bearing success closes the breaker / clears cooldown.
+        {
+          const doneBridge = bridgeIdForProviderId(providerId);
+          if (doneBridge) {
+            try {
+              if (isSterileBridgeContent(turn.content)) {
+                this.bridgeCooldowns.recordSterileTurn(doneBridge, bridgeAccountIdForBot(opts.bot));
+              } else {
+                this.bridgeCooldowns.recordSuccess(doneBridge, bridgeAccountIdForBot(opts.bot));
+              }
+            } catch { /* bookkeeping must never break a turn */ }
           }
         }
         // Post-call near-limit check: the call just refreshed the snapshot.

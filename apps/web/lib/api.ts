@@ -500,6 +500,16 @@ export interface ProviderInfo {
   cliPath?: string;
   /** A8, bridge only: plain-words reason the pinned CLI path cannot be used, when it cannot. */
   cliPathError?: string;
+  /**
+   * A1, bridge only: per-account usage gauge + cooldown state.
+   * `utilisationPercent: null` renders as "usage unknown" (honest — the
+   * CLI exposes no figure), never as 0%.
+   */
+  bridgeAccounts?: Array<{
+    accountId: string;
+    usage: { utilisationPercent: number | null; resetAt: string | null; source: 'cli-status' | 'no-surface' | 'cli-unavailable' };
+    cooldown: { family: 'rate_limit' | 'exhausted' | 'unavailable'; reason: string; until: string | null } | null;
+  }>;
   /** Local provider (Ollama): on-machine, no API key ever required. */
   local?: boolean;
   /** Keyless-lane metadata (free-LLM stack): true when usable with NO api key. */
@@ -1287,6 +1297,94 @@ export async function decidePcAccessRequest(
   return res.card;
 }
 
+// ---- Secrets broker (brokered identities, A12) -----------------------------
+
+export interface BrokerIdentityInfo {
+  identity: string;
+  /** Canonical API host brokered calls go to — the only host, ever. */
+  host: string;
+  connected: boolean;
+}
+
+export interface BrokerStandingGrant {
+  id: string;
+  identity: string;
+  actionClass: 'read' | 'write';
+  /** 'all' = every bot; otherwise the single bot id. */
+  scope: string;
+  createdAt: number;
+  createdVia: 'settings';
+}
+
+export interface BrokerGrantRequest {
+  id: string;
+  botId: string;
+  sessionId: string;
+  identity: string;
+  actionClass: 'read' | 'write';
+  action: string;
+  resource: string | null;
+  status: 'pending' | 'approved' | 'denied' | 'expired';
+  createdAt: number;
+  expiresAt: number | null;
+  decidedAt: number | null;
+}
+
+export async function getBrokerIdentities(): Promise<BrokerIdentityInfo[]> {
+  const res = await apiJson<{ ok: boolean; identities: BrokerIdentityInfo[] }>('/api/broker/identities');
+  return res.identities;
+}
+
+export async function connectBrokerGitHub(token: string): Promise<void> {
+  await apiJson('/api/broker/identities/github', {
+    method: 'POST',
+    body: JSON.stringify({ token }),
+  });
+}
+
+export async function disconnectBrokerGitHub(): Promise<void> {
+  await apiJson('/api/broker/identities/github', { method: 'DELETE' });
+}
+
+export async function getBrokerGrants(): Promise<BrokerStandingGrant[]> {
+  const res = await apiJson<{ ok: boolean; grants: BrokerStandingGrant[] }>('/api/broker/grants');
+  return res.grants;
+}
+
+export async function addBrokerGrant(body: {
+  identity: string;
+  actionClass: 'read' | 'write';
+  scope?: string;
+}): Promise<BrokerStandingGrant> {
+  const res = await apiJson<{ ok: boolean; grant: BrokerStandingGrant }>('/api/broker/grants', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+  return res.grant;
+}
+
+export async function revokeBrokerGrant(id: string): Promise<void> {
+  await apiJson(`/api/broker/grants/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+/** Per-run broker grant request cards (approvals inbox). */
+export async function getBrokerRequests(status?: string): Promise<BrokerGrantRequest[]> {
+  const q = status ? `?status=${encodeURIComponent(status)}` : '';
+  const res = await apiJson<{ ok: boolean; cards: BrokerGrantRequest[] }>(`/api/broker/requests${q}`);
+  return res.cards;
+}
+
+export async function decideBrokerRequest(
+  id: string,
+  decision: 'approve' | 'deny',
+): Promise<BrokerGrantRequest> {
+  const res = await apiJson<{ ok: boolean; card: BrokerGrantRequest }>(
+    `/api/broker/requests/${encodeURIComponent(id)}`,
+    { method: 'POST', body: JSON.stringify({ decision }) },
+  );
+  return res.card;
+}
+
 export async function getPeerApprovals(status?: string): Promise<PeerApprovalCard[]> {
   const q = status ? `?status=${encodeURIComponent(status)}` : '';
   const res = await apiJson<{ ok: boolean; cards: PeerApprovalCard[] }>(`/api/peer-approvals${q}`);
@@ -1775,6 +1873,29 @@ export function clearBridgeCliPath(
 ): Promise<{ ok: boolean; cliPath: string; cliPathError?: string }> {
   return apiJson(`/api/providers/bridges/${encodeURIComponent(bridgeId)}/cli-path`, {
     method: 'DELETE',
+  });
+}
+
+/**
+ * A1: manual re-check of a cooled-down bridge account — clears an
+ * exhausted/unavailable cooldown (never a live rate-limit window) and
+ * re-probes the usage gauge.
+ */
+export function recheckBridgeAccount(
+  bridgeId: string,
+  accountId?: string,
+): Promise<{
+  ok: boolean;
+  accountId: string;
+  cleared: boolean;
+  utilisationPercent: number | null;
+  resetAt: string | null;
+  cooldown: { family: string; reason: string; until: string | null } | null;
+}> {
+  return apiJson(`/api/providers/bridges/${encodeURIComponent(bridgeId)}/recheck`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(accountId ? { accountId } : {}),
   });
 }
 

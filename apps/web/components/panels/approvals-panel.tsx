@@ -14,11 +14,13 @@ import {
   decideCredentialProposal,
   getPcAccessRequests,
   decidePcAccessRequest,
+  getBrokerRequests,
+  decideBrokerRequest,
   getWatchItems,
   dismissWatchItem,
   draftWatchItem,
 } from '../../lib/api';
-import type { ApprovalRecord, PeerApprovalCard, PeerGrant, PeerDecision, CredentialProposal, PcAccessRequest, WatchItem } from '../../lib/api';
+import type { ApprovalRecord, PeerApprovalCard, PeerGrant, PeerDecision, CredentialProposal, PcAccessRequest, BrokerGrantRequest, WatchItem } from '../../lib/api';
 import { BulkBar, ShortcutHelp, useActivityShortcuts, type TriageHandlers } from '../activity/triage';
 import { PeerOriginSecurityNote } from '../provenance-chip';
 
@@ -57,6 +59,8 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
   const [credPending, setCredPending] = useState<CredentialProposal[]>([]);
   // --- PC file access cards (a bot wants to list/read an ungranted folder) ---
   const [pcPending, setPcPending] = useState<PcAccessRequest[]>([]);
+  // --- Broker grant cards (a bot wants to act on a brokered identity) ---
+  const [brokerPending, setBrokerPending] = useState<BrokerGrantRequest[]>([]);
   // --- Watch items (W5): proactive account watching "needs you" entries ---
   const [watchNew, setWatchNew] = useState<WatchItem[]>([]);
   const [watchActioned, setWatchActioned] = useState<WatchItem[]>([]);
@@ -77,7 +81,7 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
 
   const refresh = useCallback(async () => {
     try {
-      const [p, all, pp, ppAll, grants, creds, pcReqs, wNew, wActioned] = await Promise.all([
+      const [p, all, pp, ppAll, grants, creds, pcReqs, brokerReqs, wNew, wActioned] = await Promise.all([
         getApprovals('pending'),
         getApprovals(),
         getPeerApprovals('pending'),
@@ -85,6 +89,7 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
         getPeerGrants(),
         getCredentialProposals('pending'),
         getPcAccessRequests('pending').catch(() => [] as PcAccessRequest[]),
+        getBrokerRequests('pending').catch(() => [] as BrokerGrantRequest[]),
         getWatchItems('new').catch(() => [] as WatchItem[]),
         getWatchItems('actioned').catch(() => [] as WatchItem[]),
       ]);
@@ -95,6 +100,7 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
       setPeerGrants(grants);
       setCredPending(creds);
       setPcPending(pcReqs);
+      setBrokerPending(brokerReqs);
       setWatchNew(wNew);
       setWatchActioned(wActioned.slice(0, 10));
       setError('');
@@ -604,6 +610,16 @@ export function ApprovalsPanel({ hideHeader = false }: { hideHeader?: boolean })
         refresh={refresh}
       />
 
+      {/* --- Broker grant cards: a bot wants to act on a brokered identity
+          (GitHub) with the app-held credential. Approve grants this run
+          only — standing grants are a Settings choice, never a card. --- */}
+      <BrokerRequestsSection
+        cards={brokerPending}
+        acting={acting}
+        setActing={setActing}
+        refresh={refresh}
+      />
+
       {/* --- Peer grants ------------------------------------------------- */}
       <div className="row-between mt">
         <h3 className="mt0">Peer grants ({peerGrants.length})</h3>
@@ -851,6 +867,84 @@ function PcAccessRequestsSection({
           <div className="small muted" style={{ marginTop: 6 }}>
             “Always” grants this folder to {c.botId} only (read-only) — revoke it any time in
             Settings → Permissions → PC file access.
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}
+
+function BrokerRequestsSection({
+  cards,
+  acting,
+  setActing,
+  refresh,
+}: {
+  cards: BrokerGrantRequest[];
+  acting: string;
+  setActing: (s: string) => void;
+  refresh: () => Promise<void>;
+}) {
+  if (cards.length === 0) return null;
+
+  const decide = async (id: string, decision: 'approve' | 'deny') => {
+    setActing(id);
+    try {
+      await decideBrokerRequest(id, decision);
+      await refresh();
+    } finally {
+      setActing('');
+    }
+  };
+
+  return (
+    <>
+      <div className="row-between mt">
+        <h3 className="mt0">Brokered identity access ({cards.length})</h3>
+        <span className="small muted" title="A bot asked to act on a brokered identity with the credential the app holds. The bot never sees the credential. Approving covers this run only.">
+          bot → brokered identity · this run only · 15-min expiry
+        </span>
+      </div>
+      {cards.map((c) => (
+        <div key={c.id} className="card triage-item" style={{ borderLeft: '3px solid var(--warn, #c90)' }}>
+          <div className="row-between">
+            <div>
+              <span className="chip" title="Brokered identity request">🔑 broker</span>{' '}
+              <strong>{c.botId}</strong>{' '}
+              <span className="small muted">
+                wants {c.actionClass} actions on {c.identity} — first asked for{' '}
+                <code>{c.action}</code>
+                {c.resource ? (
+                  <>
+                    {' '}on <code>{c.resource}</code>
+                  </>
+                ) : null}
+                . The app makes the call with the vault-held credential; the bot never sees it.
+              </span>
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              className="btn btn-sm btn-primary"
+              disabled={acting === c.id}
+              onClick={() => void decide(c.id, 'approve')}
+              title="Allow this bot to use this identity's action class for the rest of this run"
+            >
+              Approve for this run
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm"
+              disabled={acting === c.id}
+              onClick={() => void decide(c.id, 'deny')}
+            >
+              Deny
+            </button>
+          </div>
+          <div className="small muted" style={{ marginTop: 6 }}>
+            Approving never creates a standing grant — for that, use Settings → Providers →
+            Brokered identities. Every decision and action is journaled in Activity.
           </div>
         </div>
       ))}

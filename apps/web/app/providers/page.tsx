@@ -11,6 +11,7 @@ import {
   getModelsCatalogInfo,
   getProviders,
   pollCliLogin,
+  recheckBridgeAccount,
   refreshModelsCatalog,
   removeProviderKey,
   saveProviderKey,
@@ -21,6 +22,7 @@ import {
 import type { CliLoginStatus, ModelsCatalogInfo, ProviderInfo, RateLimitSnapshot } from '../../lib/api';
 import { formatResetIn, formatTokens } from '../../lib/usage';
 import { ChannelsPanel } from '../../components/channels/channels-panel';
+import BrokerIdentitiesPanel from '../../components/panels/broker-identities-panel';
 import { KEYLESS_LANE_FALLBACKS, keylessLaneFor } from '../../lib/octomind-web';
 import { KeySuggestionCard } from '../../components/key-suggestion-card';
 
@@ -81,6 +83,49 @@ function cliLabelFor(bridge?: string): string {
   return (bridge && CLI_LABELS[bridge]) || 'CLI';
 }
 
+/**
+ * A1: one bridge account row — usage gauge (or the honest "usage
+ * unknown") plus cooldown state as a chip, with a manual Re-check action
+ * while cooled down. No new screens: this lives inside the bridge card.
+ */
+function BridgeAccountLine({
+  account,
+  saving,
+  onRecheck,
+}: {
+  account: NonNullable<ProviderInfo['bridgeAccounts']>[number];
+  saving: boolean;
+  onRecheck: (accountId: string) => void;
+}) {
+  const { usage, cooldown } = account;
+  const usageText =
+    usage.utilisationPercent === null
+      ? 'usage unknown'
+      : `${usage.utilisationPercent}% used${usage.resetAt ? ` · ${formatResetIn(usage.resetAt) ?? `resets ${usage.resetAt}`}` : ''}`;
+  const chip =
+    cooldown === null
+      ? null
+      : cooldown.family === 'rate_limit'
+        ? `cooling down — rate limit${cooldown.until ? `, ${formatResetIn(cooldown.until) ?? `until ${cooldown.until}`}` : ''}`
+        : cooldown.family === 'exhausted'
+          ? 'exhausted — top up or re-check'
+          : 'unavailable — circuit breaker open';
+  return (
+    <p className="small muted" style={{ marginTop: 4 }}>
+      Account {account.accountId}: Usage: {usageText}
+      {chip && (
+        <>
+          {' '}
+          <span className="chip amber" title={cooldown?.reason}>{chip}</span>{' '}
+          <button className="btn btn-sm" disabled={saving} onClick={() => onRecheck(account.accountId)}>
+            Re-check
+          </button>
+        </>
+      )}
+    </p>
+  );
+}
+
 function BridgeCard({
   p,
   models,
@@ -92,6 +137,7 @@ function BridgeCard({
   onSignIn,
   onSaveCliPath,
   onClearCliPath,
+  onRecheck,
 }: {
   p: ProviderInfo;
   /** Model ids to display (already filtered by the "Free only" toggle). */
@@ -105,6 +151,7 @@ function BridgeCard({
   onSignIn: (p: ProviderInfo) => void;
   onSaveCliPath: (p: ProviderInfo, path: string) => void;
   onClearCliPath: (p: ProviderInfo) => void;
+  onRecheck: (p: ProviderInfo, accountId: string) => void;
 }) {
   const cliLabel = cliLabelFor(p.bridge);
   const signedIn = authStatus?.signedIn === true;
@@ -138,6 +185,14 @@ function BridgeCard({
             : 'No catalog models.'}
       </p>
       <RateLimitLine rateLimit={p.rateLimit} />
+      {(p.bridgeAccounts ?? []).map((account) => (
+        <BridgeAccountLine
+          key={account.accountId}
+          account={account}
+          saving={saving === p.id}
+          onRecheck={(accountId) => onRecheck(p, accountId)}
+        />
+      ))}
       <div className="warn-box" style={{ marginTop: 8 }}>
         <strong>Use your {cliLabel} login — no API key needed.</strong>
         <br />
@@ -636,6 +691,28 @@ export default function ProvidersPage() {
     }
   };
 
+  const recheck = async (p: ProviderInfo, accountId: string) => {
+    if (!p.bridge) return;
+    setSaving(p.id);
+    setError('');
+    setNotice('');
+    try {
+      const state = await recheckBridgeAccount(p.bridge, accountId);
+      setNotice(
+        state.cleared
+          ? `${p.name} account ${state.accountId} re-checked — cooldown cleared.`
+          : state.cooldown
+            ? `${p.name} account ${state.accountId} re-checked — still cooling down (${state.cooldown.family}). A live rate-limit window is the provider's and is not cleared early.`
+            : `${p.name} account ${state.accountId} re-checked.`,
+      );
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving('');
+    }
+  };
+
   const clearCliPath = async (p: ProviderInfo) => {
     if (!p.bridge) return;
     setSaving(p.id);
@@ -873,6 +950,7 @@ export default function ProvidersPage() {
               onSignIn={(bp) => setSignInFor(bp)}
               onSaveCliPath={(bp, path) => void saveCliPath(bp, path)}
               onClearCliPath={(bp) => void clearCliPath(bp)}
+              onRecheck={(bp, accountId) => void recheck(bp, accountId)}
             />
           ))}
         </>
@@ -1047,6 +1125,8 @@ export default function ProvidersPage() {
         </div>
       )}
       {providers.length === 0 && !error && <p className="muted">Loading providers…</p>}
+
+      <BrokerIdentitiesPanel />
 
       <ChannelsPanel />
     </div>
