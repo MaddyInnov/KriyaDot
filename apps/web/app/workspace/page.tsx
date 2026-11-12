@@ -4,6 +4,7 @@
 import { useState } from 'react';
 import { NotesPanel } from '../../components/panels/notes-panel';
 import { TasksPanel } from '../../components/panels/tasks-panel';
+import { IdeasPanel } from '../../components/panels/ideas-panel';
 import { FilesPanel } from '../../components/panels/files-panel';
 import PhonePanel from '../../components/panels/phone-panel';
 import DevicesPanel from '../../components/panels/devices-panel';
@@ -15,6 +16,7 @@ import { MemoryExplorerPanel } from '../../components/panels/memory-explorer';
 const TABS = [
   { id: 'notes', label: 'Notes' },
   { id: 'tasks', label: 'Tasks' },
+  { id: 'ideas', label: 'Ideas', title: 'Parked ideas — inert until you action one' },
   { id: 'files', label: 'Files' },
   { id: 'memory', label: 'Memory', title: 'Explore what your bots remember' },
   { id: 'phone', label: 'Phone', title: 'Control your phone' },
@@ -56,6 +58,8 @@ export default function WorkspacePage() {
           <NotesPanel hideHeader />
         ) : tab === 'tasks' ? (
           <TasksPanel hideHeader />
+        ) : tab === 'ideas' ? (
+          <IdeasPanel hideHeader />
         ) : tab === 'memory' ? (
           <MemoryExplorerPanel />
         ) : tab === 'phone' ? (

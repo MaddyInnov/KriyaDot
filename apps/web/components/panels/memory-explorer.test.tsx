@@ -65,6 +65,17 @@ vi.mock('../../lib/api', () => ({
   getRuleProposals: async () => ({ ok: true, botId: 'scout', status: 'pending', proposals: [] }),
   decideRuleProposal: async () => ({ ok: true, proposal: {} }),
   synthesizeRuleProposals: async () => ({ ok: true, botId: 'scout', created: [], skipped: 0, lane: 'none' }),
+  // A11 Dreams section (rendered by the explorer; empty + off by default here).
+  getDreams: async () => ({
+    ok: true,
+    botId: 'scout',
+    settings: { enabled: false, hour: 3, minute: 15, summarise: false, updatedAt: new Date(0).toISOString() },
+    lastRunAt: null,
+    leads: [],
+  }),
+  saveDreamSettings: async () => ({ ok: true, botId: 'scout', settings: { enabled: false, hour: 3, minute: 15, summarise: false, updatedAt: new Date(0).toISOString() } }),
+  runDreamsNow: async () => ({ ok: true, created: [], suppressed: 0, considered: 0, lane: 'deterministic' }),
+  decideDreamLead: async () => ({ ok: true, lead: {} }),
   ruleScopeLabel: (scope: { kind: string; id?: string }) =>
     scope.kind === 'global' ? 'Global' : `${scope.kind === 'agent' ? 'Agent' : 'Project'} · ${scope.id ?? ''}`,
 }));

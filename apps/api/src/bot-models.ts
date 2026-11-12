@@ -24,6 +24,36 @@ export interface BotModelSelection {
   /** AI failover (W1): backup provider/model for hard-limit failures. */
   backupProvider?: string;
   backupModel?: string;
+  /** A6: the bot's bridge-account picks, keyed by bridge id (account ids only). */
+  bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode', string>>;
+}
+
+const BRIDGE_IDS_FOR_ACCOUNTS = ['claude', 'codex', 'opencode'] as const;
+
+/**
+ * Sanitise a bridgeAccounts patch: known bridge keys only; a string
+ * value sets the bot's account for that bridge, null/'' clears it.
+ * Returns undefined when the input carries no usable entry.
+ */
+export function sanitizeBridgeAccounts(
+  input: unknown,
+): Partial<Record<'claude' | 'codex' | 'opencode', string | null>> | undefined {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) return undefined;
+  const o = input as Record<string, unknown>;
+  const out: Partial<Record<'claude' | 'codex' | 'opencode', string | null>> = {};
+  let any = false;
+  for (const bridge of BRIDGE_IDS_FOR_ACCOUNTS) {
+    if (!(bridge in o)) continue;
+    const v = o[bridge];
+    if (typeof v === 'string' && v.trim()) {
+      out[bridge] = v.trim().slice(0, 64);
+      any = true;
+    } else if (v === null || v === '') {
+      out[bridge] = null;
+      any = true;
+    }
+  }
+  return any ? out : undefined;
 }
 
 type ModelsFile = Record<string, BotModelSelection>;
@@ -94,6 +124,16 @@ export function applyBotModels(bots: BotConfig[], dataDir: string): void {
     if (typeof sel.backupModel === 'string' && sel.backupModel.trim()) {
       bot.backupModel = sel.backupModel.trim();
     }
+    if (sel.bridgeAccounts) {
+      const clean = sanitizeBridgeAccounts(sel.bridgeAccounts);
+      if (clean) {
+        const applied: Partial<Record<'claude' | 'codex' | 'opencode', string>> = {};
+        for (const [bridge, accountId] of Object.entries(clean)) {
+          if (accountId) applied[bridge as 'claude' | 'codex' | 'opencode'] = accountId;
+        }
+        if (Object.keys(applied).length > 0) bot.bridgeAccounts = applied;
+      }
+    }
   }
 }
 
@@ -107,7 +147,7 @@ export function saveBotModel(
   botId: string,
   model: unknown,
   modelOptions: unknown,
-  backup?: { backupProvider?: unknown; backupModel?: unknown },
+  backup?: { backupProvider?: unknown; backupModel?: unknown; bridgeAccounts?: unknown },
 ): BotModelSelection {
   const bot = bots.find((b) => b.id === botId);
   if (!bot) throw new Error(`Unknown bot: ${botId}`);
@@ -134,6 +174,19 @@ export function saveBotModel(
       bot.backupModel = undefined;
     }
   }
+  // A6: per-bridge account picks. Merged into the bot + the persisted
+  // selection; a null/'' entry clears that bridge's pick.
+  const bridgePatch = backup ? sanitizeBridgeAccounts(backup.bridgeAccounts) : undefined;
+  if (bridgePatch) {
+    const merged: Partial<Record<'claude' | 'codex' | 'opencode', string>> = { ...(bot.bridgeAccounts ?? {}) };
+    for (const [bridge, accountId] of Object.entries(bridgePatch)) {
+      const b = bridge as 'claude' | 'codex' | 'opencode';
+      if (accountId) merged[b] = accountId;
+      else delete merged[b];
+    }
+    bot.bridgeAccounts = Object.keys(merged).length > 0 ? merged : undefined;
+    sel.bridgeAccounts = bot.bridgeAccounts;
+  }
   const opts = sanitizeOptions(modelOptions);
   if (Object.keys(opts).length > 0) {
     sel.modelOptions = opts;
@@ -149,6 +202,8 @@ export function saveBotModel(
   // Explicit backup clears must also drop the persisted keys.
   if (backup?.backupProvider === null || backup?.backupProvider === '') delete file[botId].backupProvider;
   if (backup?.backupModel === null || backup?.backupModel === '') delete file[botId].backupModel;
+  // A6: when every bridge pick was cleared, drop the persisted map too.
+  if (bridgePatch && !bot.bridgeAccounts) delete file[botId].bridgeAccounts;
   if (Object.keys(file[botId]).length === 0) delete file[botId];
   writeFile(dataDir, file);
   return file[botId] ?? {};

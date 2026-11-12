@@ -175,6 +175,8 @@ export interface BotConfig {
   /** AI failover (W1): backup provider/model for hard usage-limit failures. */
   backupProvider?: string;
   backupModel?: string;
+  /** A6: this bot's bridge-account picks, keyed by bridge id (account ids only). */
+  bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode', string>>;
   modelOptions?: ModelOptions;
   skills: string[];
   tools: string[];
@@ -507,6 +509,18 @@ export interface ProviderInfo {
    */
   bridgeAccounts?: Array<{
     accountId: string;
+    /** A6: human label ('Machine default' for the built-in account). */
+    label?: string;
+    /** A6: the machine's existing sign-in (no config-dir override, unremovable). */
+    machineDefault?: boolean;
+    /** A6: the user's chosen default account for this bridge. */
+    isUserDefault?: boolean;
+    /** A6: the account's config dir (null for the machine default). */
+    configDir?: string | null;
+    /** A6: sign-in state for THIS account, probed independently. */
+    signedIn?: boolean;
+    /** A6: true when KriyaDot created this account's config dir. */
+    createdByUs?: boolean;
     usage: { utilisationPercent: number | null; resetAt: string | null; source: 'cli-status' | 'no-surface' | 'cli-unavailable' };
     cooldown: { family: 'rate_limit' | 'exhausted' | 'unavailable'; reason: string; until: string | null } | null;
   }>;
@@ -1040,7 +1054,11 @@ export const setBotModel = (
   botId: string,
   model: string | null,
   modelOptions: ModelOptions | null,
-  backup?: { backupProvider?: string | null; backupModel?: string | null },
+  backup?: {
+    backupProvider?: string | null;
+    backupModel?: string | null;
+    bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode', string | null>>;
+  },
 ): Promise<{
   ok: boolean;
   botId: string;
@@ -1048,6 +1066,7 @@ export const setBotModel = (
   modelOptions?: ModelOptions;
   backupProvider?: string;
   backupModel?: string;
+  bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode', string>>;
 }> =>
   apiJson(`/api/bots/${encodeURIComponent(botId)}/model`, {
     method: 'PUT',
@@ -1925,8 +1944,74 @@ export function getCliAuthStatus(): Promise<{ ok: boolean; clis: CliLoginStatus[
 
 export function startCliLogin(
   cliId: string,
-): Promise<{ ok: boolean; loginId: string; url: string; acceptsCode?: boolean }> {
-  return apiJson(`/api/cli-auth/${encodeURIComponent(cliId)}/login`, { method: 'POST' });
+  accountId?: string,
+): Promise<{ ok: boolean; loginId: string; url: string; acceptsCode?: boolean; accountId?: string }> {
+  return apiJson(`/api/cli-auth/${encodeURIComponent(cliId)}/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(accountId ? { accountId } : {}),
+  });
+}
+
+// ---- Bridge accounts (A6: multiple sign-ins per CLI bridge) ----------------
+
+export interface BridgeAccountInfo {
+  accountId: string;
+  bridgeId: string;
+  label: string;
+  configDir: string | null;
+  machineDefault: boolean;
+  createdByUs: boolean;
+  isUserDefault: boolean;
+  signedIn: boolean;
+  credentialsPath: string;
+}
+
+export function createBridgeAccount(
+  bridgeId: string,
+  label: string,
+): Promise<{ ok: boolean; account: BridgeAccountInfo }> {
+  return apiJson('/api/bridge-accounts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ bridgeId, label }),
+  });
+}
+
+export function renameBridgeAccount(
+  bridgeId: string,
+  accountId: string,
+  label: string,
+): Promise<{ ok: boolean; account: BridgeAccountInfo }> {
+  return apiJson(
+    `/api/bridge-accounts/${encodeURIComponent(bridgeId)}/${encodeURIComponent(accountId)}`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label }),
+    },
+  );
+}
+
+export function setBridgeAccountDefault(
+  bridgeId: string,
+  accountId: string,
+): Promise<{ ok: boolean; userDefault: string }> {
+  return apiJson(
+    `/api/bridge-accounts/${encodeURIComponent(bridgeId)}/${encodeURIComponent(accountId)}/default`,
+    { method: 'POST' },
+  );
+}
+
+export function removeBridgeAccount(
+  bridgeId: string,
+  accountId: string,
+  deleteConfigDir: boolean,
+): Promise<{ ok: boolean; removed: string; configDir: string | null; configDirDeleted: boolean; configDirNote: string }> {
+  return apiJson(
+    `/api/bridge-accounts/${encodeURIComponent(bridgeId)}/${encodeURIComponent(accountId)}?deleteConfigDir=${deleteConfigDir ? '1' : '0'}`,
+    { method: 'DELETE' },
+  );
 }
 
 /**
@@ -3201,6 +3286,90 @@ export const decideRuleProposal = (
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ botId, action, ...(text !== undefined ? { text } : {}) }),
+  });
+
+// ---- Dreams (A11) -----------------------------------------------------------
+// Overnight self-improvement PROPOSALS. The pass is opt-in (settings
+// default off) and propose-only: leads land here; Accept maps a lead to
+// a pending rule proposal or a DISABLED routine draft (or merely
+// acknowledges it) — Dreams never applies a change itself.
+
+export type DreamLeadKind =
+  | 'recurring-failure'
+  | 'approval-friction'
+  | 'cooldown-refusal'
+  | 'stale-rule'
+  | 'manual-pattern'
+  | 'proposal-backlog';
+
+export interface DreamLeadRecord {
+  id: string;
+  botId: string;
+  kind: DreamLeadKind;
+  title: string;
+  suggestedAction: string;
+  score: number;
+  evidence: { count: number; windowStart: number; windowEnd: number; examples: string[]; metrics: Record<string, number> };
+  artefact: { type: 'rule' | 'routine' | 'none' };
+  status: 'pending' | 'accepted' | 'dismissed' | 'snoozed';
+  createdAt: number;
+  decidedAt?: number;
+  snoozedUntil?: number;
+  acceptedArtefact?: { type: 'rule-proposal' | 'routine-draft' | 'acknowledged'; id?: string };
+}
+
+export interface DreamSettingsRecord {
+  enabled: boolean;
+  hour: number;
+  minute: number;
+  summarise: boolean;
+  updatedAt: string;
+}
+
+export interface DreamsOverview {
+  ok: boolean;
+  botId: string;
+  settings: DreamSettingsRecord;
+  lastRunAt: number | null;
+  leads: DreamLeadRecord[];
+}
+
+/** GET /api/memory/dreams?botId= → settings + pending leads + last run. */
+export const getDreams = (botId: string): Promise<DreamsOverview> =>
+  apiJson(`/api/memory/dreams?botId=${encodeURIComponent(botId)}`);
+
+/** PUT /api/memory/dreams/settings { botId, enabled?, hour?, minute?, summarise? } — user-only server-side. */
+export const saveDreamSettings = (
+  botId: string,
+  settings: Partial<Pick<DreamSettingsRecord, 'enabled' | 'hour' | 'minute' | 'summarise'>>,
+): Promise<{ ok: boolean; botId: string; settings: DreamSettingsRecord }> =>
+  apiJson('/api/memory/dreams/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ botId, ...settings }),
+  });
+
+/** POST /api/memory/dreams/run { botId } — manual pass (works while the schedule is off). */
+export const runDreamsNow = (
+  botId: string,
+): Promise<{ ok: boolean; created: DreamLeadRecord[]; suppressed: number; considered: number; summary?: string; lane: string }> =>
+  apiJson('/api/memory/dreams/run', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ botId }),
+  });
+
+/** POST /api/memory/dreams/leads/:id/decide { botId, action, snoozeDays? } — user-only server-side. */
+export const decideDreamLead = (
+  botId: string,
+  leadId: string,
+  action: 'accept' | 'dismiss' | 'snooze',
+  snoozeDays?: number,
+): Promise<{ ok: boolean; lead: DreamLeadRecord }> =>
+  apiJson(`/api/memory/dreams/leads/${encodeURIComponent(leadId)}/decide`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ botId, action, ...(snoozeDays !== undefined ? { snoozeDays } : {}) }),
   });
 
 // ---- Memory ingestion (OH-4) ------------------------------------------------

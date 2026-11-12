@@ -148,6 +148,7 @@ import { createBrokerRouter } from './broker-routes.js';
 import { BrokerStore, GITHUB_BROKER_VAULT_NAME, SecretsBroker } from '@mvp/agent-runtime';
 import { registerBrokerTool } from '@mvp/agent-runtime/dist/tools/broker.js';
 import { createMemoryUpkeepRouter, startMemoryUpkeep, aboutMeContext } from './memory-upkeep-routes.js';
+import { startDreamsScheduler } from './memory-dreams-routes.js';
 import { createMemoryIngestionRouter } from './memory-ingestion-routes.js';
 import { startMemoryIngestionScheduler } from './memory-ingestion.js';
 import {
@@ -1750,6 +1751,15 @@ async function boot(): Promise<void> {
   for (const tool of createKbTools(kbStore)) {
     if (!toolRegistry.has(tool.name)) toolRegistry.set(tool.name, tool);
   }
+  // B6: park_idea chat capture — write-only into the parked-ideas
+  // notebook; the tool holds no task/routine handle (parked-idea-tools.ts).
+  {
+    const { ParkedIdeaStore } = await import('./parked-ideas.js');
+    const { createParkedIdeaTools } = await import('./parked-idea-tools.js');
+    for (const tool of createParkedIdeaTools(new ParkedIdeaStore(config.dataDir))) {
+      if (!toolRegistry.has(tool.name)) toolRegistry.set(tool.name, tool);
+    }
+  }
   // Typed extraction (OMB §1.1): extract_values runs on the extraction
   // purpose profile via a host provider for the first bot's provider id.
   {
@@ -2906,6 +2916,20 @@ async function boot(): Promise<void> {
   });
   void memoryUpkeep;
 
+  // Dreams (A11): overnight self-improvement proposal pass. OPT-IN —
+  // the scheduler does no work for a bot until the user enables Dreams
+  // in Workspace → Memory (settings default off). Propose-only: runs
+  // write improvement leads to the inbox, never changes.
+  const dreamsScheduler = startDreamsScheduler({
+    dataDir: config.dataDir,
+    tieredMemoryStore,
+    getBots: () => seed.bots.map((b) => ({ id: b.id })),
+    getBotById: (id: string) => botsById.get(id),
+    listAudit: (limit: number) => governance.listAudit(limit),
+    audit: (action, fields) => governance.audit(action, fields),
+  });
+  void dreamsScheduler;
+
   // Sentinel health scanner (OpenMausBot parity): cheap scheduled
   // self-check; report at GET /api/health/detail.
   const sentinel = startSentinel({
@@ -3652,6 +3676,13 @@ async function boot(): Promise<void> {
       // Nightly dreaming: the briefing's dream section reads the store.
       // SI-2: reflective-dreaming items ride the same briefing section.
       dreamsSource: () => [...dreamBriefingItems(dreamStore), ...reflectionBriefingItems(reflectionStore)],
+      // A11 Dreams: accepting a routine-type lead creates the routine
+      // DISABLED (a draft the user reviews and enables themselves).
+      dreamsRoutineDraft: (draft: { botId: string; name: string; promptTemplate: string }) => {
+        const created = routineStore.create({ name: draft.name, botId: draft.botId, promptTemplate: draft.promptTemplate });
+        const disabled = routineStore.update(created.id, { enabled: false });
+        return { id: (disabled ?? created).id };
+      },
       // First-reply rescue: a failed first turn lands in the owner's
       // needs-you inbox (team inbox, FYI kind, needs-you state).
       addNeedsYou: (item) => {
@@ -5367,6 +5398,19 @@ async function boot(): Promise<void> {
         bots: seed.bots,
         audit: (action, fields) => governance.audit(action, fields),
         workspaceDir: config.workspaceDir,
+      }),
+    );
+    // A6: multiple sign-ins per CLI bridge — account registry routes;
+    // loading the store here also seeds the runtime's process-wide
+    // bridge-account store so turn-time account resolution sees them.
+    const { createBridgeAccountsRouter, loadBridgeAccountStore } = await import('./bridge-accounts-routes.js');
+    loadBridgeAccountStore(config.dataDir);
+    app.use(
+      '/api',
+      createBridgeAccountsRouter({
+        dataDir: config.dataDir,
+        bots: seed.bots,
+        audit: (action, fields) => governance.audit(action, fields),
       }),
     );
   }

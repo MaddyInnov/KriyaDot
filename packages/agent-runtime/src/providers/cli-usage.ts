@@ -49,7 +49,7 @@ import {
   type DetectOptions,
 } from './cli-bridge.js';
 
-/** The default (only, until A6) account id for a bridge login. */
+/** The machine-default account id for a bridge login (A6: siblings carry their own ids). */
 export const DEFAULT_BRIDGE_ACCOUNT_ID = 'default';
 
 /** One bridge account's usage gauge. `utilisationPercent: null` = unknown. */
@@ -262,11 +262,17 @@ export function parseCliUsageOutput(output: string, nowMs: number = Date.now()):
 export type UsageRunFn = (
   executablePath: string,
   args: string[],
-  opts: { platform?: NodeJS.Platform; timeoutMs?: number },
+  opts: { platform?: NodeJS.Platform; timeoutMs?: number; env?: Record<string, string> },
 ) => { code: number | null; output: string };
 
 export interface ProbeBridgeUsageOptions {
   accountId?: string;
+  /**
+   * A6: the account's config-dir env (bridgeAccountSpawnEnv) — a
+   * non-default account's gauge probe must run under ITS config dir,
+   * or it would report the machine-default account's figures.
+   */
+  env?: Record<string, string>;
   detect?: DetectOptions;
   platform?: NodeJS.Platform;
   timeoutMs?: number;
@@ -303,7 +309,10 @@ export function probeBridgeUsage(id: CliBridgeId, opts: ProbeBridgeUsageOptions 
   }
   const resolveFn = opts.resolveFn ?? ((bid: CliBridgeId) => resolveVerifiedCliExecutable(bid, opts.detect ?? {}).path);
   const resolvedPath = resolveFn(id);
-  const cacheKey = `${id}:${accountId}:${resolvedPath ?? 'none'}`;
+  // A6: the cache key carries the account env signature — two accounts
+  // of one bridge must never share a cached gauge.
+  const envSig = opts.env ? Object.values(opts.env).join('|') : '';
+  const cacheKey = `${id}:${accountId}:${resolvedPath ?? 'none'}:${envSig}`;
   const cached = gaugeCache.get(cacheKey);
   if (!opts.fresh && cached) {
     const ttl = cached.gauge.utilisationPercent !== null ? GAUGE_TTL_MS : GAUGE_UNKNOWN_TTL_MS;
@@ -316,7 +325,11 @@ export function probeBridgeUsage(id: CliBridgeId, opts: ProbeBridgeUsageOptions 
     const runFn = opts.runFn ?? runCliSync;
     let output = '';
     try {
-      output = runFn(resolvedPath, decl.statusArgs, { platform: opts.platform, timeoutMs: opts.timeoutMs ?? 5000 }).output;
+      output = runFn(resolvedPath, decl.statusArgs, {
+        platform: opts.platform,
+        timeoutMs: opts.timeoutMs ?? 5000,
+        ...(opts.env ? { env: opts.env } : {}),
+      }).output;
     } catch {
       output = '';
     }

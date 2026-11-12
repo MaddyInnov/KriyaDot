@@ -603,7 +603,7 @@ export function summarizeCliFailure(opts: {
 export function runCliSync(
   executablePath: string,
   args: string[],
-  opts: { platform?: NodeJS.Platform; timeoutMs?: number } = {},
+  opts: { platform?: NodeJS.Platform; timeoutMs?: number; env?: Record<string, string> } = {},
 ): { code: number | null; output: string } {
   const cmd = buildCliSpawnCommand(executablePath, args, opts.platform);
   try {
@@ -612,6 +612,9 @@ export function runCliSync(
       timeout: opts.timeoutMs ?? 5000,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
+      // A6: per-account probes run under the account's config-dir env
+      // (merged over the process env, exactly like a turn spawn).
+      ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
     });
     return { code: 0, output: typeof out === 'string' ? out : '' };
   } catch (err) {
@@ -753,6 +756,34 @@ export function bridgeHasUsableToken(id: CliBridgeId, homeDir?: string): boolean
   if (id === 'claude') return claudeTokenFromFile(parsed) !== undefined;
   if (id === 'opencode') return opencodeTokenFromFile(parsed) !== undefined;
   return codexTokenFromFile(parsed) !== undefined;
+}
+
+/**
+ * A6: consent-free shape probe for ONE credential file at an explicit
+ * path — the per-account variant of bridgeHasUsableToken (an account's
+ * credential file lives inside its own config dir, not under the machine
+ * home). Boolean only — never returns token bytes.
+ */
+export function bridgeHasUsableTokenAtPath(id: CliBridgeId, credentialsPath: string): boolean {
+  const parsed = readJsonFile(credentialsPath);
+  if (parsed === undefined) return false;
+  if (id === 'claude') return claudeTokenFromFile(parsed) !== undefined;
+  if (id === 'opencode') return opencodeTokenFromFile(parsed) !== undefined;
+  return codexTokenFromFile(parsed) !== undefined;
+}
+
+/**
+ * A6: consent-gated token load from an explicit credential file path —
+ * the per-account variant of loadBridgeToken. Memory-only, never logged
+ * or persisted, exactly like the machine-default loader.
+ */
+export function loadBridgeTokenAtPath(id: CliBridgeId, credentialsPath: string): string | undefined {
+  if (!isBridgeConnected(id)) return undefined;
+  const parsed = readJsonFile(credentialsPath);
+  if (parsed === undefined) return undefined;
+  if (id === 'claude') return claudeTokenFromFile(parsed);
+  if (id === 'opencode') return opencodeTokenFromFile(parsed);
+  return codexTokenFromFile(parsed);
 }
 
 function numberField(obj: unknown, path: string[]): number | undefined {

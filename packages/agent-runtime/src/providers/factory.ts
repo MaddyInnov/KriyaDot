@@ -18,6 +18,7 @@ import { OpenAICompatibleProvider } from './openai-compatible.js';
 import { createAgentCliProvider, parseAgentProviderId } from './agent-cli.js';
 import { createAcpEngineProvider } from './acp-engines.js';
 import { createNativeCliDriver } from './cli-driver.js';
+import { loadBridgeTokenAtPath, loadBridgeTokenForClaudeProfile } from './cli-bridge.js';
 import { BedrockProvider } from './bedrock.js';
 import { VertexProvider } from './vertex.js';
 import { CohereProvider } from './cohere.js';
@@ -38,7 +39,20 @@ import { keylessChain, type KeylessLane } from './keyless-stack.js';
  * has not configured an endpoint yet, this throws a clear configuration error
  * instead of attempting a request to an empty URL.
  */
-export function createProvider(providerId: string, opts?: { apiKey?: string }): LLMProvider {
+export function createProvider(
+  providerId: string,
+  opts?: {
+    apiKey?: string;
+    /**
+     * A6: per-account spawn env for CLI-backed providers (the resolved
+     * bridge account's config-dir isolation, from bridge-accounts.ts).
+     * Native CLI drivers spawn under it; the Claude bridge reads its
+     * token from the account's config dir instead of the machine
+     * default's. Absent/empty = machine default, exactly as before.
+     */
+    env?: Record<string, string>;
+  },
+): LLMProvider {
   // Demo mock provider for the video guide / screenshots (DEMO_MOCK=1 only).
   // Scripted two-step turn: announce a file write, then confirm after the
   // approval-gated tool call completes. Clearly labeled "(mock)" in the UI.
@@ -85,7 +99,10 @@ export function createProvider(providerId: string, opts?: { apiKey?: string }): 
     // first; native-driver CLIs (claude-code, codex) keep their drivers.
     const acpProvider = createAcpEngineProvider(providerId);
     if (acpProvider) return acpProvider;
-    return createNativeCliDriver(providerId) ?? createAgentCliProvider(providerId);
+    return (
+      createNativeCliDriver(providerId, { ...(opts?.env ? { env: opts.env } : {}) }) ??
+      createAgentCliProvider(providerId)
+    );
   }
 
   const preset = getProviderPreset(providerId) ?? getCustomProviderPreset(providerId);
@@ -136,10 +153,32 @@ export function createProvider(providerId: string, opts?: { apiKey?: string }): 
   // is preferred; falls back to the one-shot provider.
   if (preset.bridge === 'codex') {
     const defaultModel = getDefaultModel(preset.id) || 'gpt-5';
-    return createNativeCliDriver(`agent/codex/${defaultModel}`) ?? createAgentCliProvider(`agent/codex/${defaultModel}`);
+    return (
+      createNativeCliDriver(`agent/codex/${defaultModel}`, { ...(opts?.env ? { env: opts.env } : {}) }) ??
+      createAgentCliProvider(`agent/codex/${defaultModel}`)
+    );
   }
 
-  const apiKey = opts?.apiKey ?? resolveApiKey(providerId);
+  // A6: a Claude bridge turn scoped to a non-default account reads the
+  // token from THAT account's config dir (consent-gated, memory-only).
+  // Deliberately NO fallback to the machine default's token: silently
+  // answering as a different sign-in than the one selected would break
+  // selection integrity — a missing account token fails as "not
+  // connected" below instead.
+  const accountConfigDir = preset.bridge === 'claude' ? opts?.env?.CLAUDE_CONFIG_DIR : undefined;
+  // OpenCode's HTTPS lane reads its token from the account's data dir
+  // (XDG_DATA_HOME/opencode/auth.json) when account-scoped.
+  const accountOpencodeCreds =
+    preset.bridge === 'opencode' && opts?.env?.XDG_DATA_HOME
+      ? `${opts.env.XDG_DATA_HOME}/opencode/auth.json`
+      : undefined;
+  const apiKey =
+    opts?.apiKey ??
+    (accountConfigDir
+      ? loadBridgeTokenForClaudeProfile(accountConfigDir)
+      : accountOpencodeCreds
+        ? loadBridgeTokenAtPath('opencode', accountOpencodeCreds)
+        : resolveApiKey(providerId));
   // Keyless presets (free-LLM stack: LLM7 anonymous): no API key is sent
   // at all when the user has not supplied one. If the user DID supply a
   // key/token for the lane, fall through to the normal bearer path.

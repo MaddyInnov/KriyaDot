@@ -100,6 +100,7 @@ import { registerKnowledgeRoutes } from './knowledge.js';
 import { attachNoteContextProvider, registerNoteAttachmentRoutes } from './note-attachments.js';
 import { attachSpendCapGate } from './spend-caps.js';
 import { registerTasksRoutes } from './tasks.js';
+import { ParkedIdeaStore, registerParkedIdeasRoutes } from './parked-ideas.js';
 import { registerPagesRoutes } from './pages.js';
 import { registerPagePublicationRoutes } from './public-pages.js';
 import { registerBackgroundRunRoutes, registerSessionShareRoutes } from './session-share.js';
@@ -147,6 +148,7 @@ import { AUTO_MODEL_SENTINEL, recordAutoModelDecision, resolveAutoModel } from '
 import { createMemoryFabricRouter } from './memory-fabric-routes.js';
 import { createMemoryUpkeepRouter } from './memory-upkeep-routes.js';
 import { createMemoryProposalsRouter } from './memory-proposals-routes.js';
+import { createMemoryDreamsRouter } from './memory-dreams-routes.js';
 import { createCrashRecoveryRouter } from './crash-recovery.js';
 import type { TurnTracker } from './crash-recovery.js';
 import { OnBehalfOfLedger } from '@mvp/agent-runtime';
@@ -346,6 +348,12 @@ export interface RouteDeps {
    */
   mcpClientsByServer?: Map<string, unknown>;
   dreamsSource?: () => import('./briefing.js').BriefingItem[];
+  /**
+   * A11 Dreams: host mapping for accepting a routine-type dream lead —
+   * MUST create the routine DISABLED and return its id. Optional: when
+   * absent, accepting a routine lead answers 501 and stays pending.
+   */
+  dreamsRoutineDraft?: (draft: { botId: string; name: string; promptTemplate: string }) => { id: string };
   addNeedsYou?: (item: { personId?: string; title: string; summary: string; botId?: string }) => void;
   /**
    * Companion app module (phone → PC remote control). Created by index.ts
@@ -1351,6 +1359,24 @@ export function createRouter(deps: RouteDeps): express.Router {
     }),
   );
 
+  // ---- Dreams (A11): overnight self-improvement PROPOSAL pass. Opt-in
+  // (off by default; scheduler lives in index.ts). Settings/run/decide
+  // require a verified principal — the pass itself only writes leads;
+  // Accept maps onto a pending A10 proposal or a DISABLED routine draft.
+  router.use(
+    '/memory',
+    createMemoryDreamsRouter({
+      dataDir: config.dataDir,
+      tieredMemoryStore,
+      getBots: () => bots.map((b) => ({ id: b.id })),
+      getBotById: (id: string) => bots.find((b) => b.id === id),
+      principalContext: { dataDir: config.dataDir },
+      listAudit: (limit: number) => governance.listAudit(limit),
+      ...(deps.dreamsRoutineDraft ? { createRoutineDraft: deps.dreamsRoutineDraft } : {}),
+      audit: (action, fields) => governance.audit(action, fields),
+    }),
+  );
+
   // ---- MBTI personas --------------------------------------------------------
   // Octop parity: 16 personality templates shaping bot tone/working style.
   router.get('/personas', (_req, res) => {
@@ -1432,11 +1458,13 @@ export function createRouter(deps: RouteDeps): express.Router {
       modelOptions?: unknown;
       backupProvider?: unknown;
       backupModel?: unknown;
+      bridgeAccounts?: unknown;
     };
     try {
       const sel = saveBotModel(config.dataDir, bots, req.params.id, body.model, body.modelOptions, {
         backupProvider: body.backupProvider,
         backupModel: body.backupModel,
+        bridgeAccounts: body.bridgeAccounts,
       });
       res.json({ ok: true, botId: req.params.id, ...sel });
     } catch (err) {
@@ -3619,7 +3647,17 @@ export function createRouter(deps: RouteDeps): express.Router {
   registerKnowledgeRoutes(notesRouter, { dataDir: config.dataDir });
   registerNotesRoutes(notesRouter, { dataDir: config.dataDir });
   router.use('/notes', notesRouter);
-  registerTasksRoutes(router, { dataDir: config.dataDir });
+  registerTasksRoutes(router, {
+    dataDir: config.dataDir,
+    // B6 outcome loop: a completed task that came from a parked idea
+    // stamps a pending outcome onto the idea (see parked-ideas.ts).
+    onTaskCompleted: (task) => {
+      if (task.ideaId) new ParkedIdeaStore(config.dataDir).noteTaskCompleted(task.id);
+    },
+  });
+  // B6: parked-ideas notebook — a SEPARATE store beside tasks, on
+  // purpose, so no task enumeration/dispatcher can ever see an idea.
+  registerParkedIdeasRoutes(router, { dataDir: config.dataDir });
 
   // ---- Feature interconnection (P2-E) -------------------------------------
   // Notes/pages attachable to bot context (API surface; the context

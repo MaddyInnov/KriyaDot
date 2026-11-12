@@ -32,6 +32,13 @@ export interface Task {
   done: boolean;
   createdAt: number;
   updatedAt: number;
+  /**
+   * B6: set only when this task was created by the explicit "Action this
+   * idea" action on a parked idea (parked-ideas.ts). The link lives on
+   * the TASK side so the ideas store stays structurally separate — task
+   * enumeration never needs to know ideas exist.
+   */
+  ideaId?: string;
 }
 
 export interface CalendarEvent {
@@ -50,6 +57,8 @@ export interface TaskInput {
   notes?: string;
   /** ISO-8601 string; null clears the due date. */
   dueAt?: string | null;
+  /** B6: originating parked-idea id, set by the action bridge only. */
+  ideaId?: string;
 }
 
 export interface EventInput {
@@ -63,6 +72,12 @@ export interface TasksDeps {
   dataDir: string;
   taskStore?: TaskStore;
   eventStore?: CalendarEventStore;
+  /**
+   * B6 outcome loop: called when a task transitions open → done through
+   * the routes, so the host can write the completion back to a linked
+   * parked idea. Optional; failures are swallowed by the route.
+   */
+  onTaskCompleted?: (task: Task) => void;
 }
 
 abstract class JsonFileStore {
@@ -119,6 +134,7 @@ export class TaskStore extends JsonFileStore {
       done: false,
       createdAt: now,
       updatedAt: now,
+      ...(typeof input.ideaId === 'string' && input.ideaId ? { ideaId: input.ideaId } : {}),
     };
     const rows = this.readRows();
     rows.push(task);
@@ -250,7 +266,18 @@ export function registerTasksRoutes(router: Router, deps: TasksDeps): void {
 
   router.put('/tasks/:id', (req: Request, res: Response) => {
     try {
-      res.json(tasks.update(req.params.id, taskUpdateFrom(req.body)));
+      const before = tasks.get(req.params.id);
+      const updated = tasks.update(req.params.id, taskUpdateFrom(req.body));
+      // B6: open → done transition notifies the host (outcome write-back
+      // to a linked parked idea). Best-effort: never fails the update.
+      if (before && !before.done && updated.done && deps.onTaskCompleted) {
+        try {
+          deps.onTaskCompleted(updated);
+        } catch (hookErr) {
+          console.error('[tasks] onTaskCompleted hook failed:', errMessage(hookErr, 'unknown'));
+        }
+      }
+      res.json(updated);
     } catch (err) {
       res.status(statusFor(err)).json({ error: errMessage(err, 'failed to update task') });
     }

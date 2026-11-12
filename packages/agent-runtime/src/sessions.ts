@@ -699,6 +699,15 @@ export class SessionStore {
    * list`). Each summary carries message counts and the last-message
    * timestamp so clients can render a useful thread picker without
    * fetching every thread's messages.
+   *
+   * Ordering is deterministic: activity timestamps are millisecond ISO
+   * strings, so events in the same millisecond tie. Ties break on the
+   * latest message id (AUTOINCREMENT, so higher = later), with
+   * message-less sessions explicitly last (COALESCE -1 — a bare
+   * MAX(m.id) is NULL for them and the ordering would otherwise rest on
+   * SQLite's implicit NULL placement), then on session creation time,
+   * then on session id, so two empty sessions created in the same
+   * millisecond still come back in a stable order.
    */
   listSessions(
     opts: { botId?: string; limit?: number; ownerPersonId?: string; projectId?: string } = {},
@@ -733,7 +742,7 @@ export class SessionStore {
          LEFT JOIN messages m ON m.session_id = s.id
          WHERE (? IS NULL OR s.bot_id = ?)${ownerClause}${projectClause}
          GROUP BY s.id
-         ORDER BY COALESCE(MAX(m.ts), s.created_at) DESC, MAX(m.id) DESC, s.created_at DESC
+         ORDER BY COALESCE(MAX(m.ts), s.created_at) DESC, COALESCE(MAX(m.id), -1) DESC, s.created_at DESC, s.id DESC
          LIMIT ?`,
       )
       .all(...params) as Array<{

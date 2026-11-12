@@ -112,6 +112,18 @@ export interface ProviderInfo {
    */
   bridgeAccounts?: Array<{
     accountId: string;
+    /** A6: human label ('Machine default' for the built-in account). */
+    label?: string;
+    /** A6: true for the machine's existing sign-in (no config-dir override, unremovable). */
+    machineDefault?: boolean;
+    /** A6: true when this is the user's chosen default account for the bridge. */
+    isUserDefault?: boolean;
+    /** A6: the account's config dir (null for the machine default). Paths only, never contents. */
+    configDir?: string | null;
+    /** A6: sign-in state detected independently for THIS account (credential-file shape probe). */
+    signedIn?: boolean;
+    /** A6: true when KriyaDot created this account's config dir (removal may delete it, on request). */
+    createdByUs?: boolean;
     usage: {
       utilisationPercent: number | null;
       /** ISO reset instant of the binding window, when the CLI reported one. */

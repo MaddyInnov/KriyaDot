@@ -306,7 +306,11 @@ function ModelPicker({
     botId: string,
     model: string,
     modelOptions?: ModelOptions,
-    backup?: { backupProvider?: string; backupModel?: string },
+    backup?: {
+      backupProvider?: string;
+      backupModel?: string;
+      bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode', string>>;
+    },
   ) => void;
 }) {
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
@@ -315,6 +319,9 @@ function ModelPicker({
   const [options, setOptions] = useState<ModelOptions>(bot.modelOptions ?? {});
   const [backupProvider, setBackupProvider] = useState(bot.backupProvider ?? '');
   const [backupModel, setBackupModel] = useState(bot.backupModel ?? '');
+  // A6: the bot's account pick for its provider's bridge ('' = follow
+  // the user's default account for the bridge).
+  const [bridgeAccount, setBridgeAccount] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -356,6 +363,13 @@ function ModelPicker({
   }, [bot.id, bot.provider]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const provider = providers.find((p) => p.id === bot.provider);
+  // A6: bridge account picker data — the accounts of the bot provider's
+  // bridge, from the Providers surface (labels + sign-in state included).
+  const bridgeId = provider?.bridge as 'claude' | 'codex' | 'opencode' | undefined;
+  const bridgeAccounts = provider?.bridgeAccounts ?? [];
+  useEffect(() => {
+    if (bridgeId) setBridgeAccount(bot.bridgeAccounts?.[bridgeId] ?? '');
+  }, [bot.id, bridgeId]); // eslint-disable-line react-hooks/exhaustive-deps
   // Prefer live-discovered agent models; fall back to provider catalog.
   const catalogModels: AgentModel[] = (provider?.models ?? []).map((m) => ({ id: m.id, name: m.name }));
   const models = agentModels.length > 0 ? agentModels : catalogModels;
@@ -379,11 +393,15 @@ function ModelPicker({
         {
           backupProvider: backupProvider || null,
           backupModel: backupProvider ? backupModel || null : null,
+          ...(bridgeId
+            ? { bridgeAccounts: { [bridgeId]: bridgeAccount || null } }
+            : {}),
         },
       );
       onSaved(bot.id, res.model ?? selected, res.modelOptions, {
         backupProvider: res.backupProvider,
         backupModel: res.backupModel,
+        bridgeAccounts: res.bridgeAccounts,
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -490,6 +508,32 @@ function ModelPicker({
               </p>
             )}
           </div>
+          {bridgeId && bridgeAccounts.length > 0 && (
+            <div style={{ borderTop: '1px solid var(--border, #e5e7eb)', paddingTop: 12, marginBottom: 12 }}>
+              <label className="small" style={{ display: 'block', marginBottom: 4 }}>
+                Bridge account <span className="muted">(which sign-in of this bridge this bot runs on)</span>
+              </label>
+              <select
+                value={bridgeAccount}
+                onChange={(e) => setBridgeAccount(e.target.value)}
+                style={{ width: '100%', marginBottom: 4 }}
+                aria-label="Bridge account"
+              >
+                <option value="">Your default account for this bridge</option>
+                {bridgeAccounts.map((a) => (
+                  <option key={a.accountId} value={a.accountId}>
+                    {a.label ?? a.accountId}
+                    {a.machineDefault ? ' (machine default)' : ''}
+                    {a.signedIn === false ? ' — not signed in' : ''}
+                  </option>
+                ))}
+              </select>
+              <p className="small muted" style={{ margin: 0 }}>
+                Manage accounts in Settings → Providers. A bot on its own account is not
+                affected when another account of the same bridge hits its limit.
+              </p>
+            </div>
+          )}
           <button onClick={save} disabled={saving} className="btn btn-primary">
             {saving ? 'Saving…' : 'Save model'}
           </button>
@@ -892,12 +936,23 @@ function BotsPageInner() {
     botId: string,
     model: string,
     modelOptions?: ModelOptions,
-    backup?: { backupProvider?: string; backupModel?: string },
+    backup?: {
+      backupProvider?: string;
+      backupModel?: string;
+      bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode', string>>;
+    },
   ) => {
     setBots((prev) =>
       prev.map((b) =>
         b.id === botId
-          ? { ...b, model, modelOptions, backupProvider: backup?.backupProvider, backupModel: backup?.backupModel }
+          ? {
+              ...b,
+              model,
+              modelOptions,
+              backupProvider: backup?.backupProvider,
+              backupModel: backup?.backupModel,
+              bridgeAccounts: backup?.bridgeAccounts ?? b.bridgeAccounts,
+            }
           : b,
       ),
     );

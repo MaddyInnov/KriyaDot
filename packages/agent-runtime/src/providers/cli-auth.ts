@@ -31,6 +31,7 @@ import { delimiter, join } from 'node:path';
 import {
   bridgeAccountHint,
   bridgeHasUsableToken,
+  bridgeHasUsableTokenAtPath,
   bridgeNamesakeMessage,
   bridgePinnedMessage,
   bridgeTokenExpiry,
@@ -40,6 +41,19 @@ import {
   spawnCliProcess,
   type CliBridgeId,
 } from './cli-bridge.js';
+
+/**
+ * A6: a non-default bridge account's sign-in context — the account's
+ * config-dir env (the login child is spawned under it, so the CLI
+ * writes the NEW account's credential file, never the machine
+ * default's) plus that account's credential file path (completion is
+ * polled there). Built by bridge-accounts.ts consumers; this module
+ * stays ignorant of the account registry.
+ */
+export interface CliAccountContext {
+  env?: Record<string, string>;
+  credentialsPath?: string;
+}
 
 export type CliAuthId = 'claude' | 'codex' | 'opencode' | 'antigravity' | 'copilot';
 
@@ -140,7 +154,8 @@ export interface CliResolution {
 export interface CliAuthDeps {
   homeDir?: string;
   pathDirs?: string[];
-  spawnFn?: (command: string, args: string[]) => SpawnHandle;
+  /** A6: the optional third arg carries a per-account spawn env. */
+  spawnFn?: (command: string, args: string[], opts?: { env?: Record<string, string> }) => SpawnHandle;
   fileExists?: (path: string) => boolean;
   fileMtimeMs?: (path: string) => number | undefined;
   readText?: (path: string) => string | undefined;
@@ -216,13 +231,23 @@ function defaultHomeDir(): string {
   return homedir();
 }
 
-function defaultSpawn(command: string, args: string[], platform: NodeJS.Platform): SpawnHandle {
+function defaultSpawn(
+  command: string,
+  args: string[],
+  platform: NodeJS.Platform,
+  env?: Record<string, string>,
+): SpawnHandle {
   // spawnCliProcess applies the Windows batch-shim rule: npm-installed
   // CLIs are .cmd files, which CreateProcess cannot run directly — the
   // spawn goes through the shell with Node's argument escaping. stdin is
   // a pipe so paste-code login flows (Claude Code) can receive the code
-  // the user copies from the browser page.
-  const child = spawnCliProcess(command, args, { stdio: ['pipe', 'pipe', 'pipe'], platform });
+  // the user copies from the browser page. A6: a per-account env is
+  // merged over the process env (config-dir isolation for the login).
+  const child = spawnCliProcess(command, args, {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    platform,
+    ...(env ? { env: { ...process.env, ...env } as Record<string, string> } : {}),
+  });
   return { child, stdin: child.stdin, stdout: child.stdout, stderr: child.stderr };
 }
 
@@ -238,7 +263,7 @@ export function redactTokenish(s: string): string {
 export class CliAuthManager {
   private readonly homeDir: string;
   private readonly pathDirs: string[];
-  private readonly spawnFn: (command: string, args: string[]) => SpawnHandle;
+  private readonly spawnFn: (command: string, args: string[], opts?: { env?: Record<string, string> }) => SpawnHandle;
   private readonly usingDefaultSpawn: boolean;
   private readonly platform: NodeJS.Platform;
   private readonly resolveCliFn: ((id: CliAuthId) => CliResolution) | undefined;
@@ -255,7 +280,8 @@ export class CliAuthManager {
     this.pathDirs = deps.pathDirs ?? (process.env.PATH ?? '').split(delimiter).filter((d) => d.length > 0);
     this.platform = deps.platform ?? process.platform;
     this.usingDefaultSpawn = deps.spawnFn === undefined;
-    this.spawnFn = deps.spawnFn ?? ((command, args) => defaultSpawn(command, args, this.platform));
+    this.spawnFn =
+      deps.spawnFn ?? ((command, args, opts) => defaultSpawn(command, args, this.platform, opts?.env));
     this.resolveCliFn = deps.resolveCli;
     this.fileExists =
       deps.fileExists ?? ((p) => { try { return existsSync(p); } catch { return false; } });
@@ -305,7 +331,9 @@ export class CliAuthManager {
     return this.resolveCli(id).path ?? CLI_COMMANDS[id];
   }
 
-  private credentialsPath(id: CliAuthId): string {
+  private credentialsPath(id: CliAuthId, account?: CliAccountContext): string {
+    // A6: a non-default bridge account polls ITS OWN credential file.
+    if (account?.credentialsPath && isBridgeId(id)) return account.credentialsPath;
     if (id === 'antigravity') return join(this.homeDir, ANTIGRAVITY_CRED_REL);
     if (id === 'copilot') return join(this.homeDir, COPILOT_CRED_REL);
     const rel =
@@ -322,7 +350,10 @@ export class CliAuthManager {
    * in the OS keyring (unreadable from Node), so file-shape presence of the
    * ACP profile's oauth_creds.json is the signal — documented as heuristic.
    */
-  private hasUsableCredential(id: CliAuthId): boolean {
+  private hasUsableCredential(id: CliAuthId, account?: CliAccountContext): boolean {
+    if (account?.credentialsPath && isBridgeId(id)) {
+      return bridgeHasUsableTokenAtPath(toBridgeId(id), account.credentialsPath);
+    }
     if (id === 'antigravity') return this.fileExists(this.credentialsPath(id));
     if (id === 'copilot') return this.ghHostsHasLogin();
     return bridgeHasUsableToken(toBridgeId(id), this.homeDir);
@@ -354,18 +385,20 @@ export class CliAuthManager {
     return this.resolveCli(id).path !== undefined;
   }
 
-  /** Sign-in status. Never returns token bytes. */
-  async getStatus(id: CliAuthId): Promise<CliLoginStatus> {
+  /** Sign-in status. Never returns token bytes. A6: pass a non-default
+   *  account's context to probe THAT account (its env + credential file)
+   *  independently of the machine default. */
+  async getStatus(id: CliAuthId, account?: CliAccountContext): Promise<CliLoginStatus> {
     const resolution = this.resolveCli(id);
     const cliPresent = resolution.path !== undefined;
     const namesakeWarning = resolution.namesakeWarning;
-    const credPath = this.credentialsPath(id);
+    const credPath = this.credentialsPath(id, account);
     const credentialsPresent = this.fileExists(credPath);
 
     // Prefer the CLI's own status command when one exists.
     const statusArgs = STATUS_COMMAND[id];
     if (statusArgs && cliPresent) {
-      const out = await this.runStatusCommand(id, statusArgs);
+      const out = await this.runStatusCommand(id, statusArgs, account);
       if (out !== undefined) {
         if (id === 'claude') {
           const parsed = parseClaudeAuthStatus(out);
@@ -388,14 +421,16 @@ export class CliAuthManager {
       // Status command failed — fall through to the file-shape probe.
     }
 
-    const signedIn = credentialsPresent && this.hasUsableCredential(id);
+    const signedIn = credentialsPresent && this.hasUsableCredential(id, account);
     let expired: boolean | undefined;
     let accountHint: string | undefined;
     // Antigravity tokens live in the OS keyring — no expiry/hint available.
     // Copilot's hint is the GitHub username from hosts.yml (no expiry data).
+    // A6: for a non-default account, no machine-home expiry/hint is read —
+    // those describe the machine default's login, not this account's.
     if (signedIn && id === 'copilot') {
       accountHint = this.ghAccountHint();
-    } else if (signedIn && isBridgeId(id)) {
+    } else if (signedIn && isBridgeId(id) && !account?.credentialsPath) {
       const expiry = bridgeTokenExpiry(toBridgeId(id), this.homeDir);
       expired = expiry !== undefined ? expiry <= this.now() : undefined;
       accountHint = bridgeAccountHint(toBridgeId(id), this.homeDir);
@@ -411,11 +446,11 @@ export class CliAuthManager {
     };
   }
 
-  private runStatusCommand(id: CliAuthId, args: string[]): Promise<string | undefined> {
+  private runStatusCommand(id: CliAuthId, args: string[], account?: CliAccountContext): Promise<string | undefined> {
     return new Promise((resolve) => {
       let handle: SpawnHandle;
       try {
-        handle = this.spawnFn(this.spawnCommand(id), args);
+        handle = this.spawnFn(this.spawnCommand(id), args, account?.env ? { env: account.env } : undefined);
       } catch {
         resolve(undefined);
         return;
@@ -449,7 +484,7 @@ export class CliAuthManager {
    * file until the login completes. The user completes auth in their
    * browser; no tokens are ever pasted or displayed.
    */
-  startLogin(id: CliAuthId): ActiveLogin {
+  startLogin(id: CliAuthId, account?: CliAccountContext): ActiveLogin {
     const failedEarly = (reason: string): ActiveLogin => ({
       url: Promise.reject(new Error(reason)),
       done: Promise.resolve({ ok: false, reason }),
@@ -477,16 +512,18 @@ export class CliAuthManager {
       }
     }
 
-    const credPath = this.credentialsPath(id);
+    const credPath = this.credentialsPath(id, account);
     const beforeMtime = this.fileMtimeMs(credPath);
-    const beforeValid = this.hasUsableCredential(id);
+    const beforeValid = this.hasUsableCredential(id, account);
     const signInHint = isBridgeId(id)
       ? CLI_BRIDGE_META[toBridgeId(id)].signInCommand
       : CLI_COMMANDS[id];
 
     let handle: SpawnHandle;
     try {
-      handle = this.spawnFn(this.spawnCommand(id), LOGIN_ARGS[id]);
+      // A6: the login child runs under the account's config-dir env, so
+      // signing into a second account never disturbs the first.
+      handle = this.spawnFn(this.spawnCommand(id), LOGIN_ARGS[id], account?.env ? { env: account.env } : undefined);
     } catch (err) {
       const reason = `Could not start the ${CLI_COMMANDS[id]} login: ${err instanceof Error ? err.message : String(err)}`;
       return failedEarly(reason);
@@ -588,7 +625,7 @@ export class CliAuthManager {
         // changed since we started (avoids "already logged in" false-positives
         // when the user never completes THIS flow... though an existing valid
         // login also satisfies sign-in — see below).
-        if (this.hasUsableCredential(id) && (beforeMtime === undefined || mtime === undefined || mtime > beforeMtime || !beforeValid)) {
+        if (this.hasUsableCredential(id, account) && (beforeMtime === undefined || mtime === undefined || mtime > beforeMtime || !beforeValid)) {
           kill(handle);
           return { ok: true };
         }
@@ -596,7 +633,7 @@ export class CliAuthManager {
       kill(handle);
       if (cancelled) return { ok: false, reason: 'Login cancelled.' };
       // Final check: maybe the user was already signed in and the CLI reused it.
-      if (this.hasUsableCredential(id)) return { ok: true };
+      if (this.hasUsableCredential(id, account)) return { ok: true };
       return {
         ok: false,
         reason: `Login not completed within ${Math.round(this.loginTimeoutMs / 1000 / 60)} minutes. The authorize URL expired — start again for a fresh one.`,

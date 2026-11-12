@@ -19,12 +19,36 @@
 import express, { type Router } from 'express';
 import {
   CliAuthManager,
+  bridgeAccountCredentialsPath,
+  bridgeAccountSpawnEnv,
+  getBridgeAccountStore,
+  isBridgeAccountBridge,
   listNativeCliSessions,
   type ActiveLogin,
+  type CliAccountContext,
   type CliAuthId,
 } from '@mvp/agent-runtime';
 
 const CLI_IDS: CliAuthId[] = ['claude', 'codex', 'opencode', 'antigravity', 'copilot'];
+
+/**
+ * A6: resolve a non-default account id for a bridge CLI into the
+ * sign-in context (config-dir env + the account's credential file).
+ * Returns undefined for the machine default (today's behaviour,
+ * unchanged), or null when the account id names no stored account.
+ */
+function accountContextFor(cliId: CliAuthId, accountId: unknown): CliAccountContext | undefined | null {
+  if (accountId === undefined || accountId === null || accountId === '' || accountId === 'default') {
+    return undefined;
+  }
+  if (typeof accountId !== 'string' || !isBridgeAccountBridge(cliId)) return null;
+  const account = getBridgeAccountStore().get(cliId, accountId);
+  if (!account || account.machineDefault) return null;
+  return {
+    env: bridgeAccountSpawnEnv(account),
+    credentialsPath: bridgeAccountCredentialsPath(account),
+  };
+}
 
 function errorBody(message: string): Record<string, unknown> {
   return { ok: false, error: message };
@@ -39,6 +63,8 @@ interface TrackedLogin {
   status: 'waiting' | 'done' | 'failed' | 'cancelled';
   reason?: string;
   url?: string;
+  /** A6: the account this login signs into ('default' = machine default). */
+  accountId: string;
 }
 
 export function createCliAuthRouter(): Router {
@@ -50,8 +76,40 @@ export function createCliAuthRouter(): Router {
 
   const keyOf = (cliId: string, loginId: string): string => `${cliId}:${loginId}`;
 
-  router.get('/status', async (_req, res) => {
+  router.get('/status', async (req, res) => {
     try {
+      // A6: ?cliId=<bridge>&accountId=<id> probes ONE non-default
+      // account's sign-in state, independently of the machine default.
+      const accountId = req.query.accountId;
+      if (accountId !== undefined) {
+        const cliId = asCliAuthId(String(req.query.cliId ?? ''));
+        if (!cliId) {
+          res.status(400).json(errorBody('cliId is required with accountId.'));
+          return;
+        }
+        const ctx = accountContextFor(cliId, accountId);
+        if (ctx === null) {
+          res.status(404).json(errorBody(`No bridge account "${String(accountId)}" for ${cliId}.`));
+          return;
+        }
+        const c = await manager.getStatus(cliId, ctx);
+        res.json({
+          ok: true,
+          clis: [
+            {
+              cliId: c.cliId,
+              accountId: String(accountId),
+              cliPresent: c.cliPresent,
+              credentialsPresent: c.credentialsPresent,
+              signedIn: c.signedIn,
+              ...(c.accountHint ? { accountHint: c.accountHint } : {}),
+              ...(c.expired !== undefined ? { expired: c.expired } : {}),
+              ...(c.namesakeWarning ? { namesakeWarning: c.namesakeWarning } : {}),
+            },
+          ],
+        });
+        return;
+      }
       const clis = await Promise.all(CLI_IDS.map((id) => manager.getStatus(id)));
       // Strip to the safe public shape (defense in depth — the manager
       // already returns no token bytes).
@@ -78,14 +136,25 @@ export function createCliAuthRouter(): Router {
       res.status(400).json(errorBody(`Unknown CLI "${req.params.cliId}". Expected one of ${CLI_IDS.join(', ')}.`));
       return;
     }
+    // A6: an optional { accountId } in the body signs into THAT bridge
+    // account (the login runs under its fresh config dir); absent =
+    // the machine default, exactly as before. Concurrent logins are
+    // tracked per (cli, account) — two accounts may sign in at once.
+    const accountIdRaw = (req.body as { accountId?: unknown } | undefined)?.accountId;
+    const ctx = accountContextFor(cliId, accountIdRaw);
+    if (ctx === null) {
+      res.status(404).json(errorBody(`No bridge account "${String(accountIdRaw)}" for ${cliId}. Add the account first.`));
+      return;
+    }
+    const accountId = typeof accountIdRaw === 'string' && accountIdRaw ? accountIdRaw : 'default';
     for (const [k, t] of logins) {
-      if (k.startsWith(`${cliId}:`) && t.status === 'waiting') {
-        res.status(409).json(errorBody(`A login is already in progress for ${cliId}. Cancel it first.`));
+      if (k.startsWith(`${cliId}:`) && t.status === 'waiting' && t.accountId === accountId) {
+        res.status(409).json(errorBody(`A login is already in progress for ${cliId} account "${accountId}". Cancel it first.`));
         return;
       }
     }
     const loginId = `login_${Date.now().toString(36)}_${(loginSeq += 1)}`;
-    const tracked: TrackedLogin = { login: manager.startLogin(cliId), status: 'waiting' };
+    const tracked: TrackedLogin = { login: manager.startLogin(cliId, ctx), status: 'waiting', accountId };
     logins.set(keyOf(cliId, loginId), tracked);
     // Prune terminal logins so the map stays small.
     for (const [k, t] of [...logins]) {
@@ -97,7 +166,7 @@ export function createCliAuthRouter(): Router {
       // acceptsCode: paste-code flows (Claude Code) — after authorizing,
       // the browser page shows a code the UI collects and POSTs to the
       // /code endpoint below.
-      res.json({ ok: true, loginId, url, acceptsCode: tracked.login.submitCode !== undefined });
+      res.json({ ok: true, loginId, url, accountId, acceptsCode: tracked.login.submitCode !== undefined });
     } catch (err) {
       tracked.status = 'failed';
       tracked.reason = err instanceof Error ? err.message : String(err);

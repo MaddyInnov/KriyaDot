@@ -300,23 +300,37 @@ describe('session worktree links', () => {
 
 describe('listSessions', () => {
   it('lists sessions with message counts, most-recently-active first', () => {
-    const store = new SessionStore(':memory:');
-    const a = store.createSession('bot-a');
-    store.appendMessage(a, { role: 'user', content: 'one' });
-    store.appendMessage(a, { role: 'assistant', content: 'two' });
-    const b = store.createSession('bot-b');
-    const c = store.createSession('bot-a');
-    store.appendMessage(c, { role: 'user', content: 'three' });
+    // CI red 2026-11-12 (run 178, main 13e91923): on a loaded runner the
+    // creates/appends straddled a millisecond boundary, so b's created_at
+    // (1 ms after a's last message) outranked a and the order came back
+    // [c, b, a]. The [c, a, b] expectation assumes all six events share
+    // one millisecond — freeze the clock so that holds by construction,
+    // not by machine speed. The tie-break (latest message id first,
+    // message-less sessions last) then decides deterministically; see
+    // the ORDER BY comment in listSessions.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-11-12T10:00:00.000Z'));
+      const store = new SessionStore(':memory:');
+      const a = store.createSession('bot-a');
+      store.appendMessage(a, { role: 'user', content: 'one' });
+      store.appendMessage(a, { role: 'assistant', content: 'two' });
+      const b = store.createSession('bot-b');
+      const c = store.createSession('bot-a');
+      store.appendMessage(c, { role: 'user', content: 'three' });
 
-    const all = store.listSessions();
-    expect(all).toHaveLength(3);
-    // c got its message after a's messages → c first, then a, then empty b
-    expect(all.map((s) => s.id)).toEqual([c, a, b]);
-    expect(all[0]).toMatchObject({ botId: 'bot-a', messageCount: 1 });
-    expect(all[1]).toMatchObject({ botId: 'bot-a', messageCount: 2 });
-    expect(all[2]).toMatchObject({ botId: 'bot-b', messageCount: 0, lastMessageTs: null });
-    expect(all[0].lastMessageTs).toBeTruthy();
-    store.close();
+      const all = store.listSessions();
+      expect(all).toHaveLength(3);
+      // c got its message after a's messages → c first, then a, then empty b
+      expect(all.map((s) => s.id)).toEqual([c, a, b]);
+      expect(all[0]).toMatchObject({ botId: 'bot-a', messageCount: 1 });
+      expect(all[1]).toMatchObject({ botId: 'bot-a', messageCount: 2 });
+      expect(all[2]).toMatchObject({ botId: 'bot-b', messageCount: 0, lastMessageTs: null });
+      expect(all[0].lastMessageTs).toBeTruthy();
+      store.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('filters by botId and clamps the limit', () => {

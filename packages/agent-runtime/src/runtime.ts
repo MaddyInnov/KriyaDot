@@ -102,6 +102,12 @@ import {
   decideBridgeSwap,
   declaredSelectionBackup,
 } from './providers/cli-swap.js';
+import {
+  bridgeAccountSpawnEnv,
+  findHealthySiblingAccount,
+  getBridgeAccountStore,
+  resolveBridgeAccount,
+} from './providers/bridge-accounts.js';
 import { getRateLimit } from './providers/rate-limit.js';
 import { TurnStateRegistry } from './turn-state.js';
 import { BotTurnScheduler } from './turn-scheduler.js';
@@ -1437,12 +1443,38 @@ ${record.priorContext ?? ''}`;
    * The demo mock provider is stateful (scripted cursor) and must NOT be
    * shared across turns — it bypasses the cache.
    */
-  protected resolveProvider(providerId: string): LLMProvider {
+  protected resolveProvider(
+    providerId: string,
+    bot?: BotConfig,
+    accountIdOverride?: string,
+  ): LLMProvider {
     if (providerId === 'demo') return createProvider(providerId);
-    let provider = this.providerCache.get(providerId);
+    // A6 spawn isolation: when the turn's bot resolves to a NON-DEFAULT
+    // account of the provider's bridge, the provider is constructed with
+    // that account's config-dir env (native drivers spawn under it; the
+    // Claude/OpenCode HTTPS lanes read that account's token) and cached
+    // under an account-scoped key so two accounts never share a driver.
+    // Machine-default resolution is byte-for-byte the old behaviour.
+    let cacheKey = providerId;
+    let env: Record<string, string> | undefined;
+    const bridge = bot ? bridgeIdForProviderId(providerId) : undefined;
+    if (bridge && bot) {
+      const store = getBridgeAccountStore();
+      const account = accountIdOverride
+        ? store.get(bridge, accountIdOverride)
+        : resolveBridgeAccount(bot, bridge, store);
+      if (account && !account.machineDefault) {
+        const spawnEnv = bridgeAccountSpawnEnv(account);
+        if (Object.keys(spawnEnv).length > 0) {
+          env = spawnEnv;
+          cacheKey = `${providerId}#acct:${account.id}`;
+        }
+      }
+    }
+    let provider = this.providerCache.get(cacheKey);
     if (!provider) {
-      provider = createProvider(providerId);
-      this.providerCache.set(providerId, provider);
+      provider = createProvider(providerId, env ? { env } : undefined);
+      this.providerCache.set(cacheKey, provider);
     }
     return provider;
   }
@@ -1716,7 +1748,7 @@ ${record.priorContext ?? ''}`;
       provider = createProvider(providerId, { apiKey: opts.apiKeyOverride });
     } else {
       try {
-        provider = this.resolveProvider(providerId);
+        provider = this.resolveProvider(providerId, opts.bot);
       } catch (err) {
         if (!isProviderConfigError(err)) throw err;
         const fb = await resolveViableKeylessProvider({ toolUse: (opts.bot.tools?.length ?? 0) > 0 });
@@ -2463,6 +2495,14 @@ ${record.priorContext ?? ''}`;
       });
     };
 
+    // A6: per-turn account overrides (bridge → account id) set when a
+    // sibling-account swap moves this turn to another account of the
+    // same bridge; cooldown/usage bookkeeping then keys on the account
+    // that actually ran, not the one that died.
+    const turnAccountOverrides = new Map<string, string>();
+    const acctId = (bridge: string): string =>
+      turnAccountOverrides.get(bridge) ?? bridgeAccountIdForBot(opts.bot, bridge as 'claude' | 'codex' | 'opencode');
+
     // A1 cooldown consult: a bridge backend in active cooldown is
     // SKIPPED with the reason visible — never retried blindly. Auto
     // routing starts the turn on the backup (transcript replay is
@@ -2473,7 +2513,14 @@ ${record.priorContext ?? ''}`;
     {
       const startBridge = bridgeIdForProviderId(providerId);
       if (startBridge) {
-        const accountId = bridgeAccountIdForBot(opts.bot);
+        const accountId = bridgeAccountIdForBot(opts.bot, startBridge);
+        // A6: sibling candidate for the AUTO lane (never computed for an
+        // explicit selection — a sibling is a different sign-in than the
+        // one the user picked, so it is not a backup candidate there).
+        const startSibling =
+          opts.explicitSelection === true
+            ? undefined
+            : findHealthySiblingAccount(getBridgeAccountStore(), this.bridgeCooldowns, startBridge, accountId);
         const check = this.bridgeCooldowns.check(startBridge, accountId);
         if (check.active) {
           const skipReason = cooldownSkipReason(this.bridgeCooldowns, startBridge, accountId) ?? check.reason ?? 'in cooldown';
@@ -2490,11 +2537,19 @@ ${record.priorContext ?? ''}`;
             const fromModel = model;
             provider = opts.apiKeyOverride
               ? createProvider(declared.providerId, { apiKey: opts.apiKeyOverride })
-              : this.resolveProvider(declared.providerId);
+              : this.resolveProvider(declared.providerId, opts.bot);
             providerId = declared.providerId;
             model = declared.modelId;
             await emit({ type: 'failover', fromProvider, fromModel, toProvider: providerId, toModel: model, reason: 'bridge-cooldown', message: `${skipReason}; starting this turn on your pre-declared selection backup ${providerId}/${model}.` });
             await emit({ type: 'notice', kind: 'failover', message: `${skipReason}; starting this turn on your pre-declared selection backup ${providerId}/${model}.` });
+          } else if (startSibling) {
+            // A6 (auto lane only): a healthy sibling account of the same
+            // bridge takes the turn before any cross-provider backup —
+            // same provider/model, different sign-in. The cooled account
+            // stays cooled; only this turn's account changes.
+            turnAccountOverrides.set(startBridge, startSibling.id);
+            provider = this.resolveProvider(providerId, opts.bot, startSibling.id);
+            await emit({ type: 'notice', kind: 'failover', message: `${skipReason}; this turn runs on the "${startSibling.label}" account of the same bridge instead.` });
           } else {
             const t = resolveFailoverTarget({ bot: opts.bot, excludeProviderId: providerId });
             const tBridge = t ? bridgeIdForProviderId(t.providerId) : undefined;
@@ -2502,7 +2557,7 @@ ${record.priorContext ?? ''}`;
             if (t && !tCooled) {
               const fromProvider = providerId;
               const fromModel = model;
-              provider = opts.apiKeyOverride ? createProvider(t.providerId, { apiKey: opts.apiKeyOverride }) : this.resolveProvider(t.providerId);
+              provider = opts.apiKeyOverride ? createProvider(t.providerId, { apiKey: opts.apiKeyOverride }) : this.resolveProvider(t.providerId, opts.bot);
               await emit({ type: 'failover', fromProvider, fromModel, toProvider: t.providerId, toModel: t.modelId, reason: 'bridge-cooldown', message: `${skipReason}; starting this turn on the backup ${t.providerId}/${t.modelId}.` });
               await emit({ type: 'notice', kind: 'failover', message: `${skipReason}; starting this turn on the backup ${t.providerId}/${t.modelId}.` });
               providerId = t.providerId;
@@ -2524,7 +2579,7 @@ ${record.priorContext ?? ''}`;
         const t = resolveFailoverTarget({ bot: opts.bot, excludeProviderId: providerId });
         if (t) {
           const hp = providerHealth.health(providerId, model);
-          provider = opts.apiKeyOverride ? createProvider(t.providerId, { apiKey: opts.apiKeyOverride }) : this.resolveProvider(t.providerId);
+          provider = opts.apiKeyOverride ? createProvider(t.providerId, { apiKey: opts.apiKeyOverride }) : this.resolveProvider(t.providerId, opts.bot);
           await emit({ type: 'failover', fromProvider: providerId, fromModel: model, toProvider: t.providerId, toModel: t.modelId, reason: 'provider-health', message: `Provider ${providerId} is unhealthy (${hp.failures} recent failures, ${hp.lastErrorKind ?? 'error'}); starting this turn on the backup.` });
           providerId = t.providerId; model = t.modelId;
         }
@@ -2805,7 +2860,7 @@ ${record.priorContext ?? ''}`;
           const classified = classifyProviderError(err, { providerId });
           const errText = err instanceof Error ? err.message : String(err);
           const failedBridge = bridgeIdForProviderId(providerId);
-          const failedAccount = bridgeAccountIdForBot(opts.bot);
+          const failedAccount = failedBridge ? acctId(failedBridge) : bridgeAccountIdForBot(opts.bot);
           if (failedBridge) {
             try {
               this.bridgeCooldowns.recordFailure(failedBridge, failedAccount, err);
@@ -2831,17 +2886,26 @@ ${record.priorContext ?? ''}`;
           const autoCooldownReason = autoBridge
             ? cooldownSkipReason(this.bridgeCooldowns, autoBridge, failedAccount)
             : null;
+          // A6: a healthy sibling account of the failed bridge is an
+          // AUTO-lane swap candidate (decideBridgeSwap ignores it for
+          // explicit selections — selection integrity).
+          const sibling =
+            failedBridge && !failoverUsed && opts.explicitSelection !== true
+              ? findHealthySiblingAccount(getBridgeAccountStore(), this.bridgeCooldowns, failedBridge, failedAccount)
+              : undefined;
           const decision = decideBridgeSwap({
             explicitSelection: opts.explicitSelection === true,
             quotaDeath: classified.isLimit,
             driverFailure: err instanceof CliDriverError || isBridgeOrAgentProviderId(providerId),
             failedProviderId: providerId,
+            failedModelId: model,
             failedReason: classified.isLimit ? `usage limit / quota death: ${errText}` : errText,
             declaredBackup: failoverUsed ? null : declaredSelectionBackup(opts.bot, opts),
             autoTarget,
             autoTargetCooldownReason: autoCooldownReason,
+            siblingAccount: sibling ? { accountId: sibling.id } : null,
           });
-          let target: { providerId: string; modelId: string; reason: string } | null = null;
+          let target: { providerId: string; modelId: string; reason: string; accountId?: string } | null = null;
           if (decision.action === 'refuse') {
             llmStep?.end({ ok: false, errorKind: 'selection-refused' });
             throw new ProviderSelectionRefusedError({
@@ -2854,7 +2918,9 @@ ${record.priorContext ?? ''}`;
             target =
               decision.via === 'declared-backup'
                 ? { ...decision.target, reason: 'pre-declared selection backup' }
-                : { ...decision.target, reason: autoResolved?.reason ?? 'auto failover' };
+                : decision.via === 'sibling-account'
+                  ? { ...decision.target, reason: `sibling account "${decision.target.accountId}" of the same bridge` }
+                  : { ...decision.target, reason: autoResolved?.reason ?? 'auto failover' };
           } else if (opts.explicitSelection !== true && classified.isModelUnavailable && autoTarget && !autoCooldownReason) {
             // W1 quick fallback for a vanished model (not a quota death):
             // unchanged auto behaviour.
@@ -2884,7 +2950,14 @@ ${record.priorContext ?? ''}`;
             assertModelAllowed(target.providerId, target.modelId);
             backupProvider = opts.apiKeyOverride
               ? createProvider(target.providerId, { apiKey: opts.apiKeyOverride })
-              : this.resolveProvider(target.providerId);
+              : target.accountId
+                ? this.resolveProvider(target.providerId, opts.bot, target.accountId)
+                : this.resolveProvider(target.providerId);
+            // A6: a sibling-account swap re-keys this turn's bookkeeping
+            // to the account that is about to run.
+            if (target.accountId && failedBridge) {
+              turnAccountOverrides.set(failedBridge, target.accountId);
+            }
           } catch {
             llmStep?.end({ ok: false, errorKind: err instanceof Error ? err.name : 'Error' });
             throw err;
@@ -2945,7 +3018,9 @@ ${record.priorContext ?? ''}`;
             const backupBridge = bridgeIdForProviderId(target.providerId);
             if (backupBridge) {
               try {
-                this.bridgeCooldowns.recordFailure(backupBridge, failedAccount, backupErr);
+                // A6: a sibling-account backup's death is recorded
+                // against the SIBLING account, not the original one.
+                this.bridgeCooldowns.recordFailure(backupBridge, target.accountId ?? failedAccount, backupErr);
               } catch { /* the registry must never break a turn */ }
             }
             llmStep?.end({ ok: false, errorKind: backupErr instanceof Error ? backupErr.name : 'Error' });
@@ -2960,9 +3035,9 @@ ${record.priorContext ?? ''}`;
           if (doneBridge) {
             try {
               if (isSterileBridgeContent(turn.content)) {
-                this.bridgeCooldowns.recordSterileTurn(doneBridge, bridgeAccountIdForBot(opts.bot));
+                this.bridgeCooldowns.recordSterileTurn(doneBridge, acctId(doneBridge));
               } else {
-                this.bridgeCooldowns.recordSuccess(doneBridge, bridgeAccountIdForBot(opts.bot));
+                this.bridgeCooldowns.recordSuccess(doneBridge, acctId(doneBridge));
               }
             } catch { /* bookkeeping must never break a turn */ }
           }

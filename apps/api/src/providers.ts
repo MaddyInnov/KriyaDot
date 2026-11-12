@@ -19,6 +19,8 @@ import fs from 'node:fs';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import path from 'node:path';
 import {
+  bridgeAccountSignedIn,
+  bridgeAccountSpawnEnv,
   bridgeConnectable,
   bridgePinnedMessage,
   cliPathPinEnvName,
@@ -43,9 +45,11 @@ import {
   setCliPathPin,
   templateFieldEnvName,
   usageWarningFromSnapshot,
+  type BridgeAccount,
 } from '@mvp/agent-runtime';
 import type { CliBridgeId, ModelInfo } from '@mvp/agent-runtime';
 import type { ProviderInfo } from './types.js';
+import { loadBridgeAccountStore } from './bridge-accounts-routes.js';
 
 const LOCAL_KEYS_FILE = 'providers.local.json';
 const CUSTOM_ID_PATTERN = /^custom-[a-z0-9][a-z0-9-]*$/;
@@ -427,7 +431,14 @@ export function recheckBridgeAccount(
   const registry = getBridgeCooldownRegistry(path.join(dataDir, 'bridge-state.json'));
   const cleared = registry.recheck(id, accountId);
   resetBridgeUsageCache();
-  const gauge = probeBridgeUsage(id, { accountId, fresh: true });
+  // A6: re-probe under the account's own config-dir env.
+  const account = loadBridgeAccountStore(dataDir).get(id, accountId);
+  const env = account ? bridgeAccountSpawnEnv(account) : {};
+  const gauge = probeBridgeUsage(id, {
+    accountId,
+    fresh: true,
+    ...(Object.keys(env).length > 0 ? { env } : {}),
+  });
   const entry = registry.get(id, accountId);
   return {
     accountId,
@@ -696,14 +707,34 @@ export async function listProviders(dataDir: string): Promise<ProviderInfo[]> {
       // providers.local.json, on first use.
       {
         const registry = getBridgeCooldownRegistry(path.join(dataDir, 'bridge-state.json'));
-        const accountIds = [DEFAULT_BRIDGE_ACCOUNT_ID];
-        // A6 readiness: any account with cooldown state is surfaced too.
+        // A6: the bridge's REAL accounts (machine default + every stored
+        // sign-in), loaded from <dataDir>/bridge-accounts.json. Any
+        // account id with cooldown state that is not in the store
+        // (e.g. a legacy Claude profile id) is surfaced too.
+        const store = loadBridgeAccountStore(dataDir);
+        const accounts: BridgeAccount[] = store.list(preset.bridge);
+        const seen = new Set(accounts.map((a) => a.id));
         for (const e of registry.list()) {
-          if (e.bridgeId === preset.bridge && !accountIds.includes(e.accountId)) accountIds.push(e.accountId);
+          if (e.bridgeId === preset.bridge && !seen.has(e.accountId)) {
+            seen.add(e.accountId);
+            accounts.push({
+              id: e.accountId,
+              bridgeId: preset.bridge,
+              label: e.accountId,
+              machineDefault: false,
+              createdByUs: false,
+            });
+          }
         }
-        info.bridgeAccounts = accountIds.map((accountId) => {
+        const userDefaultId = store.userDefaultId(preset.bridge) ?? DEFAULT_BRIDGE_ACCOUNT_ID;
+        info.bridgeAccounts = accounts.map((account) => {
+          const accountId = account.id;
+          // A6: the gauge probe runs under THIS account's config-dir
+          // env — otherwise a non-default account would report the
+          // machine default's figures.
+          const env = bridgeAccountSpawnEnv(account);
           const gauge = info.detected
-            ? probeBridgeUsage(preset.bridge!, { accountId })
+            ? probeBridgeUsage(preset.bridge!, { accountId, ...(Object.keys(env).length > 0 ? { env } : {}) })
             : {
                 utilisationPercent: null,
                 resetAtMs: null,
@@ -712,6 +743,12 @@ export async function listProviders(dataDir: string): Promise<ProviderInfo[]> {
           const entry = registry.get(preset.bridge!, accountId);
           return {
             accountId,
+            label: account.label,
+            machineDefault: account.machineDefault,
+            isUserDefault: userDefaultId === accountId,
+            configDir: account.configDir ?? null,
+            signedIn: bridgeAccountSignedIn(account),
+            createdByUs: account.createdByUs,
             usage: {
               utilisationPercent: gauge.utilisationPercent,
               resetAt: gauge.resetAtMs !== null ? new Date(gauge.resetAtMs).toISOString() : null,

@@ -36,6 +36,7 @@ import { getDefaultModel, getProviderPreset } from './catalog.js';
 import type { BotConfig, ChatMessage } from '../types.js';
 import type { CliBridgeId } from './cli-bridge.js';
 import { DEFAULT_BRIDGE_ACCOUNT_ID } from './cli-usage.js';
+import { resolveBridgeAccountId } from './bridge-accounts.js';
 
 /** Agent-CLI driver ids that map onto subscription bridges. */
 const AGENT_CLI_TO_BRIDGE: Record<string, CliBridgeId> = {
@@ -59,14 +60,30 @@ export function bridgeIdForProviderId(providerId: string): CliBridgeId | undefin
   return undefined;
 }
 
-/** The account a bot's bridge turns run under (A6: profile id; else default). */
-export function bridgeAccountIdForBot(bot: Pick<BotConfig, 'accountProfile'>): string {
-  return bot.accountProfile ?? DEFAULT_BRIDGE_ACCOUNT_ID;
+/**
+ * The account a bot's bridge turns run under. With a bridge id this is
+ * the full A6 precedence (bot's per-bridge pick → legacy Claude profile
+ * → user's default choice → machine default, resolved against the
+ * process-wide bridge-account store); without one it keeps the A1
+ * behaviour (the bot's Claude profile id, else 'default').
+ */
+export function bridgeAccountIdForBot(
+  bot: Pick<BotConfig, 'accountProfile' | 'bridgeAccounts'>,
+  bridgeId?: CliBridgeId,
+): string {
+  if (bridgeId) return resolveBridgeAccountId(bot, bridgeId);
+  return bot.bridgeAccounts?.claude ?? bot.accountProfile ?? DEFAULT_BRIDGE_ACCOUNT_ID;
 }
 
 export interface SwapTarget {
   providerId: string;
   modelId: string;
+  /**
+   * A6: when the target is a SIBLING ACCOUNT of the same bridge (same
+   * provider + model, different account), the account the retry runs
+   * under. Absent for ordinary cross-provider targets.
+   */
+  accountId?: string;
 }
 
 /**
@@ -89,7 +106,7 @@ export function declaredSelectionBackup(
 }
 
 export type SwapDecision =
-  | { action: 'swap'; target: SwapTarget; via: 'declared-backup' | 'auto' }
+  | { action: 'swap'; target: SwapTarget; via: 'declared-backup' | 'auto' | 'sibling-account' }
   | { action: 'refuse'; reason: string }
   | { action: 'fail'; reason?: string };
 
@@ -111,10 +128,20 @@ export function decideBridgeSwap(args: {
   quotaDeath: boolean;
   driverFailure: boolean;
   failedProviderId: string;
+  /** The model that died (a sibling-account swap keeps the same model). */
+  failedModelId?: string;
   failedReason: string;
   declaredBackup: SwapTarget | null;
   autoTarget: SwapTarget | null;
   autoTargetCooldownReason?: string | null;
+  /**
+   * A6: a healthy sibling account of the SAME bridge (same provider +
+   * model, different account id), when one exists. AUTO lanes only —
+   * an explicit selection never treats a sibling as a backup candidate
+   * (the user picked that account's provider; a sibling is a different
+   * sign-in they did not pick).
+   */
+  siblingAccount?: { accountId: string } | null;
 }): SwapDecision {
   const death = args.quotaDeath || args.driverFailure;
   if (args.explicitSelection) {
@@ -130,6 +157,20 @@ export function decideBridgeSwap(args: {
     };
   }
   if (!args.quotaDeath) return { action: 'fail' };
+  // A6 sibling-account swap (auto lane only — explicit selections
+  // returned above): the same provider/model on a healthy sibling
+  // account of the same bridge beats leaving the bridge entirely.
+  if (args.siblingAccount) {
+    return {
+      action: 'swap',
+      target: {
+        providerId: args.failedProviderId,
+        modelId: args.failedModelId ?? '',
+        accountId: args.siblingAccount.accountId,
+      },
+      via: 'sibling-account',
+    };
+  }
   if (!args.autoTarget) return { action: 'fail' };
   if (args.autoTargetCooldownReason) {
     return { action: 'fail', reason: args.autoTargetCooldownReason };

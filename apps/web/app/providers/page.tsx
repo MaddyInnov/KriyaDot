@@ -6,6 +6,7 @@ import {
   cancelCliLogin,
   clearBridgeCliPath,
   connectBridge,
+  createBridgeAccount,
   disconnectBridge,
   getCliAuthStatus,
   getModelsCatalogInfo,
@@ -13,8 +14,11 @@ import {
   pollCliLogin,
   recheckBridgeAccount,
   refreshModelsCatalog,
+  removeBridgeAccount,
   removeProviderKey,
+  renameBridgeAccount,
   saveProviderKey,
+  setBridgeAccountDefault,
   setBridgeCliPath,
   startCliLogin,
   submitCliLoginCode,
@@ -84,20 +88,36 @@ function cliLabelFor(bridge?: string): string {
 }
 
 /**
- * A1: one bridge account row — usage gauge (or the honest "usage
- * unknown") plus cooldown state as a chip, with a manual Re-check action
- * while cooled down. No new screens: this lives inside the bridge card.
+ * A1 + A6: one bridge account row in the account list — label, default /
+ * sign-in chips, the usage gauge (or the honest "usage unknown") plus
+ * cooldown state, and the account actions: sign in (into this account's
+ * own config dir), rename, set as my default, remove. The machine
+ * default account is the machine's existing sign-in: it has no config
+ * dir of ours and cannot be renamed or removed. No new screens: this
+ * lives inside the bridge card.
  */
 function BridgeAccountLine({
   account,
   saving,
   onRecheck,
+  onSignInAccount,
+  onRenameAccount,
+  onSetDefaultAccount,
+  onRemoveAccount,
 }: {
   account: NonNullable<ProviderInfo['bridgeAccounts']>[number];
   saving: boolean;
   onRecheck: (accountId: string) => void;
+  onSignInAccount: (account: NonNullable<ProviderInfo['bridgeAccounts']>[number]) => void;
+  onRenameAccount: (accountId: string, label: string) => void;
+  onSetDefaultAccount: (accountId: string) => void;
+  onRemoveAccount: (accountId: string, deleteConfigDir: boolean) => void;
 }) {
   const { usage, cooldown } = account;
+  const [renaming, setRenaming] = useState(false);
+  const [labelDraft, setLabelDraft] = useState(account.label ?? account.accountId);
+  const [confirmingRemove, setConfirmingRemove] = useState(false);
+  const [deleteDir, setDeleteDir] = useState(false);
   const usageText =
     usage.utilisationPercent === null
       ? 'usage unknown'
@@ -111,18 +131,97 @@ function BridgeAccountLine({
           ? 'exhausted — top up or re-check'
           : 'unavailable — circuit breaker open';
   return (
-    <p className="small muted" style={{ marginTop: 4 }}>
-      Account {account.accountId}: Usage: {usageText}
-      {chip && (
-        <>
-          {' '}
-          <span className="chip amber" title={cooldown?.reason}>{chip}</span>{' '}
-          <button className="btn btn-sm" disabled={saving} onClick={() => onRecheck(account.accountId)}>
-            Re-check
+    <div style={{ marginTop: 6, borderTop: '1px dashed var(--border, #e5e7eb)', paddingTop: 6 }}>
+      <p className="small" style={{ margin: 0 }}>
+        <strong>{account.label ?? account.accountId}</strong>{' '}
+        {account.machineDefault && <span className="chip gray">machine default</span>}{' '}
+        {account.isUserDefault && <span className="chip green">your default</span>}{' '}
+        {account.signedIn !== undefined && (
+          <span className={`chip ${account.signedIn ? 'green' : 'amber'}`}>
+            {account.signedIn ? 'signed in' : 'not signed in'}
+          </span>
+        )}
+      </p>
+      <p className="small muted" style={{ marginTop: 2 }}>
+        Usage: {usageText}
+        {chip && (
+          <>
+            {' '}
+            <span className="chip amber" title={cooldown?.reason}>{chip}</span>{' '}
+            <button className="btn btn-sm" disabled={saving} onClick={() => onRecheck(account.accountId)}>
+              Re-check
+            </button>
+          </>
+        )}
+      </p>
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 2 }}>
+        {!account.machineDefault && account.signedIn === false && (
+          <button className="btn btn-sm" disabled={saving} onClick={() => onSignInAccount(account)}>
+            Sign in to this account
           </button>
-        </>
+        )}
+        {!account.isUserDefault && (
+          <button className="btn btn-sm" disabled={saving} onClick={() => onSetDefaultAccount(account.accountId)}>
+            Set as my default
+          </button>
+        )}
+        {!account.machineDefault && !renaming && (
+          <button className="btn btn-sm" disabled={saving} onClick={() => { setLabelDraft(account.label ?? account.accountId); setRenaming(true); }}>
+            Rename
+          </button>
+        )}
+        {!account.machineDefault && !confirmingRemove && (
+          <button className="btn btn-sm" disabled={saving} onClick={() => setConfirmingRemove(true)}>
+            Remove
+          </button>
+        )}
+      </div>
+      {renaming && (
+        <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
+          <input
+            className="input"
+            aria-label="Account label"
+            value={labelDraft}
+            onChange={(e) => setLabelDraft(e.target.value)}
+          />
+          <button
+            className="btn btn-sm"
+            disabled={saving || !labelDraft.trim()}
+            onClick={() => { onRenameAccount(account.accountId, labelDraft.trim()); setRenaming(false); }}
+          >
+            Save label
+          </button>
+          <button className="btn btn-sm" onClick={() => setRenaming(false)}>Cancel</button>
+        </div>
       )}
-    </p>
+      {confirmingRemove && (
+        <div className="warn-box" style={{ marginTop: 6 }}>
+          <p className="small" style={{ margin: 0 }}>
+            Remove the “{account.label ?? account.accountId}” account from KriyaDot? This removes
+            KriyaDot’s record of the account. The sign-in data the CLI stored is only deleted if
+            you also delete the config directory KriyaDot created for it
+            {account.configDir ? ` (${account.configDir})` : ''} — directories you supplied
+            yourself are never deleted. Bots set to this account fall back to your default account.
+          </p>
+          {account.createdByUs && (
+            <label className="small" style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
+              <input type="checkbox" checked={deleteDir} onChange={(e) => setDeleteDir(e.target.checked)} />
+              Also delete the config directory KriyaDot created for this account
+            </label>
+          )}
+          <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
+            <button
+              className="btn btn-danger btn-sm"
+              disabled={saving}
+              onClick={() => { onRemoveAccount(account.accountId, deleteDir); setConfirmingRemove(false); }}
+            >
+              Remove account
+            </button>
+            <button className="btn btn-sm" onClick={() => setConfirmingRemove(false)}>Keep account</button>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -138,6 +237,11 @@ function BridgeCard({
   onSaveCliPath,
   onClearCliPath,
   onRecheck,
+  onSignInAccount,
+  onAddAccount,
+  onRenameAccount,
+  onSetDefaultAccount,
+  onRemoveAccount,
 }: {
   p: ProviderInfo;
   /** Model ids to display (already filtered by the "Free only" toggle). */
@@ -152,6 +256,11 @@ function BridgeCard({
   onSaveCliPath: (p: ProviderInfo, path: string) => void;
   onClearCliPath: (p: ProviderInfo) => void;
   onRecheck: (p: ProviderInfo, accountId: string) => void;
+  onSignInAccount: (p: ProviderInfo, account: NonNullable<ProviderInfo['bridgeAccounts']>[number]) => void;
+  onAddAccount: (p: ProviderInfo, label: string) => void;
+  onRenameAccount: (p: ProviderInfo, accountId: string, label: string) => void;
+  onSetDefaultAccount: (p: ProviderInfo, accountId: string) => void;
+  onRemoveAccount: (p: ProviderInfo, accountId: string, deleteConfigDir: boolean) => void;
 }) {
   const cliLabel = cliLabelFor(p.bridge);
   const signedIn = authStatus?.signedIn === true;
@@ -161,6 +270,8 @@ function BridgeCard({
   useEffect(() => {
     setCliPathDraft(p.cliPath ?? '');
   }, [p.cliPath]);
+  // A6: "Add account" label draft (per card).
+  const [newAccountLabel, setNewAccountLabel] = useState('');
   return (
     <div className="card">
       <div className="row-between">
@@ -191,8 +302,42 @@ function BridgeCard({
           account={account}
           saving={saving === p.id}
           onRecheck={(accountId) => onRecheck(p, accountId)}
+          onSignInAccount={(a) => onSignInAccount(p, a)}
+          onRenameAccount={(accountId, label) => onRenameAccount(p, accountId, label)}
+          onSetDefaultAccount={(accountId) => onSetDefaultAccount(p, accountId)}
+          onRemoveAccount={(accountId, deleteDir) => onRemoveAccount(p, accountId, deleteDir)}
         />
       ))}
+      <div className="field" style={{ marginTop: 10 }}>
+        <label className="label" htmlFor={`add-account-${p.id}`}>
+          Add another {cliLabel} account
+        </label>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <input
+            id={`add-account-${p.id}`}
+            className="input"
+            autoComplete="off"
+            placeholder="Label, e.g. Work login"
+            value={newAccountLabel}
+            onChange={(e) => setNewAccountLabel(e.target.value)}
+          />
+          <button
+            className="btn btn-sm"
+            disabled={saving === p.id || !newAccountLabel.trim()}
+            onClick={() => {
+              onAddAccount(p, newAccountLabel.trim());
+              setNewAccountLabel('');
+            }}
+          >
+            Add account
+          </button>
+        </div>
+        <p className="small muted" style={{ marginTop: 4 }}>
+          The new account gets its own sign-in folder, separate from your existing login —
+          adding it never signs you out of the account you already use. After adding, use
+          “Sign in to this account” on its row.
+        </p>
+      </div>
       <div className="warn-box" style={{ marginTop: 8 }}>
         <strong>Use your {cliLabel} login — no API key needed.</strong>
         <br />
@@ -285,11 +430,16 @@ function BridgeCard({
 function CliSignInModal({
   cliLabel,
   cliId,
+  accountId,
+  accountLabel,
   onClose,
   onDone,
 }: {
   cliLabel: string;
   cliId: string;
+  /** A6: when set, this sign-in runs against that bridge account's own config dir. */
+  accountId?: string;
+  accountLabel?: string;
   onClose: () => void;
   onDone: () => void;
 }) {
@@ -308,7 +458,7 @@ function CliSignInModal({
     let timer: ReturnType<typeof setInterval> | undefined;
     (async () => {
       try {
-        const started = await startCliLogin(cliId);
+        const started = await startCliLogin(cliId, accountId);
         if (cancelled) {
           void cancelCliLogin(cliId, started.loginId).catch(() => undefined);
           return;
@@ -347,7 +497,7 @@ function CliSignInModal({
       if (timer) clearInterval(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cliId]);
+  }, [cliId, accountId]);
 
   const cancel = async () => {
     if (loginId) {
@@ -377,7 +527,16 @@ function CliSignInModal({
   return (
     <div className="modal-overlay" onClick={cancel}>
       <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 520 }}>
-        <h3>Sign in to {cliLabel}</h3>
+        <h3>
+          Sign in to {cliLabel}
+          {accountLabel ? ` — ${accountLabel}` : ''}
+        </h3>
+        {accountLabel && (
+          <p className="small muted">
+            This sign-in is saved under the “{accountLabel}” account only — your other
+            {' '}{cliLabel} sign-ins are not touched.
+          </p>
+        )}
         {phase === 'starting' && <p className="small muted">Starting the {cliLabel} login…</p>}
         {phase === 'failed' && (
           <>
@@ -502,7 +661,11 @@ export default function ProvidersPage() {
   const [templateVals, setTemplateVals] = useState<Record<string, Record<string, string>>>({});
   // In-app CLI sign-in status (OpenMausBot parity).
   const [cliAuth, setCliAuth] = useState<CliLoginStatus[]>([]);
-  const [signInFor, setSignInFor] = useState<ProviderInfo | null>(null);
+  const [signInFor, setSignInFor] = useState<{
+    provider: ProviderInfo;
+    accountId?: string;
+    accountLabel?: string;
+  } | null>(null);
   // API keys picker: search text + the provider whose config dialog is
   // open (42 full cards were an endless scroll — the list is compact now
   // and the existing form opens in a dialog on select).
@@ -705,6 +868,73 @@ export default function ProvidersPage() {
             ? `${p.name} account ${state.accountId} re-checked — still cooling down (${state.cooldown.family}). A live rate-limit window is the provider's and is not cleared early.`
             : `${p.name} account ${state.accountId} re-checked.`,
       );
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving('');
+    }
+  };
+
+  // A6: bridge account management (add / rename / set-default / remove).
+  // Every action round-trips the API then refreshes the providers list —
+  // the list is the source of truth for labels, defaults and sign-ins.
+  const addAccount = async (p: ProviderInfo, label: string) => {
+    if (!p.bridge) return;
+    setSaving(p.id);
+    setError('');
+    setNotice('');
+    try {
+      const { account } = await createBridgeAccount(p.bridge, label);
+      setNotice(
+        `${p.name}: account “${account.label}” added. Use “Sign in to this account” on its row to sign in — your existing sign-in is untouched.`,
+      );
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving('');
+    }
+  };
+
+  const renameAccount = async (p: ProviderInfo, accountId: string, label: string) => {
+    if (!p.bridge) return;
+    setSaving(p.id);
+    setError('');
+    try {
+      await renameBridgeAccount(p.bridge, accountId, label);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving('');
+    }
+  };
+
+  const setDefaultAccount = async (p: ProviderInfo, accountId: string) => {
+    if (!p.bridge) return;
+    setSaving(p.id);
+    setError('');
+    setNotice('');
+    try {
+      await setBridgeAccountDefault(p.bridge, accountId);
+      setNotice(`${p.name}: your default account is now “${accountId}”. Bots without their own account pick will run on it.`);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving('');
+    }
+  };
+
+  const removeAccount = async (p: ProviderInfo, accountId: string, deleteConfigDir: boolean) => {
+    if (!p.bridge) return;
+    setSaving(p.id);
+    setError('');
+    setNotice('');
+    try {
+      const res = await removeBridgeAccount(p.bridge, accountId, deleteConfigDir);
+      setNotice(`${p.name}: ${res.configDirNote}`);
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -947,18 +1177,27 @@ export default function ProvidersPage() {
               authStatus={p.bridge ? cliAuth.find((c) => c.cliId === p.bridge) : undefined}
               onConnect={connect}
               onDisconnect={disconnect}
-              onSignIn={(bp) => setSignInFor(bp)}
+              onSignIn={(bp) => setSignInFor({ provider: bp })}
               onSaveCliPath={(bp, path) => void saveCliPath(bp, path)}
               onClearCliPath={(bp) => void clearCliPath(bp)}
               onRecheck={(bp, accountId) => void recheck(bp, accountId)}
+              onSignInAccount={(bp, account) =>
+                setSignInFor({ provider: bp, accountId: account.accountId, accountLabel: account.label ?? account.accountId })
+              }
+              onAddAccount={(bp, label) => void addAccount(bp, label)}
+              onRenameAccount={(bp, accountId, label) => void renameAccount(bp, accountId, label)}
+              onSetDefaultAccount={(bp, accountId) => void setDefaultAccount(bp, accountId)}
+              onRemoveAccount={(bp, accountId, deleteDir) => void removeAccount(bp, accountId, deleteDir)}
             />
           ))}
         </>
       )}
-      {signInFor?.bridge && (
+      {signInFor?.provider.bridge && (
         <CliSignInModal
-          cliLabel={cliLabelFor(signInFor.bridge)}
-          cliId={signInFor.bridge}
+          cliLabel={cliLabelFor(signInFor.provider.bridge)}
+          cliId={signInFor.provider.bridge}
+          accountId={signInFor.accountId}
+          accountLabel={signInFor.accountLabel}
           onClose={() => setSignInFor(null)}
           onDone={() => {
             void refresh();

@@ -37,6 +37,7 @@ import {
 import { useCollapsed } from '../../lib/use-collapsed';
 import { CollapseChevron } from '../collapse';
 import { MemoryProposalsSection } from './memory-proposals';
+import { MemoryDreamsSection } from './memory-dreams';
 
 export const MEMORY_CATEGORIES = [
   'fact',
@@ -152,6 +153,7 @@ export function MemoryExplorerPanel() {
   const askCol = useCollapsed('memory-explorer-ask', false);
   const ingestCol = useCollapsed('memory-explorer-ingestion', false);
   const proposalsCol = useCollapsed('memory-explorer-proposals', false);
+  const dreamsCol = useCollapsed('memory-explorer-dreams', false);
 
   useEffect(() => {
     let live = true;
@@ -390,6 +392,21 @@ export function MemoryExplorerPanel() {
         <div className={`kd-collapsible${proposalsCol.collapsed ? ' closed' : ''}`}>
           <div className="kd-collapsible-inner">
             {botId ? <MemoryProposalsSection key={botId} botId={botId} /> : <p className="muted">Pick a bot first.</p>}
+          </div>
+        </div>
+      </section>
+
+      {/* ---- Dreams (A11): overnight improvement leads, propose-only --- */}
+      <section className="card" aria-label="Dreams" style={{ marginBottom: 12 }}>
+        <SectionHead
+          title="Dreams — improvement leads"
+          collapsed={dreamsCol.collapsed}
+          onToggle={dreamsCol.toggle}
+          testId="memory-dreams-head"
+        />
+        <div className={`kd-collapsible${dreamsCol.collapsed ? ' closed' : ''}`}>
+          <div className="kd-collapsible-inner">
+            {botId ? <MemoryDreamsSection key={`dreams-${botId}`} botId={botId} /> : <p className="muted">Pick a bot first.</p>}
           </div>
         </div>
       </section>
