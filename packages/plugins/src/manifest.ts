@@ -10,7 +10,8 @@
 //     "description": "Example tools",
 //     "kinds": ["tool"],
 //     "entry": "index.js",              // required for executable kinds
-//     "permissions": { "network": false, "env": ["SOME_TOKEN"] },
+//     "permissions": { "network": false, "env": ["SOME_TOKEN"],
+//                      "fs": { "read": ["/data/shared"], "write": [] } },
 //     "ui": { "dir": "public", "title": "Panel" }  // required for kind "ui"
 //   }
 //
@@ -34,15 +35,32 @@ export type PluginKind = (typeof PLUGIN_KINDS)[number];
 /** Kinds whose plugin runs code (stdio JSON-RPC child process). */
 export const EXECUTABLE_KINDS: readonly PluginKind[] = ['tool', 'hook', 'channel'];
 
+export interface PluginFsPermissions {
+  /** Additional ABSOLUTE paths the plugin child may read (read+execute),
+   *  beyond its own directory and the runtime allowlist. Enforced by the
+   *  kernel sandbox (plugin-sandbox.ts); surfaced at install approval. */
+  read?: string[];
+  /** Additional ABSOLUTE paths the plugin child may read AND write,
+   *  beyond its own directory. Enforced like `read`. */
+  write?: string[];
+}
+
 export interface PluginPermissions {
-  /** Declared network access. Declarative: recorded and surfaced to the
-   *  approval flow / UI. The stdio sandbox does not itself block sockets
-   *  (no portable way without an OS sandbox); hosts that need hard
-   *  isolation should run plugins under their sandbox backend. */
+  /** Declared network access. ENFORCED by the kernel sandbox
+   *  (plugin-sandbox.ts): anything other than `true` means the child
+   *  runs with network access denied (network namespace + Landlock NET
+   *  rules on Linux, Seatbelt network denial on macOS). On a host with
+   *  no kernel sandbox backend, a plugin that does not declare
+   *  `network: true` (plus filesystem access to "/") is REFUSED rather
+   *  than run unconfined — see plugin-sandbox.ts fail-closed policy. */
   network?: boolean;
   /** Names of host environment variables the plugin process may see.
    *  Everything else is scrubbed from the child environment. */
   env?: string[];
+  /** Additional filesystem grants beyond the plugin's own directory.
+   *  The child is otherwise confined to its own directory (read+write)
+   *  plus a read-only runtime allowlist. */
+  fs?: PluginFsPermissions;
 }
 
 export interface PluginUiSpec {
@@ -141,7 +159,7 @@ export function validateManifest(raw: unknown): PluginManifest {
   let permissions: PluginPermissions | undefined;
   if (raw.permissions !== undefined) {
     if (!isRecord(raw.permissions)) {
-      issues.push('permissions must be an object { network?: boolean, env?: string[] }');
+      issues.push('permissions must be an object { network?: boolean, env?: string[], fs?: { read?: string[], write?: string[] } }');
     } else {
       permissions = {};
       if (raw.permissions.network !== undefined) {
@@ -153,6 +171,41 @@ export function validateManifest(raw: unknown): PluginManifest {
           issues.push('permissions.env must be an array of environment variable names (e.g. ["MY_TOKEN"])');
         } else {
           permissions.env = [...(raw.permissions.env as string[])];
+        }
+      }
+      if (raw.permissions.fs !== undefined) {
+        if (!isRecord(raw.permissions.fs)) {
+          issues.push('permissions.fs must be an object { read?: string[], write?: string[] }');
+        } else {
+          // Declared grants are part of the approval surface, so they are
+          // kept literal: absolute paths only, no ".." segments (nothing
+          // for the sandbox layer to reinterpret), bounded in count/size.
+          const validGrantList = (v: unknown): v is string[] =>
+            Array.isArray(v) &&
+            v.length <= 32 &&
+            v.every(
+              (p) =>
+                typeof p === 'string' &&
+                p.length <= 512 &&
+                p.startsWith('/') &&
+                !p.includes('\\') &&
+                p.split('/').every((seg) => seg !== '..'),
+            );
+          const fs: PluginFsPermissions = {};
+          let fsOk = true;
+          if (raw.permissions.fs.read !== undefined) {
+            if (!validGrantList(raw.permissions.fs.read)) {
+              issues.push('permissions.fs.read must be an array of at most 32 absolute paths (no "..", no backslashes)');
+              fsOk = false;
+            } else fs.read = [...raw.permissions.fs.read];
+          }
+          if (raw.permissions.fs.write !== undefined) {
+            if (!validGrantList(raw.permissions.fs.write)) {
+              issues.push('permissions.fs.write must be an array of at most 32 absolute paths (no "..", no backslashes)');
+              fsOk = false;
+            } else fs.write = [...raw.permissions.fs.write];
+          }
+          if (fsOk) permissions.fs = fs;
         }
       }
     }

@@ -6,6 +6,7 @@ export * from './governance.js';
 export * from './providers/catalog.js';
 export * from './providers/models-dev.js';
 export * from './providers/cli-bridge.js';
+export * from './providers/provider-manifest.js';
 export * from './providers/cli-identity.js';
 export * from './providers/bridge-accounts.js';
 export * from './providers/cli-usage.js';

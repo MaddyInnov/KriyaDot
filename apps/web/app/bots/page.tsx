@@ -309,7 +309,7 @@ function ModelPicker({
     backup?: {
       backupProvider?: string;
       backupModel?: string;
-      bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode', string>>;
+      bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode' | 'copilot' | 'grok' | 'kimi' | 'pi' | 'hermes', string>>;
     },
   ) => void;
 }) {
@@ -365,7 +365,7 @@ function ModelPicker({
   const provider = providers.find((p) => p.id === bot.provider);
   // A6: bridge account picker data — the accounts of the bot provider's
   // bridge, from the Providers surface (labels + sign-in state included).
-  const bridgeId = provider?.bridge as 'claude' | 'codex' | 'opencode' | undefined;
+  const bridgeId = provider?.bridge as 'claude' | 'codex' | 'opencode' | 'copilot' | 'grok' | 'kimi' | 'pi' | 'hermes' | undefined;
   const bridgeAccounts = provider?.bridgeAccounts ?? [];
   useEffect(() => {
     if (bridgeId) setBridgeAccount(bot.bridgeAccounts?.[bridgeId] ?? '');
@@ -939,7 +939,7 @@ function BotsPageInner() {
     backup?: {
       backupProvider?: string;
       backupModel?: string;
-      bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode', string>>;
+      bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode' | 'copilot' | 'grok' | 'kimi' | 'pi' | 'hermes', string>>;
     },
   ) => {
     setBots((prev) =>

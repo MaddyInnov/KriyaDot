@@ -18,7 +18,14 @@ import { OpenAICompatibleProvider } from './openai-compatible.js';
 import { createAgentCliProvider, parseAgentProviderId } from './agent-cli.js';
 import { createAcpEngineProvider } from './acp-engines.js';
 import { createNativeCliDriver } from './cli-driver.js';
-import { loadBridgeTokenAtPath, loadBridgeTokenForClaudeProfile } from './cli-bridge.js';
+import {
+  bridgeResolutionFailureMessage,
+  isBridgeConnected,
+  loadBridgeTokenAtPath,
+  loadBridgeTokenForClaudeProfile,
+  resolveVerifiedCliExecutable,
+} from './cli-bridge.js';
+import { getProviderManifest, isLegacyCliBridgeId } from './provider-manifest.js';
 import { BedrockProvider } from './bedrock.js';
 import { VertexProvider } from './vertex.js';
 import { CohereProvider } from './cohere.js';
@@ -157,6 +164,44 @@ export function createProvider(
       createNativeCliDriver(`agent/codex/${defaultModel}`, { ...(opts?.env ? { env: opts.env } : {}) }) ??
       createAgentCliProvider(`agent/codex/${defaultModel}`)
     );
+  }
+
+  // A2 manifest-first bridges (copilot / grok / kimi / pi / hermes):
+  // the turns run through the CLI itself — ACP mode for copilot / grok /
+  // kimi / hermes, the one-shot agent driver for pi — parameterised by
+  // the bridge's manifest driver block, never a bespoke driver. The
+  // executable is resolved through the SAME identity-verified path as
+  // the legacy bridges (a same-named impostor is never spawned), and
+  // Connect consent is required exactly like the other bridges: without
+  // it the lane refuses as "not connected" instead of silently running.
+  if (preset.bridge && !isLegacyCliBridgeId(preset.bridge)) {
+    const bridge = preset.bridge;
+    const manifest = getProviderManifest(bridge);
+    const defaultModel = getDefaultModel(preset.id) || 'default';
+    if (!isBridgeConnected(bridge)) {
+      throw new Error(
+        `${preset.name} is not connected: click Connect in the Providers settings page to use your ${manifest.displayName} login. ` +
+          `The CLI handles its own auth; KriyaDot never reads its credential bytes.`,
+      );
+    }
+    const resolution = resolveVerifiedCliExecutable(bridge);
+    if (!resolution.path) {
+      throw new Error(bridgeResolutionFailureMessage(bridge, resolution));
+    }
+    if (manifest.driver.kind === 'acp') {
+      const acp = createAcpEngineProvider(`agent/${manifest.driver.agentCliId}/${defaultModel}`, {
+        command: resolution.path,
+        ...(opts?.env ? { env: opts.env } : {}),
+      });
+      if (acp) return acp;
+    }
+    // agent-cli kind (pi): the one-shot driver with the verified binary.
+    // Residual (same class as A6's opencode ACP note): the one-shot
+    // provider spawns with the inherited process env, so a non-default
+    // account's PI_CODING_AGENT_DIR is not applied on this lane yet.
+    return createAgentCliProvider(`agent/${manifest.driver.agentCliId}/${defaultModel}`, {
+      command: resolution.path,
+    });
   }
 
   // A6: a Claude bridge turn scoped to a non-default account reads the

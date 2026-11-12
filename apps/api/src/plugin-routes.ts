@@ -38,6 +38,7 @@ import {
   PluginManifestError,
   PluginNotFoundError,
   ZipError,
+  pluginSandboxStatusSync,
   type InstalledPlugin,
   type PluginInstallSource,
   type PluginManager,
@@ -133,7 +134,12 @@ export function createPluginRouter(deps: PluginRouterDeps): Router {
   const audit = deps.audit ?? (() => {});
 
   router.get('/plugins', (_req, res) => {
-    res.json({ ok: true, plugins: manager.list().map(serializeInstalledPlugin) });
+    // OPEN-2: surface the host's plugin-sandbox capability honestly.
+    // `backend` names the kernel backend for this platform; enforcement
+    // is per-invocation — a restrictive plugin whose declarations cannot
+    // be enforced on this host is refused at invoke time, never run
+    // unconfined (see @mvp/plugins plugin-sandbox.ts).
+    res.json({ ok: true, sandbox: pluginSandboxStatusSync(), plugins: manager.list().map(serializeInstalledPlugin) });
   });
 
   router.get('/plugins/:id', (req, res) => {

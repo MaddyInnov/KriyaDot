@@ -109,7 +109,8 @@ afterEach(() => {
 describe('detection', () => {
   it('detects nothing on a bare machine', () => {
     const found = detectCliBridges();
-    expect(found).toHaveLength(3); // claude, codex, opencode bridges
+    // A2: detection covers all eight manifest bridges (was 3 before A2).
+    expect(found).toHaveLength(8);
     expect(found.every((d) => d.detected === false)).toBe(true);
     expect(detectCliBridge('claude').credentialsPresent).toBe(false);
   });

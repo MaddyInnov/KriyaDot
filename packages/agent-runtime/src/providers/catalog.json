@@ -19,7 +19,7 @@
         }
       ],
       "name": "AI21 Labs",
-      "notes": "AI21's OpenAI-compatible chat completions API. Use your own AI21 API key (AI21_API_KEY) \u2014 never a shared or pooled key."
+      "notes": "AI21's OpenAI-compatible chat completions API. Use your own AI21 API key (AI21_API_KEY) — never a shared or pooled key."
     },
     "aihorde": {
       "api": "aihorde",
@@ -161,6 +161,31 @@
       ],
       "name": "Cerebras"
     },
+    "claude-subscription": {
+      "id": "claude-subscription",
+      "name": "Claude subscription (Claude Code login)",
+      "api": "anthropic",
+      "baseUrl": "https://api.anthropic.com/v1",
+      "envKey": "CLAUDE_SUBSCRIPTION_TOKEN",
+      "bridge": "claude",
+      "models": [
+        {
+          "id": "claude-opus-4-1",
+          "name": "Claude Opus 4.1",
+          "default": true
+        },
+        {
+          "id": "claude-sonnet-4-5",
+          "name": "Claude Sonnet 4.5"
+        },
+        {
+          "id": "claude-haiku-4-5",
+          "name": "Claude Haiku 4.5"
+        }
+      ],
+      "notes": "Uses YOUR Claude Code CLI login (~/.claude/.credentials.json) — no API key needed. Shown only when the CLI is detected; requires your explicit Connect consent. Token is read at request time and never stored or logged.",
+      "liveModels": true
+    },
     "cloudflare-ai-gateway": {
       "api": "openai-compatible",
       "baseUrl": "",
@@ -234,31 +259,6 @@
         }
       ]
     },
-    "claude-subscription": {
-      "id": "claude-subscription",
-      "name": "Claude subscription (Claude Code login)",
-      "api": "anthropic",
-      "baseUrl": "https://api.anthropic.com/v1",
-      "envKey": "CLAUDE_SUBSCRIPTION_TOKEN",
-      "bridge": "claude",
-      "models": [
-        {
-          "id": "claude-opus-4-1",
-          "name": "Claude Opus 4.1",
-          "default": true
-        },
-        {
-          "id": "claude-sonnet-4-5",
-          "name": "Claude Sonnet 4.5"
-        },
-        {
-          "id": "claude-haiku-4-5",
-          "name": "Claude Haiku 4.5"
-        }
-      ],
-      "notes": "Uses YOUR Claude Code CLI login (~/.claude/.credentials.json) \u2014 no API key needed. Shown only when the CLI is detected; requires your explicit Connect consent. Token is read at request time and never stored or logged.",
-      "liveModels": true
-    },
     "codex-subscription": {
       "id": "codex-subscription",
       "name": "ChatGPT subscription (Codex CLI login)",
@@ -309,7 +309,7 @@
           "name": "o4-mini"
         }
       ],
-      "notes": "Uses YOUR Codex CLI login (~/.codex/auth.json) \u2014 no API key needed. Shown only when the CLI is detected; requires your explicit Connect consent. Token is read at request time and never stored or logged.",
+      "notes": "Uses YOUR Codex CLI login (~/.codex/auth.json) — no API key needed. Shown only when the CLI is detected; requires your explicit Connect consent. Token is read at request time and never stored or logged.",
       "liveModels": true
     },
     "cohere": {
@@ -336,7 +336,32 @@
         }
       ],
       "name": "Cohere",
-      "notes": "Cohere's native v2 chat API (NOT OpenAI-shaped) via the dedicated Cohere driver. Use your own Cohere API key (COHERE_API_KEY) \u2014 never a shared or pooled key."
+      "notes": "Cohere's native v2 chat API (NOT OpenAI-shaped) via the dedicated Cohere driver. Use your own Cohere API key (COHERE_API_KEY) — never a shared or pooled key."
+    },
+    "copilot-subscription": {
+      "id": "copilot-subscription",
+      "name": "GitHub Copilot subscription (Copilot CLI login)",
+      "api": "openai-compatible",
+      "baseUrl": "https://api.githubcopilot.com",
+      "envKey": "COPILOT_SUBSCRIPTION_TOKEN",
+      "bridge": "copilot",
+      "liveModels": false,
+      "models": [
+        {
+          "id": "default",
+          "name": "Copilot default model",
+          "default": true
+        },
+        {
+          "id": "gpt-5",
+          "name": "GPT-5 (via Copilot)"
+        },
+        {
+          "id": "claude-sonnet-4.5",
+          "name": "Claude Sonnet 4.5 (via Copilot)"
+        }
+      ],
+      "notes": "Uses YOUR GitHub Copilot CLI login (shared GitHub CLI login, ~/.config/gh/hosts.yml) — no API key needed. Turns run through the Copilot CLI itself (ACP mode); KriyaDot never reads GitHub credential bytes. Shown only when the CLI is detected; requires your explicit Connect consent. Copilot documents no per-account config-dir knob, so this bridge is single-account (see the copilot provider manifest)."
     },
     "deepinfra": {
       "api": "openai-compatible",
@@ -362,7 +387,7 @@
         }
       ],
       "name": "DeepInfra",
-      "notes": "DeepInfra's OpenAI-compatible API. Use your own DeepInfra API key (DEEPINFRA_API_KEY) \u2014 never a shared or pooled key."
+      "notes": "DeepInfra's OpenAI-compatible API. Use your own DeepInfra API key (DEEPINFRA_API_KEY) — never a shared or pooled key."
     },
     "deepseek": {
       "api": "openai-compatible",
@@ -383,7 +408,7 @@
         }
       ],
       "name": "DeepSeek",
-      "notes": "DeepSeek's OpenAI-compatible API. Use your own DeepSeek API key (DEEPSEEK_API_KEY) from platform.deepseek.com \u2014 never a shared or pooled key."
+      "notes": "DeepSeek's OpenAI-compatible API. Use your own DeepSeek API key (DEEPSEEK_API_KEY) from platform.deepseek.com — never a shared or pooled key."
     },
     "fireworks": {
       "api": "openai-compatible",
@@ -432,6 +457,31 @@
       "name": "Google AI Studio (Gemini)",
       "notes": "Google AI Studio / Gemini API through Google's OpenAI-compatible endpoint; paste an AI Studio API key (aistudio.google.com/apikey). Models are fetched live from the endpoint. Vertex AI (GCP service accounts) is the separate Vertex preset."
     },
+    "grok-subscription": {
+      "id": "grok-subscription",
+      "name": "Grok subscription (Grok CLI login)",
+      "api": "openai-compatible",
+      "baseUrl": "https://api.x.ai/v1",
+      "envKey": "GROK_SUBSCRIPTION_TOKEN",
+      "bridge": "grok",
+      "liveModels": false,
+      "models": [
+        {
+          "id": "grok-4.7",
+          "name": "Grok 4.7",
+          "default": true
+        },
+        {
+          "id": "grok-4.6",
+          "name": "Grok 4.6"
+        },
+        {
+          "id": "grok-4.5",
+          "name": "Grok 4.5"
+        }
+      ],
+      "notes": "Uses YOUR Grok Build CLI login (~/.grok) — no xAI API key needed. Turns run through the Grok CLI itself (ACP mode); KriyaDot never reads its credential bytes. Shown only when the CLI is detected; requires your explicit Connect consent. No per-account config-dir knob is verified for this CLI, so this bridge is single-account (see the grok provider manifest)."
+    },
     "groq": {
       "api": "openai-compatible",
       "baseUrl": "https://api.groq.com/openai/v1",
@@ -461,6 +511,23 @@
         }
       ],
       "name": "Groq"
+    },
+    "hermes-subscription": {
+      "id": "hermes-subscription",
+      "name": "Hermes subscription (Hermes Agent login)",
+      "api": "openai-compatible",
+      "baseUrl": "https://inference.nousresearch.com/v1",
+      "envKey": "HERMES_SUBSCRIPTION_TOKEN",
+      "bridge": "hermes",
+      "liveModels": false,
+      "models": [
+        {
+          "id": "hermes-default",
+          "name": "Hermes configured default model",
+          "default": true
+        }
+      ],
+      "notes": "Uses YOUR Hermes Agent setup (~/.hermes, HERMES_HOME per account) — no API key needed. Turns run through the Hermes CLI itself (ACP mode); KriyaDot never reads its credential bytes. Shown only when the CLI is detected; requires your explicit Connect consent."
     },
     "huggingface": {
       "api": "openai-compatible",
@@ -505,7 +572,36 @@
         }
       ],
       "name": "Hyperbolic",
-      "notes": "Hyperbolic's OpenAI-compatible API. Use your own Hyperbolic API key (HYPERBOLIC_API_KEY) \u2014 never a shared or pooled key."
+      "notes": "Hyperbolic's OpenAI-compatible API. Use your own Hyperbolic API key (HYPERBOLIC_API_KEY) — never a shared or pooled key."
+    },
+    "kimi-subscription": {
+      "id": "kimi-subscription",
+      "name": "Kimi subscription (Kimi CLI login)",
+      "api": "openai-compatible",
+      "baseUrl": "https://api.moonshot.ai/v1",
+      "envKey": "KIMI_SUBSCRIPTION_TOKEN",
+      "bridge": "kimi",
+      "liveModels": false,
+      "models": [
+        {
+          "id": "kimi-code/k3",
+          "name": "Kimi K3",
+          "default": true
+        },
+        {
+          "id": "kimi-code/k3-256k",
+          "name": "Kimi K3 256K"
+        },
+        {
+          "id": "kimi-code/kimi-for-coding",
+          "name": "Kimi for Coding"
+        },
+        {
+          "id": "kimi-code/kimi-for-coding-highspeed",
+          "name": "Kimi for Coding Highspeed"
+        }
+      ],
+      "notes": "Uses YOUR Kimi Code CLI login (~/.kimi) — no Moonshot API key needed. Turns run through the Kimi CLI itself (ACP mode); KriyaDot never reads its credential bytes. Shown only when the CLI is detected; requires your explicit Connect consent. No per-account config-dir knob is verified for this CLI, so this bridge is single-account (see the kimi provider manifest)."
     },
     "lambda": {
       "api": "openai-compatible",
@@ -526,7 +622,7 @@
         }
       ],
       "name": "Lambda Inference",
-      "notes": "Lambda's OpenAI-compatible inference API. Use your own Lambda API key (LAMBDA_API_KEY) \u2014 never a shared or pooled key."
+      "notes": "Lambda's OpenAI-compatible inference API. Use your own Lambda API key (LAMBDA_API_KEY) — never a shared or pooled key."
     },
     "llamacpp": {
       "api": "llamacpp",
@@ -537,7 +633,7 @@
       "liveModels": true,
       "models": [],
       "name": "Local LLM (llama.cpp)",
-      "notes": "Managed local models via stock llama.cpp \u2014 zero-config binary download, GPU auto-detect, served on 127.0.0.1 only. No API key, ever. Manage it in Settings \u2192 Local LLM. Set KRIYADOT_LLAMACPP_PORT to change the server port.",
+      "notes": "Managed local models via stock llama.cpp — zero-config binary download, GPU auto-detect, served on 127.0.0.1 only. No API key, ever. Manage it in Settings → Local LLM. Set KRIYADOT_LLAMACPP_PORT to change the server port.",
       "replyTimeoutMs": 300000
     },
     "llm7-anonymous": {
@@ -562,7 +658,7 @@
         }
       ],
       "name": "LLM7.io (anonymous, best-effort)",
-      "notes": "Keyless community gateway \u2014 NO API key is sent. Anonymous limits are undocumented and shared per IP; treat as best-effort only, never the sole default. Prompts leave this device."
+      "notes": "Keyless community gateway — NO API key is sent. Anonymous limits are undocumented and shared per IP; treat as best-effort only, never the sole default. Prompts leave this device."
     },
     "lmstudio": {
       "api": "openai-compatible",
@@ -573,7 +669,7 @@
       "liveModels": true,
       "models": [],
       "name": "LM Studio (local)",
-      "notes": "Fully local models via LM Studio's OpenAI-compatible server \u2014 no API key needed, ever. Start LM Studio, load a model, and enable its local server (default http://localhost:1234/v1). Set LMSTUDIO_BASE_URL if it runs elsewhere. Model list is fetched live from /v1/models.",
+      "notes": "Fully local models via LM Studio's OpenAI-compatible server — no API key needed, ever. Start LM Studio, load a model, and enable its local server (default http://localhost:1234/v1). Set LMSTUDIO_BASE_URL if it runs elsewhere. Model list is fetched live from /v1/models.",
       "replyTimeoutMs": 300000
     },
     "meta": {
@@ -601,7 +697,7 @@
         }
       ],
       "name": "Meta (Muse API)",
-      "notes": "Meta's Muse model API (OpenAI-compatible chat completions). Use your own Meta API key (META_API_KEY) from dev.meta.ai \u2014 never a shared or pooled key. This is Meta's hosted Muse API, distinct from Llama weights served by other providers."
+      "notes": "Meta's Muse model API (OpenAI-compatible chat completions). Use your own Meta API key (META_API_KEY) from dev.meta.ai — never a shared or pooled key. This is Meta's hosted Muse API, distinct from Llama weights served by other providers."
     },
     "minimax": {
       "api": "openai-compatible",
@@ -648,7 +744,7 @@
         }
       ],
       "name": "Mistral AI",
-      "notes": "Mistral AI's OpenAI-compatible API. Use your own Mistral API key (MISTRAL_API_KEY) from console.mistral.ai \u2014 never a shared or pooled key."
+      "notes": "Mistral AI's OpenAI-compatible API. Use your own Mistral API key (MISTRAL_API_KEY) from console.mistral.ai — never a shared or pooled key."
     },
     "moonshot": {
       "api": "openai-compatible",
@@ -699,7 +795,7 @@
         }
       ],
       "name": "Nebius AI Studio",
-      "notes": "Nebius AI Studio's OpenAI-compatible API. Use your own Nebius API key (NEBIUS_API_KEY) \u2014 never a shared or pooled key."
+      "notes": "Nebius AI Studio's OpenAI-compatible API. Use your own Nebius API key (NEBIUS_API_KEY) — never a shared or pooled key."
     },
     "novita": {
       "api": "openai-compatible",
@@ -720,7 +816,7 @@
         }
       ],
       "name": "Novita AI",
-      "notes": "Novita's OpenAI-compatible API. Use your own Novita API key (NOVITA_API_KEY) \u2014 never a shared or pooled key."
+      "notes": "Novita's OpenAI-compatible API. Use your own Novita API key (NOVITA_API_KEY) — never a shared or pooled key."
     },
     "ollama": {
       "api": "ollama",
@@ -731,7 +827,7 @@
       "liveModels": true,
       "models": [],
       "name": "Ollama (local)",
-      "notes": "Fully local models via Ollama \u2014 no API key needed, ever. Install from https://ollama.com/download, pull a model (e.g. \"ollama pull llama3.1\"), and it just works. Set OLLAMA_HOST if Ollama runs on another host.",
+      "notes": "Fully local models via Ollama — no API key needed, ever. Install from https://ollama.com/download, pull a model (e.g. \"ollama pull llama3.1\"), and it just works. Set OLLAMA_HOST if Ollama runs on another host.",
       "replyTimeoutMs": 300000
     },
     "omnirush": {
@@ -743,7 +839,7 @@
       "liveModels": false,
       "models": [],
       "name": "OmniRush (bring your own)",
-      "notes": "Bring-your-own preset. Paste YOUR OWN OmniRush API key/token from your own OmniRush account \u2014 never a shared or pooled key. Set the base URL from your OmniRush app/account; no endpoint is pre-configured."
+      "notes": "Bring-your-own preset. Paste YOUR OWN OmniRush API key/token from your own OmniRush account — never a shared or pooled key. Set the base URL from your OmniRush app/account; no endpoint is pre-configured."
     },
     "openai": {
       "api": "openai-compatible",
@@ -780,7 +876,7 @@
           "default": true
         }
       ],
-      "notes": "Uses YOUR OpenCode CLI login (~/.local/share/opencode/auth.json) \u2014 no API key needed. Shown only when the CLI is detected; requires your explicit Connect consent. Token is read at request time and never stored or logged."
+      "notes": "Uses YOUR OpenCode CLI login (~/.local/share/opencode/auth.json) — no API key needed. Shown only when the CLI is detected; requires your explicit Connect consent. Token is read at request time and never stored or logged."
     },
     "opencode-zen": {
       "api": "openai-compatible",
@@ -858,7 +954,7 @@
       ],
       "id": "opencode-zen",
       "name": "OpenCode Zen (bring your own)",
-      "notes": "Bring-your-own preset. Sign up at opencode.ai/zen for your own API key (no card needed for the free rotation). Free roster checked 2026-10-09 \u2014 it rotates, so the live /models fetch is authoritative; only -free models are zero-cost, most other Zen models are pay-as-you-go."
+      "notes": "Bring-your-own preset. Sign up at opencode.ai/zen for your own API key (no card needed for the free rotation). Free roster checked 2026-10-09 — it rotates, so the live /models fetch is authoritative; only -free models are zero-cost, most other Zen models are pay-as-you-go."
     },
     "openrouter": {
       "api": "openai-compatible",
@@ -879,7 +975,7 @@
       "envKey": "OVH_API_KEY",
       "id": "ovh-anonymous",
       "keyless": true,
-      "limitsNote": "Anonymous lane: 2 requests/min per model (shared) \u2014 modest limits",
+      "limitsNote": "Anonymous lane: 2 requests/min per model (shared) — modest limits",
       "models": [
         {
           "default": true,
@@ -899,7 +995,7 @@
         }
       ],
       "name": "OVHcloud AI Endpoints (anonymous)",
-      "notes": "Keyless lane of OVHcloud AI Endpoints (officially documented anonymous tier) \u2014 NO API key is sent. The driver rotates across models on 429 because the cap is per model. Prompts leave this device."
+      "notes": "Keyless lane of OVHcloud AI Endpoints (officially documented anonymous tier) — NO API key is sent. The driver rotates across models on 429 because the cap is per model. Prompts leave this device."
     },
     "perplexity": {
       "api": "openai-compatible",
@@ -925,7 +1021,24 @@
         }
       ],
       "name": "Perplexity",
-      "notes": "Perplexity's OpenAI-compatible chat completions API (preset is sufficient \u2014 its wire shape matches the shared driver; no provider-specific driver needed). Use your own Perplexity API key (PERPLEXITY_API_KEY) \u2014 never a shared or pooled key."
+      "notes": "Perplexity's OpenAI-compatible chat completions API (preset is sufficient — its wire shape matches the shared driver; no provider-specific driver needed). Use your own Perplexity API key (PERPLEXITY_API_KEY) — never a shared or pooled key."
+    },
+    "pi-subscription": {
+      "id": "pi-subscription",
+      "name": "Pi subscription (Pi coding agent login)",
+      "api": "openai-compatible",
+      "baseUrl": "https://api.openai.com/v1",
+      "envKey": "PI_SUBSCRIPTION_TOKEN",
+      "bridge": "pi",
+      "liveModels": false,
+      "models": [
+        {
+          "id": "default",
+          "name": "Pi configured default model",
+          "default": true
+        }
+      ],
+      "notes": "Uses YOUR Pi coding agent logins (~/.pi/agent/auth.json, PI_CODING_AGENT_DIR per account) — the providers and models are the ones you configured inside Pi; the single 'default' model label is honest about that. Turns run through the Pi CLI itself. Shown only when the CLI is detected; requires your explicit Connect consent."
     },
     "pollinations": {
       "api": "openai-compatible",
@@ -963,7 +1076,7 @@
         }
       ],
       "name": "SambaNova",
-      "notes": "SambaNova Cloud's OpenAI-compatible API. Use your own SambaNova API key (SAMBANOVA_API_KEY) \u2014 never a shared or pooled key."
+      "notes": "SambaNova Cloud's OpenAI-compatible API. Use your own SambaNova API key (SAMBANOVA_API_KEY) — never a shared or pooled key."
     },
     "together": {
       "api": "openai-compatible",

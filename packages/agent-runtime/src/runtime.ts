@@ -2501,7 +2501,7 @@ ${record.priorContext ?? ''}`;
     // that actually ran, not the one that died.
     const turnAccountOverrides = new Map<string, string>();
     const acctId = (bridge: string): string =>
-      turnAccountOverrides.get(bridge) ?? bridgeAccountIdForBot(opts.bot, bridge as 'claude' | 'codex' | 'opencode');
+      turnAccountOverrides.get(bridge) ?? bridgeAccountIdForBot(opts.bot, bridge as 'claude' | 'codex' | 'opencode' | 'copilot' | 'grok' | 'kimi' | 'pi' | 'hermes');
 
     // A1 cooldown consult: a bridge backend in active cooldown is
     // SKIPPED with the reason visible — never retried blindly. Auto

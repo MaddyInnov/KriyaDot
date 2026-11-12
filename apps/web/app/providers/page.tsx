@@ -71,16 +71,30 @@ function RateLimitLine({ rateLimit }: { rateLimit: RateLimitSnapshot | null }) {
 }
 
 /** Display names + terminal sign-in commands per bridge CLI. */
+// Display labels per bridge id. The bridge CARDS themselves derive
+// from the providers data (no hardcoded provider list); this map only
+// supplies the human label + terminal sign-in command per bridge id,
+// with a plain fallback for any id it doesn't know.
 const CLI_LABELS: Record<string, string> = {
   claude: 'Claude Code',
   codex: 'Codex CLI',
   opencode: 'OpenCode CLI',
+  copilot: 'GitHub Copilot CLI',
+  grok: 'Grok CLI',
+  kimi: 'Kimi CLI',
+  pi: 'Pi',
+  hermes: 'Hermes Agent',
 };
 
 const CLI_SIGNIN_COMMANDS: Record<string, string> = {
   claude: 'claude auth login',
   codex: 'codex login',
   opencode: 'opencode auth login',
+  copilot: 'copilot',
+  grok: 'grok login',
+  kimi: 'kimi login',
+  pi: 'pi',
+  hermes: 'hermes setup',
 };
 
 function cliLabelFor(bridge?: string): string {

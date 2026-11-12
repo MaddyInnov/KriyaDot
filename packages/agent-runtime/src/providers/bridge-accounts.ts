@@ -67,7 +67,22 @@ import {
 import { DEFAULT_BRIDGE_ACCOUNT_ID } from './cli-usage.js';
 
 /** The bridge ids that carry subscription accounts. */
-export const BRIDGE_ACCOUNT_BRIDGES: CliBridgeId[] = ['claude', 'codex', 'opencode'];
+/**
+ * Every bridge that carries subscription accounts: the original three
+ * plus the five A2 manifest-first bridges (multi-account from birth —
+ * a bridge whose CLI has no isolation knob is still registered here and
+ * modelled honestly via BRIDGE_ISOLATION's isolatable: false).
+ */
+export const BRIDGE_ACCOUNT_BRIDGES: CliBridgeId[] = [
+  'claude',
+  'codex',
+  'opencode',
+  'copilot',
+  'grok',
+  'kimi',
+  'pi',
+  'hermes',
+];
 
 export function isBridgeAccountBridge(v: unknown): v is CliBridgeId {
   return typeof v === 'string' && (BRIDGE_ACCOUNT_BRIDGES as string[]).includes(v);
@@ -107,6 +122,49 @@ export const BRIDGE_ISOLATION: Record<CliBridgeId, BridgeIsolationSpec> = {
     note:
       'OpenCode splits config and data: OPENCODE_CONFIG_DIR moves config only, NOT the login — ' +
       'the login (auth.json) follows XDG_DATA_HOME, so isolation sets the whole XDG family at per-account subdirs.',
+  },
+  // A2 bridges (declared in their provider manifests; kept field-equal
+  // by the A2 tests). copilot / grok / kimi document no per-account
+  // config-dir knob, so they are honestly single-account: accounts may
+  // be registered, but spawns carry no override and every account
+  // resolves to the machine's one login for that CLI.
+  copilot: {
+    bridgeId: 'copilot',
+    isolatable: false,
+    envKnobs: [],
+    note:
+      'GitHub Copilot CLI documents no per-account config-dir knob: it shares the GitHub CLI login ' +
+      '(~/.config/gh/hosts.yml) machine-wide. Modelled honestly as single-account.',
+  },
+  grok: {
+    bridgeId: 'grok',
+    isolatable: false,
+    envKnobs: [],
+    note:
+      'No per-account config-dir environment knob is verified for the Grok Build CLI (login under ~/.grok). ' +
+      'Modelled honestly as single-account until xAI documents one.',
+  },
+  kimi: {
+    bridgeId: 'kimi',
+    isolatable: false,
+    envKnobs: [],
+    note:
+      'No per-account config-dir environment knob is verified for the Kimi Code CLI (login under ~/.kimi). ' +
+      'Modelled honestly as single-account until Moonshot documents one.',
+  },
+  pi: {
+    bridgeId: 'pi',
+    isolatable: true,
+    envKnobs: ['PI_CODING_AGENT_DIR'],
+    note: 'PI_CODING_AGENT_DIR points Pi at a per-account agent dir (credentials at <dir>/auth.json).',
+  },
+  hermes: {
+    bridgeId: 'hermes',
+    isolatable: true,
+    envKnobs: ['HERMES_HOME'],
+    note:
+      'HERMES_HOME points Hermes at a per-account home dir (assumed knob — see the hermes manifest ' +
+      'verificationBasis); the machine default is ~/.hermes.',
   },
 };
 
@@ -158,7 +216,7 @@ export function validateBridgeAccount(
   if (typeof input !== 'object' || input === null) throw new Error('account must be an object');
   const o = input as Record<string, unknown>;
   if (!isBridgeAccountBridge(o.bridgeId)) {
-    throw new Error(`invalid bridge "${String(o.bridgeId)}" (expected claude, codex or opencode)`);
+    throw new Error(`invalid bridge "${String(o.bridgeId)}" (expected one of ${BRIDGE_ACCOUNT_BRIDGES.join(', ')})`);
   }
   const bridgeId = o.bridgeId;
   const id = typeof o.id === 'string' ? o.id.trim() : '';
@@ -200,11 +258,19 @@ export function managedAccountConfigDir(dataDir: string, bridgeId: CliBridgeId, 
 export function bridgeAccountSpawnEnv(account: BridgeAccount): Record<string, string> {
   if (account.machineDefault || !account.configDir) return {};
   const dir = account.configDir;
+  // A2: a bridge with no isolation knob spawns with NO override — the
+  // CLI always uses the machine's one login, whatever account record
+  // the turn resolved to (BRIDGE_ISOLATION carries the honest note).
+  if (!BRIDGE_ISOLATION[account.bridgeId].isolatable) return {};
   switch (account.bridgeId) {
     case 'claude':
       return { CLAUDE_CONFIG_DIR: dir };
     case 'codex':
       return { CODEX_HOME: dir };
+    case 'pi':
+      return { PI_CODING_AGENT_DIR: dir };
+    case 'hermes':
+      return { HERMES_HOME: dir };
     case 'opencode':
       return {
         XDG_CONFIG_HOME: join(dir, 'config'),
@@ -213,6 +279,10 @@ export function bridgeAccountSpawnEnv(account: BridgeAccount): Record<string, st
         XDG_CACHE_HOME: join(dir, 'cache'),
         OPENCODE_CONFIG_DIR: join(dir, 'config', 'opencode'),
       };
+    case 'copilot':
+    case 'grok':
+    case 'kimi':
+      return {}; // unreachable: non-isolatable bridges returned above
   }
 }
 
@@ -231,7 +301,23 @@ export function bridgeAccountCredentialsPath(account: BridgeAccount, homeDir: st
         return join(homeDir, '.codex', 'auth.json');
       case 'opencode':
         return join(homeDir, '.local', 'share', 'opencode', 'auth.json');
+      case 'copilot':
+        return join(homeDir, '.config', 'gh', 'hosts.yml');
+      case 'grok':
+        return join(homeDir, '.grok', 'auth.json');
+      case 'kimi':
+        return join(homeDir, '.kimi', 'credentials.json');
+      case 'pi':
+        return join(homeDir, '.pi', 'agent', 'auth.json');
+      case 'hermes':
+        return join(homeDir, '.hermes', 'auth.json');
     }
+  }
+  // A2: a non-isolatable bridge's CLI can only ever read the machine
+  // default location — probing an account dir would report a sign-in
+  // the CLI itself will never use.
+  if (!BRIDGE_ISOLATION[account.bridgeId].isolatable) {
+    return bridgeAccountCredentialsPath({ ...account, machineDefault: true, configDir: undefined }, homeDir);
   }
   const dir = account.configDir;
   switch (account.bridgeId) {
@@ -241,6 +327,15 @@ export function bridgeAccountCredentialsPath(account: BridgeAccount, homeDir: st
       return join(dir, 'auth.json');
     case 'opencode':
       return join(dir, 'data', 'opencode', 'auth.json');
+    case 'pi':
+      return join(dir, 'auth.json');
+    case 'hermes':
+      return join(dir, 'auth.json');
+    case 'copilot':
+    case 'grok':
+    case 'kimi':
+      // Unreachable (non-isolatable handled above); kept for exhaustiveness.
+      return join(dir, 'auth.json');
   }
 }
 

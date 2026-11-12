@@ -92,10 +92,18 @@ export interface ProviderInfo {
    */
   usageWarning?: { usedPercent: number; message: string; source: 'rate-limit' } | null;
   /**
-   * Subscription/CLI bridge (MausBot parity): 'claude' | 'codex' | 'opencode'. Set only on
+   * Subscription/CLI bridge (MausBot parity): any of the eight manifest bridge ids. Set only on
    * bridge presets (claude-subscription / codex-subscription / opencode-subscription).
    */
-  bridge?: 'claude' | 'codex' | 'opencode';
+  bridge?:
+    | 'claude'
+    | 'codex'
+    | 'opencode'
+    | 'copilot'
+    | 'grok'
+    | 'kimi'
+    | 'pi'
+    | 'hermes';
   /** Bridge only: a matching CLI or credential file was detected on this machine. */
   detected?: boolean;
   /** Bridge only: the user granted Connect consent (token readable in memory). */

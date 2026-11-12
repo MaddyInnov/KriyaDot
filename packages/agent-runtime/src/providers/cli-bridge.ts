@@ -20,7 +20,6 @@ import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { homedir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import {
-  CLI_IDENTITY_DECLARATIONS,
   extractSemver,
   getCachedIdentity,
   getCliPathPin,
@@ -33,13 +32,30 @@ import {
   statForCache,
   clearIdentityCache,
 } from './cli-identity.js';
+import {
+  ALL_CLI_BRIDGE_IDS,
+  getProviderManifest,
+  isLegacyCliBridgeId,
+  listProviderManifests,
+  manifestIdentityDeclaration,
+  type AnyCliBridgeId,
+  type LegacyCliBridgeId,
+} from './provider-manifest.js';
+
+export type { LegacyCliBridgeId } from './provider-manifest.js';
 
 // NOTE: the cli-identity helpers (declarations, pins, safe matching,
 // redaction) are exported from the package root via cli-identity.js
 // (see index.ts) — they are intentionally not re-exported here, so the
 // root surface has exactly one source per name.
 
-export type CliBridgeId = 'claude' | 'codex' | 'opencode';
+/**
+ * Every subscription bridge id. A2 widened this from the original three
+ * (claude / codex / opencode — see LegacyCliBridgeId) to all eight
+ * manifest-declared bridges; the original three keep their exact
+ * shipped behaviour everywhere below.
+ */
+export type CliBridgeId = AnyCliBridgeId;
 
 export interface BridgeDetection {
   id: CliBridgeId;
@@ -70,26 +86,25 @@ export interface DetectOptions {
 }
 
 /** Plain-language per-CLI facts used in user-facing state and error copy. */
+/**
+ * Plain-language per-CLI facts used in user-facing state and error copy.
+ * A2: derived from the provider manifests (the manifest is the declared
+ * source; for the original three bridges the manifest values are the
+ * exact strings that shipped in v0.2.2 — asserted by the A2 tests).
+ */
 export const CLI_BRIDGE_META: Record<
   CliBridgeId,
   { label: string; signInCommand: string; installCommand: string }
-> = {
-  claude: {
-    label: 'Claude Code',
-    signInCommand: 'claude auth login',
-    installCommand: 'npm install -g @anthropic-ai/claude-code',
-  },
-  codex: {
-    label: 'Codex CLI',
-    signInCommand: 'codex login',
-    installCommand: 'npm install -g @openai/codex',
-  },
-  opencode: {
-    label: 'OpenCode CLI',
-    signInCommand: 'opencode auth login',
-    installCommand: 'npm install -g opencode-ai',
-  },
-};
+> = Object.fromEntries(
+  listProviderManifests().map((m) => [
+    m.bridgeId,
+    {
+      label: m.displayName,
+      signInCommand: m.auth.signInCommand,
+      installCommand: m.binary.install.posix,
+    },
+  ]),
+) as Record<CliBridgeId, { label: string; signInCommand: string; installCommand: string }>;
 
 function defaultHomeDir(): string {
   // Honor $HOME explicitly so tests (and containers) can point detection at
@@ -195,11 +210,31 @@ function executableOnPath(name: string, pathDirs: string[], platform: NodeJS.Pla
   return false;
 }
 
-const BRIDGE_PATHS: Record<CliBridgeId, { cli: string; credentialsRel: string }> = {
+const BRIDGE_PATHS: Record<LegacyCliBridgeId, { cli: string; credentialsRel: string }> = {
   claude: { cli: 'claude', credentialsRel: join('.claude', '.credentials.json') },
   codex: { cli: 'codex', credentialsRel: join('.codex', 'auth.json') },
   opencode: { cli: 'opencode', credentialsRel: join('.local', 'share', 'opencode', 'auth.json') },
 };
+
+/**
+ * A2: binary name + credential location for EVERY bridge, derived from
+ * the provider manifests (the legacy three resolve to exactly the
+ * BRIDGE_PATHS values above). Detection and verified resolution run off
+ * this map; token-byte extraction stays legacy-only (the new bridges are
+ * `cli-own`: KriyaDot never reads their credential bytes).
+ */
+export const BRIDGE_PATHS_ALL: Record<CliBridgeId, { cli: string; credentialsRel: string }> =
+  Object.fromEntries(
+    listProviderManifests().map((m) => [
+      m.bridgeId,
+      { cli: m.binary.names[0]!, credentialsRel: join(...m.credentials.homeRelative.split('/')) },
+    ]),
+  ) as Record<CliBridgeId, { cli: string; credentialsRel: string }>;
+
+/** True when a value is one of the eight declared bridge ids. */
+export function isCliBridgeId(v: unknown): v is CliBridgeId {
+  return typeof v === 'string' && (ALL_CLI_BRIDGE_IDS as string[]).includes(v);
+}
 
 function detectOne(
   id: CliBridgeId,
@@ -208,7 +243,7 @@ function detectOne(
   platform: NodeJS.Platform,
   opts: DetectOptions = {},
 ): BridgeDetection {
-  const spec = BRIDGE_PATHS[id];
+  const spec = BRIDGE_PATHS_ALL[id];
   let cliPresent = executableOnPath(spec.cli, pathDirs, platform);
   if (!cliPresent) {
     // A8: a user-pinned CLI path counts for detection even when the CLI
@@ -236,7 +271,7 @@ export function detectCliBridges(opts: DetectOptions = {}): BridgeDetection[] {
   const homeDir = opts.homeDir ?? defaultHomeDir();
   const pathDirs = effectiveCliPathDirs(opts);
   const platform = opts.platform ?? process.platform;
-  return (Object.keys(BRIDGE_PATHS) as CliBridgeId[]).map((id) => detectOne(id, homeDir, pathDirs, platform, opts));
+  return ALL_CLI_BRIDGE_IDS.map((id) => detectOne(id, homeDir, pathDirs, platform, opts));
 }
 
 export function detectCliBridge(id: CliBridgeId, opts: DetectOptions = {}): BridgeDetection {
@@ -335,7 +370,9 @@ export function probeCliIdentity(
     if (cached) return cached;
   }
 
-  const decl = CLI_IDENTITY_DECLARATIONS[id];
+  // A2: the identity declaration comes from the bridge's manifest (for
+  // the legacy three it is field-for-field the A8 declaration).
+  const decl = manifestIdentityDeclaration(id);
   const timeoutMs = opts.timeoutMs ?? 5000;
   const versionRun = runCliSync(executablePath, decl.versionArgs, { platform: opts.platform, timeoutMs });
   const rejected = outputMatchesReject(versionRun.output, decl.rejectIfOutputContains);
@@ -455,7 +492,7 @@ export function resolveVerifiedCliExecutable(
       },
     };
   }
-  const candidates = enumerateCliCandidates(BRIDGE_PATHS[id].cli, opts);
+  const candidates = enumerateCliCandidates(BRIDGE_PATHS_ALL[id].cli, opts);
   let namesake: VerifiedCliResolution['namesake'];
   for (const candidate of candidates) {
     const probe = probeCliIdentity(id, candidate, { platform: opts.platform, timeoutMs: opts.timeoutMs });
@@ -477,7 +514,7 @@ export function bridgeNamesakeMessage(
   namesake: { path: string; looksLike?: string; firstLine?: string },
 ): string {
   const meta = CLI_BRIDGE_META[id];
-  const name = BRIDGE_PATHS[id].cli;
+  const name = BRIDGE_PATHS_ALL[id].cli;
   return (
     `Found a program named "${name}" on this machine, but it isn't ${meta.label}` +
     `${namesake.looksLike ? ` — it appears to be ${namesake.looksLike}` : ''}. ` +
@@ -729,12 +766,38 @@ function opencodeTokenFromFile(parsed: unknown): string | undefined {
 }
 
 /**
+ * A2 shape probe for a `cli-own` bridge's credential file (copilot /
+ * grok / kimi / pi / hermes): does a plausible login exist at this path?
+ * Boolean only — token bytes are never returned. For the GitHub hosts
+ * file the shape is the one cli-auth already used (a host entry carrying
+ * an `oauth_token:` or `user:` value); for the other cli-own bridges the
+ * honest signal available without reading credential semantics is a
+ * non-empty credential file at the manifest's declared location.
+ */
+export function manifestCredentialUsableAtPath(id: CliBridgeId, credentialsPath: string): boolean {
+  const manifest = getProviderManifest(id);
+  try {
+    const text = readFileSync(credentialsPath, 'utf8');
+    if (text.trim().length === 0) return false;
+    if (manifest.credentials.tokenShape === 'gh-hosts') {
+      return /^\s*(oauth_token|user):\s*\S+/m.test(text);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Load the bridge's bearer token from the CLI's stored credentials.
  * Returns undefined unless the user granted consent AND a token is readable.
  * The token is returned in memory only — callers must never persist or log it.
  */
 export function loadBridgeToken(id: CliBridgeId, homeDir?: string): string | undefined {
   if (!isBridgeConnected(id)) return undefined;
+  // A2 cli-own bridges have no HTTPS token lane: their turns run through
+  // the CLI itself (ACP / agent driver), which owns the login end to end.
+  if (!isLegacyCliBridgeId(id)) return undefined;
   const home = homeDir ?? defaultHomeDir();
   const parsed = readJsonFile(join(home, BRIDGE_PATHS[id].credentialsRel));
   if (parsed === undefined) return undefined;
@@ -751,6 +814,9 @@ export function loadBridgeToken(id: CliBridgeId, homeDir?: string): string | und
  */
 export function bridgeHasUsableToken(id: CliBridgeId, homeDir?: string): boolean {
   const home = homeDir ?? defaultHomeDir();
+  if (!isLegacyCliBridgeId(id)) {
+    return manifestCredentialUsableAtPath(id, join(home, BRIDGE_PATHS_ALL[id].credentialsRel));
+  }
   const parsed = readJsonFile(join(home, BRIDGE_PATHS[id].credentialsRel));
   if (parsed === undefined) return false;
   if (id === 'claude') return claudeTokenFromFile(parsed) !== undefined;
@@ -765,6 +831,7 @@ export function bridgeHasUsableToken(id: CliBridgeId, homeDir?: string): boolean
  * home). Boolean only — never returns token bytes.
  */
 export function bridgeHasUsableTokenAtPath(id: CliBridgeId, credentialsPath: string): boolean {
+  if (!isLegacyCliBridgeId(id)) return manifestCredentialUsableAtPath(id, credentialsPath);
   const parsed = readJsonFile(credentialsPath);
   if (parsed === undefined) return false;
   if (id === 'claude') return claudeTokenFromFile(parsed) !== undefined;
@@ -779,6 +846,8 @@ export function bridgeHasUsableTokenAtPath(id: CliBridgeId, credentialsPath: str
  */
 export function loadBridgeTokenAtPath(id: CliBridgeId, credentialsPath: string): string | undefined {
   if (!isBridgeConnected(id)) return undefined;
+  // A2 cli-own bridges: no token bytes are ever read (see loadBridgeToken).
+  if (!isLegacyCliBridgeId(id)) return undefined;
   const parsed = readJsonFile(credentialsPath);
   if (parsed === undefined) return undefined;
   if (id === 'claude') return claudeTokenFromFile(parsed);
@@ -801,6 +870,8 @@ function numberField(obj: unknown, path: string[]): number | undefined {
  * no credential file). Never returns token bytes.
  */
 export function bridgeTokenExpiry(id: CliBridgeId, homeDir?: string): number | undefined {
+  // A2 cli-own bridges expose no expiry KriyaDot may read.
+  if (!isLegacyCliBridgeId(id)) return undefined;
   const home = homeDir ?? defaultHomeDir();
   const parsed = readJsonFile(join(home, BRIDGE_PATHS[id].credentialsRel));
   if (parsed === undefined || typeof parsed !== 'object' || parsed === null) return undefined;
@@ -836,6 +907,9 @@ function safeAccountHint(value: unknown): string | undefined {
  * carry only tokens).
  */
 export function bridgeAccountHint(id: CliBridgeId, homeDir?: string): string | undefined {
+  // A2 cli-own bridges: cli-auth surfaces the Copilot GitHub username
+  // from hosts.yml itself; the others expose no identity KriyaDot reads.
+  if (!isLegacyCliBridgeId(id)) return undefined;
   const home = homeDir ?? defaultHomeDir();
   if (id === 'claude') {
     // ~/.claude.json carries the account profile next to the real
@@ -952,7 +1026,7 @@ export function bridgeConnectable(id: CliBridgeId, opts: DetectOptions = {}): Br
       ok: false,
       code: 'cli-missing',
       reason:
-        `A stored ${meta.label} login was found, but the ${BRIDGE_PATHS[id].cli} program itself wasn't found on this machine. ` +
+        `A stored ${meta.label} login was found, but the ${BRIDGE_PATHS_ALL[id].cli} program itself wasn't found on this machine. ` +
         `Install it (${meta.installCommand}) — your existing login will then work as-is.`,
     };
   }
@@ -1031,8 +1105,13 @@ export function resetBridgeModelsCache(): void {
 }
 
 export function getBridgeModels(id: CliBridgeId, opts: DetectOptions = {}): Array<{ id: string; name: string }> {
-  const spec = BRIDGE_PATHS[id];
+  const spec = BRIDGE_PATHS_ALL[id];
   if (!spec) return [];
+  // A2: the model source is the manifest's declaration. A catalog-static
+  // bridge (the legacy claude bridge + all five new bridges) has no CLI
+  // model-list command KriyaDot may trust — return [] and let the caller
+  // serve the curated catalog list, exactly as claude always behaved.
+  if (getProviderManifest(id).models.source !== 'cli-command') return [];
   if (id !== 'codex' && id !== 'opencode') return [];
   // Resolve first (identity probes are cached per file, so this is cheap):
   // the model cache is only valid for the SAME resolved binary — an A8 pin
@@ -1048,7 +1127,7 @@ export function getBridgeModels(id: CliBridgeId, opts: DetectOptions = {}): Arra
     return [];
   }
 
-  const args = id === 'codex' ? ['debug', 'models'] : ['models'];
+  const args = getProviderManifest(id).models.cliArgs ?? (id === 'codex' ? ['debug', 'models'] : ['models']);
   const { output } = runCliSync(resolution.path, args, { platform: opts.platform, timeoutMs: 10000 });
 
   const models: Array<{ id: string; name: string }> = [];

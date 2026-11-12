@@ -155,7 +155,7 @@ export function createBridgeAccountsRouter(deps: BridgeAccountsDeps): Router {
     try {
       const body = (req.body ?? {}) as { bridgeId?: unknown; label?: unknown; configDir?: unknown };
       if (!isBridgeAccountBridge(body.bridgeId)) {
-        res.status(400).json(errorBody('bridgeId must be one of claude, codex, opencode.'));
+        res.status(400).json(errorBody(`bridgeId must be one of ${BRIDGE_ACCOUNT_BRIDGES.join(', ')}.`));
         return;
       }
       const bridgeId = body.bridgeId;

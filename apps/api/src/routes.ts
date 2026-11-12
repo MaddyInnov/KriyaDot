@@ -99,8 +99,15 @@ import { registerKnowledgeRoutes } from './knowledge.js';
 // (single implementation — the duplicate modules were removed).
 import { attachNoteContextProvider, registerNoteAttachmentRoutes } from './note-attachments.js';
 import { attachSpendCapGate } from './spend-caps.js';
-import { registerTasksRoutes } from './tasks.js';
+import { registerTasksRoutes, TaskStore } from './tasks.js';
 import { ParkedIdeaStore, registerParkedIdeasRoutes } from './parked-ideas.js';
+import {
+  MissionDispatcher,
+  MissionService,
+  MissionStore,
+  createRuntimeBotRunner,
+  registerMissionRoutes,
+} from './missions.js';
 import { registerPagesRoutes } from './pages.js';
 import { registerPagePublicationRoutes } from './public-pages.js';
 import { registerBackgroundRunRoutes, registerSessionShareRoutes } from './session-share.js';
@@ -3658,6 +3665,60 @@ export function createRouter(deps: RouteDeps): express.Router {
   // B6: parked-ideas notebook — a SEPARATE store beside tasks, on
   // purpose, so no task enumeration/dispatcher can ever see an idea.
   registerParkedIdeasRoutes(router, { dataDir: config.dataDir });
+
+  // A5: coding missions + Kanban dispatcher. The service/dispatcher
+  // consume the Tasks store ONLY (parked ideas stay invisible, B6);
+  // the dispatcher defaults to disabled and landing always requires
+  // the 'mission-land' approval card (see missions.ts header).
+  {
+    const missionTaskStore = new TaskStore(config.dataDir);
+    const missionStore = new MissionStore(config.dataDir);
+    const missionService = new MissionService({
+      taskStore: missionTaskStore,
+      missionStore,
+      worktreeRoot: join(config.workspaceDir, '.worktrees'),
+      botRunner: createRuntimeBotRunner({
+        getBot: (botId) => bots.find((b) => b.id === botId),
+        runTurn: (opts) => agentRuntime.runTurn(opts as never),
+        attachWorktree: (sessionId, worktreePath) =>
+          agentRuntime.sessionStore.attachWorktree(sessionId, worktreePath),
+      }),
+      approvalGate: {
+        request: async (mission, summary) =>
+          governance.requestApproval(
+            'mission-land',
+            {
+              missionId: mission.id,
+              taskId: mission.taskId,
+              branch: mission.branch,
+              targetBranch: mission.targetBranch,
+              summary,
+            },
+            { sessionId: `mission:${mission.id}`, botId: 'mission-service', actor: 'mission-service' },
+          ),
+        awaitDecision: (approvalId) => governance.awaitDecision(approvalId),
+      },
+      audit: (action, fields) =>
+        governance.audit(action, {
+          actor: typeof fields.actor === 'string' ? fields.actor : 'mission-service',
+          detail: fields,
+        }),
+      getBot: (botId) => {
+        const b = bots.find((x) => x.id === botId);
+        return b ? { provider: b.provider, model: b.model } : undefined;
+      },
+      onTaskCompleted: (task) => {
+        if (task.ideaId) new ParkedIdeaStore(config.dataDir).noteTaskCompleted(task.id);
+      },
+    });
+    const missionDispatcher = new MissionDispatcher(missionService, missionTaskStore, missionStore);
+    registerMissionRoutes(router, {
+      dataDir: config.dataDir,
+      service: missionService,
+      dispatcher: missionDispatcher,
+      missionStore,
+    });
+  }
 
   // ---- Feature interconnection (P2-E) -------------------------------------
   // Notes/pages attachable to bot context (API surface; the context

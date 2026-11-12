@@ -29,6 +29,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import {
+  BRIDGE_PATHS_ALL,
   bridgeAccountHint,
   bridgeHasUsableToken,
   bridgeHasUsableTokenAtPath,
@@ -55,16 +56,30 @@ export interface CliAccountContext {
   credentialsPath?: string;
 }
 
-export type CliAuthId = 'claude' | 'codex' | 'opencode' | 'antigravity' | 'copilot';
+export type CliAuthId =
+  | 'claude'
+  | 'codex'
+  | 'opencode'
+  | 'antigravity'
+  | 'copilot'
+  | 'grok'
+  | 'kimi'
+  | 'pi'
+  | 'hermes';
 
-/** Map the auth-module ids onto the bridge ids (same CLIs). Antigravity and Copilot have no bridge. */
+/**
+ * Map the auth-module ids onto the bridge ids (same CLIs). Antigravity
+ * has no bridge. A2: Copilot became a bridge (its auth layout below is
+ * unchanged — the GitHub hosts.yml shape), joined by grok / kimi / pi /
+ * hermes, all declared in their provider manifests.
+ */
 function toBridgeId(id: CliAuthId): CliBridgeId {
-  if (id === 'antigravity' || id === 'copilot') throw new Error(`${id} has no CLI bridge`);
+  if (id === 'antigravity') throw new Error(`${id} has no CLI bridge`);
   return id;
 }
 
 function isBridgeId(id: CliAuthId): boolean {
-  return id === 'claude' || id === 'codex' || id === 'opencode';
+  return id !== 'antigravity';
 }
 
 /**
@@ -178,6 +193,10 @@ const CLI_COMMANDS: Record<CliAuthId, string> = {
   opencode: 'opencode',
   antigravity: 'agy',
   copilot: 'copilot',
+  grok: 'grok',
+  kimi: 'kimi',
+  pi: 'pi',
+  hermes: 'hermes',
 };
 
 /**
@@ -201,6 +220,15 @@ const LOGIN_ARGS: Record<CliAuthId, string[]> = {
   antigravity: [],
   // A bare `copilot` run walks through the GitHub login when unauthenticated.
   copilot: [],
+  // A2 (declared in each manifest's auth block; banner/args marked
+  // assumed there where no binary could be run to confirm them):
+  // grok / kimi expose a `login` command in their public docs; Hermes'
+  // sign-in lives in its `setup` flow; Pi signs in from its own first
+  // run / interactive `/login`, so a bare run is the honest spawn.
+  grok: ['login'],
+  kimi: ['login'],
+  pi: [],
+  hermes: ['setup'],
 };
 
 /** Command that reports login status without starting a flow (when available). */
@@ -215,6 +243,12 @@ const STATUS_COMMAND: Record<CliAuthId, string[] | null> = {
   antigravity: null,
   // No status subcommand; fall back to the gh hosts.yml shape.
   copilot: null,
+  // A2 bridges: no verified non-interactive status command — the
+  // credential-file shape probe is the sign-in signal (see manifests).
+  grok: null,
+  kimi: null,
+  pi: null,
+  hermes: null,
 };
 
 const URL_RE = /https?:\/\/[^\s"'<>]+/;
@@ -335,14 +369,10 @@ export class CliAuthManager {
     // A6: a non-default bridge account polls ITS OWN credential file.
     if (account?.credentialsPath && isBridgeId(id)) return account.credentialsPath;
     if (id === 'antigravity') return join(this.homeDir, ANTIGRAVITY_CRED_REL);
-    if (id === 'copilot') return join(this.homeDir, COPILOT_CRED_REL);
-    const rel =
-      id === 'claude'
-        ? join('.claude', '.credentials.json')
-        : id === 'codex'
-          ? join('.codex', 'auth.json')
-          : join('.local', 'share', 'opencode', 'auth.json');
-    return join(this.homeDir, rel);
+    // A2: every bridge's credential location comes from its manifest
+    // (BRIDGE_PATHS_ALL) — for copilot that is the same ~/.config/gh/
+    // hosts.yml this module has always probed (COPILOT_CRED_REL).
+    return join(this.homeDir, BRIDGE_PATHS_ALL[toBridgeId(id)].credentialsRel);
   }
 
   /**

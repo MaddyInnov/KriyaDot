@@ -19,6 +19,7 @@ import fs from 'node:fs';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import path from 'node:path';
 import {
+  ALL_CLI_BRIDGE_IDS,
   bridgeAccountSignedIn,
   bridgeAccountSpawnEnv,
   bridgeConnectable,
@@ -384,7 +385,10 @@ export function saveProviderKey(
   }
 }
 
-const BRIDGE_IDS: CliBridgeId[] = ['claude', 'codex', 'opencode'];
+// A2: every manifest-declared bridge (the original three plus copilot /
+// grok / kimi / pi / hermes) — derived from the runtime's manifest set,
+// not restated here.
+const BRIDGE_IDS: CliBridgeId[] = [...ALL_CLI_BRIDGE_IDS];
 
 function asBridgeId(value: unknown): CliBridgeId | undefined {
   return typeof value === 'string' && (BRIDGE_IDS as string[]).includes(value)
@@ -399,7 +403,7 @@ function asBridgeId(value: unknown): CliBridgeId | undefined {
  */
 export function connectBridge(bridgeId: string): void {
   const id = asBridgeId(bridgeId);
-  if (!id) throw new Error(`Unknown bridge "${bridgeId}". Expected one of "claude", "codex", "opencode".`);
+  if (!id) throw new Error(`Unknown bridge "${bridgeId}". Expected one of ${BRIDGE_IDS.join(', ')}.`);
   const probe = bridgeConnectable(id);
   if (!probe.ok) {
     // The probe reason is plain-words and actionable; the machine code
@@ -427,7 +431,7 @@ export function recheckBridgeAccount(
   accountId: string = DEFAULT_BRIDGE_ACCOUNT_ID,
 ): { accountId: string; cleared: boolean; utilisationPercent: number | null; resetAt: string | null; cooldown: { family: string; reason: string; until: string | null } | null } {
   const id = asBridgeId(bridgeId);
-  if (!id) throw new Error(`Unknown bridge "${bridgeId}". Expected one of "claude", "codex", "opencode".`);
+  if (!id) throw new Error(`Unknown bridge "${bridgeId}". Expected one of ${BRIDGE_IDS.join(', ')}.`);
   const registry = getBridgeCooldownRegistry(path.join(dataDir, 'bridge-state.json'));
   const cleared = registry.recheck(id, accountId);
   resetBridgeUsageCache();
@@ -532,7 +536,7 @@ export function setStoredCliPathPin(
   rawPath: unknown,
 ): { cliPath: string; cliPathError?: string } {
   const id = asBridgeId(bridgeId);
-  if (!id) throw new Error(`Unknown bridge "${bridgeId}". Expected one of "claude", "codex", "opencode".`);
+  if (!id) throw new Error(`Unknown bridge "${bridgeId}". Expected one of ${BRIDGE_IDS.join(', ')}.`);
   if (typeof rawPath !== 'string') throw new Error('CLI path must be a string (empty to clear).');
   const value = rawPath.trim();
   if (value.length > 1024 || /[\0\r\n]/.test(value)) {

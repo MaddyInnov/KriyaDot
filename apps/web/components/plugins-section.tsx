@@ -20,7 +20,7 @@ interface InstalledPluginDto {
   version: string;
   description: string;
   kinds: string[];
-  permissions: { network?: boolean; env?: string[] };
+  permissions: { network?: boolean; env?: string[]; fs?: { read?: string[]; write?: string[] } };
   ui?: { dir: string; title: string };
   enabled: boolean;
   installedAt: number;
@@ -76,7 +76,7 @@ export default function PluginsSection(): React.JSX.Element {
     try {
       await post('/api/plugins/install', { source, path: path.trim() });
       setPath('');
-      setNotice('Plugin installed. Executable plugins run as separate stdio processes with a scrubbed environment, but with your OS user\'s file and network access — only install plugins you trust.');
+      setNotice('Plugin installed. Executable plugins run as short-lived stdio processes with a scrubbed environment, confined by the host kernel sandbox (Landlock on Linux, Seatbelt on macOS) to their own directory plus any filesystem paths they declare, with network access only if they declare it. On a host without a kernel sandbox, plugins with restrictive declarations are refused rather than run unconfined. Installs are approval-gated — only install plugins you trust.');
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -118,7 +118,10 @@ export default function PluginsSection(): React.JSX.Element {
       <p>
         Third-party plugins extend KriyaDot with tools, hooks, skills, channels, and UI panels. Installs are
         approval-gated on the server; executable plugins run as short-lived stdio processes with a scrubbed
-        environment.
+        environment, confined by the host kernel sandbox (Landlock on Linux, Seatbelt on macOS) to their own
+        directory plus any filesystem paths they declare in their manifest, with network access only if they
+        declare it. On a host without a kernel sandbox backend, a plugin whose declared permissions are
+        restrictive will refuse to run rather than run unconfined.
       </p>
 
       {error ? <p role="alert" style={{ color: 'crimson' }}>{error}</p> : null}
@@ -162,8 +165,10 @@ export default function PluginsSection(): React.JSX.Element {
               <p style={{ margin: '0.25rem 0' }}>{plugin.description}</p>
               <p style={{ margin: '0.25rem 0', fontSize: '0.85em' }}>
                 Kinds: {plugin.kinds.join(', ')} · Source: {plugin.sourceType}
-                {plugin.permissions.network ? ' · Network: declared' : ''}
+                {plugin.permissions.network ? ' · Network: declared' : ' · Network: denied (sandbox)'}
                 {plugin.permissions.env?.length ? ` · Env: ${plugin.permissions.env.join(', ')}` : ''}
+                {plugin.permissions.fs?.read?.length ? ` · FS read: ${plugin.permissions.fs.read.join(', ')}` : ''}
+                {plugin.permissions.fs?.write?.length ? ` · FS write: ${plugin.permissions.fs.write.join(', ')}` : ''}
               </p>
               <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
                 <button type="button" onClick={() => void toggle(plugin)} disabled={busy === plugin.id}>

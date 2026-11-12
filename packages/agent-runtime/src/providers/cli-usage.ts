@@ -96,6 +96,34 @@ export const CLI_USAGE_PROBES: Record<CliBridgeId, CliUsageProbeDeclaration> = {
     statusArgs: null,
     note: 'OpenCode exposes no status/usage command at all; the gauge is always unknown.',
   },
+  // A2 bridges: no machine-readable usage surface exists for any of the
+  // five (see each manifest's verificationBasis) — the gauge is honestly
+  // null with source 'no-surface', never a fabricated figure.
+  copilot: {
+    bridgeId: 'copilot',
+    statusArgs: null,
+    note: 'Copilot CLI exposes no machine-readable usage surface; the gauge is always unknown.',
+  },
+  grok: {
+    bridgeId: 'grok',
+    statusArgs: null,
+    note: 'Grok CLI exposes no machine-readable usage surface; the gauge is always unknown.',
+  },
+  kimi: {
+    bridgeId: 'kimi',
+    statusArgs: null,
+    note: 'Kimi CLI exposes no machine-readable usage surface; the gauge is always unknown.',
+  },
+  pi: {
+    bridgeId: 'pi',
+    statusArgs: null,
+    note: 'Pi exposes no machine-readable subscription usage surface; the gauge is always unknown.',
+  },
+  hermes: {
+    bridgeId: 'hermes',
+    statusArgs: null,
+    note: 'Hermes exposes no machine-readable usage surface; the gauge is always unknown.',
+  },
 };
 
 // ---------------------------------------------------------------------------

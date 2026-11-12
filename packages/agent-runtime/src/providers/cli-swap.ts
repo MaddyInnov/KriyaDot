@@ -43,6 +43,12 @@ const AGENT_CLI_TO_BRIDGE: Record<string, CliBridgeId> = {
   'claude-code': 'claude',
   codex: 'codex',
   opencode: 'opencode',
+  // A2: the manifest-first bridges keep their own names as agent ids.
+  copilot: 'copilot',
+  grok: 'grok',
+  kimi: 'kimi',
+  pi: 'pi',
+  hermes: 'hermes',
 };
 
 /**

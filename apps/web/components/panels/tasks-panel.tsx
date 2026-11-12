@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { authedFetch } from '../../lib/api';
 
 interface Task {
@@ -12,6 +12,9 @@ interface Task {
   done: boolean;
   createdAt: number;
   updatedAt: number;
+  /** A5: chain blockers + coding-mission stage (missions.ts). */
+  blockedBy?: string[];
+  missionStage?: 'queued' | 'working' | 'review' | 'gate' | 'landed' | 'blocked';
 }
 
 interface CalendarEvent {
@@ -259,9 +262,20 @@ export function TasksPanel({ hideHeader = false }: { hideHeader?: boolean }) {
                     <input type="checkbox" checked={t.done} onChange={() => void toggleTask(t)} aria-label={`Mark "${t.title}" ${t.done ? 'open' : 'done'}`} />
                     <div>
                       <span style={{ textDecoration: t.done ? 'line-through' : 'none' }}>{t.title}</span>
+                      {t.missionStage && (
+                        <span className={`chip ${t.missionStage === 'blocked' ? 'red' : t.missionStage === 'landed' ? 'green' : 'blue'}`}>
+                          {' '}
+                          mission: {t.missionStage}
+                        </span>
+                      )}
                       <div className="small muted">
                         {t.dueAt ? `due ${fmtDate(t.dueAt)}` : 'no due date'}
                         {t.notes ? ` · ${t.notes}` : ''}
+                        {t.blockedBy && t.blockedBy.length > 0
+                          ? ` · blocked by ${t.blockedBy
+                              .map((id) => tasks.find((x) => x.id === id)?.title ?? id)
+                              .join(', ')}`
+                          : ''}
                       </div>
                     </div>
                   </div>

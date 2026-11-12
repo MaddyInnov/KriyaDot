@@ -644,14 +644,16 @@ export interface BotConfig {
   accountProfile?: string;
   /**
    * A6 (multiple sign-ins per CLI bridge): this bot's account choice per
-   * bridge, keyed by bridge id ('claude' | 'codex' | 'opencode') with an
+   * bridge, keyed by bridge id (any of the eight manifest bridges) with an
    * account id from the bridge-account store ('default' = the machine's
    * existing sign-in). Precedence over the user's default account choice
    * for the bridge; the legacy Claude-only `accountProfile` above is
    * honoured for the claude bridge when no per-bridge entry exists.
    * Ids only — never paths or secrets.
    */
-  bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode', string>>;
+  bridgeAccounts?: Partial<
+    Record<'claude' | 'codex' | 'opencode' | 'copilot' | 'grok' | 'kimi' | 'pi' | 'hermes', string>
+  >;
   /**
    * Per-engine homes (ENGINES pack): when true, engine processes spawned
    * for this bot SHARE the user's real home directory instead of the

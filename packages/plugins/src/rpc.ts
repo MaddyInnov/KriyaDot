@@ -15,7 +15,7 @@
 // use files inside its own plugin directory (its cwd, and the only place
 // it is expected to write).
 //
-// Isolation (deliberately honest scope):
+// Isolation:
 //   - cwd is pinned to the plugin directory; the entry path must resolve
 //     inside it.
 //   - The child environment is scrubbed: only PATH (plus the platform
@@ -24,14 +24,21 @@
 //   - A hard timeout kills the child (SIGKILL).
 //   - `.js` / `.mjs` / `.cjs` entries run under the host's Node binary;
 //     any other entry is executed directly (it must be executable).
-// Network access is NOT blocked at this layer (no portable socket sandbox
-// in-process) — permissions.network is a declaration surfaced at install
-// approval time, not an enforcement mechanism. See manifest.ts.
+//   - Filesystem + network confinement is enforced by the KERNEL
+//     sandbox (plugin-sandbox.ts, closing QA OPEN-2): the child is
+//     spawned through Landlock (Linux) / Seatbelt (macOS) configured
+//     from the manifest's declared permissions — confined to its own
+//     directory plus declared `permissions.fs` grants, with network
+//     denied unless `permissions.network: true`. When no kernel backend
+//     can enforce a restrictive plugin's declarations, the spawn FAILS
+//     CLOSED (PluginSandboxUnavailableError) instead of running the
+//     child unconfined.
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { resolve, sep } from 'node:path';
 import type { PluginManifest } from './manifest.js';
+import { spawnPluginChild, type PluginSandboxReport } from './plugin-sandbox.js';
 
 export const DEFAULT_RPC_TIMEOUT_MS = 15_000;
 const MAX_STDERR_BYTES = 64 * 1024;
@@ -62,6 +69,10 @@ export interface InvokeOptions {
   timeoutMs?: number;
   /** Host environment to scrub from (defaults to process.env). */
   hostEnv?: NodeJS.ProcessEnv;
+  /** Called once per invocation with the sandbox report for the spawn
+   *  (backend, whether confinement was actually applied, network
+   *  posture) so hosts can log/surface enforcement honestly. */
+  onSandbox?: (report: PluginSandboxReport) => void;
 }
 
 /** Build the scrubbed child environment for a plugin invocation. */
@@ -92,15 +103,19 @@ export function resolveEntry(target: PluginProcessTarget): string {
   return abs;
 }
 
-function spawnTarget(target: PluginProcessTarget, opts: InvokeOptions): ChildProcess {
+async function spawnTarget(
+  target: PluginProcessTarget,
+  opts: InvokeOptions,
+): Promise<{ child: ChildProcess; report: PluginSandboxReport }> {
   const entryAbs = resolveEntry(target);
   const isScript = /\.(mjs|cjs|js)$/.test(entryAbs);
   const command = isScript ? process.execPath : entryAbs;
   const args = isScript ? [entryAbs] : [];
-  return spawn(command, args, {
-    cwd: target.dir,
+  return spawnPluginChild(command, args, {
+    dir: target.dir,
+    manifest: target.manifest,
     env: buildPluginEnv(target.manifest, target.dir, opts.hostEnv),
-    stdio: ['pipe', 'pipe', 'pipe'],
+    ...(opts.hostEnv ? { hostEnv: opts.hostEnv } : {}),
   });
 }
 
@@ -121,14 +136,28 @@ export function invokePluginRpc<T = unknown>(
   const timeoutMs = opts.timeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
   const id = nextId++;
   return new Promise<T>((resolvePromise, rejectPromise) => {
-    let child: ChildProcess;
-    try {
-      child = spawnTarget(target, opts);
-    } catch (err) {
-      rejectPromise(err instanceof Error ? err : new PluginRpcError(String(err)));
+    let settled = false;
+    // Spawn is async since OPEN-2: the kernel sandbox must confirm
+    // confinement before any plugin code runs. A spawn refusal (e.g.
+    // PluginSandboxUnavailableError, fail-closed) rejects the invoke.
+    void spawnTarget(target, opts).then(
+      ({ child, report }) => {
+        opts.onSandbox?.(report);
+        wireChild(child);
+      },
+      (err: unknown) => {
+        rejectPromise(err instanceof Error ? err : new PluginRpcError(String(err)));
+      },
+    );
+    function wireChild(child: ChildProcess) {
+    if (settled) {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // already gone
+      }
       return;
     }
-    let settled = false;
     let stdoutBuf = '';
     let stderr = '';
     const finish = (fn: () => void) => {
@@ -191,5 +220,6 @@ export function invokePluginRpc<T = unknown>(
       }
     });
     child.stdin?.end(JSON.stringify({ jsonrpc: '2.0', id, method, params: params ?? {} }) + '\n');
+    }
   });
 }

@@ -2,6 +2,7 @@
 export * from './manifest.js';
 export * from './zip.js';
 export * from './rpc.js';
+export * from './plugin-sandbox.js';
 export * from './runtime.js';
 export * from './manager.js';
 export * from './bundle.js';

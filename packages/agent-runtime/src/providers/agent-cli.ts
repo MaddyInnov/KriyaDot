@@ -49,6 +49,13 @@ import {
 const AGENT_CLI_BRIDGE_IDS: Record<string, CliBridgeId> = {
   'claude-code': 'claude',
   codex: 'codex',
+  // A2: agent ids that are also manifest bridges resolve through the
+  // same identity-verified path (grok / pi have one-shot specs here;
+  // copilot / kimi / hermes are ACP-first in factory.ts and only reach
+  // this map when a host constructs the one-shot provider directly for
+  // an id that has a registered spec).
+  grok: 'grok',
+  pi: 'pi',
 };
 
 /** Well-known agent CLI ids. Custom ids can be registered at runtime. */

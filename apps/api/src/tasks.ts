@@ -23,6 +23,20 @@ import { join } from 'node:path';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 
+/** A5: stage of a coding mission attached to a task (mirrored from the
+ * mission record in missions.ts so the existing Tasks board can show it
+ * without a second board or a second store read model). */
+export type TaskMissionStage = 'queued' | 'working' | 'review' | 'gate' | 'landed' | 'blocked';
+
+export const TASK_MISSION_STAGES: readonly TaskMissionStage[] = [
+  'queued',
+  'working',
+  'review',
+  'gate',
+  'landed',
+  'blocked',
+];
+
 export interface Task {
   id: string;
   title: string;
@@ -32,6 +46,15 @@ export interface Task {
   done: boolean;
   createdAt: number;
   updatedAt: number;
+  /**
+   * A5 task chains: ids of tasks that must be done before this one is
+   * runnable. Validated at declaration time (create/update): unknown
+   * blockers, self-blocks and cycles are rejected fail-closed, so a
+   * chain can never silently deadlock the dispatcher.
+   */
+  blockedBy?: string[];
+  /** A5: mission stage mirror for board display; set by missions.ts only. */
+  missionStage?: TaskMissionStage;
   /**
    * B6: set only when this task was created by the explicit "Action this
    * idea" action on a parked idea (parked-ideas.ts). The link lives on
@@ -59,6 +82,11 @@ export interface TaskInput {
   dueAt?: string | null;
   /** B6: originating parked-idea id, set by the action bridge only. */
   ideaId?: string;
+  /** A5: chain blockers (see Task.blockedBy). Accepted from HTTP bodies. */
+  blockedBy?: string[];
+  /** A5: mission stage mirror — set by missions.ts via the store only,
+   * never accepted from the HTTP task create/update bodies. */
+  missionStage?: TaskMissionStage;
 }
 
 export interface EventInput {
@@ -126,6 +154,8 @@ export class TaskStore extends JsonFileStore {
 
   create(input: TaskInput): Task {
     const now = Date.now();
+    const rows = this.readRows();
+    const existing = rows.filter(isTask);
     const task: Task = {
       id: randomUUID(),
       title: requireTitle(input.title),
@@ -136,7 +166,11 @@ export class TaskStore extends JsonFileStore {
       updatedAt: now,
       ...(typeof input.ideaId === 'string' && input.ideaId ? { ideaId: input.ideaId } : {}),
     };
-    const rows = this.readRows();
+    // A5: validate the chain declaration against the existing graph
+    // (unknown blockers / cycles fail closed before anything persists).
+    const blockedBy = normalizeBlockedBy(input.blockedBy, task.id, existing);
+    if (blockedBy) task.blockedBy = blockedBy;
+    if (input.missionStage !== undefined) task.missionStage = requireMissionStage(input.missionStage);
     rows.push(task);
     this.writeRows(rows);
     return task;
@@ -147,12 +181,19 @@ export class TaskStore extends JsonFileStore {
     const idx = rows.findIndex((r) => isTask(r) && r.id === id);
     if (idx === -1) throw storeNotFound('task', id);
     const current = rows[idx] as Task;
+    const all = rows.filter(isTask);
     const next: Task = {
       ...current,
       title: input.title === undefined ? current.title : requireTitle(input.title),
       notes: input.notes === undefined ? current.notes : optNotes(input.notes),
       dueAt: input.dueAt === undefined ? current.dueAt : normalizeDueAt(input.dueAt),
       done: input.done === undefined ? current.done : requireBool(input.done, 'done'),
+      // A5: blockedBy replaces wholesale when present (validated against
+      // the whole graph); missionStage is the missions.ts mirror.
+      blockedBy:
+        input.blockedBy === undefined ? current.blockedBy : normalizeBlockedBy(input.blockedBy, id, all),
+      missionStage:
+        input.missionStage === undefined ? current.missionStage : requireMissionStage(input.missionStage),
       // Monotonic: an update must always sort after the previous state, even
       // when two ops land in the same millisecond.
       updatedAt: Math.max(Date.now(), current.updatedAt + 1),
@@ -373,10 +414,12 @@ export function makeTaskCreator(deps: TasksDeps): (input: TaskCreatorInput) => T
 function taskInputFrom(body: unknown): TaskInput {
   const b = (body ?? {}) as Record<string, unknown>;
   // Note: "done" is ignored on create — new tasks are always open.
+  // "missionStage" is likewise ignored here: missions.ts owns it.
   return {
     title: b.title as string,
     notes: b.notes as string | undefined,
     dueAt: (b.dueAt as string | null | undefined) ?? undefined,
+    blockedBy: Array.isArray(b.blockedBy) ? (b.blockedBy as string[]) : undefined,
   };
 }
 
@@ -387,6 +430,8 @@ function taskUpdateFrom(body: unknown): Partial<TaskInput> & { done?: boolean } 
   if ('notes' in b) out.notes = b.notes as string | undefined;
   if ('dueAt' in b) out.dueAt = b.dueAt as string | null | undefined;
   if ('done' in b) out.done = b.done as boolean;
+  // A5: chains are user-declared on the board; missionStage is not (above).
+  if ('blockedBy' in b) out.blockedBy = b.blockedBy as string[];
   return out;
 }
 
@@ -468,6 +513,69 @@ function assertRange(startsAt: string, endsAt: string): void {
   if (Date.parse(endsAt) < Date.parse(startsAt)) {
     throw validationError('event "endsAt" must not be before "startsAt"');
   }
+}
+
+// ---------------------------------------------------------------------------
+// A5 task chains: declaration-time validation + runnability
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate a blockedBy declaration for task `selfId` against the existing
+ * graph. Fails closed (validation error) on: non-string entries, unknown
+ * blocker ids, a self-block, or any cycle the declaration would create.
+ * Returns the normalized list (deduped), or undefined for "no blockers".
+ */
+function normalizeBlockedBy(blockedBy: unknown, selfId: string, all: Task[]): string[] | undefined {
+  if (blockedBy === undefined || blockedBy === null) return undefined;
+  if (!Array.isArray(blockedBy)) throw validationError('"blockedBy" must be an array of task ids');
+  const out: string[] = [];
+  for (const entry of blockedBy) {
+    if (typeof entry !== 'string' || !entry) {
+      throw validationError('"blockedBy" entries must be non-empty task id strings');
+    }
+    if (entry === selfId) throw validationError('a task cannot block itself (cycle)');
+    if (!out.includes(entry)) out.push(entry);
+  }
+  if (out.length === 0) return undefined;
+  const known = new Set(all.map((t) => t.id));
+  for (const id of out) {
+    if (!known.has(id)) throw validationError(`"blockedBy" references unknown task: ${id}`);
+  }
+  assertAcyclic(selfId, out, all);
+  return out;
+}
+
+/** DFS over blockedBy edges with selfId's edges replaced by `candidate`. */
+function assertAcyclic(selfId: string, candidate: string[], all: Task[]): void {
+  const edges = new Map<string, string[]>();
+  for (const t of all) edges.set(t.id, t.id === selfId ? candidate : (t.blockedBy ?? []));
+  if (!edges.has(selfId)) edges.set(selfId, candidate);
+  const state = new Map<string, 'visiting' | 'done'>();
+  const visit = (id: string, trail: string[]): void => {
+    const s = state.get(id);
+    if (s === 'done') return;
+    if (s === 'visiting') {
+      throw validationError(`task dependency cycle detected: ${[...trail, id].join(' -> ')}`);
+    }
+    state.set(id, 'visiting');
+    for (const next of edges.get(id) ?? []) visit(next, [...trail, id]);
+    state.set(id, 'done');
+  };
+  for (const id of edges.keys()) visit(id, []);
+}
+
+function requireMissionStage(value: unknown): TaskMissionStage {
+  if (typeof value === 'string' && (TASK_MISSION_STAGES as readonly string[]).includes(value)) {
+    return value as TaskMissionStage;
+  }
+  throw validationError(`"missionStage" must be one of: ${TASK_MISSION_STAGES.join(', ')}`);
+}
+
+/** A task is runnable when it is open and every blocker is done. */
+export function taskBlockersSatisfied(task: Task, all: Task[]): boolean {
+  if (!task.blockedBy || task.blockedBy.length === 0) return true;
+  const byId = new Map(all.map((t) => [t.id, t]));
+  return task.blockedBy.every((id) => byId.get(id)?.done === true);
 }
 
 function requireBool(value: unknown, field: string): boolean {

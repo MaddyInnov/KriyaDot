@@ -68,7 +68,8 @@ describe('cli-auth routes', () => {
     expect(status).toBe(200);
     const body = json as { ok: boolean; clis: Array<Record<string, unknown>> };
     expect(body.ok).toBe(true);
-    expect(body.clis.map((c) => c['cliId']).sort()).toEqual(['antigravity', 'claude', 'codex', 'copilot', 'opencode']);
+    // A2: the sign-in surface covers the five manifest bridges too.
+    expect(body.clis.map((c) => c['cliId']).sort()).toEqual(['antigravity', 'claude', 'codex', 'copilot', 'grok', 'hermes', 'kimi', 'opencode', 'pi']);
     for (const c of body.clis) {
       expect(c).toHaveProperty('cliPresent');
       expect(c).toHaveProperty('signedIn');

@@ -29,7 +29,19 @@ import {
   type CliAuthId,
 } from '@mvp/agent-runtime';
 
-const CLI_IDS: CliAuthId[] = ['claude', 'codex', 'opencode', 'antigravity', 'copilot'];
+// A2: the five manifest-first bridges join the sign-in surface (copilot
+// was already here pre-bridge; grok / kimi / pi / hermes are new).
+const CLI_IDS: CliAuthId[] = [
+  'claude',
+  'codex',
+  'opencode',
+  'antigravity',
+  'copilot',
+  'grok',
+  'kimi',
+  'pi',
+  'hermes',
+];
 
 /**
  * A6: resolve a non-default account id for a bridge CLI into the

@@ -176,7 +176,7 @@ export interface BotConfig {
   backupProvider?: string;
   backupModel?: string;
   /** A6: this bot's bridge-account picks, keyed by bridge id (account ids only). */
-  bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode', string>>;
+  bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode' | 'copilot' | 'grok' | 'kimi' | 'pi' | 'hermes', string>>;
   modelOptions?: ModelOptions;
   skills: string[];
   tools: string[];
@@ -493,7 +493,7 @@ export interface ProviderInfo {
   /** Near-limit warning (W1): only when observed usage crosses the threshold; null otherwise / no data. */
   usageWarning?: { usedPercent: number; message: string; source: 'rate-limit' } | null;
   /** Subscription/CLI bridge: 'claude' | 'codex' | 'opencode'. Set only on bridge presets. */
-  bridge?: 'claude' | 'codex' | 'opencode';
+  bridge?: 'claude' | 'codex' | 'opencode' | 'copilot' | 'grok' | 'kimi' | 'pi' | 'hermes';
   /** Bridge only: a matching CLI or credential file was detected on this machine. */
   detected?: boolean;
   /** Bridge only: Connect consent granted (token readable in memory). */
@@ -1057,7 +1057,7 @@ export const setBotModel = (
   backup?: {
     backupProvider?: string | null;
     backupModel?: string | null;
-    bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode', string | null>>;
+    bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode' | 'copilot' | 'grok' | 'kimi' | 'pi' | 'hermes', string | null>>;
   },
 ): Promise<{
   ok: boolean;
@@ -1066,7 +1066,7 @@ export const setBotModel = (
   modelOptions?: ModelOptions;
   backupProvider?: string;
   backupModel?: string;
-  bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode', string>>;
+  bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode' | 'copilot' | 'grok' | 'kimi' | 'pi' | 'hermes', string>>;
 }> =>
   apiJson(`/api/bots/${encodeURIComponent(botId)}/model`, {
     method: 'PUT',

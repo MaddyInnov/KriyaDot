@@ -114,7 +114,21 @@ export interface ProviderPreset {
    * loaded consent-gated from the CLI's credential file at request time
    * (see cli-bridge.ts). Never falls back to env vars or the local key file.
    */
-  bridge?: 'claude' | 'codex' | 'opencode';
+  /**
+   * A2: widened to every manifest-declared bridge (the original three
+   * plus copilot / grok / kimi / pi / hermes). The type is spelled out
+   * here rather than imported from cli-bridge.ts to keep this module
+   * free of an import cycle; provider-manifest.ts is the authority.
+   */
+  bridge?:
+    | 'claude'
+    | 'codex'
+    | 'opencode'
+    | 'copilot'
+    | 'grok'
+    | 'kimi'
+    | 'pi'
+    | 'hermes';
   /** When true, listModels() is fetched live from the provider. */
   liveModels?: boolean;
   /**

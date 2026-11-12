@@ -99,12 +99,29 @@ describe('bridge account registry routes', () => {
     const { status, json } = await api('GET', '/api/bridge-accounts');
     expect(status).toBe(200);
     const bridges = json.bridges as Array<{ bridgeId: string; isolatable: boolean; isolationNote: string; accounts: Array<{ accountId: string; machineDefault: boolean }> }>;
-    expect(bridges.map((b) => b.bridgeId)).toEqual(['claude', 'codex', 'opencode']);
+    // A2: the registry covers all eight manifest bridges from birth.
+    expect(bridges.map((b) => b.bridgeId)).toEqual([
+      'claude',
+      'codex',
+      'opencode',
+      'copilot',
+      'grok',
+      'kimi',
+      'pi',
+      'hermes',
+    ]);
     for (const b of bridges) {
-      expect(b.isolatable).toBe(true);
       expect(b.accounts).toHaveLength(1);
       expect(b.accounts[0]!.accountId).toBe('default');
       expect(b.accounts[0]!.machineDefault).toBe(true);
+    }
+    // The original three (and pi/hermes) are isolatable; copilot / grok /
+    // kimi honestly report single-account (no verified config-dir knob).
+    for (const b of bridges.filter((x) => ['claude', 'codex', 'opencode', 'pi', 'hermes'].includes(x.bridgeId))) {
+      expect(b.isolatable).toBe(true);
+    }
+    for (const b of bridges.filter((x) => ['copilot', 'grok', 'kimi'].includes(x.bridgeId))) {
+      expect(b.isolatable).toBe(false);
     }
     expect(bridges.find((b) => b.bridgeId === 'opencode')!.isolationNote).toMatch(/NOT the login/);
   });

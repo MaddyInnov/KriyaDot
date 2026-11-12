@@ -52,6 +52,21 @@ import { statSync } from 'node:fs';
 export type CliIdentityBridgeId = 'claude' | 'codex' | 'opencode';
 
 /**
+ * A2: every bridge id, including the five manifest-first bridges whose
+ * identity declarations live in their provider manifests (provider-
+ * manifest.ts) rather than in CLI_IDENTITY_DECLARATIONS below. The pin
+ * registry is keyed by this wider id so A2 bridges get pinnable CLI
+ * paths through exactly the same machinery.
+ */
+export type CliIdentityAnyBridgeId =
+  | CliIdentityBridgeId
+  | 'copilot'
+  | 'grok'
+  | 'kimi'
+  | 'pi'
+  | 'hermes';
+
+/**
  * One identity test, as data. All kinds are evaluated by matchIdentity()
  * with linear scans over capped input, except `regex`, which is gated by
  * assertSafeRegexPattern() at declaration load.
@@ -307,11 +322,11 @@ export function statForCache(path: string): { size: number; mtimeMs: number } | 
 // ---------------------------------------------------------------------------
 
 /** Env var the API layer mirrors a persisted pin into (boot path). */
-export function cliPathPinEnvName(id: CliIdentityBridgeId): string {
+export function cliPathPinEnvName(id: CliIdentityAnyBridgeId): string {
   return `KRIYADOT_CLI_PATH_${id.toUpperCase()}`;
 }
 
-const cliPathPins = new Map<CliIdentityBridgeId, string>();
+const cliPathPins = new Map<CliIdentityAnyBridgeId, string>();
 
 function normalizePin(raw: string | undefined | null): string | undefined {
   if (typeof raw !== 'string') return undefined;
@@ -320,7 +335,7 @@ function normalizePin(raw: string | undefined | null): string | undefined {
 }
 
 /** Set (or, with an empty/undefined value, clear) the in-memory pin for a bridge. */
-export function setCliPathPin(id: CliIdentityBridgeId, rawPath: string | undefined | null): void {
+export function setCliPathPin(id: CliIdentityAnyBridgeId, rawPath: string | undefined | null): void {
   const v = normalizePin(rawPath);
   if (v) cliPathPins.set(id, v);
   else cliPathPins.delete(id);
@@ -331,7 +346,7 @@ export function setCliPathPin(id: CliIdentityBridgeId, rawPath: string | undefin
  * then the in-memory registry, then the mirrored env var.
  */
 export function getCliPathPin(
-  id: CliIdentityBridgeId,
+  id: CliIdentityAnyBridgeId,
   opts: { override?: string; env?: NodeJS.ProcessEnv } = {},
 ): string | undefined {
   const override = normalizePin(opts.override);
@@ -343,8 +358,8 @@ export function getCliPathPin(
 }
 
 /** All in-memory pins (env-only pins are not listed; the API merges those itself). */
-export function getAllCliPathPins(): Partial<Record<CliIdentityBridgeId, string>> {
-  return Object.fromEntries(cliPathPins) as Partial<Record<CliIdentityBridgeId, string>>;
+export function getAllCliPathPins(): Partial<Record<CliIdentityAnyBridgeId, string>> {
+  return Object.fromEntries(cliPathPins) as Partial<Record<CliIdentityAnyBridgeId, string>>;
 }
 
 /** Test helper: drop all in-memory pins. */

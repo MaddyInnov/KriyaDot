@@ -25,10 +25,20 @@ export interface BotModelSelection {
   backupProvider?: string;
   backupModel?: string;
   /** A6: the bot's bridge-account picks, keyed by bridge id (account ids only). */
-  bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode', string>>;
+  bridgeAccounts?: Partial<Record<'claude' | 'codex' | 'opencode' | 'copilot' | 'grok' | 'kimi' | 'pi' | 'hermes', string>>;
 }
 
-const BRIDGE_IDS_FOR_ACCOUNTS = ['claude', 'codex', 'opencode'] as const;
+// A2: all eight manifest bridges carry per-bot account picks.
+const BRIDGE_IDS_FOR_ACCOUNTS = [
+  'claude',
+  'codex',
+  'opencode',
+  'copilot',
+  'grok',
+  'kimi',
+  'pi',
+  'hermes',
+] as const;
 
 /**
  * Sanitise a bridgeAccounts patch: known bridge keys only; a string
@@ -37,10 +47,10 @@ const BRIDGE_IDS_FOR_ACCOUNTS = ['claude', 'codex', 'opencode'] as const;
  */
 export function sanitizeBridgeAccounts(
   input: unknown,
-): Partial<Record<'claude' | 'codex' | 'opencode', string | null>> | undefined {
+): Partial<Record<'claude' | 'codex' | 'opencode' | 'copilot' | 'grok' | 'kimi' | 'pi' | 'hermes', string | null>> | undefined {
   if (typeof input !== 'object' || input === null || Array.isArray(input)) return undefined;
   const o = input as Record<string, unknown>;
-  const out: Partial<Record<'claude' | 'codex' | 'opencode', string | null>> = {};
+  const out: Partial<Record<'claude' | 'codex' | 'opencode' | 'copilot' | 'grok' | 'kimi' | 'pi' | 'hermes', string | null>> = {};
   let any = false;
   for (const bridge of BRIDGE_IDS_FOR_ACCOUNTS) {
     if (!(bridge in o)) continue;
@@ -127,9 +137,9 @@ export function applyBotModels(bots: BotConfig[], dataDir: string): void {
     if (sel.bridgeAccounts) {
       const clean = sanitizeBridgeAccounts(sel.bridgeAccounts);
       if (clean) {
-        const applied: Partial<Record<'claude' | 'codex' | 'opencode', string>> = {};
+        const applied: Partial<Record<'claude' | 'codex' | 'opencode' | 'copilot' | 'grok' | 'kimi' | 'pi' | 'hermes', string>> = {};
         for (const [bridge, accountId] of Object.entries(clean)) {
-          if (accountId) applied[bridge as 'claude' | 'codex' | 'opencode'] = accountId;
+          if (accountId) applied[bridge as 'claude' | 'codex' | 'opencode' | 'copilot' | 'grok' | 'kimi' | 'pi' | 'hermes'] = accountId;
         }
         if (Object.keys(applied).length > 0) bot.bridgeAccounts = applied;
       }
@@ -178,9 +188,9 @@ export function saveBotModel(
   // selection; a null/'' entry clears that bridge's pick.
   const bridgePatch = backup ? sanitizeBridgeAccounts(backup.bridgeAccounts) : undefined;
   if (bridgePatch) {
-    const merged: Partial<Record<'claude' | 'codex' | 'opencode', string>> = { ...(bot.bridgeAccounts ?? {}) };
+    const merged: Partial<Record<'claude' | 'codex' | 'opencode' | 'copilot' | 'grok' | 'kimi' | 'pi' | 'hermes', string>> = { ...(bot.bridgeAccounts ?? {}) };
     for (const [bridge, accountId] of Object.entries(bridgePatch)) {
-      const b = bridge as 'claude' | 'codex' | 'opencode';
+      const b = bridge as 'claude' | 'codex' | 'opencode' | 'copilot' | 'grok' | 'kimi' | 'pi' | 'hermes';
       if (accountId) merged[b] = accountId;
       else delete merged[b];
     }
