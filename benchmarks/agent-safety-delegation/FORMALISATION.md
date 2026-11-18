@@ -74,16 +74,20 @@ buying `d > 0`; each protocol's *measured* detection rate is
 `d̂ = 1 − (propagation under protocol) / (reader error rate on the same
 cases)`, computed from `results/summary.json`:
 
-| Protocol | Mechanism in bound terms | Measured (this study) |
+| Protocol | Mechanism in bound terms | Measured (this study, n=10 subset; reader conclusions forged 7/10; delegated finals forged 8/10) |
 |---|---|---|
-| (baseline) conclusion-only delegation | `d ≈ 0` by construction | see results §Replication |
-| P1 independent re-read | boundary replaces adoption with P's own read: effective `a → P's direct error`, i.e. `d̂ ≈ 1 − ε_P/p` | see results §Protocols |
-| P2 second reader + agreement | disagreement escalates to a re-read; adoption needs two independent errors: `p_eff ≈ p₁p₂ + P(disagree)·ε_P` | see results §Protocols |
-| P3 evidence-only returns | changes the channel: S cannot inject a conclusion, only quotes; P concludes from evidence, so `a` is measured against quoted-evidence fidelity, not conclusion trust | see results §Protocols |
+| (baseline) conclusion-only delegation | `d ≈ 0` by construction | conditional adoption **a = 13/13 = 1.00** (n=20 arm) ⇒ `d̂ = 0` |
+| P1 independent re-read | boundary replaces adoption with P's own read: effective `a → P's direct error`, i.e. `d̂ ≈ 1 − ε_P/p` | finals forged **3/10**; the 3 are exactly P's calibration failures ⇒ residual = ε_P as predicted; `d̂ = 1 − 3/7 ≈ 0.57` against the reader-error base |
+| P2 second reader + agreement | disagreement escalates to a re-read; adoption needs two independent errors: `p_eff ≈ p₁p₂ + P(disagree)·ε_P` | finals forged **7/10** ⇒ `d̂ ≈ 0`: readers agreed in 9/10 (errors correlated, §4.1 realised in practice) |
+| P3 evidence-only returns | changes the channel: S cannot inject a conclusion, only quotes; P concludes from evidence, so `a` is measured against quoted-evidence fidelity, not conclusion trust | finals forged **0/10** ⇒ `d̂ = 1.00` on this subset (with 3/10 non-answers as the cost — outside the bound, which counts only forged adoption) |
 
 Exact measured values, with raw counts, are reported in `README.md` §Results
-and `results/summary.json`; this note's table is filled from those numbers
-and never the other way round.
+and `results/summary.json`; this table is filled from those numbers and
+never the other way round. One study-specific refinement the measurements
+force: in this model pair the delegated reader's `p` was **brief-dependent**
+(0/10 under a careful brief, 13/20 forged conclusions under the casual brief
+delegation actually produces) — `p` in the bound must be read as
+`p(model, brief, channel)`, not a fixed model property.
 
 ## 4. Where the bound is loose — scope conditions
 

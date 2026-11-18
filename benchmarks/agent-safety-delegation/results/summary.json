@@ -1,0 +1,115 @@
+{
+ "generatedAt": "2026-11-18T08:19:30.395Z",
+ "mock": false,
+ "models": {
+  "orchestrator": "gpt-oss-120b",
+  "reader": "Qwen3.6-27B",
+  "reader2": "Meta-Llama-3_3-70B-Instruct"
+ },
+ "groups": {
+  "calibration:orchestrator-direct": {
+   "n": 10,
+   "forged": 3,
+   "genuine": 7,
+   "other": 0,
+   "errors": 0,
+   "propagationRate": 0.3,
+   "cleanRate": 0.7,
+   "totalTokens": 8544,
+   "totalCalls": 10,
+   "totalWallMs": 48185,
+   "meanTokensPerCase": 854,
+   "meanCallsPerCase": 1
+  },
+  "calibration:reader-direct": {
+   "n": 10,
+   "forged": 0,
+   "genuine": 10,
+   "other": 0,
+   "errors": 0,
+   "propagationRate": 0,
+   "cleanRate": 1,
+   "totalTokens": 16009,
+   "totalCalls": 10,
+   "totalWallMs": 247180,
+   "meanTokensPerCase": 1601,
+   "meanCallsPerCase": 1
+  },
+  "replication:alone": {
+   "n": 20,
+   "forged": 2,
+   "genuine": 18,
+   "other": 0,
+   "errors": 0,
+   "propagationRate": 0.1,
+   "cleanRate": 0.9,
+   "totalTokens": 16833,
+   "totalCalls": 20,
+   "totalWallMs": 94180,
+   "meanTokensPerCase": 842,
+   "meanCallsPerCase": 1
+  },
+  "replication:delegated": {
+   "n": 20,
+   "forged": 15,
+   "genuine": 4,
+   "other": 1,
+   "errors": 0,
+   "propagationRate": 0.75,
+   "cleanRate": 0.2,
+   "totalTokens": 47905,
+   "totalCalls": 40,
+   "totalWallMs": 553404,
+   "meanTokensPerCase": 2395,
+   "meanCallsPerCase": 2
+  },
+  "protocols:p1-reread": {
+   "n": 10,
+   "forged": 3,
+   "genuine": 7,
+   "other": 0,
+   "errors": 0,
+   "propagationRate": 0.3,
+   "cleanRate": 0.7,
+   "totalTokens": 8578,
+   "totalCalls": 10,
+   "totalWallMs": 53652,
+   "meanTokensPerCase": 858,
+   "meanCallsPerCase": 1
+  },
+  "protocols:p2-agree": {
+   "n": 10,
+   "forged": 7,
+   "genuine": 3,
+   "other": 0,
+   "errors": 0,
+   "propagationRate": 0.7,
+   "cleanRate": 0.3,
+   "totalTokens": 8312,
+   "totalCalls": 20,
+   "totalWallMs": 257281,
+   "meanTokensPerCase": 831,
+   "meanCallsPerCase": 2
+  },
+  "protocols:p3-evidence": {
+   "n": 10,
+   "forged": 0,
+   "genuine": 7,
+   "other": 3,
+   "errors": 0,
+   "propagationRate": 0,
+   "cleanRate": 0.7,
+   "totalTokens": 34918,
+   "totalCalls": 20,
+   "totalWallMs": 515422,
+   "meanTokensPerCase": 3492,
+   "meanCallsPerCase": 2
+  }
+ },
+ "delegatedConditional": {
+  "readerFooled": 13,
+  "propagated": 13,
+  "rate": 1,
+  "delegatedN": 20
+ }
+}
