@@ -12,6 +12,7 @@ import type { HookBus } from '../hooks.js';
 import { AcpClient, acpOptionsFromBot } from '../acp.js';
 import type { BotConfig } from '../types.js';
 import type { DelegationDecisionEvent } from '../routing-decisions.js';
+import { applyEvidenceOnlyReturn, resolveDelegateReturnMode } from '../delegation-safety.js';
 
 export interface CreateDelegateToolsOptions {
   /**
@@ -244,6 +245,17 @@ export function createDelegateTools(opts: CreateDelegateToolsOptions): ToolDefin
         ? (args.tools as unknown[]).map(String).filter((t) => t && t !== 'delegate')
         : undefined;
 
+      // Delegation safety (Workstream 2): evidence-only return mode. The
+      // caller may pass `returnMode: 'evidence'` (handler-level arg, not
+      // in the advertised schema — same precedent as profileId/isolation),
+      // or the host may default it via KRIYADOT_DELEGATE_EVIDENCE_ONLY.
+      // In evidence mode the child is instructed to return quoted evidence
+      // with source ids instead of a conclusion, so the parent judges
+      // checkable material rather than adopting an unverifiable summary
+      // (see delegation-safety.ts for the measured basis). Default OFF.
+      const returnMode = resolveDelegateReturnMode({ requested: args.returnMode });
+      const spawnTask = returnMode === 'evidence' ? applyEvidenceOnlyReturn(task) : task;
+
       // P1 #13: the child's turn inherits the parent's provenance with the
       // relay path extended by the child bot, so nested delegation keeps a
       // full origin chain and the consent rule applies downstream.
@@ -290,7 +302,7 @@ export function createDelegateTools(opts: CreateDelegateToolsOptions): ToolDefin
         }
         try {
           const result = await spawn({
-            task,
+            task: spawnTask,
             tools: requested ?? profile?.tools,
             botId: childBotId,
             parentSessionId: ctx.sessionId,
@@ -312,7 +324,7 @@ export function createDelegateTools(opts: CreateDelegateToolsOptions): ToolDefin
               })
               .catch(() => undefined);
           }
-          return { result: result.result, usage: result.usage ?? null, ...(iso ? { worktreePath: iso.info.path, worktreeBranch: iso.info.branch } : {}) };
+          return { result: result.result, usage: result.usage ?? null, returnMode, ...(iso ? { worktreePath: iso.info.path, worktreeBranch: iso.info.branch } : {}) };
         } catch (err) {
           recordDecision({ delegatingBotId: ctx.botId, targetBotId: childBotId, via: 'subagent', outcome: 'failed', task, error: err instanceof Error ? err.message : String(err) });
           if (opts.hooks) {
@@ -342,7 +354,7 @@ export function createDelegateTools(opts: CreateDelegateToolsOptions): ToolDefin
           maxDepth,
           parentBotId: ctx.botId,
           parentSessionId: ctx.sessionId,
-          task,
+          task: spawnTask,
           tools: requested ?? profile?.tools,
           botId: botOverride ?? ctx.botId,
           provenance: childProvenance,
@@ -355,6 +367,7 @@ export function createDelegateTools(opts: CreateDelegateToolsOptions): ToolDefin
         return {
           result: spawned.result,
           usage: spawned.usage ?? null,
+          returnMode,
           subagentId: spawned.subagentId,
           ...(iso ? { worktreePath: iso.info.path, worktreeBranch: iso.info.branch } : {}),
         };

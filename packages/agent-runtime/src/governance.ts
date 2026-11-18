@@ -28,6 +28,12 @@ export interface GovernanceEvaluation {
    * translation race.
    */
   approvalId?: string;
+  /**
+   * Soteria Verified Plans (Workstream 1): hard-floor detail when a
+   * floor forced this evaluation — tier 'catastrophic' denials are
+   * absolute for plan recovery (no skip / re-plan around them).
+   */
+  hardFloor?: { tier: 'catastrophic' | 'destructive'; reason: string; patternId: string };
 }
 
 /** Where an approval decision came from. Surfaced in the inbox UI. */
@@ -62,6 +68,36 @@ export interface GovernanceGateway {
   decide(approvalId: string, decision: 'approved' | 'denied', opts?: { decidedBy?: string; note?: string }): void;
   /** Append an audit event. Must never carry PII. */
   audit(entry: AuditEntry): void | Promise<void>;
+  /**
+   * Soteria Verified Plans (Workstream 1) — OPTIONAL oracle surface.
+   * Side-effect-free policy simulation for one hypothetical call (the
+   * plan verifier's per-step oracle): the decision the gateway WOULD
+   * make, with hard-floor/denylist detail, minting no approvals and
+   * writing no audit rows. Implemented by the host GovernanceAdapter;
+   * absent on test fakes (the verifier then falls back to classify()).
+   */
+  simulatePolicy?(
+    botId: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    sessionToolHistory?: string[],
+  ): Promise<{
+    effect: GovernanceDecision;
+    reason?: string;
+    matchedRuleId?: string;
+    hardFloor?: { tier: 'catastrophic' | 'destructive'; reason: string; patternId: string };
+    denylist?: boolean;
+  }>;
+  /**
+   * Soteria Verified Plans (Workstream 1) — OPTIONAL: the effective
+   * planSpecs for a bot (workspace layer ahead of bot config ahead of
+   * global), so the plan gate verifies against the same merged policy
+   * the adapter evaluates calls against.
+   */
+  planSpecsForBot?(botId: string): import('./plan-specs.js').PlanSpec[];
+  /** OPTIONAL: the effective plan-verification scope for a bot
+   *  (kill-criterion narrowing flag). Absent → bot config / 'all'. */
+  planVerificationScopeForBot?(botId: string): import('./plan-specs.js').PlanVerificationScope;
   /** Governance hooks run around every tool execution. */
   runPreHooks(call: ToolCall, ctx: ToolContext): Promise<void>;
   runPostHooks(call: ToolCall, result: unknown, ctx: ToolContext): Promise<void>;

@@ -243,7 +243,12 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
   private mergedPolicyFor(botId: string, ctx?: ToolContext): Policy | null {
     const botPolicy = this.getBotConfig?.(botId)?.policy;
     let merged: Policy | null = null;
-    if (botPolicy && botPolicy.rules.length > 0) {
+    // Soteria (Workstream 1): a layer also merges when it carries ONLY
+    // planSpecs — plan-level constraints must reach evaluation/snapshot
+    // even when the layer adds no per-call rules.
+    const hasContent = (p?: { rules: unknown[]; planSpecs?: unknown[] }): boolean =>
+      !!p && (p.rules.length > 0 || (p.planSpecs?.length ?? 0) > 0);
+    if (hasContent(botPolicy)) {
       merged = mergeBotPolicy(this.globalPolicy, botPolicy);
     }
     const workspaceDir = this.workspaceDirForBot?.(botId);
@@ -258,12 +263,37 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
           ts: new Date().toISOString(),
         });
       }
-      if (loaded.policy.rules.length > 0) {
+      if (hasContent(loaded.policy)) {
         const wsPolicy: BotPolicy = loaded.policy;
         merged = mergeBotPolicy(merged ?? this.globalPolicy, wsPolicy);
       }
     }
     return merged;
+  }
+
+  /**
+   * Soteria Verified Plans (Workstream 1): the effective planSpecs for
+   * a bot — workspace layer ahead of bot config ahead of global, the
+   * same merge order as rules — for the runtime's plan verifier.
+   */
+  planSpecsForBot(botId: string): import('@mvp/governance').PlanSpec[] {
+    const merged = this.mergedPolicyFor(botId);
+    return [...(merged?.planSpecs ?? this.globalPolicy.planSpecs ?? [])];
+  }
+
+  /** Soteria: the effective verification scope for a bot (bot config
+   *  wins, then the workspace policy file). Default 'high-risk-only' —
+   *  the Workstream 1 kill-criterion narrowing (2026-11-18); see
+   *  benchmarks/agent-safety/RESULTS.md. */
+  planVerificationScopeForBot(botId: string): 'all' | 'high-risk-only' {
+    const botScope = this.getBotConfig?.(botId)?.policy?.planVerificationScope;
+    if (botScope) return botScope;
+    const workspaceDir = this.workspaceDirForBot?.(botId);
+    if (workspaceDir) {
+      const scope = loadWorkspacePolicy(workspaceDir).policy.planVerificationScope;
+      if (scope) return scope;
+    }
+    return 'high-risk-only';
   }
 
   /** Whether snapshot mode (#70) is opted into for this bot/workspace. */
@@ -329,9 +359,18 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
           if (!first.done) this.idMap.delete(first.value);
         }
         this.notifyApprovalMinted(call, ctx, res.approvalId);
-        return { decision: 'require-approval', approvalId: runtimeId, reason: floorHit.reason };
+        return {
+          decision: 'require-approval',
+          approvalId: runtimeId,
+          reason: floorHit.reason,
+          hardFloor: { tier: floorHit.tier, reason: floorHit.reason, patternId: floorHit.patternId },
+        };
       }
-      return { decision: res.effect, reason: floorHit.reason };
+      return {
+        decision: res.effect,
+        reason: floorHit.reason,
+        hardFloor: { tier: floorHit.tier, reason: floorHit.reason, patternId: floorHit.patternId },
+      };
     }
     // Learned preferences (preference learning loop): deny is fail-closed and
     // audited. 'allow' never applies to untrusted/privileged tools — those

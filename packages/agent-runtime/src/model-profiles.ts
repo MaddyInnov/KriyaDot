@@ -31,7 +31,8 @@ export type ModelPurpose =
   | 'summarizer'
   | 'triage'
   | 'extraction'
-  | 'evaluate';
+  | 'evaluate'
+  | 'verifier';
 
 export const MODEL_PURPOSES: readonly ModelPurpose[] = [
   'main',
@@ -43,6 +44,7 @@ export const MODEL_PURPOSES: readonly ModelPurpose[] = [
   'triage',
   'extraction',
   'evaluate',
+  'verifier',
 ];
 
 export interface PurposeModelProfile {

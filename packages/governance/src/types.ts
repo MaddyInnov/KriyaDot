@@ -82,6 +82,15 @@ export type SessionToolHistory = Array<string | SessionHistoryEntry>;
 export interface Policy {
   defaultEffect: Effect;
   rules: PolicyRule[];
+  /**
+   * Plan-level policy specs (Soteria Verified Plans, Workstream 1):
+   * whole-plan constraints (ordering / requires-history / provenance /
+   * postcondition — see plan-specs.ts) evaluated by the plan verifier
+   * in @mvp/agent-runtime before a structured plan executes. Optional;
+   * absent = no plan-level constraints. Covered by the policy-snapshot
+   * hash like everything else on the policy.
+   */
+  planSpecs?: import('./plan-specs.js').PlanSpec[];
 }
 
 export type ApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired';

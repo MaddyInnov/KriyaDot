@@ -16,6 +16,7 @@
 // BotPolicyRule/BotPolicy in packages/agent-runtime/src/types.ts.
 
 import type { Policy, PolicyRule } from './types.js';
+import type { PlanSpec } from './plan-specs.js';
 
 /** Per-bot governance rule — field-compatible with agent-runtime's BotPolicyRule. */
 export interface BotPolicyRule {
@@ -51,6 +52,22 @@ export interface BotPolicy {
    * because the adapter consults the bot config directly.
    */
   sandboxAutoAllow?: boolean;
+  /**
+   * Plan-level policy specs (Soteria Verified Plans, Workstream 1) —
+   * field-compatible with agent-runtime's BotPolicy.planSpecs. Merged
+   * by mergeBotPolicy ahead of the global policy's specs, mirroring
+   * rule layering (most specific scope first).
+   */
+  planSpecs?: PlanSpec[];
+  /**
+   * Verification scope for plan specs (kill-criterion narrowing): when
+   * 'high-risk-only', the plan verifier checks only high-risk tool
+   * classes (file deletes, payments, sends). Absent = the runtime
+   * default, which the 2026-11-18 harness outcome set to
+   * 'high-risk-only' (see benchmarks/agent-safety/RESULTS.md).
+   * Field-compatible with agent-runtime's BotPolicy.planVerificationScope.
+   */
+  planVerificationScope?: 'all' | 'high-risk-only';
 }
 
 /**
@@ -68,8 +85,10 @@ export function mergeBotPolicy(globalPolicy: Policy, botPolicy?: BotPolicy): Pol
     requiresHistory: r.requiresHistory,
     domains: r.domains,
   }));
+  const planSpecs = [...(botPolicy?.planSpecs ?? []), ...(globalPolicy.planSpecs ?? [])];
   return {
     defaultEffect: globalPolicy.defaultEffect,
     rules: [...botRules, ...globalPolicy.rules],
+    ...(planSpecs.length > 0 ? { planSpecs } : {}),
   };
 }

@@ -56,6 +56,101 @@ export function buildPlanPrompt(userMessage: string): string {
 }
 
 /**
+ * Soteria Verified Plans (Workstream 1 (b)): the structured-plan prompt
+ * used at the runPlanGate seam when verified plans are enabled for a
+ * bot. The model must answer with a JSON object of tool-level steps —
+ * the shape plan-verifier.ts checks — instead of prose. The human
+ * approval card renders these steps; prose remains the fallback when
+ * the model's answer does not parse (the gate then proceeds
+ * unverified-but-audited rather than deadlocking the turn).
+ */
+export function buildStructuredPlanPrompt(userMessage: string): string {
+  return (
+    `You are about to work on the following task. Before taking any action, produce a STRUCTURED plan ` +
+    `as exactly one JSON object (no prose, no markdown fences):\n` +
+    `{"steps":[{"id":"s1","tool":"<tool name>","args":{},"dependsOn":[],"description":"<one line>","outputs":{},"goal":false}]}\n` +
+    `Rules: ids are s1, s2, ... in execution order; "tool" is the exact tool name the step will call ` +
+    `(use "" for a pure-reasoning step); "args" are the concrete arguments; "dependsOn" lists step ids that ` +
+    `must finish first; "outputs" declares the values the step will produce that later steps rely on ` +
+    `(later steps may reference them as "$s1.<outputName>"); mark the step(s) that achieve the user's goal ` +
+    `with "goal":true. Be specific about files/tools and flag risky or irreversible steps in their description.\n\n` +
+    `Task: ${userMessage}\n\nPlan JSON:`
+  );
+}
+
+/** One parsed structured step (sanitized). See plan-verifier.ts PlanStep. */
+export interface ParsedStructuredStep {
+  id: string;
+  tool: string;
+  args: Record<string, unknown>;
+  dependsOn: string[];
+  description?: string;
+  outputs?: Record<string, unknown>;
+  goal?: boolean;
+  semantic?: boolean;
+}
+
+const SEND_CONTENT_TOOLS = /send|message|email|publish|post_/i;
+
+/**
+ * Parse + sanitize a structured plan from model output (raw JSON or
+ * JSON in markdown fences). Returns null when the output is not a
+ * usable structured plan — the caller falls back to the prose plan.
+ * Sanitizing mirrors Fusion's sanitizePlan discipline: dedupe ids,
+ * drop unknown/self dependencies, cap the step count.
+ */
+export function parseStructuredPlan(text: string): { steps: ParsedStructuredStep[] } | null {
+  const raw = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const stepsRaw = (parsed as Record<string, unknown>).steps;
+  if (!Array.isArray(stepsRaw) || stepsRaw.length === 0) return null;
+  const seen = new Set<string>();
+  const steps: ParsedStructuredStep[] = [];
+  for (const entry of stepsRaw.slice(0, 25)) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const e = entry as Record<string, unknown>;
+    const id = typeof e.id === 'string' && e.id.trim() ? e.id.trim() : `s${steps.length + 1}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const tool = typeof e.tool === 'string' ? e.tool : '';
+    const args = typeof e.args === 'object' && e.args !== null && !Array.isArray(e.args)
+      ? (e.args as Record<string, unknown>)
+      : {};
+    const dependsOn = Array.isArray(e.dependsOn)
+      ? e.dependsOn.filter((d): d is string => typeof d === 'string' && d !== id)
+      : [];
+    // Free-text send content is semantic: symbolic checks cannot settle
+    // it, so the verifier marks it undecidable (judge-gated) by design.
+    const semantic =
+      e.semantic === true ||
+      (SEND_CONTENT_TOOLS.test(tool) &&
+        ['content', 'body', 'message', 'text'].some((k) => typeof args[k] === 'string'));
+    steps.push({
+      id,
+      tool,
+      args,
+      dependsOn,
+      ...(typeof e.description === 'string' ? { description: e.description } : {}),
+      ...(typeof e.outputs === 'object' && e.outputs !== null && !Array.isArray(e.outputs)
+        ? { outputs: e.outputs as Record<string, unknown> }
+        : {}),
+      ...(e.goal === true ? { goal: true } : {}),
+      ...(semantic ? { semantic: true } : {}),
+    });
+  }
+  if (steps.length === 0) return null;
+  const ids = new Set(steps.map((s) => s.id));
+  for (const s of steps) s.dependsOn = s.dependsOn.filter((d) => ids.has(d));
+  return { steps };
+}
+
+/**
  * Validate a raw approvalMode value from a bot manifest/config.
  * Returns the mode or undefined (caller keeps the default) plus errors.
  */

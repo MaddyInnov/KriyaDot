@@ -19,6 +19,7 @@
 //   mode instead of failing the run.
 
 import type { ChatMessage, TokenUsage } from './types.js';
+import { fusionPlanToPlanSteps, renderVerificationSummary } from './plan-verifier.js';
 
 export const FUSION_DEFAULT_MAX_SUBTASKS = 8;
 export const FUSION_DEFAULT_MAX_CONCURRENCY = 4;
@@ -125,6 +126,17 @@ export interface FusionDeps {
   runWorkerTurn: (input: FusionWorkerTurnInput) => Promise<FusionWorkerTurnOutput>;
   /** Optional USD cost estimator; without it the budget guard is disabled. */
   costOf?: (usage: TokenUsage) => number;
+  /**
+   * Soteria Verified Plans (Workstream 1 (b)) — OPTIONAL whole-plan
+   * verification hook, run on the sanitized plan BEFORE any worker
+   * launches. Receives the plan converted via
+   * `fusionPlanToPlanSteps` (plan-verifier.ts); returning a result
+   * with status 'blocked' fails the run with the block reasons and no
+   * worker executes. Absent → no verification (previous behaviour).
+   */
+  verifyPlan?: (
+    plan: import('./plan-verifier.js').StructuredPlan,
+  ) => Promise<import('./plan-verifier.js').PlanVerificationResult>;
 }
 
 export class FusionPlanError extends Error {
@@ -419,6 +431,30 @@ export class FusionOrchestrator {
       return this.runSingleAgent(task, options, usage, costUsd, emit, reason);
     }
     await emit({ type: 'plan_created', plan });
+
+    // Soteria (Workstream 1 (b)): whole-plan verification of the
+    // sanitized plan, when the host injected a verifier. A blocked
+    // plan fails the run BEFORE any worker launches — workers are
+    // ordinary turns, so an unverified plan would otherwise fan out
+    // into governed-but-unplanned execution.
+    if (this.deps.verifyPlan) {
+      try {
+        const verdict = await this.deps.verifyPlan(fusionPlanToPlanSteps(plan));
+        if (verdict.status === 'blocked') {
+          return fail(`Plan blocked by verification — no workers launched.\n${renderVerificationSummary(verdict)}`, {
+            status: 'failed',
+            plan,
+          });
+        }
+      } catch (err) {
+        // A verifier that errors must not silently pass a plan in a
+        // deployment that asked for verification — fail the run.
+        return fail(`Plan verification errored: ${err instanceof Error ? err.message : String(err)}`, {
+          status: 'failed',
+          plan,
+        });
+      }
+    }
 
     // Empty plan (planner decided no decomposition) → single worker, still fused trivially.
     if (plan.subtasks.length === 0) {

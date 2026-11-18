@@ -12,3 +12,4 @@ export * from './policy-file.js';
 export * from './history.js';
 export * from './domains.js';
 export * from './policy-snapshot.js';
+export * from './plan-specs.js';

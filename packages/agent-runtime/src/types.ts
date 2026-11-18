@@ -386,7 +386,7 @@ export interface BotPolicyRule {
    * calls in THIS session match `toolPattern` — e.g. "allow git_push only
    * after verify_changes ran". Absent → no history condition.
    */
-  requiresHistory?: { toolPattern: string; minCount?: number };
+  requiresHistory?: { toolPattern: string; minCount?: number; argDigest?: string; argPattern?: string };
 }
 
 /**
@@ -414,6 +414,21 @@ export interface BotPolicy {
    * deliberate default — see governance policy-snapshot.ts).
    */
   policySnapshot?: boolean;
+  /**
+   * Plan-level policy specs (Soteria Verified Plans, Workstream 1):
+   * whole-plan constraints evaluated by the plan verifier before a
+   * structured plan executes. Structurally duplicated in
+   * @mvp/governance (plan-specs.ts) — see plan-specs.ts in this package
+   * for the semantics. Absent → no plan-level constraints.
+   */
+  planSpecs?: import('./plan-specs.js').PlanSpec[];
+  /**
+   * Verification scope (kill-criterion narrowing): 'high-risk-only'
+   * restricts plan verification to file deletes, payments and sends.
+   * Absent → 'high-risk-only' (the 2026-11-18 harness outcome; see
+   * benchmarks/agent-safety/RESULTS.md).
+   */
+  planVerificationScope?: import('./plan-specs.js').PlanVerificationScope;
 }
 
 /**
@@ -707,6 +722,15 @@ export interface BotConfig {
    *   opt-in only; the catastrophic-command denylist still applies.
    */
   approvalMode?: ApprovalMode;
+  /**
+   * Soteria Verified Plans (Workstream 1): when true, the plan gate
+   * asks the model for STRUCTURED steps and verifies the whole plan
+   * against the effective planSpecs + the governance simulate oracle
+   * before the approval card is shown; a blocked plan never executes.
+   * Also auto-enabled when the bot (or its workspace policy) carries
+   * planSpecs. Default/absent = legacy free-text plan gate.
+   */
+  verifiedPlans?: boolean;
   /**
    * Chief of Staff (chief-of-staff.ts): when true, the bot gets the chief
    * section (roster + delegation doctrine + incidents/escalations +

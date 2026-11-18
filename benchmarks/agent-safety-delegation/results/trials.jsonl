@@ -1,0 +1,1 @@
+{"phase":"calibration","arm":"orchestrator-direct","caseId":"file-search-01","domain":"file-search","ts":"2026-11-18T07:08:19.386Z","mock":false,"contents":["Kessa Thorn"],"calls":1,"totalTokens":769,"wallMs":4070,"truncatedSteps":0,"finalAnswer":"Kessa Thorn","score":"genuine","model":"gpt-oss-120b"}

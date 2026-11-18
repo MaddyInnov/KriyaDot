@@ -56,7 +56,19 @@ import {
   isUserOrigin,
   wrapPeerContent,
 } from './provenance.js';
-import { PLAN_APPROVAL_TOOL, applyApprovalMode, buildPlanPrompt, parsePlanSteps, type ExtendedLayerStage } from './approval-modes.js';
+import { PLAN_APPROVAL_TOOL, applyApprovalMode, buildPlanPrompt, buildStructuredPlanPrompt, parsePlanSteps, parseStructuredPlan, type ExtendedLayerStage } from './approval-modes.js';
+import {
+  applySkipWithDependents,
+  createProviderPlanJudge,
+  planRecoveryDecision,
+  renderStructuredPlan,
+  renderVerificationSummary,
+  verifyPlan,
+  type PlanPolicyOracle,
+  type PlanVerificationResult,
+  type StructuredPlan,
+} from './plan-verifier.js';
+import type { PlanSpec } from './plan-specs.js';
 import {
   ProgressGuard,
   ToolErrorTracker,
@@ -143,6 +155,7 @@ import {
 import { didYouMeanSuffix, withSemanticHint } from './tool-hints.js';
 import { evaluateQuestion, resolveEvaluateModel } from './evaluate.js';
 import {
+  profileModelForProvider,
   resolvePurposeProfile,
   type ModelProfiles,
 } from './model-profiles.js';
@@ -2215,6 +2228,88 @@ ${record.priorContext ?? ''}`;
         action: summarizeToolAction({ tool: call.name, args: call.args }),
       });
     };
+    // Soteria Verified Plans (Workstream 1 (c)) — recovery from the
+    // VERIFIED plan when a planned step is blocked mid-execution. The
+    // verified plan for this turn is installed by the plan gate below;
+    // recovery never improvises: skip-with-dependents → ONE bounded
+    // re-plan of the remainder (policyContextRevision bump = the
+    // AttemptLedger material-change channel; the remainder is
+    // re-verified by per-call governance as it executes) → ask.
+    // Tier-1 catastrophic denials are absolute (escalate). The ledger's
+    // rule is untouched: the denial itself is never retried.
+    let verifiedPlanState: { plan: StructuredPlan; replanUsed: boolean } | null = null;
+    const notePlanStepBlocked = (
+      call: ToolCall,
+      failure: string,
+      catastrophic: boolean,
+    ): string | null => {
+      if (!verifiedPlanState) return null;
+      const step = verifiedPlanState.plan.steps.find((s) => s.tool === call.name);
+      if (!step) return null;
+      const decision = planRecoveryDecision({
+        plan: verifiedPlanState.plan,
+        blockedStepId: step.id,
+        reason: failure,
+        catastrophic,
+        replanUsed: verifiedPlanState.replanUsed,
+      });
+      // Mark the blocked step on the persistent supervisor plan (the
+      // store's steps mirror the verified plan's order when the gate
+      // installed it from structured steps).
+      try {
+        const stored = this.supervisorPlans.get(sessionId);
+        const idx = verifiedPlanState.plan.steps.findIndex((s) => s.id === step.id);
+        if (stored && stored.steps.length === verifiedPlanState.plan.steps.length && idx >= 0) {
+          this.supervisorPlans.updateStep(sessionId, idx, {
+            status: 'blocked',
+            note: `blocked mid-execution: ${failure}`.slice(0, 200),
+          });
+        }
+      } catch {
+        // Plan bookkeeping must never break a turn.
+      }
+      this.audit({
+        type: 'plan.recovery',
+        sessionId,
+        botId: ctx.botId,
+        call,
+        detail: {
+          stepId: step.id,
+          action: decision.action,
+          droppedStepIds: decision.droppedStepIds,
+          catastrophic,
+        },
+      });
+      switch (decision.action) {
+        case 'skip-with-dependents': {
+          verifiedPlanState = { ...verifiedPlanState, plan: applySkipWithDependents(verifiedPlanState.plan, decision) };
+          return (
+            `[verified plan] Step ${step.id} (${call.name}) was blocked and has been dropped from the plan ` +
+            `with its dependents (${decision.droppedStepIds.join(', ')}). Continue with the surviving steps only: ` +
+            `${decision.survivingStepIds.join(', ')}. Do NOT attempt the dropped steps another way.`
+          );
+        }
+        case 'replan': {
+          verifiedPlanState = { ...verifiedPlanState, replanUsed: true };
+          policyContextRevision += 1;
+          return (
+            `[verified plan] Step ${step.id} (${call.name}) was blocked and the plan's goal steps do not survive ` +
+            `dropping it. You have ONE bounded re-plan of the remainder: propose a different approach for the ` +
+            `remaining goal — a different tool or method, never the same denied action with changed arguments.`
+          );
+        }
+        case 'escalate':
+          return (
+            `[verified plan] Step ${step.id} (${call.name}) hit a catastrophic denial — absolute, no recovery ` +
+            `is permitted around it. Stop this line of work and tell the user why: ${failure}`
+          );
+        default:
+          return (
+            `[verified plan] Step ${step.id} (${call.name}) was blocked and recovery options are exhausted. ` +
+            `Ask the user how to proceed, surfacing this reason: ${failure}`
+          );
+      }
+    };
     if (attemptLedger) {
       this.audit({
         type: 'turn.execution_policy',
@@ -2603,6 +2698,11 @@ ${record.priorContext ?? ''}`;
           return totalUsage;
         }
         messages.push(planOk.planMessage);
+        // Soteria (Workstream 1 (c)): a verified structured plan
+        // becomes the recovery reference for mid-execution blocks.
+        if (planOk.structuredPlan) {
+          verifiedPlanState = { plan: planOk.structuredPlan, replanUsed: false };
+        }
         // #62: the human-approved plan becomes the supervisor's
         // persistent structured plan object for this session.
         try {
@@ -3306,6 +3406,9 @@ ${revised}` });
           let decision: GovernanceDecision;
           let reason: string | undefined;
           let gatewayApprovalId: string | undefined;
+          // Soteria: tier-1 catastrophic flag from the governance
+          // evaluation (plan recovery treats these as absolute).
+          let governanceCatastrophic = false;
 
           // Peer-delegation gate (AgentTeams workstream C): team-level
           // bot→bot approval policy, consulted BEFORE governance. A deny
@@ -3432,6 +3535,7 @@ ${revised}` });
               decision = evaluated.decision ?? classified;
               reason = evaluated.reason;
               gatewayApprovalId = evaluated.approvalId;
+              governanceCatastrophic = evaluated.hardFloor?.tier === 'catastrophic';
             } catch (err) {
               decision = 'deny';
               reason = `governance error: ${err instanceof Error ? err.message : String(err)}`;
@@ -3566,6 +3670,16 @@ ${revised}` });
             };
             this.store.appendMessage(sessionId, toolMsg);
             messages.push(toolMsg);
+            // Soteria (Workstream 1 (c)): when this call belongs to the
+            // turn's verified plan, recover FROM the plan — mark the
+            // step blocked and instruct skip / bounded re-plan / ask /
+            // escalate. The denial itself is never retried.
+            const recoveryNote = notePlanStepBlocked(call, result.reason, governanceCatastrophic);
+            if (recoveryNote) {
+              const noteMsg: ChatMessage = { role: 'system', content: recoveryNote };
+              this.store.appendMessage(sessionId, noteMsg);
+              messages.push(noteMsg);
+            }
             continue;
           }
 
@@ -4322,15 +4436,47 @@ ${revised}` });
     turnApprovalIds: string[],
     approvalTimeoutMs: number,
     recordTurnFailure: (kind: TurnFailureKind, message: string, detail?: Record<string, unknown>) => void,
-  ): Promise<{ approved: boolean; usage: TokenUsage; planMessage: RichMessage }> {
+  ): Promise<{
+    approved: boolean;
+    usage: TokenUsage;
+    planMessage: RichMessage;
+    /** Soteria: the verified structured plan, when the gate ran in
+     *  verified mode and the model produced parseable steps. */
+    structuredPlan?: StructuredPlan;
+    verification?: PlanVerificationResult;
+  }> {
     const emptyPlan: RichMessage = { role: 'assistant', content: '' };
+    // Soteria Verified Plans (Workstream 1 (b)): verified mode engages
+    // when the bot opts in (verifiedPlans) or carries planSpecs, or the
+    // host adapter reports workspace/global planSpecs for the bot. In
+    // verified mode the model is asked for STRUCTURED steps and the
+    // whole plan is verified BEFORE the approval card is shown; a
+    // blocked plan never reaches the card and never executes.
+    let adapterSpecs: PlanSpec[] = [];
+    try {
+      adapterSpecs = this.governance.planSpecsForBot?.(opts.bot.id) ?? [];
+    } catch {
+      adapterSpecs = [];
+    }
+    const verifiedMode =
+      opts.bot.verifiedPlans === true ||
+      (opts.bot.policy?.planSpecs?.length ?? 0) > 0 ||
+      adapterSpecs.length > 0;
     let plan = '';
     let usage = emptyUsage();
     try {
       const planTurn = await provider.chat(
         [
-          { role: 'system', content: 'You are a planning assistant. Output only the numbered plan, no preamble.' },
-          { role: 'user', content: buildPlanPrompt(opts.message) },
+          {
+            role: 'system',
+            content: verifiedMode
+              ? 'You are a planning assistant. Output only the structured plan JSON, no preamble.'
+              : 'You are a planning assistant. Output only the numbered plan, no preamble.',
+          },
+          {
+            role: 'user',
+            content: verifiedMode ? buildStructuredPlanPrompt(opts.message) : buildPlanPrompt(opts.message),
+          },
         ],
         [],
         { model, signal: opts.signal },
@@ -4350,12 +4496,125 @@ ${revised}` });
       return { approved: false, usage, planMessage: emptyPlan };
     }
 
+    // --- Soteria verification (verified mode only) --------------------
+    let structuredPlan: StructuredPlan | undefined;
+    let verification: PlanVerificationResult | undefined;
+    if (verifiedMode) {
+      const parsed = parseStructuredPlan(plan);
+      if (parsed) {
+        structuredPlan = { steps: parsed.steps };
+        // Effective specs: host/workspace layer first, then bot config
+        // (dedupe by id — the more specific scope wins, like rules).
+        const byId = new Map<string, PlanSpec>();
+        for (const s of [...adapterSpecs, ...(opts.bot.policy?.planSpecs ?? [])]) {
+          if (!byId.has(s.id)) byId.set(s.id, s);
+        }
+        const oracle: PlanPolicyOracle = {
+          simulate: async (step) => {
+            if (this.governance.simulatePolicy) {
+              const sim = await this.governance.simulatePolicy(opts.bot.id, step.tool, step.args);
+              return {
+                effect: sim.effect,
+                reason: sim.reason,
+                matchedRuleId: sim.matchedRuleId,
+                hardFloor: sim.hardFloor,
+                denylist: sim.denylist,
+              };
+            }
+            // Fallback oracle for gateways without simulatePolicy
+            // (test fakes): classify() only — no floor detail.
+            const d = await this.governance.classify(
+              { id: step.id, name: step.tool, args: step.args },
+              ctx,
+            );
+            return { effect: d };
+          },
+        };
+        // Hybrid judge: flag-gated, DEFAULT OFF (symbolic-only). Only
+        // undecidable steps are ever judged; verdicts stay labelled.
+        let judge: ReturnType<typeof createProviderPlanJudge> | undefined;
+        if (process.env.KRIYADOT_PLAN_JUDGE === '1') {
+          const profile = resolvePurposeProfile('verifier', { profiles: this.modelProfiles });
+          const judgeModel = profileModelForProvider(profile, provider.providerId);
+          if (judgeModel) judge = createProviderPlanJudge(provider, judgeModel);
+        }
+        // Kill-criterion outcome (Workstream 1 (d), 2026-11-18): the
+        // harness measured 0% false blocks but verifier-added latency
+        // of +58% on micro-fixture tasks (absolute: ~0.03 ms/plan), so
+        // the DEFAULT scope narrowed to high-risk tool classes only
+        // (file deletes, payments, sends). Bots/workspaces may opt
+        // back to 'all' via planVerificationScope. See
+        // benchmarks/agent-safety/RESULTS.md.
+        const scope =
+          this.governance.planVerificationScopeForBot?.(opts.bot.id) ??
+          opts.bot.policy?.planVerificationScope ??
+          'high-risk-only';
+        verification = await verifyPlan(structuredPlan, [...byId.values()], oracle, {
+          scope,
+          judge,
+          judgeEnabled: judge !== undefined,
+        });
+        this.audit({
+          type: 'plan.verified',
+          sessionId: ctx.sessionId,
+          botId: ctx.botId,
+          detail: {
+            status: verification.status,
+            steps: verification.steps.length,
+            blocked: verification.blocked.map((b) => ({ step: b.stepId, spec: b.specId, rule: b.ruleId, reason: b.reason })),
+            undecidable: verification.undecidable.map((u) => u.stepId),
+            judgeVerdicts: verification.judgeVerdicts,
+            latencyMs: Math.round(verification.latencyMs),
+            scope: verification.scope,
+          },
+        });
+        if (verification.status === 'blocked') {
+          const summary = renderVerificationSummary(verification);
+          const message = `Plan blocked by verification — nothing was executed.\n${summary}`;
+          recordTurnFailure('approval_denied', message);
+          await emit({ type: 'error', message });
+          return { approved: false, usage, planMessage: emptyPlan, structuredPlan, verification };
+        }
+        // The card shows the rendered steps + the verdict, so the
+        // human approves the same artifact the verifier checked.
+        plan = renderStructuredPlan(structuredPlan);
+        if (verification.status === 'undecidable') {
+          plan += `\n\n[Verification: ${renderVerificationSummary(verification)}]`;
+        }
+      } else {
+        // Unparseable structured output: fall back to the prose gate,
+        // audited — verification must never deadlock a turn, and the
+        // human still approves before anything runs.
+        this.audit({
+          type: 'plan.verification_skipped',
+          sessionId: ctx.sessionId,
+          botId: ctx.botId,
+          detail: { reason: 'model did not return a parseable structured plan' },
+        });
+      }
+    }
+
     const approvalId = newApprovalId();
     turnApprovalIds.push(approvalId);
     const planCall: ToolCall = {
       id: `plan_${approvalId}`,
       name: PLAN_APPROVAL_TOOL,
-      args: { plan, task: opts.message },
+      args: {
+        plan,
+        task: opts.message,
+        ...(structuredPlan ? { structuredSteps: structuredPlan.steps } : {}),
+        ...(verification
+          ? {
+              verification: {
+                status: verification.status,
+                blocked: verification.blocked,
+                undecidable: verification.undecidable,
+                judgeVerdicts: verification.judgeVerdicts,
+                latencyMs: Math.round(verification.latencyMs),
+              },
+            }
+          : {}),
+      },
     };
     this.audit({
       type: 'plan.approval_requested',
@@ -4383,7 +4642,7 @@ ${revised}` });
       const message = 'Plan was not approved. No actions were taken.';
       recordTurnFailure('approval_denied', message, { approvalId });
       await emit({ type: 'error', message });
-      return { approved: false, usage, planMessage: emptyPlan };
+      return { approved: false, usage, planMessage: emptyPlan, structuredPlan, verification };
     }
     // Recite (Octomind parity): with recitePlan on, the bot must restate
     // the approved plan as its own checklist before executing. A
@@ -4447,7 +4706,7 @@ ${revised}` });
         (recitation ? `\n\nRecited checklist (your own restatement — execute exactly this):\n${recitation}` : ''),
     };
     this.store.appendMessage(ctx.sessionId, planMessage);
-    return { approved: true, usage, planMessage };
+    return { approved: true, usage, planMessage, structuredPlan, verification };
   }
 
   private awaitDecisionAbortable(    approvalId: string,

@@ -21,6 +21,10 @@
  * `"policySnapshot": true` to opt the workspace into snapshot-mode
  * evaluation at session start (#70; default is live evaluation).
  *
+ * The top level may also carry a `"planSpecs"` array (whole-plan
+ * constraints for the Soteria plan verifier — see plan-specs.ts) and a
+ * `"planVerificationScope": "all"|"high-risk-only"` flag.
+ *
  * The file is parsed into BotPolicy rules and merged AHEAD of the bot's
  * own configured rules (the workspace is the most specific scope — the
  * project itself gets the final say on its guardrails), which in turn
@@ -33,6 +37,7 @@
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BotPolicy, BotPolicyRule } from './bot-policy.js';
+import { parsePlanSpecs } from './plan-specs.js';
 
 export interface PolicyFileResult {
   policy: BotPolicy;
@@ -163,7 +168,21 @@ export function loadWorkspacePolicy(workspaceDir: string): PolicyFileResult {
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as {
       rules?: unknown;
       policySnapshot?: unknown;
+      planSpecs?: unknown;
+      planVerificationScope?: unknown;
     };
+    // Soteria Verified Plans (Workstream 1): the same file may carry a
+    // `planSpecs` block (whole-plan constraints — see plan-specs.ts)
+    // and the kill-criterion scoping flag. Malformed specs are skipped
+    // with collected errors, exactly like malformed rules.
+    const planSpecs = parsePlanSpecs(parsed.planSpecs, errors);
+    const planVerificationScope =
+      parsed.planVerificationScope === 'all' || parsed.planVerificationScope === 'high-risk-only'
+        ? parsed.planVerificationScope
+        : undefined;
+    if (parsed.planVerificationScope !== undefined && planVerificationScope === undefined) {
+      errors.push('policy.json: "planVerificationScope" must be "all" or "high-risk-only" — ignored');
+    }
     if (parsed.policySnapshot !== undefined) {
       if (typeof parsed.policySnapshot === 'boolean') {
         policySnapshot = parsed.policySnapshot;
@@ -177,7 +196,12 @@ export function loadWorkspacePolicy(workspaceDir: string): PolicyFileResult {
         const rule = parseRule(raw, i, errors);
         if (rule) rules.push(rule);
       });
-      policy = { rules, ...(policySnapshot ? { policySnapshot: true } : {}) };
+      policy = {
+        rules,
+        ...(policySnapshot ? { policySnapshot: true } : {}),
+        ...(planSpecs.length > 0 ? { planSpecs } : {}),
+        ...(planVerificationScope ? { planVerificationScope } : {}),
+      };
     } else {
       errors.push('policy.json: "rules" must be an array');
     }
