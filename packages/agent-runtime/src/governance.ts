@@ -96,7 +96,8 @@ export interface GovernanceGateway {
    */
   planSpecsForBot?(botId: string): import('./plan-specs.js').PlanSpec[];
   /** OPTIONAL: the effective plan-verification scope for a bot
-   *  (kill-criterion narrowing flag). Absent → bot config / 'all'. */
+   *  (kill-criterion narrowing flag; 'off' = the opt-out from the
+   *  default-on verification). Absent → bot config / 'high-risk-only'. */
   planVerificationScopeForBot?(botId: string): import('./plan-specs.js').PlanVerificationScope;
   /** Governance hooks run around every tool execution. */
   runPreHooks(call: ToolCall, ctx: ToolContext): Promise<void>;

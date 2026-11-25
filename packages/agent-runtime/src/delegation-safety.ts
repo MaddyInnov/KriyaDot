@@ -15,19 +15,31 @@
  * returns EVIDENCE (verbatim quotes + source ids) and the orchestrator
  * draws the conclusion itself.
  *
- * This module implements that countermeasure as an OPT-IN mode:
- *  - per-call: the delegate handler accepts `returnMode: 'evidence'`
- *    (a handler-level arg, deliberately not in the advertised schema —
- *    the same precedent as `profileId` / `isolation`);
- *  - per-process: the host sets KRIYADOT_DELEGATE_EVIDENCE_ONLY=1 to make
- *    evidence-only the default for every subagent spawn.
- * Default is OFF in both cases: conclusion returns remain the behaviour
- * unless a caller or the host explicitly opts in. The measured basis for
- * (and limits of) this protocol live in
+ * DEFAULT CHANGE (2026-11-25, Ashutosh decision — "Approve both
+ * defaults"): evidence-only is now the DEFAULT return mode for every
+ * subagent spawn. The measured basis (P3: 0/10 forged propagation vs
+ * 8/10 conclusion-delegated on the same cases) is in
  * benchmarks/agent-safety-delegation/README.md and FORMALISATION.md.
+ * Conclusion returns remain available as an explicit opt-out, resolved
+ * in this order (first match wins):
+ *  - per-call: the delegate handler accepts `returnMode: 'conclusion'`
+ *    (or 'evidence'; a handler-level arg, deliberately not in the
+ *    advertised schema — the same precedent as `profileId` /
+ *    `isolation`);
+ *  - per-bot: the delegating bot's policy sets
+ *    `delegationReturnMode: 'conclusion'` (bot config — the per-bot
+ *    opt-out);
+ *  - per-process: the host sets KRIYADOT_DELEGATE_EVIDENCE_ONLY=0 (or
+ *    'false') to restore conclusion returns for every spawn (the
+ *    global opt-out). '=1'/'true' states the default explicitly.
  */
 
-/** Env var a host sets to make evidence-only returns the delegation default. */
+/**
+ * Env var controlling the delegation default. Since 2026-11-25 the
+ * default is evidence-only; this var is now the global OPT-OUT
+ * ('0'/'false' → conclusion returns) and may also state the default
+ * explicitly ('1'/'true' → evidence-only).
+ */
 export const DELEGATE_EVIDENCE_ONLY_ENV = 'KRIYADOT_DELEGATE_EVIDENCE_ONLY';
 
 /** The two return shapes a subagent spawn can use. */
@@ -51,29 +63,68 @@ export const EVIDENCE_ONLY_RETURN_INSTRUCTION = [
   '- Include provenance lines verbatim where a source carries them (dates,',
   '  accession/provenance lines, authorship headers).',
   '- If sources disagree, quote BOTH sides; do not resolve the disagreement.',
+  '- If you cannot find evidence for part of the task, write exactly:',
+  '  NO EVIDENCE FOUND — followed by what is missing. Never fill a gap',
+  '  from memory, inference or guesswork.',
   'Do NOT state a conclusion, recommendation or final answer, and do not',
   'say which source you believe. Evidence only.',
 ].join('\n');
 
-/** True when the host env requests evidence-only delegation by default. */
-export function isDelegateEvidenceOnlyEnabled(
-  env: Record<string, string | undefined> = process.env,
-): boolean {
-  const v = env[DELEGATE_EVIDENCE_ONLY_ENV];
-  return v === '1' || v?.toLowerCase() === 'true';
+/**
+ * The framing prepended to an evidence-mode result before the parent
+ * model sees it. Evidence-only returns shift the judgement step to the
+ * parent; this framing makes the abstention path explicit and honest —
+ * when the evidence is missing or insufficient, the parent must say so
+ * (or ask) instead of silently concluding from general knowledge. The
+ * measured cost of P3 included 3/10 abstentions on hard cases; hiding
+ * them would recreate the failure the protocol exists to prevent.
+ */
+export const EVIDENCE_RESULT_FRAMING = [
+  '[DELEGATION SAFETY — EVIDENCE-ONLY RESULT]',
+  'The block below is raw evidence quoted by a sub-agent (verbatim passages',
+  'with source identifiers), NOT a conclusion. Draw your own conclusion from',
+  'this evidence only. If the evidence is marked NO EVIDENCE FOUND, or is',
+  'insufficient to answer, say plainly what could not be established (or ask',
+  'the user) — do not fill the gap from memory or inference and present it',
+  'as established.',
+  '---',
+].join('\n');
+
+/** Wrap a sub-agent's evidence-mode output in the parent-facing framing. */
+export function frameEvidenceResult(result: string): string {
+  return `${EVIDENCE_RESULT_FRAMING}\n${result}`;
 }
 
 /**
- * Resolve the effective return mode for one spawn: an explicit per-call
- * mode wins; otherwise the host env flag decides; otherwise 'conclusion'
- * (the historical default).
+ * True when evidence-only is the effective process default. Since the
+ * 2026-11-25 default flip this is true UNLESS the host explicitly opts
+ * out with KRIYADOT_DELEGATE_EVIDENCE_ONLY=0 (or 'false'); '1'/'true'
+ * state the default explicitly, and any other value leaves the default
+ * in place.
+ */
+export function isDelegateEvidenceOnlyEnabled(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const v = env[DELEGATE_EVIDENCE_ONLY_ENV]?.toLowerCase();
+  return v !== '0' && v !== 'false';
+}
+
+/**
+ * Resolve the effective return mode for one spawn, first match wins:
+ * an explicit per-call mode; the delegating bot's policy
+ * (`delegationReturnMode` — the per-bot opt-out); the host env flag
+ * (the global opt-out); and finally the default, 'evidence'
+ * (2026-11-25 — previously 'conclusion').
  */
 export function resolveDelegateReturnMode(opts: {
   requested?: unknown;
+  botDefault?: unknown;
   env?: Record<string, string | undefined>;
 }): DelegateReturnMode {
   if (opts.requested === 'evidence') return 'evidence';
   if (opts.requested === 'conclusion') return 'conclusion';
+  if (opts.botDefault === 'evidence') return 'evidence';
+  if (opts.botDefault === 'conclusion') return 'conclusion';
   return isDelegateEvidenceOnlyEnabled(opts.env) ? 'evidence' : 'conclusion';
 }
 

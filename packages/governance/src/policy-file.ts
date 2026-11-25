@@ -23,7 +23,9 @@
  *
  * The top level may also carry a `"planSpecs"` array (whole-plan
  * constraints for the Soteria plan verifier — see plan-specs.ts) and a
- * `"planVerificationScope": "all"|"high-risk-only"` flag.
+ * `"planVerificationScope": "all"|"high-risk-only"|"off"` flag
+ * ("off" = the documented opt-out from plan verification, which is
+ * ON by default at 'high-risk-only' scope since 2026-11-25).
  *
  * The file is parsed into BotPolicy rules and merged AHEAD of the bot's
  * own configured rules (the workspace is the most specific scope — the
@@ -177,11 +179,13 @@ export function loadWorkspacePolicy(workspaceDir: string): PolicyFileResult {
     // with collected errors, exactly like malformed rules.
     const planSpecs = parsePlanSpecs(parsed.planSpecs, errors);
     const planVerificationScope =
-      parsed.planVerificationScope === 'all' || parsed.planVerificationScope === 'high-risk-only'
+      parsed.planVerificationScope === 'all' ||
+      parsed.planVerificationScope === 'high-risk-only' ||
+      parsed.planVerificationScope === 'off'
         ? parsed.planVerificationScope
         : undefined;
     if (parsed.planVerificationScope !== undefined && planVerificationScope === undefined) {
-      errors.push('policy.json: "planVerificationScope" must be "all" or "high-risk-only" — ignored');
+      errors.push('policy.json: "planVerificationScope" must be "all", "high-risk-only" or "off" — ignored');
     }
     if (parsed.policySnapshot !== undefined) {
       if (typeof parsed.policySnapshot === 'boolean') {

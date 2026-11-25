@@ -106,7 +106,9 @@ describe('delegate bot param (AgentTeams assignment)', () => {
   it('passes the bot override through to spawn', async () => {
     const { spawn, calls } = stubSpawn();
     const [tool] = createDelegateTools({ spawn });
-    const out = (await tool!.handler({ task: 'subtask', bot: 'member-bot' }, ctx)) as { result: string };
+    // returnMode 'conclusion' isolates the bot-override mechanics from
+    // the evidence-only delegation default (2026-11-25).
+    const out = (await tool!.handler({ task: 'subtask', bot: 'member-bot', returnMode: 'conclusion' }, ctx)) as { result: string };
     expect(out.result).toBe('ok');
     expect(calls).toHaveLength(1);
     expect(calls[0]!.botId).toBe('member-bot');

@@ -99,4 +99,30 @@ describe('policy.json planSpecs loading', () => {
     expect(loaded.policy.planVerificationScope).toBe('high-risk-only');
     expect(loaded.errors.some((e) => e.includes('broken'))).toBe(true);
   });
+
+  it('loads planVerificationScope "off" (the documented opt-out, 2026-11-25)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kriyadot-policy-'));
+    mkdirSync(join(dir, '.kriyadot'), { recursive: true });
+    writeFileSync(
+      join(dir, '.kriyadot', 'policy.json'),
+      JSON.stringify({ rules: [], planVerificationScope: 'off' }),
+    );
+    clearWorkspacePolicyCache();
+    const loaded = loadWorkspacePolicy(dir);
+    expect(loaded.policy.planVerificationScope).toBe('off');
+    expect(loaded.errors).toEqual([]);
+  });
+
+  it('rejects an unknown planVerificationScope value with a collected error', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kriyadot-policy-'));
+    mkdirSync(join(dir, '.kriyadot'), { recursive: true });
+    writeFileSync(
+      join(dir, '.kriyadot', 'policy.json'),
+      JSON.stringify({ rules: [], planVerificationScope: 'everything' }),
+    );
+    clearWorkspacePolicyCache();
+    const loaded = loadWorkspacePolicy(dir);
+    expect(loaded.policy.planVerificationScope).toBeUndefined();
+    expect(loaded.errors.some((e) => e.includes('planVerificationScope'))).toBe(true);
+  });
 });

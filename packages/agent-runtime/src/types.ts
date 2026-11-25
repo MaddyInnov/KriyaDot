@@ -424,11 +424,25 @@ export interface BotPolicy {
   planSpecs?: import('./plan-specs.js').PlanSpec[];
   /**
    * Verification scope (kill-criterion narrowing): 'high-risk-only'
-   * restricts plan verification to file deletes, payments and sends.
-   * Absent → 'high-risk-only' (the 2026-11-18 harness outcome; see
-   * benchmarks/agent-safety/RESULTS.md).
+   * restricts plan verification to file deletes, payments and sends;
+   * 'all' widens it to every step; 'off' is the documented opt-out —
+   * plan verification disabled for this bot. Absent → 'high-risk-only'.
+   * Since 2026-11-25 plan verification is ON by default at this scope
+   * for every bot in plan-approval mode (Ashutosh decision); the scope
+   * field is how a bot/workspace narrows, widens or disables it.
    */
   planVerificationScope?: import('./plan-specs.js').PlanVerificationScope;
+  /**
+   * Delegation return mode (Agent-Safety Workstream 2): 'evidence'
+   * makes this bot's sub-agent delegations return verbatim evidence
+   * with source ids instead of conclusions. Since 2026-11-25
+   * 'evidence' is the product DEFAULT, so this field is the per-bot
+   * OPT-OUT: set 'conclusion' to restore conclusion returns for this
+   * bot's delegations. Absent → the host default (env
+   * KRIYADOT_DELEGATE_EVIDENCE_ONLY, itself defaulting to evidence).
+   * Field-compatible with @mvp/governance's BotPolicy.
+   */
+  delegationReturnMode?: 'evidence' | 'conclusion';
 }
 
 /**
@@ -723,12 +737,17 @@ export interface BotConfig {
    */
   approvalMode?: ApprovalMode;
   /**
-   * Soteria Verified Plans (Workstream 1): when true, the plan gate
-   * asks the model for STRUCTURED steps and verifies the whole plan
-   * against the effective planSpecs + the governance simulate oracle
-   * before the approval card is shown; a blocked plan never executes.
-   * Also auto-enabled when the bot (or its workspace policy) carries
-   * planSpecs. Default/absent = legacy free-text plan gate.
+   * Soteria Verified Plans (Workstream 1): in verified mode the plan
+   * gate asks the model for STRUCTURED steps and verifies the whole
+   * plan against the effective planSpecs + the governance simulate
+   * oracle before the approval card is shown; a blocked plan never
+   * executes. Since 2026-11-25 verified mode is ON BY DEFAULT for
+   * every bot in plan-approval mode (at the resolved
+   * planVerificationScope, default 'high-risk-only'), so this flag is
+   * now the per-bot OPT-OUT: `false` restores the legacy free-text
+   * plan gate for this bot. `true` remains an explicit opt-in
+   * (redundant with the default, kept for clarity in bot configs).
+   * Absent = default-on.
    */
   verifiedPlans?: boolean;
   /**

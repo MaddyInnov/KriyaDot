@@ -62,12 +62,25 @@ export interface BotPolicy {
   /**
    * Verification scope for plan specs (kill-criterion narrowing): when
    * 'high-risk-only', the plan verifier checks only high-risk tool
-   * classes (file deletes, payments, sends). Absent = the runtime
-   * default, which the 2026-11-18 harness outcome set to
-   * 'high-risk-only' (see benchmarks/agent-safety/RESULTS.md).
+   * classes (file deletes, payments, sends); 'all' widens to every
+   * step; 'off' is the documented opt-out (verification disabled).
+   * Absent = the runtime default, which the 2026-11-18 harness outcome
+   * set to 'high-risk-only', and which the 2026-11-25 decision made
+   * default-ON for every bot in plan-approval mode (see
+   * benchmarks/agent-safety/RESULTS.md).
    * Field-compatible with agent-runtime's BotPolicy.planVerificationScope.
    */
-  planVerificationScope?: 'all' | 'high-risk-only';
+  planVerificationScope?: 'all' | 'high-risk-only' | 'off';
+  /**
+   * Delegation return mode (Agent-Safety Workstream 2) —
+   * field-compatible with agent-runtime's BotPolicy.delegationReturnMode.
+   * 'evidence' = sub-agents return quoted evidence, never conclusions;
+   * since 2026-11-25 that is the product default, so 'conclusion' here
+   * is the per-bot opt-out. The runtime's delegate handler reads it via
+   * the bot config directly (like sandboxAutoAllow), so mergeBotPolicy
+   * does not need to carry it.
+   */
+  delegationReturnMode?: 'evidence' | 'conclusion';
 }
 
 /**

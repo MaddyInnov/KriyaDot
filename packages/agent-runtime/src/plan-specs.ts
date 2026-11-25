@@ -84,12 +84,16 @@ export type PlanSpecs = PlanSpec[];
  * Verification scope (kill-criterion narrowing, Workstream 1 (d)):
  * 'all' verifies every step; 'high-risk-only' restricts symbolic
  * verification to high-risk tool classes — file deletes, payments and
- * sends. The 2026-11-18 harness outcome (0% false blocks, but +58%
+ * sends; 'off' disables plan verification entirely (the documented
+ * opt-out). The 2026-11-18 harness outcome (0% false blocks, but +58%
  * relative latency on micro-fixture tasks at ~0.03 ms/plan absolute)
  * triggered the latency arm, so 'high-risk-only' is the DEFAULT scope
- * in the runtime wiring; 'all' remains one flag away.
+ * in the runtime wiring; 'all' remains one flag away. Since 2026-11-25
+ * (Ashutosh decision) verification itself is ON by default at that
+ * scope for every bot in plan-approval mode — 'off' (here, or
+ * `verifiedPlans: false` on the bot) is how a user turns it back off.
  */
-export type PlanVerificationScope = 'all' | 'high-risk-only';
+export type PlanVerificationScope = 'all' | 'high-risk-only' | 'off';
 
 const HIGH_RISK_TOOL_RE =
   /delete|remove|drop|erase|wipe|purge|purchase|payment|pay_|_pay|checkout|send|message_|email|post_message|publish/i;

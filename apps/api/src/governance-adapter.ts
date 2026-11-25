@@ -283,9 +283,11 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
 
   /** Soteria: the effective verification scope for a bot (bot config
    *  wins, then the workspace policy file). Default 'high-risk-only' —
-   *  the Workstream 1 kill-criterion narrowing (2026-11-18); see
+   *  the Workstream 1 kill-criterion narrowing (2026-11-18); since
+   *  2026-11-25 verification is ON by default at that scope, and 'off'
+   *  (bot config or policy.json) is the documented opt-out. See
    *  benchmarks/agent-safety/RESULTS.md. */
-  planVerificationScopeForBot(botId: string): 'all' | 'high-risk-only' {
+  planVerificationScopeForBot(botId: string): 'all' | 'high-risk-only' | 'off' {
     const botScope = this.getBotConfig?.(botId)?.policy?.planVerificationScope;
     if (botScope) return botScope;
     const workspaceDir = this.workspaceDirForBot?.(botId);

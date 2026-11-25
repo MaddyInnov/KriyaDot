@@ -68,7 +68,7 @@ import {
   type PlanVerificationResult,
   type StructuredPlan,
 } from './plan-verifier.js';
-import type { PlanSpec } from './plan-specs.js';
+import type { PlanSpec, PlanVerificationScope } from './plan-specs.js';
 import {
   ProgressGuard,
   ToolErrorTracker,
@@ -4446,22 +4446,31 @@ ${revised}` });
     verification?: PlanVerificationResult;
   }> {
     const emptyPlan: RichMessage = { role: 'assistant', content: '' };
-    // Soteria Verified Plans (Workstream 1 (b)): verified mode engages
-    // when the bot opts in (verifiedPlans) or carries planSpecs, or the
-    // host adapter reports workspace/global planSpecs for the bot. In
-    // verified mode the model is asked for STRUCTURED steps and the
-    // whole plan is verified BEFORE the approval card is shown; a
-    // blocked plan never reaches the card and never executes.
+    // Soteria Verified Plans (Workstream 1 (b)): in verified mode the
+    // model is asked for STRUCTURED steps and the whole plan is
+    // verified BEFORE the approval card is shown; a blocked plan never
+    // reaches the card and never executes.
+    //
+    // DEFAULT CHANGE (2026-11-25, Ashutosh decision — "Approve both
+    // defaults"): verified mode is ON BY DEFAULT for every bot in
+    // plan-approval mode, at the resolved scope (default
+    // 'high-risk-only' — the kill-criterion narrowing). The documented
+    // opt-outs are: planVerificationScope 'off' (bot policy or
+    // workspace policy.json, via the adapter) and `verifiedPlans:
+    // false` on the bot config. Before this change, verified mode was
+    // opt-in (bot.verifiedPlans, or planSpecs present on the bot or
+    // via the host adapter).
     let adapterSpecs: PlanSpec[] = [];
     try {
       adapterSpecs = this.governance.planSpecsForBot?.(opts.bot.id) ?? [];
     } catch {
       adapterSpecs = [];
     }
-    const verifiedMode =
-      opts.bot.verifiedPlans === true ||
-      (opts.bot.policy?.planSpecs?.length ?? 0) > 0 ||
-      adapterSpecs.length > 0;
+    const verificationScope: PlanVerificationScope =
+      this.governance.planVerificationScopeForBot?.(opts.bot.id) ??
+      opts.bot.policy?.planVerificationScope ??
+      'high-risk-only';
+    const verifiedMode = verificationScope !== 'off' && opts.bot.verifiedPlans !== false;
     let plan = '';
     let usage = emptyUsage();
     try {
@@ -4543,12 +4552,12 @@ ${revised}` });
         // of +58% on micro-fixture tasks (absolute: ~0.03 ms/plan), so
         // the DEFAULT scope narrowed to high-risk tool classes only
         // (file deletes, payments, sends). Bots/workspaces may opt
-        // back to 'all' via planVerificationScope. See
-        // benchmarks/agent-safety/RESULTS.md.
-        const scope =
-          this.governance.planVerificationScopeForBot?.(opts.bot.id) ??
-          opts.bot.policy?.planVerificationScope ??
-          'high-risk-only';
+        // back to 'all' via planVerificationScope. The scope was
+        // resolved once at the top of this gate (verificationScope) —
+        // the same value that decided verified mode — so the audit
+        // trail can never show a scope different from the one that
+        // gated the turn. See benchmarks/agent-safety/RESULTS.md.
+        const scope = verificationScope;
         verification = await verifyPlan(structuredPlan, [...byId.values()], oracle, {
           scope,
           judge,

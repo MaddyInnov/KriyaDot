@@ -56,7 +56,15 @@
  * SCOPING (kill criterion). `scope: 'high-risk-only'` restricts
  * verification to high-risk tool classes (file deletes, payments,
  * sends); out-of-scope steps are reported as such, never silently
- * treated as verified.
+ * treated as verified. `scope: 'off'` puts every step out of the
+ * POLICY scope: no oracle simulation and no spec evaluation runs for
+ * any step, high-risk or not — the runtime never calls the verifier
+ * in that configuration (the plan gate itself is disabled), but the
+ * verifier honours it too, so no caller can accidentally verify at
+ * high-risk scope while believing verification is off. (The
+ * structural pass — unknown dependencies, cycles — is scope-
+ * independent: it judges whether the plan can execute in order at
+ * all, not whether policy allows it.)
  */
 
 import type { PlanSpec, PlanVerificationScope } from './plan-specs.js';
@@ -295,7 +303,11 @@ export async function verifyPlan(
   const now = opts.now ?? (() => performance.now());
   const started = now();
   const scope: PlanVerificationScope = opts.scope ?? 'all';
-  const inScope = (step: PlanStep): boolean => scope === 'all' || isHighRiskTool(step.tool);
+  // 'off' must mean off for every step — including high-risk ones.
+  // (The naive `scope === 'all' || isHighRiskTool(...)` would keep
+  // verifying deletes/pays/sends under an explicit opt-out.)
+  const inScope = (step: PlanStep): boolean =>
+    scope === 'all' ? true : scope === 'off' ? false : isHighRiskTool(step.tool);
   const verdicts = new Map<string, PlanStepVerdict>();
   const postconditions: PlanPostconditionRecord[] = [];
   const judgeVerdicts: PlanVerificationResult['judgeVerdicts'] = [];

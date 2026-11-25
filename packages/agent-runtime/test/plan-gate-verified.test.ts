@@ -19,6 +19,8 @@ class FakeGateway implements GovernanceGateway {
   audits: Array<{ type: string; detail?: unknown }> = [];
   /** Per-tool simulate results for the verifier oracle. */
   simMap: Record<string, PlanOracleResult> = {};
+  /** Every tool name the oracle was asked to simulate, in order. */
+  simCalls: string[] = [];
   specs: PlanSpec[] = [];
 
   async classify(): Promise<GovernanceDecision> {
@@ -30,6 +32,7 @@ class FakeGateway implements GovernanceGateway {
     return { decision: sim?.effect === 'deny' ? 'deny' : this.decision, reason: sim?.reason };
   }
   async simulatePolicy(_botId: string, toolName: string): Promise<PlanOracleResult> {
+    this.simCalls.push(toolName);
     return this.simMap[toolName] ?? { effect: 'allow' };
   }
   planSpecsForBot(): PlanSpec[] {
@@ -187,7 +190,10 @@ describe('plan gate — verified mode', () => {
     expect((verified?.detail as { status: string }).status).toBe('blocked');
   });
 
-  it('bots without verified plans keep the legacy prose gate untouched', async () => {
+  it('a prose (unparseable) plan falls back to the legacy prose gate — verification never deadlocks a turn', async () => {
+    // Since 2026-11-25 this bot IS in verified mode by default; the
+    // model answered with free-text prose instead of structured steps,
+    // so the gate audits the skip and continues with the prose card.
     const gateway = new FakeGateway();
     const provider = new MockProvider([
       { content: '1. First do X\n2. Then do Y' },
@@ -206,6 +212,123 @@ describe('plan gate — verified mode', () => {
       expect((approval.call.args as Record<string, unknown>).verification).toBeUndefined();
     }
     expect(gateway.audits.some((a) => a.type === 'plan.verified')).toBe(false);
+    expect(gateway.audits.some((a) => a.type === 'plan.verification_skipped')).toBe(true);
+  });
+});
+
+describe('plan gate — verified by DEFAULT (2026-11-25 decision)', () => {
+  it('a bot with NO opt-in gets high-risk steps verified: an oracle-denied delete blocks pre-card', async () => {
+    const gateway = new FakeGateway();
+    gateway.simMap = {
+      delete_file: {
+        effect: 'deny',
+        hardFloor: { tier: 'catastrophic', reason: 'catastrophic delete', patternId: 'catastrophic-delete' },
+      },
+    };
+    const ran: Record<string, number> = {};
+    const provider = new MockProvider([{ content: STRUCTURED_PLAN }, { content: 'never reached' }]);
+    const rt = makeRuntime(gateway, [tool('list_folder', ran), tool('delete_file', ran)], provider);
+    const events: StreamEvent[] = [];
+    await rt.runTurn({
+      // No verifiedPlans, no planSpecs, no scope config — the shipped
+      // defaults alone must engage verification at high-risk scope.
+      bot: testBot({ approvalMode: 'plan', tools: ['list_folder', 'delete_file'] }),
+      message: 'Clean up old logs',
+      onEvent: (e) => void events.push(e),
+    });
+    expect(events.some((e) => e.type === 'approval_required')).toBe(false);
+    expect(ran).toEqual({});
+    const verified = gateway.audits.find((a) => a.type === 'plan.verified');
+    expect(verified).toBeDefined();
+    const detail = verified?.detail as { status: string; scope: string };
+    expect(detail.status).toBe('blocked');
+    expect(detail.scope).toBe('high-risk-only');
+    // Only the high-risk step was simulated — list_folder stayed out of scope.
+    expect(gateway.simCalls).toEqual(['delete_file']);
+  });
+
+  it('a bot with NO opt-in: an allowed high-risk plan verifies (low-risk steps out-of-scope) and executes', async () => {
+    const gateway = new FakeGateway();
+    const ran: Record<string, number> = {};
+    const provider = new MockProvider([
+      { content: STRUCTURED_PLAN },
+      { toolCalls: [{ id: 'c1', name: 'delete_file', args: { path: 'old.log' } } as ToolCall] },
+      { content: 'done' },
+    ]);
+    const rt = makeRuntime(gateway, [tool('list_folder', ran), tool('delete_file', ran)], provider);
+    const events: StreamEvent[] = [];
+    await rt.runTurn({
+      bot: testBot({ approvalMode: 'plan', tools: ['list_folder', 'delete_file'] }),
+      message: 'Clean up old logs',
+      onEvent: (e) => void events.push(e),
+    });
+    const approval = events.find((e) => e.type === 'approval_required');
+    expect(approval).toBeDefined();
+    if (approval?.type === 'approval_required') {
+      const args = approval.call.args as Record<string, unknown>;
+      expect((args.verification as { status: string }).status).toBe('verified');
+    }
+    // Scope proof: the oracle simulated ONLY the high-risk step.
+    expect(gateway.simCalls).toEqual(['delete_file']);
+    const verified = gateway.audits.find((a) => a.type === 'plan.verified');
+    const detail = verified?.detail as { status: string; scope: string; steps: number };
+    expect(detail.status).toBe('verified');
+    expect(detail.scope).toBe('high-risk-only');
+    expect(detail.steps).toBe(2);
+    expect(ran.delete_file).toBe(1);
+  });
+
+  it("OPT-OUT: planVerificationScope 'off' restores the prose gate (no verification at all)", async () => {
+    const gateway = new FakeGateway();
+    gateway.simMap = { delete_file: { effect: 'deny', reason: 'would block if verified' } };
+    const ran: Record<string, number> = {};
+    const provider = new MockProvider([
+      { content: '1. List files\n2. Delete the old log' },
+      { content: 'done' },
+    ]);
+    const rt = makeRuntime(gateway, [tool('list_folder', ran), tool('delete_file', ran)], provider);
+    const events: StreamEvent[] = [];
+    await rt.runTurn({
+      bot: testBot({
+        approvalMode: 'plan', tools: ['list_folder', 'delete_file'],
+        policy: { rules: [], planVerificationScope: 'off' },
+      }),
+      message: 'Clean up old logs',
+      onEvent: (e) => void events.push(e),
+    });
+    const approval = events.find((e) => e.type === 'approval_required');
+    expect(approval).toBeDefined();
+    if (approval?.type === 'approval_required') {
+      expect((approval.call.args as Record<string, unknown>).verification).toBeUndefined();
+    }
+    expect(gateway.audits.some((a) => a.type === 'plan.verified')).toBe(false);
+    expect(gateway.audits.some((a) => a.type === 'plan.verification_skipped')).toBe(false);
+  });
+
+  it('OPT-OUT: verifiedPlans false restores the prose gate even when planSpecs exist', async () => {
+    const gateway = new FakeGateway();
+    gateway.specs = [{
+      type: 'provenance', id: 'del-prov', toolPattern: '^delete_file$', arg: 'path',
+      sourceToolPattern: '^list_folder$', sourceArg: 'paths',
+    }];
+    const provider = new MockProvider([
+      { content: '1. First do X\n2. Then do Y' },
+      { content: 'done' },
+    ]);
+    const rt = makeRuntime(gateway, [], provider);
+    const events: StreamEvent[] = [];
+    await rt.runTurn({
+      bot: testBot({ approvalMode: 'plan', verifiedPlans: false }),
+      message: 'Do the thing',
+      onEvent: (e) => void events.push(e),
+    });
+    const approval = events.find((e) => e.type === 'approval_required');
+    expect(approval).toBeDefined();
+    if (approval?.type === 'approval_required') {
+      expect((approval.call.args as Record<string, unknown>).verification).toBeUndefined();
+    }
+    expect(gateway.audits.some((a) => a.type === 'plan.verified')).toBe(false);
+    expect(gateway.audits.some((a) => a.type === 'plan.verification_skipped')).toBe(false);
   });
 });
 

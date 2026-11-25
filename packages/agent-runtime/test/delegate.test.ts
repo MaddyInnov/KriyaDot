@@ -61,13 +61,18 @@ describe('createDelegateTools', () => {
     };
     expect(spawn).toHaveBeenCalledTimes(1);
     expect(calls[0]).toMatchObject({
-      task: 'research rivals',
       botId: 'bot-parent',
       parentSessionId: 'sess-parent',
     });
+    // Delegation-safety default (2026-11-25): the spawned task carries
+    // the original task plus the evidence-only return instruction, and
+    // the result comes back framed as evidence for the parent to judge.
+    expect(calls[0]!.task.startsWith('research rivals')).toBe(true);
+    expect(calls[0]!.task).toContain('EVIDENCE-ONLY RETURN MODE');
     // tools omitted -> undefined, so the host defaults to parent-tools-minus-delegate
     expect(calls[0]!.tools).toBeUndefined();
-    expect(out.result).toBe('child result');
+    expect(out.result).toContain('child result');
+    expect(out.result).toContain('EVIDENCE-ONLY RESULT');
     expect(out.subagentId).toMatch(/^sub_/);
 
     // parent/child record exists
@@ -110,7 +115,9 @@ describe('createDelegateTools', () => {
     const [tool] = createDelegateTools({ spawn })!;
     const out = (await tool!.handler({ task: 'no store' }, ctx)) as { result: string };
     expect(calls[0]!.parentSessionId).toBe('sess-parent');
-    expect(out.result).toBe('child result');
+    // Evidence-only default applies on this path too (framed result).
+    expect(out.result).toContain('child result');
+    expect(out.result).toContain('EVIDENCE-ONLY RESULT');
     // no subagentId in the fallback path
     expect((out as { subagentId?: string }).subagentId).toBeUndefined();
   });

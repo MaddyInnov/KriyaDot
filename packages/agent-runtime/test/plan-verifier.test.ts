@@ -202,6 +202,32 @@ describe('verifyPlan — scope + judge', () => {
     expect(res.status).toBe('verified'); // nothing in scope blocked; the execution-time floor still applies
   });
 
+  it("scope 'off' simulates NOTHING — not even high-risk steps (the opt-out means off)", async () => {
+    let calls = 0;
+    const counting: PlanPolicyOracle = {
+      simulate: async () => {
+        calls += 1;
+        return { effect: 'deny', hardFloor: { tier: 'catastrophic', reason: 'floor', patternId: 'p' } };
+      },
+    };
+    // A delete step the oracle would deny catastrophically, plus a
+    // provenance spec that would block it: under 'off', neither the
+    // oracle nor the spec pass may run.
+    const spec: PlanSpec = {
+      type: 'provenance', id: 'del-prov', toolPattern: '^delete_file$', arg: 'path',
+      sourceToolPattern: '^list_folder$', sourceArg: 'paths',
+    };
+    const plan: StructuredPlan = {
+      steps: [step({ id: 's1', tool: 'delete_file', args: { path: 'x' } })],
+    };
+    const res = await verifyPlan(plan, [spec], counting, { scope: 'off' });
+    expect(calls).toBe(0);
+    expect(res.steps[0]?.status).toBe('out-of-scope');
+    expect(res.status).toBe('verified'); // no policy verdicts at all under 'off'
+    expect(res.scope).toBe('off');
+    expect(res.postconditions).toEqual([]);
+  });
+
   it('semantic steps are undecidable symbolically; the judge is OFF by default', async () => {
     const plan: StructuredPlan = { steps: [step({ id: 's1', tool: 'send_email', args: { content: 'hi' }, semantic: true })] };
     const judge = async () => ({ verdict: 'allow' as const, reason: 'looks fine' });

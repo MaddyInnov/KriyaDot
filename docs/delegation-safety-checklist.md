@@ -29,12 +29,19 @@ small-n, the count is shown; treat rates as indicative, counts as exact.*
    (reader returns verbatim quotes + source ids, never a conclusion;
    orchestrator concludes) measured **0/10** propagation vs 8/10 for
    conclusion delegation on the same cases — including cases the
-   orchestrator itself gets wrong reading directly. KriyaDot ships this as
-   an opt-in: `delegate` arg `returnMode: 'evidence'`, or host env
-   `KRIYADOT_DELEGATE_EVIDENCE_ONLY=1` (default OFF; see
-   `packages/agent-runtime/src/delegation-safety.ts`). Known cost: ~3,492
+   orchestrator itself gets wrong reading directly. Since 2026-11-25
+   this is KriyaDot's **default** for every `delegate` spawn (see
+   `packages/agent-runtime/src/delegation-safety.ts`); conclusion
+   returns are the opt-out — per call (`returnMode: 'conclusion'`),
+   per bot (policy `delegationReturnMode: 'conclusion'`), or globally
+   (env `KRIYADOT_DELEGATE_EVIDENCE_ONLY=0`). Known cost: ~3,492
    tokens/case (vs 2,395 conclusion-delegated) and 3/10 non-answers on hard
-   cases — budget for abstention handling, not just accuracy.
+   cases — budget for abstention handling, not just accuracy. The
+   runtime supports that handling: a child that finds nothing must
+   return `NO EVIDENCE FOUND — <what is missing>`, and the result is
+   framed for the parent as evidence-to-judge with an explicit duty to
+   say plainly what could not be established rather than conclude
+   silently.
 3. **If you re-check, re-read the source — don't re-ask the reader.**
    Protocol P1 (orchestrator independently re-reads before adopting)
    measured 3/10, and its failures were exactly the orchestrator's own
@@ -75,8 +82,15 @@ small-n, the count is shown; treat rates as indicative, counts as exact.*
 
 | Setting | Default | Where |
 |---|---|---|
-| Evidence-only delegate returns | **OFF** (opt-in per call or per host) | `returnMode: 'evidence'` arg; `KRIYADOT_DELEGATE_EVIDENCE_ONLY=1` |
-| Conclusion returns | unchanged historical behaviour | `delegate` tool |
+| Evidence-only delegate returns | **ON** (since 2026-11-25) | `delegate` tool; `packages/agent-runtime/src/delegation-safety.ts` |
+| Conclusion returns (opt-out) | per call / per bot / per host | `returnMode: 'conclusion'` arg; bot policy `delegationReturnMode: 'conclusion'`; env `KRIYADOT_DELEGATE_EVIDENCE_ONLY=0` |
+| Plan verification (companion default, same decision) | **ON** at 'high-risk-only' scope for plan-approval mode | bot policy / policy.json `planVerificationScope` (`'all'` widens, `'off'` opts out); bot `verifiedPlans: false` also opts out |
 
-Enabling evidence-only by default is a product decision gated on these
-measurements (programme backlog §8), not taken by this workstream.
+*History: this checklist originally shipped (2026-11-18) with
+evidence-only as an opt-in, the by-default decision explicitly gated
+on the measurements above (programme backlog §8). Ashutosh took that
+decision on 2026-11-25 — "Approve both defaults": evidence-only
+delegation ON by default, and verified plans ON by default for
+high-risk actions. The opt-outs in the table are the supported way
+back; each is covered by tests asserting the old behaviour returns
+exactly.*

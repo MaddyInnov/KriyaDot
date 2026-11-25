@@ -236,7 +236,9 @@ describe('delegate with agent definitions + worktree isolation', () => {
       return { result: 'reviewed', usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
     });
     const [tool] = createDelegateTools({ spawn, store, workspaceDir: repo, agentDefinitions: defs(), hooks: bus })!;
-    const out = (await tool!.handler({ task: 'review the repo', profileId: 'isolated-reviewer' }, ctx)) as {
+    // returnMode 'conclusion' isolates the definition/worktree mechanics
+    // from the evidence-only delegation default (2026-11-25).
+    const out = (await tool!.handler({ task: 'review the repo', profileId: 'isolated-reviewer', returnMode: 'conclusion' }, ctx)) as {
       result: string; worktreePath?: string; worktreeBranch?: string;
     };
     expect(out.result).toBe('reviewed');

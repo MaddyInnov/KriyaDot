@@ -775,7 +775,10 @@ describe('#25 supervisor recite (plan mode)', () => {
       const gateway = new AllowGateway();
       const rt = makeRuntime(provider, [], gateway);
       await rt.runTurn({
-        bot: testBot({ approvalMode: 'plan', recitePlan: true }),
+        // verifiedPlans: false isolates the recite mechanism (#25) from
+        // the verified-plans default (ON since 2026-11-25): this
+        // provider scripts its plan response off the prose plan prompt.
+        bot: testBot({ approvalMode: 'plan', recitePlan: true, verifiedPlans: false }),
         message: 'do the three steps',
         sessionId: 's-recite',
         onEvent: () => {},
