@@ -84,10 +84,17 @@ function escapeXml(s: string): string {
     .replace(/'/g, '&apos;');
 }
 
-/** Quote one token for a systemd Exec= line / Environment= entry. */
+/**
+ * Quote one token for a systemd Exec= line / Environment= entry.
+ * Sweep 2026-11-25 (D4): systemd expands `%` specifiers (%h, %t, …)
+ * and `$VAR` references in these lines — including inside paths the
+ * user never meant as expansions — so both are doubled (`%%`, `$$`
+ * are systemd's literal forms) before any quoting.
+ */
 function systemdQuote(s: string): string {
-  if (!/[\s"\\]/.test(s)) return s;
-  return `"${s.replace(/(["\\])/g, '\\$1')}"`;
+  const esc = s.replace(/%/g, '%%').replace(/\$/g, '$$$$');
+  if (!/[\s"\\]/.test(esc)) return esc;
+  return `"${esc.replace(/(["\\])/g, '\\$1')}"`;
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +166,10 @@ export function renderWindowsTaskXml(spec: ServiceSpec): string {
   // server's DATA_DIR env is a deployment-level setting there).
   const args = spec.execArgs.map((a) => (/\s/.test(a) ? `"${a.replace(/"/g, '""')}"` : a)).join(' ');
   return [
-    '<?xml version="1.0" encoding="UTF-16"?>',
+    // D3 (sweep 2026-11-25): the declaration must match the bytes —
+    // the manager writes this file as UTF-8 (it previously declared
+    // UTF-16, which schtasks /Create /XML can reject outright).
+    '<?xml version="1.0" encoding="UTF-8"?>',
     '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">',
     '  <RegistrationInfo>',
     `    <Description>${escapeXml(SERVICE_DESCRIPTION)}</Description>`,

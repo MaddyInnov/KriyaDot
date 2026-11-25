@@ -22,9 +22,11 @@ import {
   createCopilotAcpProvider,
   detectAcpEngines,
   getAcpEnginePreset,
+  grantBridgeConsent,
   isAcpEngineId,
   listAcpEnginePresets,
   loadAgentRegistry,
+  resetBridgeConsent,
   AcpSessionManager,
   AcpSessionStore,
 } from '../src/index.js';
@@ -167,9 +169,24 @@ describe('CopilotAcpProvider', () => {
   });
 
   it('factory routes agent/copilot/<model> to the ACP provider', () => {
-    const provider = createProvider('agent/copilot/default');
-    expect(provider).toBeInstanceOf(CopilotAcpProvider);
-    (provider as CopilotAcpProvider).close();
+    // B-1 (sweep 2026-11-25): copilot's agent/… lane is bridge-backed —
+    // it routes only with bridge consent and a binary that passes the
+    // identity probe (previously it spawned the bare name unchecked).
+    const binDir = mkdtempSync(join(tmpdir(), 'fake-copilot-bin-'));
+    const shim = join(binDir, 'copilot');
+    writeFileSync(shim, '#!/bin/sh\necho "copilot 1.0.0"\n');
+    chmodSync(shim, 0o755);
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${binDir}${delimiter}${savedPath ?? ''}`;
+    grantBridgeConsent('copilot');
+    try {
+      const provider = createProvider('agent/copilot/default');
+      expect(provider).toBeInstanceOf(CopilotAcpProvider);
+      (provider as CopilotAcpProvider).close();
+    } finally {
+      process.env.PATH = savedPath;
+      resetBridgeConsent('copilot');
+    }
   });
 });
 

@@ -22,6 +22,7 @@ import {
   MissionService,
   MissionStore,
   codingMissionWorkflowTemplate,
+  createRuntimeBotRunner,
   registerMissionRoutes,
   type MissionApprovalGate,
   type MissionBotRunner,
@@ -151,7 +152,11 @@ describe('dispatcher + chained missions end-to-end', () => {
 
     const landedA = h.missionStore.get(ma.id);
     expect(landedA?.stage).toBe('landed');
-    expect(landedA?.provenance).toBe('dispatcher');
+    // C-10 (sweep 2026-11-25): provenance keeps the CREATION origin
+    // ('manual' — this mission was created by hand); the dispatcher's
+    // pickup is recorded additively in startedBy.
+    expect(landedA?.provenance).toBe('manual');
+    expect(landedA?.startedBy).toBe('dispatcher');
     expect(landedA?.reviewIndependence).toBe('cross-model');
     expect(landedA?.review?.verdict).toBe('approve');
     expect(landedA?.testResult?.exitCode).toBe(0);
@@ -162,8 +167,13 @@ describe('dispatcher + chained missions end-to-end', () => {
     expect(existsSync(join(h.repo, `feature-${a.id.slice(0, 8)}.txt`))).toBe(true);
     expect(landedA?.worktreePath && existsSync(landedA.worktreePath)).toBe(false);
     expect(git(h.repo, ['log', '--oneline']).includes('Land mission: Task A')).toBe(true);
-    // Dispatcher provenance reached the audit trail.
-    expect(h.audits.some((e) => e.action === 'mission.landed' && e.fields.provenance === 'dispatcher')).toBe(true);
+    // Dispatcher pickup reached the audit trail via the actor label,
+    // while the provenance field keeps the creation origin.
+    expect(
+      h.audits.some(
+        (e) => e.action === 'mission.landed' && e.fields.actor === 'mission-dispatcher' && e.fields.provenance === 'manual',
+      ),
+    ).toBe(true);
 
     // B unblocked by A's completion.
     expect(dispatcher.runnableMissions().map((m) => m.id)).toEqual([mb.id]);
@@ -301,5 +311,62 @@ describe('mission routes', () => {
     } finally {
       server.close();
     }
+  });
+});
+
+describe('sweep 2026-11-25: mission integrity fixes (C-8, C-9)', () => {
+  it('C-8: createMission refuses worker === reviewer (no self-review)', () => {
+    const h = makeHarness();
+    const t = h.taskStore.create({ title: 'Self review' });
+    expect(() =>
+      h.service.createMission({
+        taskId: t.id,
+        repoPath: h.repo,
+        testCommand: 'run-tests',
+        workerBotId: 'coder',
+        reviewerBotId: 'coder',
+      }),
+    ).toThrow(/different bots/);
+    expect(h.missionStore.list()).toEqual([]);
+  });
+
+  it('C-8: the runtime runner reports the provider/model that ACTUALLY ran (failover-aware)', async () => {
+    const runner = createRuntimeBotRunner({
+      getBot: (botId) =>
+        ({ id: botId, provider: 'configured-p', model: 'configured-m' }) as never,
+      runTurn: async (opts) => {
+        opts.onEvent({ type: 'token', content: 'did the work' });
+        // A1 substituted the provider mid-turn:
+        opts.onEvent({ type: 'failover', toProvider: 'backup-p', toModel: 'backup-m' });
+        return {};
+      },
+    });
+    const out = await runner({
+      missionId: 'm1',
+      taskId: 't1',
+      role: 'worker',
+      botId: 'coder',
+      provider: 'configured-p',
+      model: 'configured-m',
+      prompt: 'go',
+      worktreePath: '/tmp/wt',
+    });
+    expect(out.text).toBe('did the work');
+    expect(out.provider).toBe('backup-p');
+    expect(out.model).toBe('backup-m');
+  });
+
+  it('C-9: landing restores the main checkout to the branch it was on before', async () => {
+    const h = makeHarness();
+    // The user is working on 'dev' when the mission lands into 'main'.
+    git(h.repo, ['checkout', '-b', 'dev']);
+    const t = h.taskStore.create({ title: 'Land while on dev' });
+    const m = missionFor(h, t.id);
+    const done = await h.service.runMission(m.id);
+    expect(done.stage).toBe('landed');
+    // Main received the work…
+    expect(git(h.repo, ['cat-file', '-e', `main:feature-${t.id.slice(0, 8)}.txt`])).toBe('');
+    // …and the user's checkout is back on 'dev', not silently left on 'main'.
+    expect(git(h.repo, ['rev-parse', '--abbrev-ref', 'HEAD']).trim()).toBe('dev');
   });
 });

@@ -47,6 +47,7 @@
 
 import http from 'node:http';
 import net from 'node:net';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 
 /** The one honest label every surface for this feature must carry. */
 export const EGRESS_JOURNAL_LABEL = 'Visible, not confined';
@@ -185,18 +186,31 @@ export function httpTargetOf(req: http.IncomingMessage): { host: string; port: n
   return null;
 }
 
-/** Run id from the Proxy-Authorization Basic username (never journaled itself). */
-function runIdFromProxyAuth(req: http.IncomingMessage): string | undefined {
+/**
+ * Sweep 2026-11-25 (C-6 + C-7): the proxy serves exactly ONE run, so
+ * attribution is never client-supplied — journal entries always carry
+ * the proxy's own runId. Clients authenticate with a per-instance
+ * random token (the password half of the Basic credential in the
+ * proxy env); the username half is informational only. Before this
+ * fix the username WAS the attribution (any local process could forge
+ * another run's journal entries) and no credential was checked at all
+ * (any local process could route traffic through the proxy and have
+ * it attributed to the run).
+ */
+function proxyAuthValid(req: http.IncomingMessage, token: string): boolean {
   const header = req.headers['proxy-authorization'];
-  if (typeof header !== 'string') return undefined;
+  if (typeof header !== 'string') return false;
   const m = /^Basic\s+(.+)$/i.exec(header.trim());
-  if (!m) return undefined;
+  if (!m) return false;
   try {
     const decoded = Buffer.from(m[1], 'base64').toString('utf8');
-    const user = decoded.split(':')[0]?.trim();
-    return user ? user : undefined;
+    const sep = decoded.indexOf(':');
+    if (sep === -1) return false;
+    const presented = Buffer.from(decoded.slice(sep + 1), 'utf8');
+    const expected = Buffer.from(token, 'utf8');
+    return presented.length === expected.length && timingSafeEqual(presented, expected);
   } catch {
-    return undefined;
+    return false;
   }
 }
 
@@ -210,9 +224,11 @@ export interface EgressProxyHandle {
   /** Proxy URL WITHOUT credentials, e.g. http://127.0.0.1:54321 */
   proxyUrl: string;
   /**
-   * Child-process env for one run: upper+lowercase proxy vars with the
-   * run id as the credential username, and NO_PROXY emptied so even
-   * loopback destinations are journaled rather than silently bypassed.
+   * Child-process env for one run: upper+lowercase proxy vars carrying
+   * the run credential (run id as username, a per-instance random
+   * token as password — the proxy refuses unauthenticated requests),
+   * and NO_PROXY emptied so even loopback destinations are journaled
+   * rather than silently bypassed.
    */
   env: Record<string, string>;
   /** Stop listening and drain/destroy live sockets. Never throws. */
@@ -234,6 +250,9 @@ export interface StartEgressProxyOptions {
 export async function startEgressProxy(opts: StartEgressProxyOptions): Promise<EgressProxyHandle> {
   const { sink } = opts;
   const defaultRunId = opts.runId;
+  // C-7: per-instance credential — only this run's child processes
+  // (which receive it via the proxy env) can use the proxy at all.
+  const proxyToken = randomBytes(18).toString('base64url');
   const sockets = new Set<net.Socket>();
 
   const journal = (entry: EgressJournalEntry): void => {
@@ -256,13 +275,22 @@ export async function startEgressProxy(opts: StartEgressProxyOptions): Promise<E
 
   // -- Plain HTTP forwarding (standard forward-proxy semantics) --------
   server.on('request', (req: http.IncomingMessage, res: http.ServerResponse) => {
+    if (!proxyAuthValid(req, proxyToken)) {
+      res.writeHead(407, {
+        'content-type': 'text/plain',
+        'proxy-authenticate': 'Basic realm="kriyadot-egress"',
+      });
+      res.end('Proxy authentication required');
+      return;
+    }
     const target = httpTargetOf(req);
     if (!target) {
       res.writeHead(400, { 'content-type': 'text/plain' });
       res.end('Bad proxy request');
       return;
     }
-    const runId = runIdFromProxyAuth(req) ?? defaultRunId;
+    // C-6: attribution is the proxy's own run — never client-supplied.
+    const runId = defaultRunId;
     const ts = Date.now();
     // Byte accounting "as measurable": bodies are counted on the wire;
     // the request head is counted from the raw headers the client sent
@@ -328,8 +356,15 @@ export async function startEgressProxy(opts: StartEgressProxyOptions): Promise<E
 
   // -- CONNECT tunnelling (HTTPS): host:port only, payload is opaque ---
   server.on('connect', (req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => {
+    if (!proxyAuthValid(req, proxyToken)) {
+      clientSocket.end(
+        'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="kriyadot-egress"\r\n\r\n',
+      );
+      return;
+    }
     const target = parseAuthority(req.url ?? '');
-    const runId = runIdFromProxyAuth(req) ?? defaultRunId;
+    // C-6: attribution is the proxy's own run — never client-supplied.
+    const runId = defaultRunId;
     const ts = Date.now();
     if (!target) {
       clientSocket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
@@ -405,7 +440,7 @@ export async function startEgressProxy(opts: StartEgressProxyOptions): Promise<E
   }
   const port = address.port;
   const proxyUrl = `http://127.0.0.1:${port}`;
-  const credentialed = `http://${encodeURIComponent(defaultRunId)}@127.0.0.1:${port}`;
+  const credentialed = `http://${encodeURIComponent(defaultRunId)}:${proxyToken}@127.0.0.1:${port}`;
   const env: Record<string, string> = {
     HTTP_PROXY: credentialed,
     HTTPS_PROXY: credentialed,

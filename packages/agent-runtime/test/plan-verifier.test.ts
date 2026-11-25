@@ -67,15 +67,20 @@ describe('verifyPlan — per-step oracle pass', () => {
     expect(res.blocked[1]?.ruleId).toBe('no-delete');
   });
 
-  it('an oracle error makes the step undecidable, never verified', async () => {
+  it('an oracle error makes the step undecidable, never verified — flagged, raw error withheld (A-D6)', async () => {
     const plan: StructuredPlan = { steps: [step({ id: 's1', tool: 'mystery_tool' })] };
     const res = await verifyPlan(plan, [], {
       simulate: async () => {
-        throw new Error('oracle down');
+        throw new Error('oracle down at /internal/path');
       },
     });
     expect(res.status).toBe('undecidable');
-    expect(res.undecidable[0]?.reason).toContain('oracle down');
+    // Sweep 2026-11-25 (A-D6): the verdict carries the oracleError
+    // FLAG (the gate fails closed on it) and a generic reason — the
+    // raw error text must not reach user-facing summaries.
+    expect(res.undecidable[0]?.oracleError).toBe(true);
+    expect(res.undecidable[0]?.reason).not.toContain('oracle down');
+    expect(res.undecidable[0]?.reason).not.toContain('/internal/path');
   });
 
   it('blocks structural defects: unknown deps and cycles', async () => {
@@ -195,11 +200,42 @@ describe('verifyPlan — scope + judge', () => {
         return { effect: 'deny', hardFloor: { tier: 'catastrophic', reason: 'floor', patternId: 'p' } };
       },
     };
-    const plan: StructuredPlan = { steps: [step({ id: 's1', tool: 'run_command' })] };
+    const plan: StructuredPlan = { steps: [step({ id: 's1', tool: 'write_file' })] };
     const res = await verifyPlan(plan, [], counting, { scope: 'high-risk-only' });
     expect(calls).toBe(0);
     expect(res.steps[0]?.status).toBe('out-of-scope');
     expect(res.status).toBe('verified'); // nothing in scope blocked; the execution-time floor still applies
+  });
+
+  it("scope 'high-risk-only' DOES simulate shell-exec steps (A-D2: exec reaches every effect class)", async () => {
+    // Sweep 2026-11-25 (A-D2): run_command/run_background/shell/exec
+    // were missing from the high-risk classes, so the default scope
+    // never verified the most powerful steps in a plan.
+    for (const tool of ['run_command', 'run_background', 'shell', 'exec']) {
+      let calls = 0;
+      const counting: PlanPolicyOracle = {
+        simulate: async () => {
+          calls += 1;
+          return { effect: 'deny', reason: 'no shell' };
+        },
+      };
+      const plan: StructuredPlan = { steps: [step({ id: 's1', tool, args: { command: 'ls' } })] };
+      const res = await verifyPlan(plan, [], counting, { scope: 'high-risk-only' });
+      expect(calls, tool).toBe(1);
+      expect(res.status, tool).toBe('blocked');
+    }
+    // Anchored exact match: a lookalike name stays out of scope.
+    let calls = 0;
+    const counting: PlanPolicyOracle = {
+      simulate: async () => {
+        calls += 1;
+        return { effect: 'allow' };
+      },
+    };
+    const plan: StructuredPlan = { steps: [step({ id: 's1', tool: 'execute_query' })] };
+    const res = await verifyPlan(plan, [], counting, { scope: 'high-risk-only' });
+    expect(calls).toBe(0);
+    expect(res.steps[0]?.status).toBe('out-of-scope');
   });
 
   it("scope 'off' simulates NOTHING — not even high-risk steps (the opt-out means off)", async () => {
@@ -286,6 +322,15 @@ describe('structured plan parsing (runPlanGate seam)', () => {
   it('send steps with free-text content are flagged semantic', () => {
     const parsed = parseStructuredPlan('{"steps":[{"id":"s1","tool":"send_email","args":{"content":"hello"}}]}');
     expect(parsed?.steps[0]?.semantic).toBe(true);
+  });
+
+  it('plans over the 25-step cap report truncated (A-D7) — never silently', () => {
+    const steps = Array.from({ length: 27 }, (_, i) => ({ id: `s${i + 1}`, tool: 'read_file', args: { path: `f${i}` } }));
+    const parsed = parseStructuredPlan(JSON.stringify({ steps }));
+    expect(parsed?.steps.length).toBe(25);
+    expect(parsed?.truncated).toBe(true);
+    const small = parseStructuredPlan('{"steps":[{"id":"s1","tool":"read_file","args":{}}]}');
+    expect(small?.truncated).toBe(false);
   });
 });
 

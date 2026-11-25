@@ -276,25 +276,32 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
    * a bot — workspace layer ahead of bot config ahead of global, the
    * same merge order as rules — for the runtime's plan verifier.
    */
-  planSpecsForBot(botId: string): import('@mvp/governance').PlanSpec[] {
+  planSpecsForBot(botId: string, sessionId?: string): import('@mvp/governance').PlanSpec[] {
+    // A-D9: in snapshot mode the specs come from the session's frozen
+    // policy — the same policy evaluate() uses for that session.
+    const snapshot = sessionId ? this.sessionSnapshots.get(sessionId) : undefined;
+    if (snapshot) return [...(snapshot.policy.planSpecs ?? [])];
     const merged = this.mergedPolicyFor(botId);
     return [...(merged?.planSpecs ?? this.globalPolicy.planSpecs ?? [])];
   }
 
-  /** Soteria: the effective verification scope for a bot (bot config
-   *  wins, then the workspace policy file). Default 'high-risk-only' —
-   *  the Workstream 1 kill-criterion narrowing (2026-11-18); since
-   *  2026-11-25 verification is ON by default at that scope, and 'off'
-   *  (bot config or policy.json) is the documented opt-out. See
+  /** Soteria: the effective verification scope for a bot. Resolution
+   *  order matches the rules/specs layering (sweep 2026-11-25, A-D4):
+   *  the WORKSPACE policy file first — it is the most specific layer
+   *  and has the final say, exactly as in mergedPolicyFor — then bot
+   *  config. Default 'high-risk-only' — the Workstream 1
+   *  kill-criterion narrowing (2026-11-18); since 2026-11-25
+   *  verification is ON by default at that scope, and 'off' (either
+   *  layer) is the documented opt-out. See
    *  benchmarks/agent-safety/RESULTS.md. */
   planVerificationScopeForBot(botId: string): 'all' | 'high-risk-only' | 'off' {
-    const botScope = this.getBotConfig?.(botId)?.policy?.planVerificationScope;
-    if (botScope) return botScope;
     const workspaceDir = this.workspaceDirForBot?.(botId);
     if (workspaceDir) {
       const scope = loadWorkspacePolicy(workspaceDir).policy.planVerificationScope;
       if (scope) return scope;
     }
+    const botScope = this.getBotConfig?.(botId)?.policy?.planVerificationScope;
+    if (botScope) return botScope;
     return 'high-risk-only';
   }
 
@@ -487,9 +494,20 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
         if (!first.done) this.idMap.delete(first.value);
       }
       this.notifyApprovalMinted(call, ctx, res.approvalId);
-      return { decision: res.effect, approvalId: runtimeId };
+      return { decision: res.effect, approvalId: runtimeId, ...(res.reason ? { reason: res.reason } : {}) };
     }
-    return { decision: res.effect };
+    // Sweep 2026-11-25 (A-D1): forward the decision grounds — a
+    // denylist denial must keep its absolute status across this
+    // boundary (plan recovery escalates on it), and the runtime's
+    // denial reason comes from the gateway, not a reconstruction.
+    return {
+      decision: res.effect,
+      ...(res.reason ? { reason: res.reason } : {}),
+      ...(res.hardFloor
+        ? { hardFloor: { tier: res.hardFloor.tier, reason: res.hardFloor.reason, patternId: res.hardFloor.patternId } }
+        : {}),
+      ...(res.denylist ? { denylist: true } : {}),
+    };
   }
 
   async awaitDecision(
@@ -519,8 +537,13 @@ export class GovernanceAdapter implements RuntimeGovernanceGateway {
     toolName: string,
     args: Record<string, unknown>,
     sessionToolHistory?: string[],
+    sessionId?: string,
   ): Promise<SimulationResult> {
-    const policy = this.mergedPolicyFor(botId) ?? this.globalPolicy;
+    // A-D9: snapshot mode simulates against the session's FROZEN
+    // policy (captured by evaluate() at session start) so the plan
+    // gate and execution can never diverge mid-session.
+    const snapshot = sessionId ? this.sessionSnapshots.get(sessionId) : undefined;
+    const policy = snapshot?.policy ?? this.mergedPolicyFor(botId) ?? this.globalPolicy;
     return this.real.simulate(toolName, args, policy, sessionToolHistory);
   }
 

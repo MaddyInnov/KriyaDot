@@ -78,3 +78,65 @@ describe('policy snapshot mode (#70)', () => {
     expect(second.decision).toBe('allow');
   });
 });
+
+describe('sweep 2026-11-25: plan verification follows the same policy as execution', () => {
+  it('A-D9: simulatePolicy + planSpecsForBot use the session snapshot when a sessionId is given', async () => {
+    const bot = snapBot();
+    bot.policy = {
+      policySnapshot: true,
+      rules: [{ id: 'deny-write', toolPattern: '^write_file$', effect: 'deny', reason: 'locked at capture' }],
+      planSpecs: [{
+        type: 'provenance', id: 'cap-spec', toolPattern: '^delete_file$', arg: 'path',
+        sourceToolPattern: '^list_folder$', sourceArg: 'paths',
+      }],
+    } as BotConfig['policy'];
+    const { adapter, byId } = makeRig(bot);
+    await adapter.evaluate(call, ctx('s1')); // captures the snapshot
+
+    // Mid-session edit: loosen rules AND replace the specs.
+    byId.set('snap-bot', {
+      ...bot,
+      policy: {
+        policySnapshot: true,
+        rules: [{ id: 'allow-write', toolPattern: '^write_file$', effect: 'allow' }],
+        planSpecs: [],
+      },
+    } as BotConfig);
+
+    // With the session id: frozen policy — deny stands, captured spec returned.
+    const frozen = await adapter.simulatePolicy('snap-bot', 'write_file', { path: 'a.txt' }, undefined, 's1');
+    expect(frozen.effect).toBe('deny');
+    expect(adapter.planSpecsForBot('snap-bot', 's1').map((s) => s.id)).toEqual(['cap-spec']);
+    // Without it: live policy — allow, no specs.
+    const live = await adapter.simulatePolicy('snap-bot', 'write_file', { path: 'a.txt' });
+    expect(live.effect).toBe('allow');
+    expect(adapter.planSpecsForBot('snap-bot')).toEqual([]);
+  });
+
+  it('A-D4: the workspace policy file scope wins over bot config (same layering as rules/specs)', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const ws = mkdtempSync(join(tmpdir(), 'kriyadot-ws-scope-'));
+    mkdirSync(join(ws, '.kriyadot'), { recursive: true });
+    writeFileSync(join(ws, '.kriyadot', 'policy.json'), JSON.stringify({ planVerificationScope: 'off' }));
+    const bot = snapBot();
+    bot.policy = { rules: [], planVerificationScope: 'all' } as BotConfig['policy'];
+    const real = new GovernanceGateway({ dbPath: ':memory:', policy: DEFAULT_POLICY });
+    const adapter = new GovernanceAdapter(real, {
+      getBotConfig: () => bot,
+      globalPolicy: DEFAULT_POLICY,
+      workspaceDirForBot: () => ws,
+    });
+    // The workspace "off" (project-level opt-out) beats the bot's "all".
+    expect(adapter.planVerificationScopeForBot('snap-bot')).toBe('off');
+    // A workspace with no scope falls through to the bot config.
+    const ws2 = mkdtempSync(join(tmpdir(), 'kriyadot-ws-scope-'));
+    const adapter2 = new GovernanceAdapter(real, {
+      getBotConfig: () => bot,
+      globalPolicy: DEFAULT_POLICY,
+      workspaceDirForBot: () => ws2,
+    });
+    expect(adapter2.planVerificationScopeForBot('snap-bot')).toBe('all');
+  });
+});

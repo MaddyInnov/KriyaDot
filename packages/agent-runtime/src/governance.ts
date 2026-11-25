@@ -34,6 +34,14 @@ export interface GovernanceEvaluation {
    * absolute for plan recovery (no skip / re-plan around them).
    */
   hardFloor?: { tier: 'catastrophic' | 'destructive'; reason: string; patternId: string };
+  /**
+   * Sweep 2026-11-25 (A-D1): true when the hard denylist denied this
+   * call. Denylist denials are absolute for plan recovery, exactly
+   * like tier-1 catastrophic floors — before this field existed, the
+   * adapter dropped the denylist status at its boundary and recovery
+   * could skip/re-plan around a denylisted step.
+   */
+  denylist?: boolean;
 }
 
 /** Where an approval decision came from. Surfaced in the inbox UI. */
@@ -81,6 +89,13 @@ export interface GovernanceGateway {
     toolName: string,
     args: Record<string, unknown>,
     sessionToolHistory?: string[],
+    /**
+     * Sweep 2026-11-25 (A-D9): the calling session, when known. In
+     * opt-in snapshot mode the adapter simulates against the session's
+     * FROZEN policy — the same policy evaluate() uses for the
+     * session — instead of the live one.
+     */
+    sessionId?: string,
   ): Promise<{
     effect: GovernanceDecision;
     reason?: string;
@@ -92,9 +107,11 @@ export interface GovernanceGateway {
    * Soteria Verified Plans (Workstream 1) — OPTIONAL: the effective
    * planSpecs for a bot (workspace layer ahead of bot config ahead of
    * global), so the plan gate verifies against the same merged policy
-   * the adapter evaluates calls against.
+   * the adapter evaluates calls against. The optional sessionId
+   * (A-D9) resolves the session's frozen snapshot specs in snapshot
+   * mode.
    */
-  planSpecsForBot?(botId: string): import('./plan-specs.js').PlanSpec[];
+  planSpecsForBot?(botId: string, sessionId?: string): import('./plan-specs.js').PlanSpec[];
   /** OPTIONAL: the effective plan-verification scope for a bot
    *  (kill-criterion narrowing flag; 'off' = the opt-out from the
    *  default-on verification). Absent → bot config / 'high-risk-only'. */

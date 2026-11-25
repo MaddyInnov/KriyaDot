@@ -102,9 +102,18 @@ describe('audit-store integration', () => {
     };
     const proxy = await startEgressProxy({ runId: 'run-audit-1', sink });
     try {
+      // C-7: the proxy requires the run credential from its env.
+      const credUrl = new URL(proxy.env.HTTP_PROXY!);
+      const credential = `${decodeURIComponent(credUrl.username)}:${credUrl.password}`;
       const body = await new Promise<string>((resolvePromise, rejectPromise) => {
         const req = http.request(
-          { host: '127.0.0.1', port: proxy.port, method: 'GET', path: `http://127.0.0.1:${originPort}/secret-path?token=x` },
+          {
+            host: '127.0.0.1',
+            port: proxy.port,
+            method: 'GET',
+            path: `http://127.0.0.1:${originPort}/secret-path?token=x`,
+            headers: { 'proxy-authorization': 'Basic ' + Buffer.from(credential).toString('base64') },
+          },
           (res) => {
             const chunks: Buffer[] = [];
             res.on('data', (c: Buffer) => chunks.push(c));

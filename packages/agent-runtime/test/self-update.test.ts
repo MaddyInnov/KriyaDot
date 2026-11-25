@@ -71,6 +71,17 @@ describe('parseVersion / compareVersions', () => {
     expect(compareVersions('0.1.1-alpha', '0.1.0')).toBe(1);
   });
 
+  it('D2: prerelease numeric segments compare numerically, not lexicographically', () => {
+    // Raw string order says 'alpha.9' > 'alpha.10' ('9' > '1') — wrong.
+    expect(compareVersions('0.2.0-alpha.9', '0.2.0-alpha.10')).toBe(-1);
+    expect(compareVersions('0.2.0-alpha.10', '0.2.0-alpha.9')).toBe(1);
+    expect(compareVersions('0.2.0-alpha.10', '0.2.0-alpha.10')).toBe(0);
+    // Numeric segments sort before alphanumeric; prefix-shorter first.
+    expect(compareVersions('0.2.0-alpha.1', '0.2.0-alpha.beta')).toBe(-1);
+    expect(compareVersions('0.2.0-alpha', '0.2.0-alpha.1')).toBe(-1);
+    expect(compareVersions('0.2.0-rc.2', '0.2.0-rc.10')).toBe(-1);
+  });
+
   it('isNewerVersion answers the update question', () => {
     expect(isNewerVersion('0.1.0-alpha', 'v0.1.0')).toBe(true);
     expect(isNewerVersion('0.1.0-alpha', '0.1.1')).toBe(true);
@@ -241,6 +252,19 @@ describe('SelfUpdateManager.checkNow', () => {
     const status = await manager.checkNow();
     expect(status.state).toBe('idle');
     expect(status.latest).toBeNull();
+  });
+
+  it('D1: a verified release with NO asset for this platform is not offered', async () => {
+    // The release is real and signed, but ships only a Linux AppImage
+    // while this manager runs on win32 — no badge, no dead download.
+    const { manager, rejected } = makeManager({
+      releases: [ghRelease('v0.1.1', LINUX_ASSETS)],
+      platform: 'win32',
+    });
+    const status = await manager.checkNow();
+    expect(status.state).toBe('idle');
+    expect(status.latest).toBeNull();
+    expect(rejected.some((r) => /no installer asset for win32/.test(r.reason))).toBe(true);
   });
 
   it('picks the newest release across several', async () => {

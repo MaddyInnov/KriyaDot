@@ -11,6 +11,11 @@ import { AgentRuntime } from '../src/runtime.js';
 import { ProviderSelectionRefusedError } from '../src/failover.js';
 import { BridgeCooldownRegistry } from '../src/providers/cli-cooldown.js';
 import {
+  BridgeAccountStore,
+  setBridgeAccountStore,
+  type BridgeAccount,
+} from '../src/providers/bridge-accounts.js';
+import {
   buildTranscriptReplayMessages,
   decideBridgeSwap,
   declaredSelectionBackup,
@@ -67,6 +72,22 @@ describe('decideBridgeSwap (pure)', () => {
       declaredBackup: null, autoTargetCooldownReason: null,
     });
     expect(d.action).toBe('refuse');
+  });
+
+  it('B-5: explicit + NON-death driver failure + declared backup → fail, never swap (no silent re-route)', () => {
+    const d = decideBridgeSwap({
+      ...base, explicitSelection: true, quotaDeath: false, driverFailure: true, bridgeDeath: false,
+      declaredBackup: { providerId: 'claude-subscription', modelId: 'sonnet' }, autoTargetCooldownReason: null,
+    });
+    expect(d.action).toBe('fail');
+  });
+
+  it('B-5: explicit + bridge death (process died) + declared backup → swap to the declared backup', () => {
+    const d = decideBridgeSwap({
+      ...base, explicitSelection: true, quotaDeath: false, driverFailure: true, bridgeDeath: true,
+      declaredBackup: { providerId: 'claude-subscription', modelId: 'sonnet' }, autoTargetCooldownReason: null,
+    });
+    expect(d).toEqual({ action: 'swap', via: 'declared-backup', target: { providerId: 'claude-subscription', modelId: 'sonnet' } });
   });
 
   it('explicit + ordinary error (no death) → fail (caller surfaces it; no refusal, no swap)', () => {
@@ -137,6 +158,28 @@ describe('buildTranscriptReplayMessages', () => {
     expect(markerIdx).toBeGreaterThan(0);
     expect(markerIdx).toBeLessThan(texts.indexOf('second question'));
     expect(texts[markerIdx]).toContain('do not restart from scratch');
+  });
+
+  it('B-7: priorActions tells the backup what the dead backend ALREADY executed (no repeated side effects)', () => {
+    const messages: ChatMessage[] = [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: 'do the job' },
+    ];
+    const out = buildTranscriptReplayMessages(messages, {
+      fromProvider: 'claude-subscription', fromModel: 'sonnet',
+      toProvider: 'backup', toModel: 'backup-model', reason: 'usage limit / quota death',
+      priorActions: ['write_file {"path":"out.txt"}', 'run_command {"command":"npm run build"}'],
+    });
+    const note = out.map((m) => m.content).find((t) => t.includes(TRANSCRIPT_REPLAY_MARKER));
+    expect(note).toContain('ALREADY EXECUTED');
+    expect(note).toContain('write_file');
+    expect(note).toContain('npm run build');
+    expect(note).toContain('Do NOT repeat them');
+    // Without priorActions the note is unchanged (no empty claim).
+    const plain = buildTranscriptReplayMessages(messages, {
+      fromProvider: 'a', fromModel: 'm', toProvider: 'b', toModel: 'n', reason: 'x',
+    });
+    expect(plain.map((m) => m.content).join(' ')).not.toContain('ALREADY EXECUTED');
   });
 });
 
@@ -345,6 +388,44 @@ describe('runtime: mid-job swap with transcript replay', () => {
     expect((err as Error).message).toMatch(/cooldown/);
     expect(primary.calls).toHaveLength(0);
     expect(backup.calls).toHaveLength(0);
+    rt.close();
+  });
+});
+
+describe('B-6: cooldown consults key on the TARGET bridge account (sweep 2026-11-25)', () => {
+  it('turn-start: a cooled FOREIGN account id on the target bridge does not block the failover', async () => {
+    // The bot's claude account 'work' must exist in the account store
+    // for resolution to land on it (an unknown id falls back to
+    // 'default' by design).
+    const store = new BridgeAccountStore();
+    store.upsert({
+      id: 'work', bridgeId: 'claude', label: 'Work',
+      machineDefault: false, createdByUs: true, configDir: '/tmp/b6-claude-work',
+    } as BridgeAccount);
+    setBridgeAccountStore(store);
+    const cooldowns = new BridgeCooldownRegistry({});
+    // Primary (codex/default) sits in an active cooldown.
+    cooldowns.recordFailure('codex', 'default', quotaError());
+    expect(cooldowns.check('codex', 'default').active).toBe(true);
+    // TRAP: claude's 'default' account is ALSO cooled. The buggy code
+    // consulted the target bridge with the PRIMARY's account id
+    // ('default') and would have refused the failover as "backup also
+    // unavailable". The bot's claude account is 'work' — healthy.
+    cooldowns.recordFailure('claude', 'default', quotaError());
+    expect(cooldowns.check('claude', 'default').active).toBe(true);
+    const primary = new ScriptedProvider('codex-subscription', () => ({ content: 'must not run' }));
+    const backup = new ScriptedProvider('claude-subscription', () => ({ content: 'on claude work account' }));
+    const rt = makeRuntime(new Map([['codex-subscription', primary], ['claude-subscription', backup]]), cooldowns);
+    const bot = bridgeBot({
+      backupProvider: 'claude-subscription', backupModel: 'sonnet',
+      bridgeAccounts: { claude: 'work' },
+    });
+    const ev: StreamEvent[] = [];
+    await rt.runTurn({ bot, message: 'hello', sessionId: 'b6-turn-start', onEvent: (e) => { ev.push(e); } });
+    expect(primary.calls).toHaveLength(0); // cooled primary skipped, never retried
+    expect(backup.calls).toHaveLength(1); // …and the healthy target account ran
+    expect(await sessionText(rt, 'b6-turn-start')).toContain('on claude work account');
+    expect(ev.some((e) => e.type === 'error')).toBe(false);
     rt.close();
   });
 });

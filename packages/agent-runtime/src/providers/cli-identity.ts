@@ -110,8 +110,15 @@ export interface CliIdentityDeclaration {
  * - codex: real `--version` prints "codex-cli 0.142.0" — anchored at the
  *   line start because a namesake's crash output mentions "codex" in file
  *   paths, so an unanchored mention proves nothing.
- * - opencode: real `--version` prints a bare semver ("1.0.119"), which is
- *   weak evidence on its own, so `--help` must also name the tool.
+ * - opencode: real `--version` prints a bare semver ("1.0.119"). That
+ *   is WEAK evidence — any binary whose --version starts with a semver
+ *   is accepted (shipped v0.2.2 behaviour, restated deliberately; the
+ *   A2 manifests carry the same acceptance for pi). The `--help` match
+ *   is only a FALLBACK for when the version match fails — it is NOT
+ *   corroboration, despite an earlier wording of this comment claiming
+ *   otherwise (corrected in the 2026-11-25 sweep, B-3; tightening to
+ *   AND semantics is a product decision for a real-binary pass, since
+ *   it can false-reject the real CLIs).
  */
 export const CLI_IDENTITY_DECLARATIONS: Record<CliIdentityBridgeId, CliIdentityDeclaration> = {
   claude: {
@@ -187,12 +194,51 @@ export function assertSafeRegexPattern(source: string): boolean {
   // anything richer — quantifiers, alternation, or multiple atoms inside
   // a repeated group — is refused. Conservative by design: banner checks
   // never need grouped repetition.
-  const groupRe = /\((?:\?(?::|<=|<!|=|!))?([^()]*)\)\s*(?:[+*]|\{)/g;
-  let m: RegExpExecArray | null;
-  while ((m = groupRe.exec(source)) !== null) {
-    const body = m[1];
-    if (body.length !== 1 || /[+*|\\[.]/.test(body)) return false;
+  //
+  // Sweep 2026-11-25 (B-2): the scan is NESTING-AWARE. The previous
+  // flat `[^()]*` body regex could only ever see the INNERMOST group,
+  // and only when it was directly quantified — so `((a|aa))+` passed
+  // the gate and then backtracked catastrophically (measured: a
+  // 41-char input did not finish in 10 s). This scanner walks the
+  // pattern with a paren stack (escapes and character classes
+  // honoured) and inspects EVERY group that carries a quantifier,
+  // refusing any whose body contains a nested group or is not a
+  // single literal.
+  const stack: number[] = [];
+  let inClass = false;
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i]!;
+    if (ch === '\\') {
+      i++; // skip the escaped char
+      continue;
+    }
+    if (inClass) {
+      if (ch === ']') inClass = false;
+      continue;
+    }
+    if (ch === '[') {
+      inClass = true;
+      continue;
+    }
+    if (ch === '(') {
+      stack.push(i);
+      continue;
+    }
+    if (ch === ')') {
+      const start = stack.pop();
+      if (start === undefined) return false; // unbalanced — refuse
+      let j = i + 1;
+      while (j < source.length && /\s/.test(source[j]!)) j++;
+      const q = source[j];
+      if (q === '+' || q === '*' || q === '{') {
+        const body = source.slice(start + 1, i);
+        if (body.includes('(')) return false; // nested group inside a repeated group
+        const stripped = body.replace(/^\?(?::|<=|<!|=|!)/, '');
+        if (stripped.length !== 1 || /[+*|\\[.]/.test(stripped)) return false;
+      }
+    }
   }
+  if (stack.length > 0) return false; // unbalanced '(' — refuse
   return true;
 }
 

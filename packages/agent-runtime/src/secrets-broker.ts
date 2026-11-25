@@ -843,7 +843,7 @@ export interface BrokerApprovalHost {
 /** Minimal fetch surface (the global fetch satisfies this structurally). */
 export type BrokerFetch = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body?: string },
+  init: { method: string; headers: Record<string, string>; body?: string; redirect?: string },
 ) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
 
 export interface SecretsBrokerOptions {
@@ -902,7 +902,7 @@ export class SecretsBroker {
     this.store = opts.store;
     this.getCredential = opts.getCredential;
     this.approvalHost = opts.approvalHost;
-    this.fetchFn = opts.fetchFn ?? ((url, init) => fetch(url, init));
+    this.fetchFn = opts.fetchFn ?? ((url, init) => fetch(url, init as RequestInit));
     this.onJournal = opts.onJournal;
     // Allowlist compares hostnames (no port): the canonical host is
     // "api.github.com"; test fakes are "127.0.0.1" on an ephemeral port.
@@ -1052,12 +1052,17 @@ export class SecretsBroker {
     }
 
     // 5) Execute with the app-held credential. The credential is used
-    //    ONLY in the Authorization header below.
+    //    ONLY in the Authorization header below. Redirects are NEVER
+    //    followed (sweep 2026-11-25, C-5): the allowlist decision above
+    //    covers exactly this URL — a 3xx would take the credentialed
+    //    call to an endpoint nobody approved, so it is an upstream
+    //    error, not a detour.
     let status: number;
     let rawText: string;
     try {
       const res = await this.fetchFn(url.toString(), {
         method: plan.method,
+        redirect: 'manual',
         headers: {
           authorization: `Bearer ${credential}`,
           accept: 'application/vnd.github+json',
@@ -1072,6 +1077,13 @@ export class SecretsBroker {
     } catch {
       this.journal({ ...base, event: 'action_refused', resource: plan.resource, argsHash, detail: 'network_error' });
       throw brokerError('upstream_error', `${identity} API call failed (network error) for ${plan.resource}`);
+    }
+    if (status >= 300 && status < 400) {
+      this.journal({ ...base, event: 'action_refused', resource: plan.resource, argsHash, detail: `http_${status}_redirect_refused` });
+      throw brokerError(
+        'upstream_error',
+        `${identity} API attempted an HTTP ${status} redirect for ${plan.resource} — the broker never follows redirects with a credential attached`,
+      );
     }
     // Scrub BEFORE parsing/quoting anything upstream sent back.
     const safeText = scrubCredential(rawText, credential);

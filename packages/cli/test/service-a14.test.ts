@@ -80,6 +80,27 @@ describe('generators', () => {
     expect(xml).toContain('<RestartOnFailure>');
   });
 
+  it('D3: the windows task XML declares the encoding it is actually written in (UTF-8)', () => {
+    const xml = renderWindowsTaskXml(SPEC);
+    expect(xml.startsWith('<?xml version="1.0" encoding="UTF-8"?>')).toBe(true);
+    expect(xml).not.toContain('UTF-16');
+  });
+
+  it('D4: systemd rendering escapes % specifiers and $ expansions in paths', () => {
+    const unit = renderSystemdUserUnit({
+      execPath: '/opt/kd%srv/server',
+      execArgs: ['--home=$HOME'],
+      dataDir: '/var/lib/kd%h',
+    });
+    expect(unit).toContain('ExecStart=/opt/kd%%srv/server --home=$$HOME');
+    expect(unit).toContain('Environment=DATA_DIR=/var/lib/kd%%h');
+    // No BARE specifier/dollar survives (the doubled forms are the
+    // literal-safe ones).
+    expect(unit).not.toContain('kd%srv');
+    expect(unit).not.toContain('=$HOME');
+    expect(unit).not.toContain('kd%h');
+  });
+
   it('plan paths land in the per-OS service locations', () => {
     const home = join(root, 'home');
     const linux = new ServiceInstallManager({ platform: 'linux', homeDir: home, xdgConfigHome: join(root, 'xdg') });

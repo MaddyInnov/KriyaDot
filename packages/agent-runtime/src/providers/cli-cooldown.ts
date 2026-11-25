@@ -142,6 +142,9 @@ interface PersistedCooldownFile {
 
 export class BridgeCooldownRegistry {
   private readonly entries = new Map<string, CooldownEntry>();
+  /** B-8: half-open probe claims (key → claim expiry ms). In-memory
+   *  only by design — never persisted. */
+  private readonly probeClaims = new Map<string, number>();
   private readonly filePath?: string;
   private readonly now: () => number;
   private readonly threshold: number;
@@ -230,6 +233,7 @@ export class BridgeCooldownRegistry {
    */
   recordFailure(bridgeId: CliBridgeId, accountId: string, err: unknown): CooldownEntry | undefined {
     const key = BridgeCooldownRegistry.key(bridgeId, accountId);
+    this.probeClaims.delete(key); // B-8: the probe turn resolved
     const existing = this.entries.get(key);
     const limit = classifyBridgeFailure(err, { nowMs: this.now() });
     if (limit) {
@@ -270,6 +274,7 @@ export class BridgeCooldownRegistry {
   /** Record a sterile (empty-content) completed turn; may open the breaker. */
   recordSterileTurn(bridgeId: CliBridgeId, accountId: string): CooldownEntry | undefined {
     const key = BridgeCooldownRegistry.key(bridgeId, accountId);
+    this.probeClaims.delete(key); // B-8: the probe turn resolved
     const existing = this.entries.get(key);
     if (existing && (existing.family === 'rate_limit' || existing.family === 'exhausted')) {
       return existing; // a limit cooldown already explains the silence
@@ -290,7 +295,29 @@ export class BridgeCooldownRegistry {
   /** A successful turn closes the breaker and clears any cooldown. */
   recordSuccess(bridgeId: CliBridgeId, accountId: string): void {
     const key = BridgeCooldownRegistry.key(bridgeId, accountId);
+    this.probeClaims.delete(key);
     if (this.entries.delete(key)) this.save();
+  }
+
+  /**
+   * Sweep 2026-11-25 (B-8): claim the single half-open PROBE slot for
+   * a backend. check() reports halfOpen to EVERY caller once the
+   * breaker window lapses, so two concurrent turns could both run as
+   * "the probe" and race the same entry. The first caller claims the
+   * slot (TTL-bounded, in-memory only — a restart legitimately frees
+   * it); later callers get false and treat the backend as still
+   * cooling. The claim is released by recordSuccess / recordFailure /
+   * recordSterileTurn, i.e. when the probe turn resolves.
+   */
+  tryClaimProbe(bridgeId: CliBridgeId, accountId: string, ttlMs = 180_000): boolean {
+    const c = this.check(bridgeId, accountId);
+    if (!c.halfOpen) return false;
+    const key = BridgeCooldownRegistry.key(bridgeId, accountId);
+    const nowMs = this.now();
+    const existing = this.probeClaims.get(key);
+    if (existing !== undefined && existing > nowMs) return false;
+    this.probeClaims.set(key, nowMs + ttlMs);
+    return true;
   }
 
   /**

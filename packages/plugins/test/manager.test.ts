@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Manager lifecycle + runtime round-trips against the real demo plugins
 // (real child processes over stdio, no network, no mocks of the transport).
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -180,5 +180,68 @@ describe('runtime round-trips (real child processes)', () => {
     expect(ui.title).toBe('Demo Panel');
     expect(existsSync(ui.indexFile)).toBe(true);
     expect(ui.mountPath).toBe('/plugins/demo-ui/ui/');
+  });
+});
+
+describe('sweep 2026-11-25: install integrity (C-1) + symlink refusal (C-4)', () => {
+  const manifest = {
+    id: 'integrity-fixture',
+    name: 'Integrity Fixture',
+    description: 'Sweep fixture: install-integrity regression plugin.',
+    version: '1.0.0',
+    kinds: ['tool'],
+    entry: 'index.js',
+    permissions: { env: [], network: false },
+  };
+  const entryCode = 'process.stdout.write("");\n';
+
+  async function installFixture(dir: string) {
+    const src = fixturePlugin(join(dir, 'src'), manifest, { 'index.js': entryCode });
+    const mgr = new PluginManager({ dataDir: dir, approveInstall: approveAll });
+    const rec = await mgr.install({ type: 'dir', path: src });
+    return { mgr, rec };
+  }
+
+  it('C-1: a post-install manifest widening is refused at load — never adopted, never served', async () => {
+    const dir = dataDir();
+    const { rec } = await installFixture(dir);
+    // The plugin (or anything with write access) widens its own
+    // manifest after install and rewrites its entry code.
+    const widened = { ...manifest, permissions: { env: [], network: true } };
+    writeFileSync(join(rec.dir, 'plugin.json'), JSON.stringify(widened));
+    writeFileSync(join(rec.dir, 'index.js'), 'console.log("pwned");\n');
+
+    const fresh = new PluginManager({ dataDir: dir, approveInstall: approveAll });
+    const report = fresh.loadAll();
+    expect(report.loaded).toEqual([]);
+    expect(report.failed.map((f) => f.id)).toEqual(['integrity-fixture']);
+    expect(report.failed[0]!.error).toMatch(/differs from the install record|missing/);
+    // The record still carries the ORIGINAL manifest (not the widened
+    // one), and no surface serves the plugin.
+    const listed = fresh.list().find((p) => p.id === 'integrity-fixture')!;
+    expect(listed.manifest.permissions).toMatchObject({ network: false });
+    await expect(fresh.tools()).resolves.toEqual([]);
+    await expect(fresh.callTool('integrity-fixture', 'x', {})).rejects.toThrow(/integrity validation/);
+  });
+
+  it('C-1: an untouched install loads clean and carries a digest baseline', async () => {
+    const dir = dataDir();
+    const { rec } = await installFixture(dir);
+    expect(rec.filesDigest).toBeDefined();
+    expect(rec.filesDigest!['plugin.json']).toMatch(/^[0-9a-f]{64}$/);
+    expect(rec.filesDigest!['index.js']).toMatch(/^[0-9a-f]{64}$/);
+    const fresh = new PluginManager({ dataDir: dir, approveInstall: approveAll });
+    const report = fresh.loadAll();
+    expect(report.failed).toEqual([]);
+    expect(report.loaded.map((p) => p.id)).toEqual(['integrity-fixture']);
+  });
+
+  it('C-4: a plugin tree containing a symlink is refused at install', async () => {
+    const dir = dataDir();
+    const src = fixturePlugin(join(dir, 'src'), manifest, { 'index.js': entryCode });
+    symlinkSync('/etc/passwd', join(src, 'sneaky.txt'));
+    const mgr = new PluginManager({ dataDir: dir, approveInstall: approveAll });
+    await expect(mgr.install({ type: 'dir', path: src })).rejects.toThrow(/symlink/);
+    expect(mgr.list()).toEqual([]);
   });
 });

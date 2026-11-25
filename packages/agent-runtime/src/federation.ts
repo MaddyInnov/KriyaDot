@@ -41,7 +41,7 @@ import {
   sign as cryptoSign,
   verify as cryptoVerify,
 } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 // ---------------------------------------------------------------------------
@@ -314,6 +314,16 @@ export class FederationService {
   private store: FederationStoreFile;
   /** In-memory sliding-window rate counters: peerId -> request timestamps. */
   private readonly rateHits = new Map<string, number[]>();
+  /**
+   * Sweep 2026-11-25 (D5): mtime of the store file as last loaded or
+   * persisted by THIS instance. Two FederationService instances share
+   * one store file in the API process (the federation router's and the
+   * fleet coordinator's); without a freshness check, each serves its
+   * constructor-time snapshot forever — a peer unlinked or a policy
+   * revoked through one surface stayed linked on the other until
+   * restart. reloadIfChanged() re-reads the file whenever it moved.
+   */
+  private storeMtimeMs = 0;
 
   constructor(opts: FederationServiceOptions) {
     this.storePath = opts.storePath;
@@ -321,6 +331,30 @@ export class FederationService {
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.replay = new ReplayGuard(opts.replayWindowMs ?? DEFAULT_REPLAY_WINDOW_MS);
     this.store = this.loadOrCreate(opts);
+    try {
+      this.storeMtimeMs = statSync(this.storePath).mtimeMs;
+    } catch {
+      this.storeMtimeMs = 0;
+    }
+  }
+
+  /**
+   * Re-read the store file when another instance changed it on disk.
+   * Fail-soft: any read/parse problem keeps the in-memory state (the
+   * file is written atomically by persist(), so a torn read should be
+   * impossible; a corrupt file must not take this instance down).
+   */
+  private reloadIfChanged(): void {
+    try {
+      const mtime = statSync(this.storePath).mtimeMs;
+      if (mtime === this.storeMtimeMs) return;
+      const parsed = JSON.parse(readFileSync(this.storePath, 'utf8')) as FederationStoreFile;
+      if (parsed.version !== 1 || !parsed.identity?.privateKey) return;
+      this.store = parsed;
+      this.storeMtimeMs = mtime;
+    } catch {
+      /* keep in-memory state */
+    }
   }
 
   private loadOrCreate(opts: FederationServiceOptions): FederationStoreFile {
@@ -356,6 +390,11 @@ export class FederationService {
 
   private persist(): void {
     atomicWrite0600(this.storePath, `${JSON.stringify(this.store, null, 2)}\n`);
+    try {
+      this.storeMtimeMs = statSync(this.storePath).mtimeMs;
+    } catch {
+      /* the next reloadIfChanged re-stats anyway */
+    }
   }
 
   // ---- identity -----------------------------------------------------------
@@ -448,6 +487,7 @@ export class FederationService {
   // ---- invites + handshake --------------------------------------------------
 
   createInvite(opts?: { policyForPeer?: Partial<TunnelPolicy>; expiresInMs?: number }): { payload: string; invite: InviteRecord } {
+    this.reloadIfChanged();
     const now = this.nowFn();
     const record: InviteRecord = {
       inviteId: `inv_${randomUUID()}`,
@@ -501,6 +541,7 @@ export class FederationService {
 
   /** Acceptor side: store the inviter as a peer from its invite payload. */
   recordPeerFromInvite(payload: InvitePayload, myPolicy?: Partial<TunnelPolicy>): PeerRecord {
+    this.reloadIfChanged();
     const existing = this.store.peers.find((p) => p.peerId === payload.instanceId);
     const record: PeerRecord = {
       peerId: payload.instanceId,
@@ -536,6 +577,7 @@ export class FederationService {
     inviteCode: string;
     remote: { instanceId: string; name: string; url: string; publicKey: string };
   }): PeerRecord {
+    this.reloadIfChanged();
     const now = this.nowFn();
     const invite = this.store.invites.find((i) => i.code === args.inviteCode);
     if (!invite) throw new FederationError('unknown invite code', 'bad_invite', 401);
@@ -563,14 +605,17 @@ export class FederationService {
   // ---- peers ----------------------------------------------------------------
 
   getPeer(peerId: string): PeerRecord | undefined {
+    this.reloadIfChanged();
     return this.store.peers.find((p) => p.peerId === peerId);
   }
 
   listPeers(): PeerRecord[] {
+    this.reloadIfChanged();
     return [...this.store.peers];
   }
 
   removePeer(peerId: string): boolean {
+    this.reloadIfChanged();
     const before = this.store.peers.length;
     this.store.peers = this.store.peers.filter((p) => p.peerId !== peerId);
     this.store.stubs = this.store.stubs.filter((s) => s.peerId !== peerId);
@@ -604,6 +649,7 @@ export class FederationService {
   // ---- remote session stubs (home-authoritative history) ---------------------
 
   upsertStub(peerId: string, botId: string, remoteSessionId: string): RemoteSessionStub {
+    this.reloadIfChanged();
     const now = this.nowFn();
     const existing = this.store.stubs.find((s) => s.peerId === peerId && s.botId === botId && s.remoteSessionId === remoteSessionId);
     if (existing) {
@@ -619,6 +665,7 @@ export class FederationService {
   }
 
   findStub(peerId: string, botId: string): RemoteSessionStub | undefined {
+    this.reloadIfChanged();
     // Most recently updated stub for (peer, bot) — the live conversation.
     return [...this.store.stubs]
       .filter((s) => s.peerId === peerId && s.botId === botId)
@@ -626,6 +673,7 @@ export class FederationService {
   }
 
   listStubs(): RemoteSessionStub[] {
+    this.reloadIfChanged();
     return [...this.store.stubs];
   }
 

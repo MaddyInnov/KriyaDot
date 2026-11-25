@@ -115,12 +115,15 @@ describe('bridge account registry routes', () => {
       expect(b.accounts[0]!.accountId).toBe('default');
       expect(b.accounts[0]!.machineDefault).toBe(true);
     }
-    // The original three (and pi/hermes) are isolatable; copilot / grok /
-    // kimi honestly report single-account (no verified config-dir knob).
-    for (const b of bridges.filter((x) => ['claude', 'codex', 'opencode', 'pi', 'hermes'].includes(x.bridgeId))) {
+    // The original three (and pi) are isolatable; copilot / grok / kimi
+    // honestly report single-account (no verified config-dir knob).
+    // Hermes joined them in B-9 (sweep 2026-11-25): its HERMES_HOME
+    // knob is assumed, not confirmed, and an unconfirmed knob fails
+    // open — so it no longer reports isolatable.
+    for (const b of bridges.filter((x) => ['claude', 'codex', 'opencode', 'pi'].includes(x.bridgeId))) {
       expect(b.isolatable).toBe(true);
     }
-    for (const b of bridges.filter((x) => ['copilot', 'grok', 'kimi'].includes(x.bridgeId))) {
+    for (const b of bridges.filter((x) => ['copilot', 'grok', 'kimi', 'hermes'].includes(x.bridgeId))) {
       expect(b.isolatable).toBe(false);
     }
     expect(bridges.find((b) => b.bridgeId === 'opencode')!.isolationNote).toMatch(/NOT the login/);
@@ -207,6 +210,26 @@ describe('bridge account registry routes', () => {
     expect(String(r.json.configDirNote)).toMatch(/never deletes those/);
     expect(existsSync(external)).toBe(true);
     rmSync(external, { recursive: true, force: true });
+  });
+
+  it('B-11: an account whose configDir is an ANCESTOR of sibling accounts is never recursively deleted', async () => {
+    // Two normal accounts with leaf dirs under bridge-accounts/claude/.
+    const a = await api('POST', '/api/bridge-accounts', { bridgeId: 'claude', label: 'Work Login' });
+    const b = await api('POST', '/api/bridge-accounts', { bridgeId: 'claude', label: 'Play Login' });
+    const workDir = (a.json.account as { configDir: string }).configDir;
+    const playDir = (b.json.account as { configDir: string }).configDir;
+    writeFileSync(join(workDir, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'fake' } }));
+    // A third account pointing AT the bridge root itself (an ancestor
+    // of both leaf dirs). The old prefix check treated it as "ours"
+    // and recursively deleted EVERY claude account's credentials.
+    const bridgeRoot = join(dataDir, 'bridge-accounts', 'claude');
+    const root = await api('POST', '/api/bridge-accounts', { bridgeId: 'claude', label: 'Root', configDir: bridgeRoot });
+    expect(root.status).toBe(201);
+    const r = await api('DELETE', '/api/bridge-accounts/claude/root?deleteConfigDir=1');
+    expect(r.json.configDirDeleted).toBe(false);
+    expect(existsSync(workDir)).toBe(true);
+    expect(existsSync(playDir)).toBe(true);
+    expect(existsSync(join(workDir, '.credentials.json'))).toBe(true);
   });
 });
 

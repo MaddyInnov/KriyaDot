@@ -137,10 +137,29 @@ function clampPct(n: number): number | undefined {
   return Math.round(Math.min(100, Math.max(0, n)) * 10) / 10;
 }
 
-/** A percent field may be a 0..1 fraction or a 0..100 percent; >1 means percent. */
-function pctField(v: unknown): number | undefined {
+/**
+ * A percent field may be a 0..1 fraction or a 0..100 percent. The KEY
+ * decides when it can (sweep 2026-11-25, B-12): keys naming a
+ * fraction/ratio are 0..1, keys naming a percent are 0..100. For a
+ * bare ambiguous key, >1 must be percent and <1 reads as a fraction —
+ * but exactly 1 is undecidable (1% used vs a 1.0 fraction = 100%),
+ * and the honest answer is "unknown", never a manufactured figure.
+ */
+function pctField(v: unknown, key: string): number | undefined {
   if (typeof v !== 'number' || !Number.isFinite(v)) return undefined;
-  return clampPct(v <= 1 ? v * 100 : v);
+  const nk = normKey(key);
+  if (nk.includes('fraction') || nk.includes('ratio')) return clampPct(v * 100);
+  if (nk.includes('percent')) return clampPct(v);
+  if (v === 1) return undefined;
+  return clampPct(v < 1 ? v * 100 : v);
+}
+
+/** True when an object shallowly carries at least one usage-window key. */
+function isWindowShaped(obj: Record<string, unknown>): boolean {
+  return Object.keys(obj).some((k) => {
+    const nk = normKey(k);
+    return USED_KEYS.includes(nk) || REMAINING_KEYS.includes(nk) || RESET_KEYS.includes(nk);
+  });
 }
 
 function resetFieldMs(v: unknown, nowMs: number): number | undefined {
@@ -178,17 +197,23 @@ function figuresFromObject(obj: Record<string, unknown>, nowMs: number): WindowF
   let reset: number | undefined;
   for (const [k, v] of Object.entries(obj)) {
     const nk = normKey(k);
-    if (USED_KEYS.includes(nk)) used = pctField(v) ?? used;
+    if (USED_KEYS.includes(nk)) used = pctField(v, k) ?? used;
     else if (REMAINING_KEYS.includes(nk)) {
-      const r = pctField(v);
+      const r = pctField(v, k);
       if (r !== undefined) used = clampPct(100 - r) ?? used;
     } else if (RESET_KEYS.includes(nk)) reset = resetFieldMs(v, nowMs) ?? reset;
     else if (typeof v === 'object' && v !== null && !Array.isArray(v)) {
-      // A named window object (five_hour / seven_day / primary / secondary…).
-      out.push(...figuresFromObject(v as Record<string, unknown>, nowMs));
+      // A named window object (five_hour / seven_day / primary /
+      // secondary…). B-12: recurse ONLY into window-shaped objects —
+      // an unrelated nested object that happens to carry a
+      // percent-named field must not be presented as the account's
+      // usage gauge.
+      if (isWindowShaped(v as Record<string, unknown>)) {
+        out.push(...figuresFromObject(v as Record<string, unknown>, nowMs));
+      }
     } else if (Array.isArray(v)) {
       for (const item of v) {
-        if (typeof item === 'object' && item !== null) {
+        if (typeof item === 'object' && item !== null && isWindowShaped(item as Record<string, unknown>)) {
           out.push(...figuresFromObject(item as Record<string, unknown>, nowMs));
         }
       }

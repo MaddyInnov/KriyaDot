@@ -170,10 +170,27 @@ describe('generic ACP engine provider routing', () => {
   });
 
   it('factory routes fleet engines to the ACP provider', () => {
-    for (const id of ['agent/grok/grok-4.7', 'agent/antigravity/gemini-3.8-flash', 'agent/cline/cline-default']) {
-      const provider = createProvider(id);
-      expect(provider, id).toBeInstanceOf(CopilotAcpProvider);
-      (provider as CopilotAcpProvider).close();
+    // B-1 (sweep 2026-11-25): grok is a bridge-backed ACP engine, so
+    // its agent/… lane now requires bridge consent + a verified binary
+    // (it previously spawned the bare name). Antigravity/cline have no
+    // bridge and keep the plain ACP routing.
+    const binDir = mkdtempSync(join(tmpdir(), 'fleet-routing-bin-'));
+    const shim = join(binDir, 'grok');
+    writeFileSync(shim, '#!/bin/sh\necho "grok 1.0.0"\n');
+    chmodSync(shim, 0o755);
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${binDir}${delimiter}${savedPath ?? ''}`;
+    grantBridgeConsent('grok');
+    try {
+      for (const id of ['agent/grok/grok-4.7', 'agent/antigravity/gemini-3.8-flash', 'agent/cline/cline-default']) {
+        const provider = createProvider(id);
+        expect(provider, id).toBeInstanceOf(CopilotAcpProvider);
+        (provider as CopilotAcpProvider).close();
+      }
+    } finally {
+      process.env.PATH = savedPath;
+      resetBridgeConsent('grok');
+      rmSync(binDir, { recursive: true, force: true });
     }
   });
 

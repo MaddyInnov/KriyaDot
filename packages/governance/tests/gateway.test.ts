@@ -4,6 +4,7 @@ import { describe, expect, it, afterEach, vi } from 'vitest';
 import {
   GovernanceGateway,
   DEFAULT_POLICY,
+  checkHardFloor,
   mcpServerAllowRule,
   redactSecrets,
   type EvalContext,
@@ -424,5 +425,51 @@ describe('MCP trust boundary', () => {
       const res = await gw.evaluate(tool, {}, CTX);
       expect(res.effect).not.toBe('allow');
     }
+  });
+});
+
+describe('sweep 2026-11-25: EvaluateResult carries the decision grounds (A-D1, A-D10)', () => {
+  it('a denylist denial reports denylist: true (floors disabled to isolate the denylist)', async () => {
+    const gw = new GovernanceGateway({
+      dbPath: ':memory:',
+      policy: DEFAULT_POLICY,
+      hardFloors: { enabled: false },
+    });
+    gateways.push(gw);
+    const res = await gw.evaluate('run_command', { command: 'mkfs.ext4 /dev/sda1' }, CTX);
+    expect(res.effect).toBe('deny');
+    expect(res.denylist).toBe(true);
+    expect(res.reason).toContain('denylist');
+  });
+
+  it('a catastrophic floor denial reports the floor hit + tier', async () => {
+    const gw = fresh();
+    const res = await gw.evaluate('run_command', { command: 'rm -rf /etc' }, CTX);
+    expect(res.effect).toBe('deny');
+    expect(res.hardFloor?.tier).toBe('catastrophic');
+    expect(res.denylist).toBe(false);
+  });
+
+  it('a throwing user argCheck fails CLOSED as a floor hit at the pattern tier (A-D10)', () => {
+    const hit = checkHardFloor(
+      'run_command',
+      { command: 'anything' },
+      {
+        enabled: true,
+        extraPatterns: [
+          {
+            id: 'buggy-user-pattern',
+            tier: 'destructive',
+            toolPattern: '^run_command$',
+            argCheck: () => {
+              throw new Error('user bug');
+            },
+          },
+        ],
+      },
+    );
+    expect(hit).not.toBeNull();
+    expect(hit?.patternId).toBe('buggy-user-pattern');
+    expect(hit?.tier).toBe('destructive');
   });
 });

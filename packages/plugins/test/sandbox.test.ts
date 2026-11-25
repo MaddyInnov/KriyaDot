@@ -15,7 +15,7 @@
 // Landlock-dependent tests skip (loudly, via test-context skip) on hosts
 // without a kernel sandbox backend; the fail-closed tests run anywhere.
 
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -29,6 +29,11 @@ import {
   validateManifest,
   type PluginSandboxReport,
 } from '../src/index.js';
+import {
+  pluginLandlockAbi,
+  pluginLandlockHelperPath,
+  resetPluginLandlockHelperCache,
+} from '../src/plugin-sandbox.js';
 
 const CANARY_CONTENT = 'OPEN2-CANARY-SECRET';
 
@@ -304,5 +309,36 @@ describe('seatbelt profile generation (execution is darwin-gated)', () => {
     const profile = buildPluginSeatbeltProfile({ pluginDir: '/plugins/demo', network: true });
     expect(profile).toContain('(allow network*)');
     expect(profile).not.toContain('(deny network*)');
+  });
+});
+
+describe('sweep 2026-11-25: Landlock helper cache hardening (C-2)', () => {
+  it('a planted helper binary is never trusted: the cache verifies a sidecar digest and rebuilds', async () => {
+    if (process.platform !== 'linux') return;
+    // Hermetic cache dir (env override): planting here cannot race the
+    // shared cache other test files spawn through.
+    const hermetic = mkdtempSync(join(tmpdir(), 'landlock-cache-test-'));
+    process.env.KRIYADOT_PLUGIN_LANDLOCK_CACHE_DIR = hermetic;
+    try {
+      const bin = pluginLandlockHelperPath();
+      expect(bin.startsWith(hermetic)).toBe(true);
+      // Plant a trojan at the cache path: its --probe answer would
+      // claim a Landlock ABI of 999.
+      writeFileSync(bin, '#!/bin/sh\necho 999\n');
+      chmodSync(bin, 0o755);
+      resetPluginLandlockHelperCache();
+      const abi = await pluginLandlockAbi();
+      // The planted script was discarded and the real helper compiled:
+      // the probe answer is a real ABI (or 0 where Landlock is
+      // absent), never the planted 999.
+      expect(abi).not.toBe(999);
+      expect(existsSync(`${bin}.sha256`)).toBe(true);
+      // The cache dir is owner-only.
+      expect(statSync(hermetic).mode & 0o077).toBe(0);
+    } finally {
+      delete process.env.KRIYADOT_PLUGIN_LANDLOCK_CACHE_DIR;
+      resetPluginLandlockHelperCache();
+      rmSync(hermetic, { recursive: true, force: true });
+    }
   });
 });

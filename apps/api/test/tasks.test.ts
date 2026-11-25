@@ -58,6 +58,18 @@ describe('TaskStore', () => {
     expect(store.get(t.id)).toBeUndefined();
     expect(() => store.remove(t.id)).toThrow(/unknown task/);
   });
+
+  it('C-11: deleting a blocker task is refused while dependents name it (no silent deadlock)', () => {
+    const store = new TaskStore(dir);
+    const blocker = store.create({ title: 'Blocker' });
+    const dependent = store.create({ title: 'Dependent', blockedBy: [blocker.id] });
+    expect(() => store.remove(blocker.id)).toThrow(/blocker for 1 other task/);
+    expect(store.get(blocker.id)).toBeDefined();
+    // Unblock the dependent explicitly, then deletion succeeds.
+    store.update(dependent.id, { blockedBy: [] });
+    store.remove(blocker.id);
+    expect(store.get(blocker.id)).toBeUndefined();
+  });
 });
 
 describe('CalendarEventStore', () => {

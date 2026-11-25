@@ -272,7 +272,15 @@ export function checkHardFloor(
     try {
       reason = p.argCheck(args);
     } catch {
-      reason = null;
+      // Sweep 2026-11-25 (A-D10): a THROWING argCheck must fail closed,
+      // not silently read as "no floor hit" — a buggy user-supplied
+      // check would otherwise disable the floor entirely. The hit
+      // carries the pattern's own tier.
+      return {
+        patternId: p.id,
+        tier: p.tier ?? 'destructive',
+        reason: `Hard floor: ${p.id} argument check errored — treated as a hit (fail-closed)`,
+      };
     }
     if (reason) {
       return { patternId: p.id, tier: p.tier ?? 'destructive', reason: `Hard floor: ${reason}` };

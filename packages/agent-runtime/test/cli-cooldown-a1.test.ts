@@ -184,3 +184,50 @@ describe('resolver skip reason', () => {
     expect(reason).toContain('cooldown');
   });
 });
+
+describe('B-8: half-open probe claims (sweep 2026-11-25)', () => {
+  function halfOpenRegistry() {
+    let now = T0;
+    const reg = new BridgeCooldownRegistry({ now: () => now, unavailableThreshold: 3, baseBackoffMs: 60_000 });
+    reg.recordSterileTurn('codex', 'default');
+    reg.recordSterileTurn('codex', 'default');
+    reg.recordSterileTurn('codex', 'default');
+    now = T0 + 61_000; // backoff lapsed → half-open
+    return { reg, setNow: (v: number) => { now = v; } };
+  }
+
+  it('only ONE probe claim succeeds while a probe is in flight', () => {
+    const { reg } = halfOpenRegistry();
+    expect(reg.check('codex', 'default').halfOpen).toBe(true);
+    expect(reg.tryClaimProbe('codex', 'default')).toBe(true);
+    expect(reg.tryClaimProbe('codex', 'default')).toBe(false);
+    expect(reg.tryClaimProbe('codex', 'default')).toBe(false);
+  });
+
+  it('the claim is released when the probe turn resolves (success or failure)', () => {
+    const { reg } = halfOpenRegistry();
+    expect(reg.tryClaimProbe('codex', 'default')).toBe(true);
+    reg.recordSuccess('codex', 'default'); // probe succeeded → breaker closed, claim gone
+    expect(reg.check('codex', 'default')).toEqual({ active: false, halfOpen: false });
+
+    const { reg: reg2, setNow } = halfOpenRegistry();
+    expect(reg2.tryClaimProbe('codex', 'default')).toBe(true);
+    reg2.recordFailure('codex', 'default', new Error('probe died')); // re-opens the breaker
+    expect(reg2.check('codex', 'default').active).toBe(true);
+    setNow(T0 + 61_000 + 121_000); // second backoff (doubled) lapses
+    expect(reg2.check('codex', 'default').halfOpen).toBe(true);
+    expect(reg2.tryClaimProbe('codex', 'default')).toBe(true); // claimable again
+  });
+
+  it('no claim is possible when the backend is not half-open', () => {
+    const reg = new BridgeCooldownRegistry({ now: () => T0 });
+    expect(reg.tryClaimProbe('codex', 'default')).toBe(false); // no entry at all
+  });
+
+  it('a stale claim expires with its TTL', () => {
+    const { reg, setNow } = halfOpenRegistry();
+    expect(reg.tryClaimProbe('codex', 'default', 30_000)).toBe(true);
+    setNow(T0 + 61_000 + 31_000); // claim TTL lapsed (probe presumably died with its turn)
+    expect(reg.tryClaimProbe('codex', 'default', 30_000)).toBe(true);
+  });
+});

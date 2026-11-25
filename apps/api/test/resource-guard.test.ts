@@ -234,6 +234,49 @@ describe('ResourceGuard state machine', () => {
     expect(rec.actions()).toContain('resource_guard.shedding_cleared');
   });
 
+  it('D12: sustained relief below hard (3 samples) clears shedding even when RSS never returns to ok', () => {
+    const rec = auditRecorder();
+    const guard = new ResourceGuard({
+      settings: TEST_SETTINGS,
+      sampler: scriptedSampler([
+        sample({ rssBytes: 500 * MB, at: 1_000_000 }), // hard — shedding starts
+        sample({ rssBytes: 150 * MB, at: 1_030_000 }), // soft — streak 1
+        sample({ rssBytes: 150 * MB, at: 1_060_000 }), // soft — streak 2
+        sample({ rssBytes: 150 * MB, at: 1_090_000 }), // soft — streak 3 → clears
+      ]),
+      audit: rec.audit,
+      log: () => {},
+    });
+    guard.sampleNow();
+    expect(guard.state().shedding).toBe(true);
+    guard.sampleNow();
+    expect(guard.state().shedding).toBe(true); // a dip does not clear
+    guard.sampleNow();
+    expect(guard.state().shedding).toBe(true); // two samples is not proof yet
+    guard.sampleNow();
+    expect(guard.state().shedding).toBe(false); // sustained relief clears the latch
+    expect(guard.checkOptionalWork('routine:x').allowed).toBe(true);
+    expect(rec.actions()).toContain('resource_guard.shedding_cleared');
+  });
+
+  it('D12: a hard sample mid-relief restarts the streak', () => {
+    const guard = new ResourceGuard({
+      settings: TEST_SETTINGS,
+      sampler: scriptedSampler([
+        sample({ rssBytes: 500 * MB, at: 1_000_000 }), // hard
+        sample({ rssBytes: 150 * MB, at: 1_030_000 }), // soft 1
+        sample({ rssBytes: 150 * MB, at: 1_060_000 }), // soft 2
+        sample({ rssBytes: 500 * MB, at: 1_090_000 }), // hard again — streak resets
+        sample({ rssBytes: 150 * MB, at: 1_120_000 }), // soft 1
+        sample({ rssBytes: 150 * MB, at: 1_150_000 }), // soft 2
+      ]),
+      audit: () => {},
+      log: () => {},
+    });
+    for (let i = 0; i < 6; i++) guard.sampleNow();
+    expect(guard.state().shedding).toBe(true);
+  });
+
   it('monitor-only mode: hard pressure is audited but nothing is shed', () => {
     const rec = auditRecorder();
     const guard = new ResourceGuard({

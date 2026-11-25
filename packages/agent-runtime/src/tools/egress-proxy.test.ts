@@ -47,12 +47,22 @@ async function startOrigin(body = 'origin-body'): Promise<{ port: number; seen: 
   return { port, seen, close: () => closeServer(server) };
 }
 
+/** The 'user:pass' credential a run's child processes receive via the proxy env. */
+function credentialOf(proxy: { env: Record<string, string> }): string {
+  const u = new URL(proxy.env.HTTP_PROXY!);
+  return `${decodeURIComponent(u.username)}:${u.password}`;
+}
+
 /** GET via the proxy using absolute-form (standard forward-proxy request). */
-function httpViaProxy(proxyPort: number, targetUrl: string, runId?: string): Promise<{ status: number; body: string }> {
+function httpViaProxy(
+  proxyPort: number,
+  targetUrl: string,
+  credential?: string,
+): Promise<{ status: number; body: string }> {
   return new Promise((resolvePromise, rejectPromise) => {
     const headers: Record<string, string> = {};
-    if (runId) {
-      headers['proxy-authorization'] = 'Basic ' + Buffer.from(`${runId}:x`).toString('base64');
+    if (credential) {
+      headers['proxy-authorization'] = 'Basic ' + Buffer.from(credential).toString('base64');
     }
     const req = http.request(
       { host: '127.0.0.1', port: proxyPort, method: 'GET', path: targetUrl, headers },
@@ -68,10 +78,15 @@ function httpViaProxy(proxyPort: number, targetUrl: string, runId?: string): Pro
 }
 
 /** CONNECT to the proxy, then speak plain HTTP inside the tunnel. */
-function connectViaProxy(proxyPort: number, targetPort: number): Promise<string> {
+function connectViaProxy(proxyPort: number, targetPort: number, credential?: string): Promise<string> {
   return new Promise((resolvePromise, rejectPromise) => {
     const socket = net.connect(proxyPort, '127.0.0.1', () => {
-      socket.write(`CONNECT 127.0.0.1:${targetPort} HTTP/1.1\r\nHost: 127.0.0.1:${targetPort}\r\n\r\n`);
+      const auth = credential
+        ? `Proxy-Authorization: Basic ${Buffer.from(credential).toString('base64')}\r\n`
+        : '';
+      socket.write(
+        `CONNECT 127.0.0.1:${targetPort} HTTP/1.1\r\nHost: 127.0.0.1:${targetPort}\r\n${auth}\r\n`,
+      );
     });
     let buf = Buffer.alloc(0);
     let tunnelOpen = false;
@@ -127,7 +142,7 @@ describe('egress proxy', () => {
     const entries: EgressJournalEntry[] = [];
     const proxy = await startEgressProxy({ runId: 'run-http-1', sink: (e) => void entries.push(e) });
     try {
-      const res = await httpViaProxy(proxy.port, `http://127.0.0.1:${origin.port}/secret-path?token=x`);
+      const res = await httpViaProxy(proxy.port, `http://127.0.0.1:${origin.port}/secret-path?token=x`, credentialOf(proxy));
       expect(res.status).toBe(200);
       expect(res.body).toBe('origin-body');
       // The origin DID receive the full path (standard proxy behaviour)…
@@ -149,14 +164,29 @@ describe('egress proxy', () => {
     }
   });
 
-  it('attributes entries to the run id carried as the proxy credential', async () => {
+  it('C-6/C-7: attribution is the proxy run — a forged username cannot spoof it, and unauthenticated requests are refused', async () => {
     const origin = await startOrigin();
     const entries: EgressJournalEntry[] = [];
     const proxy = await startEgressProxy({ runId: 'run-default', sink: (e) => void entries.push(e) });
     try {
-      await httpViaProxy(proxy.port, `http://127.0.0.1:${origin.port}/a`, 'run-from-credential');
+      const real = credentialOf(proxy);
+      const token = real.slice(real.indexOf(':') + 1);
+      // Authenticated with the real token but a FORGED username: the
+      // traffic is the run's (it holds the run credential), but the
+      // journal must attribute it to the proxy's own run id, never to
+      // the client-supplied name.
+      const forged = await httpViaProxy(proxy.port, `http://127.0.0.1:${origin.port}/a`, `victim-run:${token}`);
+      expect(forged.status).toBe(200);
       await waitFor(() => entries.length >= 1);
-      expect(entries[0]!.runId).toBe('run-from-credential');
+      expect(entries[0]!.runId).toBe('run-default');
+      // No credential at all → 407, nothing forwarded, nothing journaled.
+      const anon = await httpViaProxy(proxy.port, `http://127.0.0.1:${origin.port}/b`);
+      expect(anon.status).toBe(407);
+      // Wrong token → 407 as well.
+      const wrong = await httpViaProxy(proxy.port, `http://127.0.0.1:${origin.port}/c`, 'run-default:wrong-token');
+      expect(wrong.status).toBe(407);
+      await new Promise((r) => setTimeout(r, 100));
+      expect(entries).toHaveLength(1);
     } finally {
       await proxy.close();
       await origin.close();
@@ -168,7 +198,7 @@ describe('egress proxy', () => {
     const entries: EgressJournalEntry[] = [];
     const proxy = await startEgressProxy({ runId: 'run-connect-1', sink: (e) => void entries.push(e) });
     try {
-      const out = await connectViaProxy(proxy.port, origin.port);
+      const out = await connectViaProxy(proxy.port, origin.port, credentialOf(proxy));
       expect(out).toContain('origin-body');
       await waitFor(() => entries.length >= 1);
       const entry = entries[0]!;
@@ -191,7 +221,7 @@ describe('egress proxy', () => {
       const probe = net.createServer();
       const deadPort = await listen(probe);
       await closeServer(probe);
-      await expect(connectViaProxy(proxy.port, deadPort)).rejects.toThrow();
+      await expect(connectViaProxy(proxy.port, deadPort, credentialOf(proxy))).rejects.toThrow();
       await waitFor(() => entries.length >= 1);
       expect(entries[0]).toMatchObject({ host: '127.0.0.1', port: deadPort, status: 'tunnel-failed' });
     } finally {
@@ -208,9 +238,9 @@ describe('egress proxy', () => {
       },
     });
     try {
-      const res = await httpViaProxy(proxy.port, `http://127.0.0.1:${origin.port}/ok`);
+      const res = await httpViaProxy(proxy.port, `http://127.0.0.1:${origin.port}/ok`, credentialOf(proxy));
       expect(res.status).toBe(200);
-      const out = await connectViaProxy(proxy.port, origin.port);
+      const out = await connectViaProxy(proxy.port, origin.port, credentialOf(proxy));
       expect(out).toContain('origin-body');
     } finally {
       await proxy.close();
@@ -222,7 +252,8 @@ describe('egress proxy', () => {
     const proxy = await startEgressProxy({ runId: 'run-env', sink: () => undefined });
     try {
       expect(proxy.proxyUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
-      expect(proxy.env.HTTP_PROXY).toContain('run-env@127.0.0.1');
+      // Credentialed env: run id as username + a per-instance token.
+      expect(proxy.env.HTTP_PROXY).toMatch(/run-env:[^@]+@127\.0\.0\.1/);
       expect(proxy.env.HTTPS_PROXY).toBe(proxy.env.HTTP_PROXY);
       expect(proxy.env.http_proxy).toBe(proxy.env.HTTP_PROXY);
       expect(proxy.env.https_proxy).toBe(proxy.env.HTTP_PROXY);

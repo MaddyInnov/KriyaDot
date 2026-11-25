@@ -99,7 +99,9 @@ const SEND_CONTENT_TOOLS = /send|message|email|publish|post_/i;
  * Sanitizing mirrors Fusion's sanitizePlan discipline: dedupe ids,
  * drop unknown/self dependencies, cap the step count.
  */
-export function parseStructuredPlan(text: string): { steps: ParsedStructuredStep[] } | null {
+export function parseStructuredPlan(
+  text: string,
+): { steps: ParsedStructuredStep[]; truncated: boolean } | null {
   const raw = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
   let parsed: unknown;
   try {
@@ -147,7 +149,10 @@ export function parseStructuredPlan(text: string): { steps: ParsedStructuredStep
   if (steps.length === 0) return null;
   const ids = new Set(steps.map((s) => s.id));
   for (const s of steps) s.dependsOn = s.dependsOn.filter((d) => ids.has(d));
-  return { steps };
+  // Sweep 2026-11-25 (A-D7): truncation past the 25-step cap is
+  // REPORTED, not silent — callers (the plan gate) audit it and note
+  // it on the approval card so dropped steps are never invisible.
+  return { steps, truncated: stepsRaw.length > 25 };
 }
 
 /**

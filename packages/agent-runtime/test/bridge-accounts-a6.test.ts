@@ -90,6 +90,21 @@ describe('per-CLI isolation knobs (investigated, declared as data)', () => {
     expect(oc.OPENCODE_CONFIG_DIR).toBe(join('/a/oc-work', 'config', 'opencode'));
   });
 
+  it('B-9: hermes is honestly single-account — its HERMES_HOME knob is ASSUMED, never confirmed', () => {
+    // An unconfirmed knob fails OPEN: turns booked to a named account
+    // would silently run as the machine-default login, and sign-in
+    // could overwrite that login. Until a real-binary pass confirms
+    // HERMES_HOME, hermes accounts are labels only.
+    expect(BRIDGE_ISOLATION.hermes.isolatable).toBe(false);
+    expect(BRIDGE_ISOLATION.hermes.envKnobs).toEqual([]);
+    const named = account({ id: 'work', bridgeId: 'hermes', configDir: '/a/hermes-work' });
+    // Spawn env: NO override — the CLI uses the machine's one login.
+    expect(bridgeAccountSpawnEnv(named)).toEqual({});
+    // Credential probing reads the MACHINE DEFAULT location (the only
+    // file the CLI will ever read), never the account dir.
+    expect(bridgeAccountCredentialsPath(named, '/home/tester')).toBe(join('/home/tester', '.hermes', 'auth.json'));
+  });
+
   it('credential paths follow each CLI layout (default vs account)', () => {
     const home = '/home/tester';
     expect(bridgeAccountCredentialsPath(machineDefaultAccount('claude'), home)).toBe(

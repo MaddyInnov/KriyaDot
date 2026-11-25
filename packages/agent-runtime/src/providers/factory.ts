@@ -25,7 +25,7 @@ import {
   loadBridgeTokenForClaudeProfile,
   resolveVerifiedCliExecutable,
 } from './cli-bridge.js';
-import { getProviderManifest, isLegacyCliBridgeId } from './provider-manifest.js';
+import { getProviderManifest, isLegacyCliBridgeId, listProviderManifests } from './provider-manifest.js';
 import { BedrockProvider } from './bedrock.js';
 import { VertexProvider } from './vertex.js';
 import { CohereProvider } from './cohere.js';
@@ -100,6 +100,44 @@ export function createProvider(
   // observation, permission brokering, and session resume (cli-driver.ts);
   // the rest stay on the one-shot provider.
   if (parseAgentProviderId(providerId)) {
+    // Sweep 2026-11-25 (B-1): a BRIDGE-BACKED cli id (one with a
+    // provider manifest — copilot / grok / kimi / hermes / pi, plus
+    // opencode's ACP preset) goes through the SAME Connect consent +
+    // identity-verified resolution as the preset lane below. This
+    // branch previously constructed the ACP / one-shot providers with
+    // NO opts, so they spawned the bare command name from PATH — a
+    // same-named impostor would run with the user's prompt, user pins
+    // were ignored, unconnected bridges ran without consent, and a
+    // non-default account's env was silently dropped. (The native
+    // driver lane never had the hole: createNativeCliDriver resolves
+    // verified executables itself. Non-bridge ACP engines — cursor,
+    // gemini, qwen, droid, cline… — have no consent/pin
+    // infrastructure and keep the ENGINES-fleet spawn-by-name path.)
+    const { cliId } = parseAgentProviderId(providerId)!;
+    const bridgeManifest = listProviderManifests().find((m) => m.driver.agentCliId === cliId);
+    const bridgeId = bridgeManifest?.bridgeId ?? (cliId === 'opencode' ? 'opencode' : undefined);
+    if (bridgeId) {
+      const manifest = getProviderManifest(bridgeId);
+      if (!isBridgeConnected(bridgeId)) {
+        throw new Error(
+          `${manifest.displayName} is not connected: click Connect in the Providers settings page to use your ${manifest.displayName} login. ` +
+            `The CLI handles its own auth; KriyaDot never reads its credential bytes.`,
+        );
+      }
+      const resolution = resolveVerifiedCliExecutable(bridgeId);
+      if (!resolution.path) {
+        throw new Error(bridgeResolutionFailureMessage(bridgeId, resolution));
+      }
+      const acpProvider = createAcpEngineProvider(providerId, {
+        command: resolution.path,
+        ...(opts?.env ? { env: opts.env } : {}),
+      });
+      if (acpProvider) return acpProvider;
+      return (
+        createNativeCliDriver(providerId, { command: resolution.path, ...(opts?.env ? { env: opts.env } : {}) }) ??
+        createAgentCliProvider(providerId, { command: resolution.path })
+      );
+    }
     // ACP engines (W9 + ENGINES fleet): ACP-speaking CLIs (Copilot,
     // OpenCode, Antigravity, Grok, Cursor, Gemini, Kimi, Qwen, Droid,
     // Hermes, Cline, DeepSeek harness) route to the ACP-backed provider

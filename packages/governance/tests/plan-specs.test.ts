@@ -125,4 +125,43 @@ describe('policy.json planSpecs loading', () => {
     expect(loaded.policy.planVerificationScope).toBeUndefined();
     expect(loaded.errors.some((e) => e.includes('planVerificationScope'))).toBe(true);
   });
+
+  // Sweep 2026-11-25 (A-D3): a policy.json WITHOUT a "rules" key must
+  // still contribute its planSpecs / planVerificationScope — before
+  // the fix the whole policy object was built only inside the rules
+  // branch, silently dropping a rules-less file's scope (including an
+  // "off" opt-out) and specs.
+  it('loads planSpecs + scope from a rules-less policy.json (A-D3)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kriyadot-policy-'));
+    mkdirSync(join(dir, '.kriyadot'), { recursive: true });
+    writeFileSync(
+      join(dir, '.kriyadot', 'policy.json'),
+      JSON.stringify({
+        planVerificationScope: 'off',
+        planSpecs: [
+          { type: 'provenance', id: 'del-prov', toolPattern: '^delete_file$', arg: 'path', sourceToolPattern: '^list_folder$' },
+        ],
+      }),
+    );
+    clearWorkspacePolicyCache();
+    const loaded = loadWorkspacePolicy(dir);
+    expect(loaded.policy.planVerificationScope).toBe('off');
+    expect(loaded.policy.planSpecs?.map((s) => s.id)).toEqual(['del-prov']);
+    expect(loaded.policy.rules).toEqual([]);
+    expect(loaded.errors).toEqual([]);
+  });
+
+  it('still errors on a present-but-non-array "rules" (A-D3)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kriyadot-policy-'));
+    mkdirSync(join(dir, '.kriyadot'), { recursive: true });
+    writeFileSync(
+      join(dir, '.kriyadot', 'policy.json'),
+      JSON.stringify({ rules: 'nope', planVerificationScope: 'all' }),
+    );
+    clearWorkspacePolicyCache();
+    const loaded = loadWorkspacePolicy(dir);
+    expect(loaded.errors.some((e) => e.includes('"rules" must be an array'))).toBe(true);
+    // …and the scope survives alongside the error.
+    expect(loaded.policy.planVerificationScope).toBe('all');
+  });
 });

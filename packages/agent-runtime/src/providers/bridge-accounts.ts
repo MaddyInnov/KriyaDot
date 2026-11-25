@@ -160,11 +160,20 @@ export const BRIDGE_ISOLATION: Record<CliBridgeId, BridgeIsolationSpec> = {
   },
   hermes: {
     bridgeId: 'hermes',
-    isolatable: true,
-    envKnobs: ['HERMES_HOME'],
+    // Sweep 2026-11-25 (B-9): HERMES_HOME is only an ASSUMED knob
+    // (public docs; never confirmed against a real binary). An
+    // unconfirmed knob fails OPEN — turns booked/cooled/gauged
+    // against a named account would silently run as the
+    // machine-default login, and a named-account sign-in could
+    // overwrite that login while polling a file that never appears.
+    // Until a real-binary pass confirms the knob, Hermes is honestly
+    // single-account, like copilot/grok/kimi.
+    isolatable: false,
+    envKnobs: [],
     note:
-      'HERMES_HOME points Hermes at a per-account home dir (assumed knob — see the hermes manifest ' +
-      'verificationBasis); the machine default is ~/.hermes.',
+      'HERMES_HOME is only an assumed per-account knob (unconfirmed against a real binary), so Hermes ' +
+      'is modelled honestly as single-account: accounts may be registered, but every account resolves ' +
+      'to the machine\u2019s one Hermes login (~/.hermes) and spawns carry no override.',
   },
 };
 

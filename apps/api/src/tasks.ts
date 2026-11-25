@@ -207,6 +207,23 @@ export class TaskStore extends JsonFileStore {
     const rows = this.readRows();
     const idx = rows.findIndex((r) => isTask(r) && r.id === id);
     if (idx === -1) throw storeNotFound('task', id);
+    // Sweep 2026-11-25 (C-11): refuse to orphan dependents. A task
+    // whose blockedBy names a missing id is treated as blocked
+    // forever (fail-closed chain semantics), so deleting a blocker
+    // would silently deadlock every dependent — the user must unblock
+    // them first, explicitly.
+    const dependents = rows
+      .filter(isTask)
+      .filter((t) => t.id !== id && Array.isArray(t.blockedBy) && t.blockedBy.includes(id));
+    if (dependents.length > 0) {
+      const err = new Error(
+        `task is a blocker for ${dependents.length} other task(s) (${dependents
+          .map((t) => `"${t.title}"`)
+          .join(', ')}) — remove it from their blocked-by lists before deleting it`,
+      );
+      (err as Error & { code?: string }).code = CONFLICT_MARK;
+      throw err;
+    }
     rows.splice(idx, 1);
     this.writeRows(rows);
   }
@@ -594,6 +611,7 @@ function byDoneThenDue(a: Task, b: Task): number {
 
 const NOT_FOUND_MARK = '__tasks_not_found__';
 const VALIDATION_MARK = '__tasks_validation__';
+const CONFLICT_MARK = '__tasks_conflict__';
 
 function storeNotFound(kind: string, id: string): Error {
   const err = new Error(`unknown ${kind}: ${id}`);
@@ -612,6 +630,7 @@ function statusFor(err: unknown): number {
   const code = (err as Error & { code?: string }).code;
   if (code === NOT_FOUND_MARK) return 404;
   if (code === VALIDATION_MARK) return 400;
+  if (code === CONFLICT_MARK) return 409;
   return 500;
 }
 

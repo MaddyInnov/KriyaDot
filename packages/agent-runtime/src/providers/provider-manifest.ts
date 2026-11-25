@@ -364,12 +364,27 @@ export function validateProviderManifestSet(raw: unknown): string[] {
   const providers = raw.providers;
   if (!isPlainObject(providers)) return [...problems, 'manifest file providers must be an object'];
   const seenProviderIds = new Map<string, string>();
+  // Sweep 2026-11-25 (B-4): binary names must be unique across the
+  // set — two bridges claiming the same binary name would make
+  // PATH resolution ambiguous (the A2 log always claimed this check
+  // existed; it did not).
+  const seenBinaryNames = new Map<string, string>();
   for (const [key, manifest] of Object.entries(providers)) {
     problems.push(...validateProviderManifest(manifest, key));
     if (isPlainObject(manifest) && typeof manifest.providerId === 'string') {
       const prior = seenProviderIds.get(manifest.providerId);
       if (prior) problems.push(`manifest "${key}": duplicate providerId "${manifest.providerId}" (also on "${prior}")`);
       seenProviderIds.set(manifest.providerId, key);
+    }
+    if (isPlainObject(manifest) && isPlainObject(manifest.binary) && Array.isArray(manifest.binary.names)) {
+      for (const name of manifest.binary.names) {
+        if (typeof name !== 'string') continue;
+        const prior = seenBinaryNames.get(name);
+        if (prior && prior !== key) {
+          problems.push(`manifest "${key}": binary name "${name}" is also claimed by "${prior}" — binary names must be unique across bridges`);
+        }
+        seenBinaryNames.set(name, key);
+      }
     }
   }
   return problems;
@@ -386,11 +401,24 @@ export function providerManifestFilePath(): string {
 }
 
 function loadManifestFile(): ProviderManifestFile {
+  // Sweep 2026-11-25 (B-4): distinguish ABSENT (use the bundled set —
+  // e.g. a packaged layout without the JSON alongside) from PRESENT
+  // BUT UNPARSEABLE (fail closed loudly: a tampered/corrupt on-disk
+  // manifest must never be silently ignored in favour of the bundled
+  // set).
+  const path = providerManifestFilePath();
+  let raw: string;
   try {
-    const raw = readFileSync(providerManifestFilePath(), 'utf8');
-    return JSON.parse(raw) as ProviderManifestFile;
+    raw = readFileSync(path, 'utf8');
   } catch {
     return bundledManifests as ProviderManifestFile;
+  }
+  try {
+    return JSON.parse(raw) as ProviderManifestFile;
+  } catch (err) {
+    throw new Error(
+      `Provider manifest at ${path} is present but unparseable (${err instanceof Error ? err.message : String(err)}) — refusing to fall back to the bundled set.`,
+    );
   }
 }
 

@@ -497,7 +497,7 @@ export class GovernanceGateway {
         },
       });
       this.notifyDecision({ toolName, effect: 'deny', botId: ctx.botId, actor: ctx.actor, sessionId: ctx.sessionId, reason: `hard floor (catastrophic): ${floorHit.reason}` });
-      return { effect: 'deny' };
+      return { effect: 'deny', reason: floorHit.reason, hardFloor: floorHit, denylist: false };
     }
     if (floorHit) {
       const approvalId = this.requestApproval(toolName, args, ctx, {
@@ -520,7 +520,7 @@ export class GovernanceGateway {
         },
       });
       this.notifyDecision({ toolName, effect: 'require-approval', botId: ctx.botId, actor: ctx.actor, sessionId: ctx.sessionId, reason: `hard floor: ${floorHit.reason}`, approvalId });
-      return { effect: 'require-approval', approvalId };
+      return { effect: 'require-approval', approvalId, reason: floorHit.reason, hardFloor: floorHit, denylist: false };
     }
 
     if (d.denylistHit) {
@@ -536,7 +536,7 @@ export class GovernanceGateway {
         },
       });
       this.notifyDecision({ toolName, effect: 'deny', botId: ctx.botId, actor: ctx.actor, sessionId: ctx.sessionId, reason: 'denylist: destructive command pattern' });
-      return { effect: 'deny' };
+      return { effect: 'deny', reason: 'denylist: destructive command pattern', hardFloor: null, denylist: true };
     }
 
     if (d.domainDenied) {
@@ -568,7 +568,7 @@ export class GovernanceGateway {
         detail: { reason: rule?.reason ?? 'default policy', ruleId: rule?.id },
       });
       this.notifyDecision({ toolName, effect: 'allow', botId: ctx.botId, actor: ctx.actor, sessionId: ctx.sessionId, reason: rule?.reason ?? 'default policy', ruleId: rule?.id });
-      return { effect };
+      return { effect, reason: rule?.reason ?? 'default policy' };
     }
 
     if (effect === 'deny') {
@@ -584,7 +584,7 @@ export class GovernanceGateway {
         },
       });
       this.notifyDecision({ toolName, effect: 'deny', botId: ctx.botId, actor: ctx.actor, sessionId: ctx.sessionId, reason: rule?.reason ?? 'default policy', ruleId: rule?.id });
-      return { effect };
+      return { effect, reason: rule?.reason ?? 'default policy' };
     }
 
     // require-approval: persist a pending approval with a redacted args snapshot.
@@ -601,7 +601,7 @@ export class GovernanceGateway {
       detail: { approvalId, args: redactSecrets(args) },
     });
     this.notifyDecision({ toolName, effect: 'require-approval', botId: ctx.botId, actor: ctx.actor, sessionId: ctx.sessionId, reason: rule?.reason ?? 'default policy', ruleId: rule?.id, approvalId });
-    return { effect, approvalId };
+    return { effect, approvalId, reason: rule?.reason ?? 'default policy' };
   }
 
   /**

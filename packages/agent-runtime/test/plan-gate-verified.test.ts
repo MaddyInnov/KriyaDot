@@ -422,3 +422,184 @@ describe('fusion verification hook', () => {
     expect(result.fused).toBe('fused');
   });
 });
+
+describe('sweep 2026-11-25 — plan-gate defect regressions', () => {
+  it('A-D1: a DENYLIST denial mid-execution escalates recovery (absolute), never re-plans around it', async () => {
+    const gateway = new FakeGateway();
+    const plan = JSON.stringify({
+      steps: [
+        { id: 's1', tool: 'read_file', args: { path: 'a' }, dependsOn: [], description: 'Read a' },
+        { id: 's2', tool: 'delete_file', args: { path: 'b' }, dependsOn: [], description: 'Delete b', goal: true },
+      ],
+    });
+    const ran: Record<string, number> = {};
+    const provider = new MockProvider([
+      { content: plan },
+      {
+        toolCalls: [
+          { id: 'c1', name: 'read_file', args: { path: 'a' } } as ToolCall,
+          { id: 'c2', name: 'delete_file', args: { path: 'b' } } as ToolCall,
+        ],
+      },
+      { content: 'done' },
+    ]);
+    const rt = makeRuntime(gateway, [tool('read_file', ran), tool('delete_file', ran)], provider);
+    const baseEvaluate = gateway.evaluate.bind(gateway);
+    gateway.evaluate = async (call: ToolCall) =>
+      call.name === 'delete_file'
+        ? { decision: 'deny' as const, reason: 'denylist: destructive command pattern', denylist: true }
+        : baseEvaluate(call);
+    await rt.runTurn({
+      bot: testBot({ approvalMode: 'plan', tools: ['read_file', 'delete_file'] }),
+      message: 'Read a and delete b',
+      onEvent: () => undefined,
+    });
+    const recovery = gateway.audits.find((a) => a.type === 'plan.recovery');
+    expect(recovery).toBeDefined();
+    const detail = recovery?.detail as { action: string; catastrophic: boolean };
+    expect(detail.catastrophic).toBe(true);
+    expect(detail.action).toBe('escalate');
+    expect(ran.delete_file).toBeUndefined();
+  });
+
+  it('A-D5: recovery drops the step whose ARGS match the blocked call — not the first same-tool step', async () => {
+    const gateway = new FakeGateway();
+    const plan = JSON.stringify({
+      steps: [
+        { id: 's1', tool: 'delete_file', args: { path: 'a.log' }, dependsOn: [], description: 'Delete a', goal: true },
+        { id: 's2', tool: 'delete_file', args: { path: 'b.log' }, dependsOn: [], description: 'Delete b' },
+        { id: 's3', tool: 'read_file', args: { path: 'c' }, dependsOn: [], description: 'Read c' },
+      ],
+    });
+    const ran: Record<string, number> = {};
+    const provider = new MockProvider([
+      { content: plan },
+      {
+        toolCalls: [
+          { id: 'c1', name: 'delete_file', args: { path: 'a.log' } } as ToolCall,
+          { id: 'c2', name: 'delete_file', args: { path: 'b.log' } } as ToolCall,
+          { id: 'c3', name: 'read_file', args: { path: 'c' } } as ToolCall,
+        ],
+      },
+      { content: 'done' },
+    ]);
+    const rt = makeRuntime(gateway, [tool('delete_file', ran), tool('read_file', ran)], provider);
+    const baseEvaluate = gateway.evaluate.bind(gateway);
+    gateway.evaluate = async (call: ToolCall) =>
+      call.name === 'delete_file' && (call.args as { path?: string }).path === 'b.log'
+        ? { decision: 'deny' as const, reason: 'b.log is frozen' }
+        : baseEvaluate(call);
+    await rt.runTurn({
+      bot: testBot({ approvalMode: 'plan', tools: ['delete_file', 'read_file'] }),
+      message: 'Delete both logs and read c',
+      onEvent: () => undefined,
+    });
+    const recovery = gateway.audits.find((a) => a.type === 'plan.recovery');
+    expect(recovery).toBeDefined();
+    const detail = recovery?.detail as { stepId: string; action: string; droppedStepIds: string[] };
+    expect(detail.stepId).toBe('s2');
+    expect(detail.action).toBe('skip-with-dependents');
+    expect(detail.droppedStepIds).toEqual(['s2']);
+    expect(ran.delete_file).toBe(1); // only a.log was deleted
+    expect(ran.read_file).toBe(1);
+  });
+
+  it('A-D5: an ambiguous same-tool block (args match no step) escalates instead of guessing', async () => {
+    const gateway = new FakeGateway();
+    const plan = JSON.stringify({
+      steps: [
+        { id: 's1', tool: 'delete_file', args: { path: 'a.log' }, dependsOn: [], description: 'Delete a' },
+        { id: 's2', tool: 'delete_file', args: { path: 'b.log' }, dependsOn: [], description: 'Delete b' },
+      ],
+    });
+    const ran: Record<string, number> = {};
+    const provider = new MockProvider([
+      { content: plan },
+      { toolCalls: [{ id: 'c1', name: 'delete_file', args: { path: 'other.log' } } as ToolCall] },
+      { content: 'done' },
+    ]);
+    const rt = makeRuntime(gateway, [tool('delete_file', ran)], provider);
+    gateway.evaluate = async () => ({ decision: 'deny' as const, reason: 'all deletes frozen' });
+    await rt.runTurn({
+      bot: testBot({ approvalMode: 'plan', tools: ['delete_file'] }),
+      message: 'Delete a log',
+      onEvent: () => undefined,
+    });
+    const recovery = gateway.audits.find((a) => a.type === 'plan.recovery');
+    expect(recovery).toBeDefined();
+    const detail = recovery?.detail as { action: string; reason?: string };
+    expect(detail.action).toBe('escalate');
+    expect(detail.reason).toBe('ambiguous-step-match');
+    expect(ran.delete_file).toBeUndefined();
+  });
+
+  it('A-D6: an oracle ERROR at the gate fails closed — plan blocked, nothing executes, no raw error leaks', async () => {
+    const gateway = new FakeGateway();
+    gateway.simulatePolicy = async () => {
+      throw new Error('adapter exploded at /secret/internal/path');
+    };
+    const ran: Record<string, number> = {};
+    const provider = new MockProvider([{ content: STRUCTURED_PLAN }, { content: 'never reached' }]);
+    const rt = makeRuntime(gateway, [tool('list_folder', ran), tool('delete_file', ran)], provider);
+    const events: StreamEvent[] = [];
+    await rt.runTurn({
+      bot: testBot({ approvalMode: 'plan', tools: ['list_folder', 'delete_file'] }),
+      message: 'Clean up old logs',
+      onEvent: (e) => void events.push(e),
+    });
+    expect(events.some((e) => e.type === 'approval_required')).toBe(false);
+    expect(ran).toEqual({});
+    const err = events.find((e) => e.type === 'error');
+    expect(err).toBeDefined();
+    if (err?.type === 'error') {
+      expect(err.message).toContain('policy check itself failed');
+      expect(err.message).not.toContain('/secret/internal/path');
+    }
+    const verified = gateway.audits.find((a) => a.type === 'plan.verified');
+    expect((verified?.detail as { oracleErrors: string[] }).oracleErrors).toEqual(['s2']);
+  });
+
+  it('A-D7: a >25-step plan is audited as truncated and the card says so', async () => {
+    const gateway = new FakeGateway();
+    const steps = Array.from({ length: 27 }, (_, i) => ({
+      id: `s${i + 1}`, tool: 'read_file', args: { path: `f${i}` }, dependsOn: [], description: `Read f${i}`,
+    }));
+    const provider = new MockProvider([{ content: JSON.stringify({ steps }) }, { content: 'done' }]);
+    const rt = makeRuntime(gateway, [tool('read_file', {})], provider);
+    const events: StreamEvent[] = [];
+    await rt.runTurn({
+      bot: testBot({ approvalMode: 'plan', tools: ['read_file'] }),
+      message: 'Read everything',
+      onEvent: (e) => void events.push(e),
+    });
+    expect(gateway.audits.some((a) => a.type === 'plan.truncated')).toBe(true);
+    const approval = events.find((e) => e.type === 'approval_required');
+    expect(approval).toBeDefined();
+    if (approval?.type === 'approval_required') {
+      expect(String((approval.call.args as Record<string, unknown>).plan)).toContain('more than 25 steps');
+    }
+  });
+
+  it('A-D8: a throwing planSpecs lookup is audited (plan.specs_unavailable) and the gate still runs', async () => {
+    const gateway = new FakeGateway();
+    gateway.planSpecsForBot = () => {
+      throw new Error('spec store unavailable');
+    };
+    const ran: Record<string, number> = {};
+    const provider = new MockProvider([
+      { content: STRUCTURED_PLAN },
+      { toolCalls: [{ id: 'c1', name: 'delete_file', args: { path: 'old.log' } } as ToolCall] },
+      { content: 'done' },
+    ]);
+    const rt = makeRuntime(gateway, [tool('list_folder', ran), tool('delete_file', ran)], provider);
+    const events: StreamEvent[] = [];
+    await rt.runTurn({
+      bot: testBot({ approvalMode: 'plan', tools: ['list_folder', 'delete_file'] }),
+      message: 'Clean up old logs',
+      onEvent: (e) => void events.push(e),
+    });
+    expect(gateway.audits.some((a) => a.type === 'plan.specs_unavailable')).toBe(true);
+    expect(events.some((e) => e.type === 'approval_required')).toBe(true);
+    expect(ran.delete_file).toBe(1);
+  });
+});

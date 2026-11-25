@@ -89,6 +89,13 @@ export interface Mission {
   reviewer: MissionBotIdentity;
   stage: MissionStage;
   provenance: MissionProvenance;
+  /**
+   * Sweep 2026-11-25 (C-10): who STARTED the run, when that differs
+   * from who created the mission. The dispatcher sets this instead of
+   * overwriting `provenance` — a manually created mission the
+   * dispatcher later picks up keeps its true origin on record.
+   */
+  startedBy?: 'dispatcher';
   /** A15: execution placement. Absent on pre-A15 records = 'local'. */
   placement?: MissionPlacement;
   /** A15: instance that asked for the work (the origin), when different. */
@@ -288,7 +295,7 @@ export function createRuntimeBotRunner(deps: {
     bot: BotConfig;
     message: string;
     sessionId: string;
-    onEvent: (e: { type: string; content?: string }) => void;
+    onEvent: (e: { type: string; content?: string; toProvider?: string; toModel?: string }) => void;
   }) => Promise<unknown>;
   attachWorktree?: (sessionId: string, worktreePath: string) => void;
 }): MissionBotRunner {
@@ -299,15 +306,26 @@ export function createRuntimeBotRunner(deps: {
     const sessionId = `mission:${req.missionId}:${req.role}`;
     deps.attachWorktree?.(sessionId, req.worktreePath);
     let text = '';
+    // Sweep 2026-11-25 (C-8): report what ACTUALLY ran, not what was
+    // configured. A1 cooldown/failover can substitute the provider or
+    // model mid-turn; the runtime announces every substitution with a
+    // 'failover' stream event, so the last one seen is the truth the
+    // review-independence record is computed from.
+    let actualProvider = effective.provider;
+    let actualModel = effective.model;
     await deps.runTurn({
       bot: effective,
       message: req.prompt,
       sessionId,
       onEvent: (e) => {
         if (e.type === 'token' && typeof e.content === 'string') text += e.content;
+        if (e.type === 'failover' && typeof e.toProvider === 'string' && e.toProvider) {
+          actualProvider = e.toProvider;
+          if (typeof e.toModel === 'string' && e.toModel) actualModel = e.toModel;
+        }
       },
     });
-    return { text, provider: effective.provider, model: effective.model };
+    return { text, provider: actualProvider, model: actualModel };
   };
 }
 
@@ -429,6 +447,13 @@ export class MissionService {
     }
     const workerBotId = input.workerBotId ?? templateBotId('work');
     const reviewerBotId = input.reviewerBotId ?? templateBotId('review');
+    // Sweep 2026-11-25 (C-8): a bot must never review its own work —
+    // the review stage's independence record would be meaningless.
+    if (workerBotId === reviewerBotId) {
+      throw validationError(
+        'worker and reviewer must be different bots — a bot cannot review its own work',
+      );
+    }
     const mission: Mission = {
       id: randomUUID(),
       taskId: task.id,
@@ -475,7 +500,10 @@ export class MissionService {
   private audit(action: string, mission: Mission, extra: Record<string, unknown> = {}): void {
     try {
       this.deps.audit?.(action, {
-        actor: mission.provenance === 'dispatcher' ? 'mission-dispatcher' : 'mission-service',
+        actor:
+          mission.provenance === 'dispatcher' || mission.startedBy === 'dispatcher'
+            ? 'mission-dispatcher'
+            : 'mission-service',
         missionId: mission.id,
         taskId: mission.taskId,
         stage: mission.stage,
@@ -684,6 +712,24 @@ export class MissionService {
     }
 
     // Approved → land: merge into the target branch in the main checkout.
+    // Sweep 2026-11-25 (C-9): landing may have to switch the MAIN
+    // checkout to the target branch — the user's checkout is restored
+    // to the branch (or detached commit) it was on before landing, on
+    // both the success and the merge-failure paths.
+    let preLandingRef: string | undefined;
+    const restoreCheckout = (): string => {
+      if (!preLandingRef) return '';
+      try {
+        const now = git(mission.repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']).trim();
+        const nowSha = git(mission.repoPath, ['rev-parse', 'HEAD']).trim();
+        if (now !== preLandingRef && nowSha !== preLandingRef) {
+          git(mission.repoPath, ['checkout', preLandingRef]);
+        }
+        return '';
+      } catch (err) {
+        return ` Checkout restore to ${preLandingRef} failed: ${errMessage(err)}`;
+      }
+    };
     try {
       const dirtyMain = git(mission.repoPath, ['status', '--porcelain']).trim();
       if (dirtyMain) {
@@ -692,6 +738,11 @@ export class MissionService {
         });
       }
       const current = git(mission.repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']).trim();
+      // 'HEAD' = detached: remember the commit instead of a branch name.
+      preLandingRef =
+        current === 'HEAD'
+          ? git(mission.repoPath, ['rev-parse', 'HEAD']).trim()
+          : current;
       if (current !== mission.targetBranch) git(mission.repoPath, ['checkout', mission.targetBranch]);
       git(mission.repoPath, ['merge', '--no-ff', '-m', `Land mission: ${task.title}`.slice(0, 200), mission.branch]);
     } catch (err) {
@@ -700,9 +751,11 @@ export class MissionService {
       } catch {
         /* no merge in progress */
       }
-      return this.block(mission, `merge failed: ${errMessage(err)}`, { worktreePath });
+      const restoreNote = restoreCheckout();
+      return this.block(mission, `merge failed: ${errMessage(err)}${restoreNote}`, { worktreePath });
     }
     const landedSha = git(mission.repoPath, ['rev-parse', 'HEAD']).trim();
+    const restoreNote = restoreCheckout();
 
     // Clean up the worktree (branch stays landed in history; the mission
     // branch ref is kept for provenance). Worktree is clean post-commit,
@@ -715,7 +768,7 @@ export class MissionService {
     }
     mission = this.setStage(mission, 'landed', {
       landedSha,
-      evidence: `Landed ${mission.branch} into ${mission.targetBranch} at ${landedSha}.${cleanupNote}`,
+      evidence: `Landed ${mission.branch} into ${mission.targetBranch} at ${landedSha}.${cleanupNote}${restoreNote}`,
     });
     this.audit('mission.landed', mission, { landedSha });
 
@@ -801,10 +854,11 @@ export class MissionDispatcher {
     if (slots <= 0) return [];
     const started: string[] = [];
     for (const mission of this.runnableMissions().slice(0, slots)) {
-      // Provenance: work the dispatcher starts is labelled as such on the
-      // mission record (and thereby in audit), whoever queued it.
-      if (mission.provenance !== 'dispatcher') {
-        this.missionStore.update(mission.id, { provenance: 'dispatcher' });
+      // Provenance: work the dispatcher starts is labelled as such —
+      // ADDITIVELY (C-10): `provenance` keeps recording who created the
+      // mission; `startedBy` records that the dispatcher picked it up.
+      if (mission.startedBy !== 'dispatcher') {
+        this.missionStore.update(mission.id, { startedBy: 'dispatcher' });
       }
       const run = this.service
         .runMission(mission.id)

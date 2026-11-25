@@ -150,6 +150,10 @@ async function makeInstance(
     missionService: service,
     missionStore,
     taskStore,
+    // D6: the receiver-configured test command for fleet missions —
+    // deliberately DIFFERENT from the 'run-tests' origins send, so
+    // tests can prove the receiver's command is what gets recorded.
+    fleetTestCommand: 'receiver-tests',
     displayName: name,
     version: '0.1.0',
     capabilities: { bridges: ['claude'], sandboxBackend: null, gitAvailable: true },
@@ -346,6 +350,9 @@ describe('cross-machine dispatch (proof leg b)', () => {
     // A's gate never was; the file landed in the repo via B's merge.
     const remote = B.missionStore.get(mirror.remoteMissionId!)!;
     expect(remote.stage).toBe('landed');
+    // D6: B ran its OWN configured test command ('receiver-tests'),
+    // not the string A's spec carried ('run-tests').
+    expect(remote.testCommand).toBe('receiver-tests');
     expect(remote.originInstanceId).toBe(A.federation.identity().instanceId);
     expect(B.gate.requests).toBe(1);
     expect(A.gate.requests).toBe(0);
@@ -440,10 +447,94 @@ describe('resume-by-transfer (proof leg c)', () => {
     const landed = git(repoB, ['log', '--oneline']);
     expect(landed).toContain('transferred work from A');
     expect(existsSync(join(repoB, `feature-${t.id.slice(0, 8)}.txt`))).toBe(true);
-    // Transcript reconstructed in B's durable session store.
+    // Transcript reconstructed in B's durable session store — FENCED
+    // (D8): peer-supplied messages are stored as untrusted context,
+    // never as verbatim history the worker would read as its own.
     const msgs = B.sessions.listThreadMessages(`mission:${remote.id}:worker`);
-    expect(msgs.map((x) => x.content)).toEqual(['implement the thing', 'implemented on A']);
+    expect(msgs).toHaveLength(2);
+    expect(msgs[0]!.content).toContain('UNTRUSTED TRANSFERRED MESSAGE');
+    expect(msgs[0]!.content).toContain('implement the thing');
+    expect(msgs[1]!.content).toContain('UNTRUSTED TRANSFERRED MESSAGE');
+    expect(msgs[1]!.content).toContain('implemented on A');
     // B's own gate decided the landing.
     expect(B.gate.requests).toBe(1);
+  });
+});
+
+describe('sweep 2026-11-25: fleet inbound hardening (D6, D7, D9)', () => {
+  it('D6: an instance with NO receiver-configured test command refuses inbound dispatch', async () => {
+    const bare = new FleetCoordinator({
+      federation: B.federation,
+      registry: B.registry,
+      missionService: B.service,
+      missionStore: B.missionStore,
+      taskStore: B.taskStore,
+      displayName: 'B',
+      version: '0.1.0',
+      capabilities: { bridges: ['claude'], sandboxBackend: null, gitAvailable: true },
+      worktreeRoot: join(B.dir, 'worktrees'),
+    });
+    const caller = B.federation.getPeer(A.federation.identity().instanceId)!;
+    await expect(
+      bare.handleInboundDispatch(caller, {
+        originInstanceId: A.federation.identity().instanceId,
+        spec: {
+          repoPath: repoShared,
+          testCommand: 'rm -rf / # peer-supplied',
+          task: { title: 'Nope' },
+        },
+      }),
+    ).rejects.toThrow(/receiver-configured test command/);
+    // Nothing was created on B.
+    expect(B.missionStore.list().filter((m) => m.originInstanceId === A.federation.identity().instanceId)).toEqual([]);
+  });
+
+  it('D7: a result report counts only from the peer the mission actually ran on', () => {
+    const t = A.taskStore.create({ title: 'Mirror target' });
+    const m = A.service.createMission({ taskId: t.id, repoPath: repoShared, testCommand: 'run-tests' });
+    A.missionStore.update(m.id, {
+      placement: 'fleet',
+      remoteMissionId: 'remote-mission-1',
+      executedOnInstanceId: B.federation.identity().instanceId,
+      stage: 'working',
+    });
+    const payload = {
+      remoteMissionId: 'remote-mission-1',
+      mission: { stage: 'landed', landedSha: 'deadbeef', evidence: 'forged' } as never,
+    };
+    // A forged report from some OTHER peer identity: ignored.
+    const forgedCaller = { peerId: 'inst_forged_peer' } as never;
+    expect(A.coordinator.handleInboundResult(forgedCaller, payload)).toBe(false);
+    expect(A.missionStore.get(m.id)?.stage).toBe('working');
+    // The real executing peer: accepted.
+    const realCaller = A.federation.getPeer(B.federation.identity().instanceId)!;
+    expect(A.coordinator.handleInboundResult(realCaller, payload)).toBe(true);
+    expect(A.missionStore.get(m.id)?.stage).toBe('landed');
+    expect(A.missionStore.get(m.id)?.landedSha).toBe('deadbeef');
+  });
+
+  it('D9: a malformed transfer bundle (missing worker identity) is a clean refusal, not a 500', async () => {
+    const caller = B.federation.getPeer(A.federation.identity().instanceId)!;
+    const bundle = {
+      v: 1,
+      kind: 'kriyadot-mission-transfer',
+      fromInstanceId: A.federation.identity().instanceId,
+      fromName: 'A',
+      transferredAt: Date.now(),
+      stageAtTransfer: 'blocked',
+      mission: {
+        id: 'x',
+        repoPath: repoShared,
+        branch: 'mission/x',
+        targetBranch: 'main',
+        testCommand: 'run-tests',
+        // worker/reviewer MISSING — the old validator let this through
+        // and the handler died dereferencing worker.botId.
+      },
+      task: { title: 'Broken bundle' },
+      transcript: [],
+      mode: 'transcript-only',
+    };
+    await expect(B.coordinator.handleInboundTransfer(caller, bundle)).rejects.toThrow(/malformed mission transfer bundle/);
   });
 });

@@ -165,8 +165,27 @@ export function compareVersions(a: string, b: string): number {
   if (pa.pre === pb.pre) return 0;
   if (pa.pre === null) return 1;
   if (pb.pre === null) return -1;
-  if (pa.pre < pb.pre) return -1;
-  if (pa.pre > pb.pre) return 1;
+  // Sweep 2026-11-25 (D2): prerelease comparison is semver segment-wise,
+  // not lexicographic — 'alpha.9' sorted NEWER than 'alpha.10' as raw
+  // strings. Numeric segments compare numerically and sort before
+  // alphanumeric ones; a shorter segment list sorts first when it is a
+  // prefix of the longer.
+  const as = pa.pre.split('.');
+  const bs = pb.pre.split('.');
+  const plen = Math.max(as.length, bs.length);
+  for (let i = 0; i < plen; i++) {
+    const x = as[i];
+    const y = bs[i];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    if (x === y) continue;
+    const xn = /^\d+$/.test(x) ? Number(x) : null;
+    const yn = /^\d+$/.test(y) ? Number(y) : null;
+    if (xn !== null && yn !== null) return xn < yn ? -1 : 1;
+    if (xn !== null) return -1;
+    if (yn !== null) return 1;
+    return x < y ? -1 : 1;
+  }
   return 0;
 }
 
@@ -576,22 +595,30 @@ export class SelfUpdateManager {
       };
     }
     const chosen = selectAssetForPlatform(assets, this.platform, this.arch);
-    if (chosen) {
-      const listed = payload.assets.find((a) => a.name === chosen.name);
-      if (!listed) {
-        return {
-          ok: false,
-          status: 'invalid',
-          reason: `signed manifest does not list the offered asset ${chosen.name}`,
-        };
-      }
-      if (listed.size !== chosen.size) {
-        return {
-          ok: false,
-          status: 'invalid',
-          reason: `signed manifest size for ${chosen.name} (${listed.size}) disagrees with the release feed (${chosen.size})`,
-        };
-      }
+    // Sweep 2026-11-25 (D1): a verified release with NO asset for this
+    // platform is not an offer — previously this returned ok and the
+    // update badge lit up for a download that could only fail.
+    if (!chosen) {
+      return {
+        ok: false,
+        status: 'invalid',
+        reason: `release ${best.tag} has no installer asset for ${this.platform}/${this.arch}`,
+      };
+    }
+    const listed = payload.assets.find((a) => a.name === chosen.name);
+    if (!listed) {
+      return {
+        ok: false,
+        status: 'invalid',
+        reason: `signed manifest does not list the offered asset ${chosen.name}`,
+      };
+    }
+    if (listed.size !== chosen.size) {
+      return {
+        ok: false,
+        status: 'invalid',
+        reason: `signed manifest size for ${chosen.name} (${listed.size}) disagrees with the release feed (${chosen.size})`,
+      };
     }
     return { ok: true, payload };
   }

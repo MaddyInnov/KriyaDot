@@ -172,6 +172,12 @@ export interface PlanStepVerdict {
   /** True when the block is a tier-1 catastrophic / denylist denial —
    *  absolute for recovery (no skip, no re-plan around it). */
   catastrophic?: boolean;
+  /** True when this verdict is 'undecidable' because the policy
+   *  ORACLE ITSELF errored (threw), as opposed to a genuine symbolic
+   *  judgement call. Sweep 2026-11-25 (A-D6): the gate treats an
+   *  oracle error as fail-closed (block), never as "proceed", and the
+   *  raw error text is never carried in the verdict reason. */
+  oracleError?: boolean;
   /** True when the oracle said this step needs human approval (the
    *  plan-approval card covers it); informational, not a block. */
   requiresApproval?: boolean;
@@ -359,10 +365,14 @@ export async function verifyPlan(
     let sim: PlanOracleResult;
     try {
       sim = await oracle.simulate(step);
-    } catch (err) {
+    } catch {
+      // Sweep 2026-11-25 (A-D6): generic reason only — the raw error
+      // message can carry internal detail (paths, config internals)
+      // and this reason is interpolated into user-facing plan
+      // summaries. The oracleError flag lets the gate fail closed.
       setVerdict({
-        stepId: step.id, status: 'undecidable', source: 'symbolic',
-        reason: `policy oracle errored: ${err instanceof Error ? err.message : String(err)}`,
+        stepId: step.id, status: 'undecidable', source: 'symbolic', oracleError: true,
+        reason: 'policy oracle errored — the step could not be evaluated',
       });
       continue;
     }

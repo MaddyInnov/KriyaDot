@@ -184,6 +184,21 @@ export interface EvalContext {
 export interface EvaluateResult {
   effect: Effect;
   approvalId?: string;
+  /**
+   * Why the decision was made (rule reason, floor reason, or the
+   * denylist marker). Surfaced so callers do not have to reconstruct
+   * the grounds from the audit log (sweep 2026-11-25, finding A-D1).
+   */
+  reason?: string;
+  /** Hard-floor hit that forced this decision, when one did. Tier-1
+   *  'catastrophic' hits are absolute denials. (Inline shape, mirroring
+   *  SimulationResult — the canonical HardFloorHit lives in
+   *  hard-floors.ts.) */
+  hardFloor?: { tier: 'catastrophic' | 'destructive'; reason: string; patternId: string } | null;
+  /** True when the hard denylist denied this call. Denylist denials
+   *  carry the same absolute status as tier-1 catastrophic floors for
+   *  plan recovery — they must never be skippable/re-plannable. */
+  denylist?: boolean;
 }
 
 /**

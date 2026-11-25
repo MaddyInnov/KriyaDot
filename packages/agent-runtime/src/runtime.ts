@@ -107,6 +107,7 @@ import {
   getBridgeCooldownRegistry,
   isSterileBridgeContent,
 } from './providers/cli-cooldown.js';
+import { getCliPathPin } from './providers/cli-identity.js';
 import {
   bridgeAccountIdForBot,
   bridgeIdForProviderId,
@@ -722,6 +723,34 @@ export function extractPatchTargets(diff: string): string[] {
     }
   }
   return out;
+}
+
+/**
+ * Sweep 2026-11-25 (A-D5): true when every argument a verified plan
+ * step DECLARED deep-equals the corresponding argument of the actual
+ * call. The call may carry extra runtime args; the declared set is
+ * what identifies the step. Values are JSON-shaped (model output).
+ */
+function declaredArgsMatch(
+  declared: Record<string, unknown>,
+  actual: Record<string, unknown>,
+): boolean {
+  const keys = Object.keys(declared);
+  if (keys.length === 0) return false;
+  return keys.every((k) => jsonDeepEqual(declared[k], actual[k]));
+}
+
+function jsonDeepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((v, i) => jsonDeepEqual(v, b[i]));
+  }
+  const ao = a as Record<string, unknown>;
+  const bo = b as Record<string, unknown>;
+  const ak = Object.keys(ao);
+  return ak.length === Object.keys(bo).length && ak.every((k) => jsonDeepEqual(ao[k], bo[k]));
 }
 
 function newApprovalId(): string {
@@ -1484,6 +1513,21 @@ ${record.priorContext ?? ''}`;
         }
       }
     }
+    // Sweep 2026-11-25 (B-10): the cache key carries the LIVE pin +
+    // env signature. Pins and account env are documented as applying
+    // live (no restart), but a provider constructed before a pin
+    // change kept spawning the previously resolved binary for the
+    // life of the process. Folding the current pin (module state the
+    // host updates on every pin change) and the env contents into the
+    // key makes a changed pin/env resolve to a fresh provider on the
+    // next turn, while unchanged inputs keep the cached instance.
+    if (bridge) {
+      const pin = getCliPathPin(bridge);
+      if (pin) cacheKey += `#pin:${pin}`;
+    }
+    if (env) {
+      cacheKey += `#env:${JSON.stringify(Object.entries(env).sort(([a], [b]) => a.localeCompare(b)))}`;
+    }
     let provider = this.providerCache.get(cacheKey);
     if (!provider) {
       provider = createProvider(providerId, env ? { env } : undefined);
@@ -2244,8 +2288,37 @@ ${record.priorContext ?? ''}`;
       catastrophic: boolean,
     ): string | null => {
       if (!verifiedPlanState) return null;
-      const step = verifiedPlanState.plan.steps.find((s) => s.tool === call.name);
-      if (!step) return null;
+      // Sweep 2026-11-25 (A-D5): match the blocked step by tool AND
+      // declared arguments — a plan may repeat a tool (two deletes,
+      // two sends), and dropping the FIRST name-match corrupts the
+      // plan (the actually-blocked step stays, a healthy step and its
+      // dependents are dropped). Ambiguity escalates; it never guesses.
+      const candidates = verifiedPlanState.plan.steps.filter((s) => s.tool === call.name);
+      if (candidates.length === 0) return null;
+      const step =
+        candidates.length === 1
+          ? candidates[0]!
+          : candidates.find((s) => declaredArgsMatch(s.args, call.args));
+      if (!step) {
+        this.audit({
+          type: 'plan.recovery',
+          sessionId,
+          botId: ctx.botId,
+          call,
+          detail: {
+            action: 'escalate',
+            reason: 'ambiguous-step-match',
+            tool: call.name,
+            candidateStepIds: candidates.map((c) => c.id),
+            catastrophic,
+          },
+        });
+        return (
+          `[verified plan] A ${call.name} step was blocked, but the plan contains ${candidates.length} ` +
+          `${call.name} steps and the blocked one could not be identified unambiguously. Stop and ask ` +
+          `the user how to proceed — do not retry the blocked action, and do not drop a step by guessing.`
+        );
+      }
       const decision = planRecoveryDecision({
         plan: verifiedPlanState.plan,
         blockedStepId: step.id,
@@ -2617,8 +2690,15 @@ ${record.priorContext ?? ''}`;
             ? undefined
             : findHealthySiblingAccount(getBridgeAccountStore(), this.bridgeCooldowns, startBridge, accountId);
         const check = this.bridgeCooldowns.check(startBridge, accountId);
-        if (check.active) {
-          const skipReason = cooldownSkipReason(this.bridgeCooldowns, startBridge, accountId) ?? check.reason ?? 'in cooldown';
+        // B-8: a half-open breaker admits ONE probe turn. Claim the
+        // slot; a turn that loses the claim treats the backend as
+        // still cooling (another turn is probing it right now).
+        const probeBlocked =
+          check.halfOpen && !this.bridgeCooldowns.tryClaimProbe(startBridge, accountId);
+        if (check.active || probeBlocked) {
+          const skipReason = probeBlocked
+            ? `${startBridge} account "${accountId}" is half-open and another turn is already probing it`
+            : cooldownSkipReason(this.bridgeCooldowns, startBridge, accountId) ?? check.reason ?? 'in cooldown';
           if (opts.explicitSelection === true) {
             const declared = declaredSelectionBackup(opts.bot, opts);
             if (!declared || declared.providerId === providerId) {
@@ -2648,7 +2728,11 @@ ${record.priorContext ?? ''}`;
           } else {
             const t = resolveFailoverTarget({ bot: opts.bot, excludeProviderId: providerId });
             const tBridge = t ? bridgeIdForProviderId(t.providerId) : undefined;
-            const tCooled = tBridge ? cooldownSkipReason(this.bridgeCooldowns, tBridge, accountId) : null;
+            // Sweep 2026-11-25 (B-6): the TARGET bridge's cooldown is
+            // keyed by the TARGET's account (acctId), never the primary
+            // bridge's — a foreign account id both misses real cooldowns
+            // and invents false ones.
+            const tCooled = tBridge ? cooldownSkipReason(this.bridgeCooldowns, tBridge, acctId(tBridge)) : null;
             if (t && !tCooled) {
               const fromProvider = providerId;
               const fromModel = model;
@@ -2830,6 +2914,12 @@ ${record.priorContext ?? ''}`;
           // a draft final, so its tokens buffer the same way.
           (attemptLedger !== undefined && executionPolicy.verifyBeforeDone);
         let tokenBuffer: string[] | null = null;
+        // B-7: tool actions the CURRENT attempt's backend executes
+        // (observed via onCliToolEvent). If the attempt dies and the
+        // turn swaps to a backup, these go into the replay note —
+        // they never reach `messages` (the attempt threw), and the
+        // backup must not repeat their side effects.
+        const attemptCliActions: string[] = [];
         const flushTokens = async (): Promise<void> => {
           const text = tokenBuffer?.join('') ?? '';
           tokenBuffer = null;
@@ -2889,6 +2979,9 @@ ${record.priorContext ?? ''}`;
             approvalMode,
             onCliToolEvent: (e) => {
               if (e.kind === 'tool_call') {
+                attemptCliActions.push(
+                  `${e.call.name} ${JSON.stringify(e.call.args ?? {}).slice(0, 200)}`,
+                );
                 this.audit({
                   type: 'cli.tool_observed',
                   sessionId,
@@ -2983,8 +3076,10 @@ ${record.priorContext ?? ''}`;
             ? { providerId: autoResolved.providerId, modelId: autoResolved.modelId }
             : null;
           const autoBridge = autoTarget ? bridgeIdForProviderId(autoTarget.providerId) : undefined;
+          // B-6: keyed by the AUTO TARGET's account, not the failed
+          // bridge's account (see the turn-start consult).
           const autoCooldownReason = autoBridge
-            ? cooldownSkipReason(this.bridgeCooldowns, autoBridge, failedAccount)
+            ? cooldownSkipReason(this.bridgeCooldowns, autoBridge, acctId(autoBridge))
             : null;
           // A6: a healthy sibling account of the failed bridge is an
           // AUTO-lane swap candidate (decideBridgeSwap ignores it for
@@ -2997,6 +3092,10 @@ ${record.priorContext ?? ''}`;
             explicitSelection: opts.explicitSelection === true,
             quotaDeath: classified.isLimit,
             driverFailure: err instanceof CliDriverError || isBridgeOrAgentProviderId(providerId),
+            // B-5: CliDriverError is thrown only for genuine bridge
+            // deaths (process exit / resolution failure) — the
+            // death class that may swap an explicit selection.
+            bridgeDeath: err instanceof CliDriverError,
             failedProviderId: providerId,
             failedModelId: model,
             failedReason: classified.isLimit ? `usage limit / quota death: ${errText}` : errText,
@@ -3110,6 +3209,9 @@ ${record.priorContext ?? ''}`;
             toProvider: target.providerId,
             toModel: target.modelId,
             reason: classified.isLimit ? `usage limit / quota death: ${errText}` : errText,
+            // B-7: work the dead backend already performed this
+            // attempt — the backup is told not to repeat it.
+            ...(attemptCliActions.length > 0 ? { priorActions: [...attemptCliActions] } : {}),
           });
           try {
             turn = await doChat(provider, model, replayMessages);
@@ -3120,7 +3222,10 @@ ${record.priorContext ?? ''}`;
               try {
                 // A6: a sibling-account backup's death is recorded
                 // against the SIBLING account, not the original one.
-                this.bridgeCooldowns.recordFailure(backupBridge, target.accountId ?? failedAccount, backupErr);
+                // B-6: a cross-provider backup's death is recorded
+                // against the BACKUP bridge's own account for this bot
+                // — never the failed bridge's account id.
+                this.bridgeCooldowns.recordFailure(backupBridge, target.accountId ?? acctId(backupBridge), backupErr);
               } catch { /* the registry must never break a turn */ }
             }
             llmStep?.end({ ok: false, errorKind: backupErr instanceof Error ? backupErr.name : 'Error' });
@@ -3535,7 +3640,12 @@ ${revised}` });
               decision = evaluated.decision ?? classified;
               reason = evaluated.reason;
               gatewayApprovalId = evaluated.approvalId;
-              governanceCatastrophic = evaluated.hardFloor?.tier === 'catastrophic';
+              // Sweep 2026-11-25 (A-D1): denylist denials are absolute
+              // for plan recovery exactly like tier-1 catastrophic
+              // floors — the verifier already treats them so at plan
+              // time (plan-verifier), and the status now survives the
+              // gateway → adapter → runtime path.
+              governanceCatastrophic = evaluated.hardFloor?.tier === 'catastrophic' || evaluated.denylist === true;
             } catch (err) {
               decision = 'deny';
               reason = `governance error: ${err instanceof Error ? err.message : String(err)}`;
@@ -4462,9 +4572,20 @@ ${revised}` });
     // via the host adapter).
     let adapterSpecs: PlanSpec[] = [];
     try {
-      adapterSpecs = this.governance.planSpecsForBot?.(opts.bot.id) ?? [];
-    } catch {
+      // A-D9: the session id lets the adapter resolve the session's
+      // frozen snapshot specs in opt-in snapshot mode.
+      adapterSpecs = this.governance.planSpecsForBot?.(opts.bot.id, ctx.sessionId) ?? [];
+    } catch (err) {
+      // Sweep 2026-11-25 (A-D8): a failing spec lookup is AUDITED,
+      // not silently swallowed — the gate proceeds on bot-config
+      // specs only, and the trail says so.
       adapterSpecs = [];
+      this.audit({
+        type: 'plan.specs_unavailable',
+        sessionId: ctx.sessionId,
+        botId: ctx.botId,
+        detail: { error: err instanceof Error ? err.message.slice(0, 200) : 'unknown error' },
+      });
     }
     const verificationScope: PlanVerificationScope =
       this.governance.planVerificationScopeForBot?.(opts.bot.id) ??
@@ -4512,6 +4633,16 @@ ${revised}` });
       const parsed = parseStructuredPlan(plan);
       if (parsed) {
         structuredPlan = { steps: parsed.steps };
+        if (parsed.truncated) {
+          // A-D7: steps past the 25-step cap were dropped by the
+          // parser — audited here and noted on the card below.
+          this.audit({
+            type: 'plan.truncated',
+            sessionId: ctx.sessionId,
+            botId: ctx.botId,
+            detail: { kept: parsed.steps.length, cap: 25 },
+          });
+        }
         // Effective specs: host/workspace layer first, then bot config
         // (dedupe by id — the more specific scope wins, like rules).
         const byId = new Map<string, PlanSpec>();
@@ -4521,7 +4652,9 @@ ${revised}` });
         const oracle: PlanPolicyOracle = {
           simulate: async (step) => {
             if (this.governance.simulatePolicy) {
-              const sim = await this.governance.simulatePolicy(opts.bot.id, step.tool, step.args);
+              // A-D9: pass the session so snapshot mode simulates
+              // against the frozen policy evaluate() will use.
+              const sim = await this.governance.simulatePolicy(opts.bot.id, step.tool, step.args, undefined, ctx.sessionId);
               return {
                 effect: sim.effect,
                 reason: sim.reason,
@@ -4572,14 +4705,23 @@ ${revised}` });
             steps: verification.steps.length,
             blocked: verification.blocked.map((b) => ({ step: b.stepId, spec: b.specId, rule: b.ruleId, reason: b.reason })),
             undecidable: verification.undecidable.map((u) => u.stepId),
+            oracleErrors: verification.steps.filter((s) => s.oracleError).map((s) => s.stepId),
             judgeVerdicts: verification.judgeVerdicts,
             latencyMs: Math.round(verification.latencyMs),
             scope: verification.scope,
           },
         });
-        if (verification.status === 'blocked') {
+        // Sweep 2026-11-25 (A-D6): an ORACLE ERROR (the policy check
+        // itself threw) fails CLOSED — the plan is blocked, never
+        // waved through as a mere 'undecidable'. A genuine symbolic
+        // undecidable (semantic content) still proceeds to the card.
+        const oracleErrorSteps = verification.steps.filter((s) => s.oracleError);
+        if (verification.status === 'blocked' || oracleErrorSteps.length > 0) {
           const summary = renderVerificationSummary(verification);
-          const message = `Plan blocked by verification — nothing was executed.\n${summary}`;
+          const message =
+            verification.status !== 'blocked'
+              ? `Plan blocked — the policy check itself failed for step(s) ${oracleErrorSteps.map((s) => s.stepId).join(', ')} and they could not be verified, so nothing was executed. Check the policy configuration, or ask the user how to proceed.\n${summary}`
+              : `Plan blocked by verification — nothing was executed.\n${summary}`;
           recordTurnFailure('approval_denied', message);
           await emit({ type: 'error', message });
           return { approved: false, usage, planMessage: emptyPlan, structuredPlan, verification };
@@ -4587,6 +4729,9 @@ ${revised}` });
         // The card shows the rendered steps + the verdict, so the
         // human approves the same artifact the verifier checked.
         plan = renderStructuredPlan(structuredPlan);
+        if (parsed.truncated) {
+          plan += `\n\n[Note: the model proposed more than 25 steps — only the first 25 were verified and are listed above. The remaining steps were dropped and must be re-proposed in a later turn.]`;
+        }
         if (verification.status === 'undecidable') {
           plan += `\n\n[Verification: ${renderVerificationSummary(verification)}]`;
         }

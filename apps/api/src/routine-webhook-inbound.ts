@@ -473,6 +473,15 @@ export class RoutineInboundWebhookStore {
     now?: number;
   }): InboundDelivery | null {
     const now = input.now ?? Date.now();
+    // Sweep 2026-11-25 (D10): prune deliveries older than the
+    // idempotency window before claiming. The unique index on
+    // (trigger_id, idempotency_key) has no time bound while lookups
+    // only reach back one window — without pruning, a key stayed
+    // burned forever (every later retry collided with the ancient
+    // row) and the table grew without bound.
+    this.db
+      .prepare('DELETE FROM routine_inbound_deliveries WHERE created_at < ?')
+      .run(now - INBOUND_WEBHOOK_IDEMPOTENCY_WINDOW_MS);
     const delivery: InboundDelivery = {
       id: randomUUID(),
       triggerId: input.triggerId,
@@ -509,6 +518,17 @@ export class RoutineInboundWebhookStore {
 
   attachRunId(deliveryId: string, runId: string): void {
     this.db.prepare('UPDATE routine_inbound_deliveries SET run_id = ? WHERE id = ?').run(runId, deliveryId);
+  }
+
+  /**
+   * D10: release a claim whose run never started (bot missing,
+   * executor failure, no executor configured). A claim that stays
+   * after a failed start burns the idempotency key AND the rate
+   * budget for a run that never happened — the sender's retry must be
+   * able to start clean.
+   */
+  releaseDelivery(deliveryId: string): void {
+    this.db.prepare('DELETE FROM routine_inbound_deliveries WHERE id = ? AND run_id IS NULL').run(deliveryId);
   }
 
   listDeliveries(routineId: string, limit = 50): InboundDelivery[] {
@@ -726,6 +746,7 @@ export function createRoutineInboundWebhookRouter(opts: RoutineInboundWebhookRou
 
     const bot = opts.getBots().find((b) => b.id === routine.botId);
     if (!bot) {
+      opts.inboundStore.releaseDelivery(delivery.id);
       res.status(500).json({ error: 'routine cannot run' });
       return;
     }
@@ -774,10 +795,12 @@ export function createRoutineInboundWebhookRouter(opts: RoutineInboundWebhookRou
             );
           });
       } else {
+        opts.inboundStore.releaseDelivery(delivery.id);
         res.status(500).json({ error: 'routine cannot run' });
         return;
       }
     } catch (err) {
+      opts.inboundStore.releaseDelivery(delivery.id);
       console.error(
         `[routine-webhook-inbound] failed to start routine "${routine.id}":`,
         err instanceof Error ? err.message : err,

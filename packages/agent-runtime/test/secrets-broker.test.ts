@@ -44,6 +44,9 @@ describe('secrets broker (fake GitHub API on 127.0.0.1)', () => {
   /** When set, the fake API echoes the Authorization header in an error
    *  body — the broker must scrub it before quoting anything. */
   let echoTokenInError = false;
+  /** When set, the fake API answers the issues POST with a 302 to
+   *  another endpoint (C-5: the broker must never follow it). */
+  let redirectMode = false;
 
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'broker-'));
@@ -51,6 +54,7 @@ describe('secrets broker (fake GitHub API on 127.0.0.1)', () => {
     seen = [];
     journalFanout = [];
     echoTokenInError = false;
+    redirectMode = false;
     server = createServer((req, res) => {
       let body = '';
       req.on('data', (c) => (body += c));
@@ -67,6 +71,11 @@ describe('secrets broker (fake GitHub API on 127.0.0.1)', () => {
         };
         if (echoTokenInError) {
           send(422, { message: `Validation Failed for token ${req.headers.authorization ?? ''}` });
+          return;
+        }
+        if (redirectMode && req.method === 'POST' && req.url === '/repos/octocat/hello-world/issues') {
+          res.writeHead(302, { location: '/user/repos' });
+          res.end('{}');
           return;
         }
         if (req.method === 'POST' && req.url === '/repos/octocat/hello-world/issues') {
@@ -164,6 +173,28 @@ describe('secrets broker (fake GitHub API on 127.0.0.1)', () => {
     // Journal carries ids/hashes, never the issue title/body content.
     expect(JSON.stringify(journal)).not.toContain('Broker test issue');
     expect(JSON.stringify(journal)).not.toContain('opened by the broker');
+  });
+
+  it('C-5: a 302 from the API is refused, never followed with the credential attached', async () => {
+    store.addStandingGrant({ identity: 'github', actionClass: 'write' });
+    redirectMode = true;
+    const broker = makeBroker();
+    await expect(
+      broker.execute({
+        botId: 'scout',
+        sessionId: 'sess-1',
+        identity: 'github',
+        action: 'github.create_issue',
+        args: issueArgs,
+      }),
+    ).rejects.toThrow(/redirect/);
+    // Exactly ONE request reached the fake API — no follow-up to the
+    // redirect target (/user/repos) was ever made.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.url).toBe('/repos/octocat/hello-world/issues');
+    const refused = store.listJournal().find((j) => j.event === 'action_refused');
+    expect(refused?.detail).toBe('http_302_redirect_refused');
+    expectTokenNowhere(store.listJournal(), journalFanout);
   });
 
   it('bot-initiated run through the broker_action tool creates an issue + journal (live-proof shape)', async () => {

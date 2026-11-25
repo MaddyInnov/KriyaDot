@@ -59,6 +59,24 @@ describe('parseCliUsageOutput (pure)', () => {
     expect(parseCliUsageOutput('You have 18% remaining on your plan limit', NOW)?.usedPercent).toBe(82);
   });
 
+  it('B-12: a percent-named key is read on the 0..100 scale — 1 means 1%, not 100%', () => {
+    expect(parseCliUsageOutput(JSON.stringify({ usage_percent: 1 }), NOW)?.usedPercent).toBe(1);
+    expect(parseCliUsageOutput(JSON.stringify({ usage_percent: 100 }), NOW)?.usedPercent).toBe(100);
+  });
+
+  it('B-12: an ambiguous bare key at exactly 1 is UNKNOWN, never a manufactured 100%', () => {
+    expect(parseCliUsageOutput(JSON.stringify({ utilization: 1 }), NOW)).toBeUndefined();
+    // …while unambiguous bare values still parse (fraction below 1, percent above 1).
+    expect(parseCliUsageOutput(JSON.stringify({ utilization: 0.5 }), NOW)?.usedPercent).toBe(50);
+    expect(parseCliUsageOutput(JSON.stringify({ utilization: 42 }), NOW)?.usedPercent).toBe(42);
+  });
+
+  it('B-12: figures buried in NON-window objects are not presented as the account gauge', () => {
+    expect(parseCliUsageOutput(JSON.stringify({ account: { plan: { usage_percent: 55 } } }), NOW)).toBeUndefined();
+    // A window-shaped nested object still parses.
+    expect(parseCliUsageOutput(JSON.stringify({ five_hour: { usage_percent: 55 } }), NOW)?.usedPercent).toBe(55);
+  });
+
   it('returns undefined for login-only output — no fabricated figure', () => {
     // Today's real `claude auth status` shape: login JSON, no usage fields.
     expect(parseCliUsageOutput(JSON.stringify({ loggedIn: true, email: 'user@example.com' }), NOW)).toBeUndefined();

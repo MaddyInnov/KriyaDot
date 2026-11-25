@@ -3756,11 +3756,14 @@ export function createRouter(deps: RouteDeps): express.Router {
     // so dispatched/transferred missions land on the same board, and the
     // transcript seam is the durable SessionStore. Inbound fleet routes
     // live under /federation/inbound/fleet/* — already loopback-exempt
-    // (signature-authenticated) via loopback-auth.ts. NOTE: this creates
-    // a second FederationService over the same store file as index.ts's
-    // federation router; both load the one persisted identity, but each
-    // keeps its own replay guard — acceptable for v1 (guards are
-    // per-process safety nets, and both processes are the same host).
+    // (signature-authenticated) via loopback-auth.ts. NOTE: this is a
+    // second FederationService over the same store file as index.ts's
+    // federation router. Since the D5 fix (sweep 2026-11-25) the
+    // service re-reads the store file whenever it changes on disk, so
+    // peer links/unlinks and policy changes made through either
+    // surface take effect on both without a restart; each instance
+    // still keeps its own replay guard (per-process safety net, and
+    // the inbound endpoint sets the two guards serve are disjoint).
     const fleetFederation = new FederationService({
       storePath: join(config.dataDir, 'federation.json'),
       name: 'KriyaDot',
@@ -3773,6 +3776,12 @@ export function createRouter(deps: RouteDeps): express.Router {
       missionService,
       missionStore,
       taskStore: missionTaskStore,
+      // D6 (sweep 2026-11-25): the only test command fleet-received
+      // missions may run on THIS machine — operator-configured, never
+      // peer-supplied. Unset → inbound fleet missions are refused.
+      ...(process.env.KRIYADOT_FLEET_TEST_COMMAND?.trim()
+        ? { fleetTestCommand: process.env.KRIYADOT_FLEET_TEST_COMMAND.trim() }
+        : {}),
       displayName: 'KriyaDot',
       version: '0.1.0',
       capabilities: detectCapabilities({ bridges: [...BRIDGE_ACCOUNT_BRIDGES] }),

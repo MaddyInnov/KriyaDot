@@ -78,7 +78,17 @@
 
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import type { PluginManifest } from './manifest.js';
@@ -97,6 +107,15 @@ export interface PluginSandboxReport {
   netns?: boolean;
   /** True when the child's network access was denied by construction. */
   networkDenied: boolean;
+  /**
+   * How confinement was confirmed (sweep 2026-11-25, C-3).
+   * 'kernel-report': the Landlock helper reported confinement applied
+   * over fd 3 BEFORE exec — positive proof. 'spawn-only': Seatbelt —
+   * sandbox-exec applies the profile before exec'ing the target (a
+   * rejected profile means the target never runs), but it offers no
+   * handshake, so the report rests on the launcher having started.
+   */
+  confirmation?: 'kernel-report' | 'spawn-only';
   /** Loud warning, present exactly when execution was NOT confined. */
   warning?: string;
 }
@@ -321,12 +340,44 @@ export const PLUGIN_RUNTIME_READ_ROOTS: readonly string[] = [
 ];
 
 function helperCacheDir(): string {
+  // Ops/test override: relocate the cache (e.g. a read-only /tmp, or a
+  // hermetic test dir that cannot race other processes' spawns).
+  const override = process.env.KRIYADOT_PLUGIN_LANDLOCK_CACHE_DIR?.trim();
+  if (override) return override;
   const hash = createHash('sha256').update(LANDLOCK_HELPER_C).digest('hex').slice(0, 12);
-  return join(tmpdir(), `kriyadot-plugin-landlock-${hash}`);
+  // Sweep 2026-11-25 (C-2): the cache lives in the SHARED system temp
+  // dir. The name carries the user id so another local user cannot
+  // squat the path, the dir is created owner-only (0700), and a cached
+  // binary is reused only when its sidecar SHA-256 matches — a planted
+  // or replaced binary is never executed on mere existence (its
+  // --probe answer gates whether plugins run confined at all).
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
+  return join(tmpdir(), `kriyadot-plugin-landlock-${hash}-u${uid}`);
 }
 
 export function pluginLandlockHelperPath(): string {
   return join(helperCacheDir(), 'plugin-landlock-exec');
+}
+
+function helperDirTrusted(dir: string): boolean {
+  try {
+    const st = statSync(dir);
+    if (!st.isDirectory()) return false;
+    if (typeof process.getuid === 'function' && st.uid !== process.getuid()) return false;
+    return (st.mode & 0o077) === 0;
+  } catch {
+    return false;
+  }
+}
+
+function helperBinaryVerified(bin: string): boolean {
+  try {
+    const expected = readFileSync(`${bin}.sha256`, 'utf8').trim();
+    if (!/^[0-9a-f]{64}$/.test(expected)) return false;
+    return createHash('sha256').update(readFileSync(bin)).digest('hex') === expected;
+  } catch {
+    return false;
+  }
 }
 
 let helperPromise: Promise<string | null> | null = null;
@@ -338,9 +389,21 @@ export function ensurePluginLandlockHelper(): Promise<string | null> {
   helperPromise = (async () => {
     const dir = helperCacheDir();
     const bin = pluginLandlockHelperPath();
-    if (existsSync(bin)) return bin;
     try {
-      mkdirSync(dir, { recursive: true });
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      try {
+        chmodSync(dir, 0o700);
+      } catch {
+        // best effort — helperDirTrusted below is the actual gate
+      }
+      if (!helperDirTrusted(dir)) return null;
+      if (existsSync(bin)) {
+        if (helperBinaryVerified(bin)) return bin;
+        // Unverifiable cache entry (planted, replaced, or written by a
+        // pre-hardening version): never execute it — rebuild instead.
+        rmSync(bin, { force: true });
+        rmSync(`${bin}.sha256`, { force: true });
+      }
       const src = join(dir, 'plugin-landlock-exec.c');
       writeFileSync(src, LANDLOCK_HELPER_C);
       // Compile to a per-process temp name, then rename into place:
@@ -349,6 +412,7 @@ export function ensurePluginLandlockHelper(): Promise<string | null> {
       const tmpOut = `${bin}.tmp-${process.pid}`;
       const cc = spawnSync('cc', ['-O2', '-Wall', '-o', tmpOut, src], { timeout: 30_000 });
       if (cc.error || cc.status !== 0 || !existsSync(tmpOut)) return null;
+      const digest = createHash('sha256').update(readFileSync(tmpOut)).digest('hex');
       try {
         renameSync(tmpOut, bin);
       } catch {
@@ -356,7 +420,8 @@ export function ensurePluginLandlockHelper(): Promise<string | null> {
         // (same source hash), so use the path if it now exists.
         if (!existsSync(bin)) return null;
       }
-      return bin;
+      writeFileSync(`${bin}.sha256`, `${digest}\n`, { mode: 0o600 });
+      return helperBinaryVerified(bin) ? bin : null;
     } catch {
       return null;
     }
@@ -635,6 +700,7 @@ export async function spawnPluginChild(
           finishOk({
             sandboxed: true,
             backend: 'landlock',
+            confirmation: 'kernel-report',
             ...(typeof parsed.abi === 'number' ? { abi: parsed.abi } : {}),
             ...(typeof parsed.netns === 'boolean' ? { netns: parsed.netns } : {}),
             networkDenied: parsed.netDenied === true,
@@ -683,9 +749,28 @@ export async function spawnPluginChild(
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     child.on('close', () => rmSync(scratch, { recursive: true, force: true }));
+    // C-3: never report confinement for a launcher that failed to
+    // start. sandbox-exec applies the profile before exec'ing the
+    // target, so a started child is confined by construction — but
+    // there is no kernel handshake (unlike Landlock's fd-3 report),
+    // hence confirmation: 'spawn-only' on the report.
+    const spawnError = await new Promise<Error | null>((resolveSpawn) => {
+      child.once('error', (err) => resolveSpawn(err));
+      child.once('spawn', () => resolveSpawn(null));
+    });
+    if (spawnError) {
+      if (!pluginIsRestrictive(opts.manifest) && pluginUnsandboxedOptedIn(hostEnv)) {
+        console.warn(`[plugins] ${PLUGIN_UNSANDBOXED_WARNING} (plugin "${opts.manifest.id}")`);
+        return spawnDirect(command, args, opts);
+      }
+      throw new PluginSandboxUnavailableError(
+        opts.manifest.id,
+        `Seatbelt launcher failed to start: ${spawnError.message}`,
+      );
+    }
     return {
       child,
-      report: { sandboxed: true, backend: 'seatbelt', networkDenied: !network },
+      report: { sandboxed: true, backend: 'seatbelt', networkDenied: !network, confirmation: 'spawn-only' },
     };
   }
 

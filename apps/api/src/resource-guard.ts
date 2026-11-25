@@ -384,6 +384,9 @@ export interface ResourceGuardState {
 
 const HISTORY_LIMIT = 120;
 
+/** D12: consecutive below-hard samples that prove relief and clear shedding. */
+const SHED_CLEAR_STREAK = 3;
+
 export interface ResourceGuardDeps {
   settings: ResourceGuardSettings;
   sampler: PressureSampler;
@@ -400,6 +403,16 @@ export class ResourceGuard {
   private history: PressureSample[] = [];
   private level: PressureLevel = 'ok';
   private shedding = false;
+  /**
+   * Sweep 2026-11-25 (D12): consecutive samples below 'hard' while
+   * shedding. Shedding originally cleared ONLY on a full 'ok' sample —
+   * but the memory signal is RSS, which in Node rarely falls back
+   * below the soft threshold after a hard spike, so one transient
+   * spike could shed optional work for the process lifetime. A
+   * sustained below-hard streak (SHED_CLEAR_STREAK samples ≈ 90 s at
+   * the default interval) proves relief without flapping.
+   */
+  private belowHardStreak = 0;
   private lastSample: PressureSample | null = null;
   private lastEvaluation: GuardEvaluation | null = null;
   private denialCount = 0;
@@ -475,6 +488,11 @@ export class ResourceGuard {
    *   shedding → ok    resource_guard.shedding_cleared (hysteresis: a dip
    *                    to soft does NOT resume work — flapping at the hard
    *                    boundary would start/stop routines every sample)
+   *   shedding → below-hard for SHED_CLEAR_STREAK consecutive samples
+   *                    resource_guard.shedding_cleared (D12: sustained
+   *                    relief also resumes work — RSS may never return
+   *                    to 'ok' after a spike, and a permanent latch is
+   *                    worse than a 3-sample proof of relief)
    *   soft → ok        resource_guard.recovered
    */
   sampleNow(): GuardEvaluation | null {
@@ -487,6 +505,8 @@ export class ResourceGuard {
     this.lastEvaluation = evaluation;
     const prev = this.level;
     this.level = evaluation.level;
+    // D12: a hard sample while shedding restarts the relief proof.
+    if (this.shedding && evaluation.level === 'hard') this.belowHardStreak = 0;
 
     if (LEVEL_RANK[evaluation.level] > LEVEL_RANK[prev]) {
       if (evaluation.level === 'hard') {
@@ -504,8 +524,22 @@ export class ResourceGuard {
       }
     } else if (this.shedding && evaluation.level === 'ok') {
       this.shedding = false;
+      this.belowHardStreak = 0;
       this.audit('resource_guard.shedding_cleared', { sample, evaluation });
       this.log('[resource-guard] pressure cleared — optional work resumes');
+    } else if (this.shedding && LEVEL_RANK[evaluation.level] < LEVEL_RANK.hard) {
+      // D12: below hard but not 'ok' — count toward sustained relief.
+      this.belowHardStreak += 1;
+      if (this.belowHardStreak >= SHED_CLEAR_STREAK) {
+        this.shedding = false;
+        this.belowHardStreak = 0;
+        this.audit('resource_guard.shedding_cleared', {
+          sample,
+          evaluation,
+          note: `sustained relief: ${SHED_CLEAR_STREAK} consecutive samples below hard`,
+        });
+        this.log('[resource-guard] sustained relief below hard pressure — optional work resumes');
+      }
     } else if (prev !== 'ok' && evaluation.level === 'ok') {
       this.audit('resource_guard.recovered', { sample, evaluation });
     }

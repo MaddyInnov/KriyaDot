@@ -216,6 +216,25 @@ describe('ReDoS safety (A8 §3)', () => {
     // A refused pattern never matches, even against a would-be hit.
     expect(matchIdentity({ kind: 'regex', source: '(a+)+$' }, 'aaaaaaaa')).toBe(false);
   });
+
+  it('B-2: NESTED quantified groups are refused too (the flat-scan bypass)', () => {
+    // The pre-fix gate scanned group bodies with a [^()]* regex, which
+    // can only see the innermost group — `((a|aa))+` sailed through
+    // and then hung the matcher (measured >10 s on 41 chars).
+    expect(assertSafeRegexPattern('((a|aa))+$')).toBe(false);
+    expect(assertSafeRegexPattern('((a|aa)+)+$')).toBe(false);
+    expect(assertSafeRegexPattern('(a(b)c)+$')).toBe(false);
+    expect(assertSafeRegexPattern('((a))+$')).toBe(false);
+    // A refused nested pattern never matches — and returns FAST.
+    const bait = `${'a'.repeat(40)}!`;
+    const started = Date.now();
+    expect(matchIdentity({ kind: 'regex', source: '^((a|aa))+$' }, bait)).toBe(false);
+    expect(Date.now() - started).toBeLessThan(1000);
+    // Nested but UNQUANTIFIED groups, and single-literal quantified
+    // groups, remain allowed.
+    expect(assertSafeRegexPattern('^(claude|codex) cli$')).toBe(true);
+    expect(assertSafeRegexPattern('(a)+$')).toBe(true);
+  });
 });
 
 describe('refusal quoting + redaction (A8 §4)', () => {

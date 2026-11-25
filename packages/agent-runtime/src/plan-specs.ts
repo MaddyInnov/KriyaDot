@@ -96,9 +96,17 @@ export type PlanSpecs = PlanSpec[];
 export type PlanVerificationScope = 'all' | 'high-risk-only' | 'off';
 
 const HIGH_RISK_TOOL_RE =
-  /delete|remove|drop|erase|wipe|purge|purchase|payment|pay_|_pay|checkout|send|message_|email|post_message|publish/i;
+  /delete|remove|drop|erase|wipe|purge|purchase|payment|pay_|_pay|checkout|send|message_|email|post_message|publish|^(run_command|run_background|shell|exec)$/i;
 
-/** True when a tool name belongs to a high-risk class (delete / pay / send). */
+/**
+ * True when a tool name belongs to a high-risk class (delete / pay /
+ * send / shell-exec). Sweep 2026-11-25 (A-D2): the shell-exec tools
+ * (`run_command`, `run_background`, `shell`, `exec`) are anchored
+ * exact matches — a plan step can reach any delete/pay/send effect
+ * through a shell command, so leaving them out of the DEFAULT scope
+ * made the highest-risk class the least verified. Exact-match
+ * anchoring keeps lookalike names (e.g. `execute_query`) out.
+ */
 export function isHighRiskTool(toolName: string): boolean {
   return HIGH_RISK_TOOL_RE.test(toolName);
 }

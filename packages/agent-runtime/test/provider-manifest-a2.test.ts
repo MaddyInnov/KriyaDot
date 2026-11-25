@@ -234,6 +234,13 @@ describe('manifest validation fails closed', () => {
     (file2.providers as Record<string, { bridgeId: string }>).grok!.bridgeId = 'kimi';
     expect(validateProviderManifestSet(file2).join(' ')).toMatch(/does not match bridgeId/);
   });
+  it('B-4: rejects two bridges claiming the same binary name at the set level', () => {
+    const file = JSON.parse(JSON.stringify(bundledManifests)) as typeof bundledManifests;
+    (file.providers as Record<string, { binary: { names: string[] } }>).kimi!.binary.names = ['grok'];
+    expect(validateProviderManifestSet(file).join(' ')).toMatch(/binary name "grok" is also claimed by/);
+    // The shipped set itself is clean.
+    expect(validateProviderManifestSet(bundledManifests)).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -295,10 +302,12 @@ describe('A6 integration: accounts + isolation from birth', () => {
     }
   });
 
-  it('isolation registry: pi + hermes carry knobs; copilot / grok / kimi are honestly single-account', () => {
+  it('isolation registry: pi carries a knob; copilot / grok / kimi / hermes are honestly single-account', () => {
     expect(BRIDGE_ISOLATION.pi).toMatchObject({ isolatable: true, envKnobs: ['PI_CODING_AGENT_DIR'] });
-    expect(BRIDGE_ISOLATION.hermes).toMatchObject({ isolatable: true, envKnobs: ['HERMES_HOME'] });
-    for (const id of ['copilot', 'grok', 'kimi'] as const) {
+    // B-9 (sweep 2026-11-25): hermes joined the single-account set —
+    // HERMES_HOME is an ASSUMED knob, and an unconfirmed knob fails
+    // open (turns would silently run as the machine-default login).
+    for (const id of ['copilot', 'grok', 'kimi', 'hermes'] as const) {
       expect(BRIDGE_ISOLATION[id].isolatable).toBe(false);
       expect(BRIDGE_ISOLATION[id].envKnobs).toEqual([]);
       expect(BRIDGE_ISOLATION[id].note.length).toBeGreaterThan(20);
@@ -317,15 +326,16 @@ describe('A6 integration: accounts + isolation from birth', () => {
     } as BridgeAccount;
   }
 
-  it('spawn env: pi + hermes accounts carry their dir; a copilot account carries nothing', () => {
+  it('spawn env: a pi account carries its dir; copilot + hermes accounts carry nothing', () => {
     expect(bridgeAccountSpawnEnv(account({ id: 'w', configDir: '/a/pi-work' }))).toEqual({
       PI_CODING_AGENT_DIR: '/a/pi-work',
     });
+    // Non-isolatable: an account record exists, but the CLI cannot be
+    // pointed anywhere — the spawn env is honestly empty. (Hermes
+    // since B-9: its knob is assumed, not confirmed.)
     expect(
       bridgeAccountSpawnEnv(account({ id: 'w', bridgeId: 'hermes', configDir: '/a/h-work' })),
-    ).toEqual({ HERMES_HOME: '/a/h-work' });
-    // Non-isolatable: an account record exists, but the CLI cannot be
-    // pointed anywhere — the spawn env is honestly empty.
+    ).toEqual({});
     expect(
       bridgeAccountSpawnEnv(account({ id: 'w', bridgeId: 'copilot', configDir: '/a/c-work' })),
     ).toEqual({});

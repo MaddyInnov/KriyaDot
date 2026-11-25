@@ -45,7 +45,7 @@
 // manifest + referenced files validated there; only approved, valid
 // plugins are moved into plugins/<id>/.
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   cpSync,
   existsSync,
@@ -183,6 +183,18 @@ export interface InstalledPlugin {
   source: PluginInstallSourceInfo;
   /** A9: signature provenance (see PluginSignatureInfo). */
   signature: PluginSignatureInfo;
+  /**
+   * Sweep 2026-11-25 (C-1): per-file SHA-256 baseline of the installed
+   * tree, recorded at install time (POSIX relative path → hex digest).
+   * loadAll re-verifies the tree against this baseline and REFUSES to
+   * serve a plugin whose installed files changed — the signature is
+   * verified over these bytes, so post-install self-modification
+   * (manifest widening, entry rewrite) must not ride on the install
+   * record. Absent on records persisted before the baseline existed;
+   * those keep the legacy adopt-from-disk load behaviour until they
+   * are reinstalled.
+   */
+  filesDigest?: Record<string, string>;
 }
 
 interface StoreFile {
@@ -242,6 +254,14 @@ export class PluginManager {
   private readonly rpcOpts: InvokeOptions;
   private readonly now: () => number;
   private records = new Map<string, InstalledPlugin>();
+  /**
+   * Sweep 2026-11-25 (C-1): ids whose on-disk tree failed loadAll
+   * validation (including the install-baseline digest check). Broken
+   * plugins stay LISTED (so the user can see and remove them) but are
+   * never SERVED: enabledTarget throws and the aggregate surfaces skip
+   * them.
+   */
+  private broken = new Set<string>();
 
   constructor(opts: PluginManagerOptions) {
     this.dataDir = resolve(opts.dataDir);
@@ -316,6 +336,11 @@ export class PluginManager {
   private enabledTarget(id: string): InstalledPlugin {
     const rec = this.records.get(id);
     if (!rec) throw new PluginNotFoundError(id);
+    if (this.broken.has(id)) {
+      throw new Error(
+        `plugin "${id}" failed integrity validation at load (its installed files differ from the install record) — refusing to run it; reinstall it to re-baseline`,
+      );
+    }
     if (!rec.enabled) throw new Error(`plugin "${id}" is disabled`);
     return rec;
   }
@@ -372,6 +397,55 @@ export class PluginManager {
     if (problems.length > 0) throw new Error(`invalid plugin package: ${problems.join('; ')}`);
   }
 
+  /**
+   * Sweep 2026-11-25 (C-4): symlinks are refused anywhere in a plugin
+   * tree. The signature digest covers regular files only, so a symlink
+   * would let a signed package carry UNVERIFIED content that host-side
+   * readers (SKILL.md, UI assets) follow outside the sandbox. cpSync
+   * preserves symlinks, so the check must be explicit.
+   */
+  private assertNoSymlinks(dir: string): void {
+    const walk = (d: string): void => {
+      for (const entry of readdirSync(d, { withFileTypes: true })) {
+        const abs = join(d, entry.name);
+        if (entry.isSymbolicLink()) {
+          throw new Error(
+            `plugin tree contains a symlink (${relative(dir, abs).split(sep).join('/')}) — symlinks are not allowed in plugin packages`,
+          );
+        }
+        if (entry.isDirectory()) walk(abs);
+      }
+    };
+    walk(dir);
+  }
+
+  /** SHA-256 baseline of every regular file in a tree (POSIX path → hex). */
+  private digestTree(dir: string): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const f of this.collectStagedFiles(dir)) {
+      out[f.name] = createHash('sha256').update(f.data).digest('hex');
+    }
+    return out;
+  }
+
+  /**
+   * Sweep 2026-11-25 (C-1): compare the installed tree against the
+   * install-time baseline. Returns a problem string, or null when the
+   * tree matches (or no baseline exists — legacy records).
+   */
+  private verifyRecordIntegrity(rec: InstalledPlugin): string | null {
+    if (!rec.filesDigest) return null;
+    for (const [name, expected] of Object.entries(rec.filesDigest)) {
+      const abs = join(rec.dir, ...name.split('/'));
+      if (!existsSync(abs)) return `installed file "${name}" is missing (the plugin tree changed after install)`;
+      const actual = createHash('sha256').update(readFileSync(abs)).digest('hex');
+      if (actual !== expected) {
+        return `installed file "${name}" differs from the install record (the plugin tree changed after install)`;
+      }
+    }
+    return null;
+  }
+
   /** All files under a staged plugin dir as package entries (POSIX names), for signature verification. */
   private collectStagedFiles(staging: string): PackageFileEntry[] {
     const out: PackageFileEntry[] = [];
@@ -400,6 +474,7 @@ export class PluginManager {
     const { staging } = this.stageDir(source);
     try {
       const info = await this.materialize(source, staging);
+      this.assertNoSymlinks(staging);
       const manifestPath = join(staging, 'plugin.json');
       if (!existsSync(manifestPath)) throw new Error('plugin package has no plugin.json at its root');
       const manifest = parseManifest(readFileSync(manifestPath, 'utf8'));
@@ -465,8 +540,11 @@ export class PluginManager {
       installedAt: this.now(),
       source: info,
       signature,
+      // C-1 baseline: the exact bytes that were approved/verified.
+      filesDigest: this.digestTree(dest),
     };
     this.records.set(manifest.id, record);
+    this.broken.delete(manifest.id);
     this.persist();
     return { ...record };
   }
@@ -477,6 +555,7 @@ export class PluginManager {
     if (!rec) throw new PluginNotFoundError(id);
     rmSync(rec.dir, { recursive: true, force: true });
     this.records.delete(id);
+    this.broken.delete(id);
     this.persist();
   }
 
@@ -497,6 +576,7 @@ export class PluginManager {
     this.records = new Map(
       this.readStore().plugins.map((p) => [p.id, { ...p, signature: p.signature ?? { status: 'unrecorded' as const } }]),
     );
+    this.broken = new Set();
     const report: PluginLoadReport = { loaded: [], failed: [] };
     for (const rec of this.records.values()) {
       try {
@@ -504,10 +584,26 @@ export class PluginManager {
         if (!existsSync(manifestPath)) throw new Error('plugin.json missing');
         const manifest = parseManifest(readFileSync(manifestPath, 'utf8'));
         if (manifest.id !== rec.id) throw new Error(`plugin.json id "${manifest.id}" != installed id "${rec.id}"`);
-        this.validateFiles(rec.dir, manifest);
-        rec.manifest = manifest;
+        this.assertNoSymlinks(rec.dir);
+        if (rec.filesDigest) {
+          // C-1: a baselined plugin is served EXACTLY as installed.
+          // The on-disk manifest is never adopted over the install
+          // record — any drift (manifest widening, entry rewrite,
+          // deleted file) fails the load and marks the plugin broken
+          // so no surface serves it.
+          const problem = this.verifyRecordIntegrity(rec);
+          if (problem) throw new Error(`${problem} — refusing to load; reinstall the plugin to re-baseline`);
+          this.validateFiles(rec.dir, rec.manifest);
+        } else {
+          // Legacy record (installed before baselines existed): no
+          // baseline to check against — keep the historical behaviour
+          // of adopting the on-disk manifest after validation.
+          this.validateFiles(rec.dir, manifest);
+          rec.manifest = manifest;
+        }
         report.loaded.push({ ...rec });
       } catch (err) {
+        this.broken.add(rec.id);
         report.failed.push({ id: rec.id, dir: rec.dir, error: err instanceof Error ? err.message : String(err) });
       }
     }
@@ -520,7 +616,7 @@ export class PluginManager {
   async tools(): Promise<PluginToolDefinition[]> {
     const out: PluginToolDefinition[] = [];
     for (const rec of this.records.values()) {
-      if (!rec.enabled || !rec.manifest.kinds.includes('tool')) continue;
+      if (!rec.enabled || this.broken.has(rec.id) || !rec.manifest.kinds.includes('tool')) continue;
       try {
         out.push(...(await listPluginTools(rec, this.invokeOpts(rec))));
       } catch (err) {
@@ -549,7 +645,7 @@ export class PluginManager {
 
   /** All enabled hook plugins, for HookBus registration by the host. */
   hookTargets(): InstalledPlugin[] {
-    return this.list().filter((p) => p.enabled && p.manifest.kinds.includes('hook'));
+    return this.list().filter((p) => p.enabled && !this.broken.has(p.id) && p.manifest.kinds.includes('hook'));
   }
 
   channelProvider(id: string): PluginMessageProvider {
@@ -559,7 +655,7 @@ export class PluginManager {
 
   channelProviders(): PluginMessageProvider[] {
     return this.list()
-      .filter((p) => p.enabled && p.manifest.kinds.includes('channel'))
+      .filter((p) => p.enabled && !this.broken.has(p.id) && p.manifest.kinds.includes('channel'))
       .map((p) => createPluginChannelProvider(p, this.invokeOpts(p)));
   }
 
@@ -576,7 +672,7 @@ export class PluginManager {
   providerDescriptors(): DeclarativeProviderDescriptor[] {
     const out: DeclarativeProviderDescriptor[] = [];
     for (const rec of this.records.values()) {
-      if (!rec.enabled || !rec.manifest.kinds.includes('provider')) continue;
+      if (!rec.enabled || this.broken.has(rec.id) || !rec.manifest.kinds.includes('provider')) continue;
       try {
         out.push(pluginProviderDescriptor(rec));
       } catch (err) {
@@ -594,7 +690,7 @@ export class PluginManager {
 
   skillDescriptors(): PluginSkillDescriptor[] {
     return this.list()
-      .filter((p) => p.enabled && p.manifest.kinds.includes('skill'))
+      .filter((p) => p.enabled && !this.broken.has(p.id) && p.manifest.kinds.includes('skill'))
       .map((p) => pluginSkillDescriptor(p));
   }
 
@@ -604,7 +700,7 @@ export class PluginManager {
 
   uiDescriptors(): PluginUiDescriptor[] {
     return this.list()
-      .filter((p) => p.enabled && p.manifest.kinds.includes('ui') && p.manifest.ui)
+      .filter((p) => p.enabled && !this.broken.has(p.id) && p.manifest.kinds.includes('ui') && p.manifest.ui)
       .map((p) => pluginUiDescriptor(p));
   }
 }

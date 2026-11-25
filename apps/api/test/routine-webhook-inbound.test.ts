@@ -348,6 +348,44 @@ describe('B5 inbound webhook triggers', () => {
     expect(turnCalls).toHaveLength(2);
   });
 
+  it('D10: an idempotency key frees up after the window (expired deliveries are pruned at claim time)', () => {
+    const summary = summarizePayload({ a: 1 }, 10);
+    const t0 = Date.now() - 26 * 60 * 60_000;
+    const claim = (now: number) =>
+      inboundStore.claimDelivery({
+        triggerId: 'trg-window',
+        routineId: 'r-window',
+        idempotencyKey: 'k-window',
+        sourceIp: '127.0.0.1',
+        payloadSummary: summary,
+        now,
+      });
+    expect(claim(t0)).not.toBeNull();
+    // Within the window the same key still dedupes (claim collision).
+    expect(claim(t0 + 60_000)).toBeNull();
+    // After the window the key is free again — previously the ancient
+    // row collided forever and the key was permanently burned.
+    expect(claim(t0 + 25 * 60 * 60_000)).not.toBeNull();
+  });
+
+  it('D10: releasing a failed-start claim frees the key + rate budget for the retry', () => {
+    const summary = summarizePayload({ a: 1 }, 10);
+    const input = {
+      triggerId: 'trg-release',
+      routineId: 'r-release',
+      idempotencyKey: 'k-release',
+      sourceIp: '127.0.0.1',
+      payloadSummary: summary,
+    };
+    const first = inboundStore.claimDelivery(input);
+    expect(first).not.toBeNull();
+    inboundStore.releaseDelivery(first!.id);
+    // The retry can claim the same key, and only ONE delivery counts
+    // against the rate budget (the released claim is gone).
+    expect(inboundStore.claimDelivery(input)).not.toBeNull();
+    expect(inboundStore.countDeliveriesSince('trg-release', 0)).toBe(1);
+  });
+
   it('governance: a webhook-started run pauses for approval instead of executing the gated action', async () => {
     const routineId = await makeRoutine('Do the thing. NEEDS_APPROVAL payload: {{payload}}');
     const { token } = await makeTrigger(routineId);

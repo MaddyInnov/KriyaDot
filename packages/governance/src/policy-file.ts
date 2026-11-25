@@ -194,21 +194,26 @@ export function loadWorkspacePolicy(workspaceDir: string): PolicyFileResult {
         errors.push('policy.json: "policySnapshot" must be a boolean — ignored');
       }
     }
+    // Sweep 2026-11-25 (A-D3): the policy object is built
+    // UNCONDITIONALLY — a specs-only or scope-only policy.json (no
+    // "rules" key at all) is a legitimate file, and its planSpecs /
+    // planVerificationScope (including an "off" opt-out) must not be
+    // silently dropped. A present-but-non-array "rules" still errors.
+    const rules: BotPolicyRule[] = [];
     if (Array.isArray(parsed.rules)) {
-      const rules: BotPolicyRule[] = [];
       parsed.rules.forEach((raw, i) => {
         const rule = parseRule(raw, i, errors);
         if (rule) rules.push(rule);
       });
-      policy = {
-        rules,
-        ...(policySnapshot ? { policySnapshot: true } : {}),
-        ...(planSpecs.length > 0 ? { planSpecs } : {}),
-        ...(planVerificationScope ? { planVerificationScope } : {}),
-      };
-    } else {
+    } else if (parsed.rules !== undefined) {
       errors.push('policy.json: "rules" must be an array');
     }
+    policy = {
+      rules,
+      ...(policySnapshot ? { policySnapshot: true } : {}),
+      ...(planSpecs.length > 0 ? { planSpecs } : {}),
+      ...(planVerificationScope ? { planVerificationScope } : {}),
+    };
   } catch (err) {
     errors.push(`policy.json: unreadable (${err instanceof Error ? err.message : String(err)})`);
   }

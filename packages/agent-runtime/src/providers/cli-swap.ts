@@ -120,8 +120,10 @@ export type SwapDecision =
  * Decide what a mid-job bridge/quota death may do. Pure: the caller
  * supplies the already-resolved auto target and its cooldown state.
  *
- * - explicit + quota/driver death + declared backup (≠ failed provider)
- *   → swap to EXACTLY the declared backup.
+ * - explicit + quota death or bridge death + declared backup
+ *   (≠ failed provider) → swap to EXACTLY the declared backup.
+ * - explicit + non-death driver failure + declared backup → fail
+ *   (B-5: the original error surfaces; no silent re-route).
  * - explicit + quota/driver death + no declared backup → refuse loudly.
  * - explicit + declared backup naming the FAILED provider itself → refuse
  *   (swapping to the corpse is not a swap).
@@ -133,6 +135,17 @@ export function decideBridgeSwap(args: {
   explicitSelection: boolean;
   quotaDeath: boolean;
   driverFailure: boolean;
+  /**
+   * Sweep 2026-11-25 (B-5): the failure is a genuine BRIDGE DEATH
+   * (the CLI process died / could not be resolved — CliDriverError),
+   * as opposed to an ordinary provider error that merely surfaced
+   * through a bridge lane. Under an explicit selection ONLY a quota
+   * death or a bridge death may swap to the declared backup; an
+   * ordinary error (a 400 the backup would also hit, an auth error)
+   * keeps the v0.2.2 behaviour — the turn fails loudly with the
+   * original error instead of being silently re-routed.
+   */
+  bridgeDeath?: boolean;
   failedProviderId: string;
   /** The model that died (a sibling-account swap keeps the same model). */
   failedModelId?: string;
@@ -151,7 +164,14 @@ export function decideBridgeSwap(args: {
 }): SwapDecision {
   const death = args.quotaDeath || args.driverFailure;
   if (args.explicitSelection) {
+    // B-5: a swap under explicit selection requires a DEATH — quota
+    // exhaustion or a bridge (process) death. A non-death driver
+    // failure with a declared backup falls through to 'fail' (the
+    // original error surfaces); without a backup it refuses, as
+    // before.
+    const swappableDeath = args.quotaDeath || args.bridgeDeath === true;
     if (!death) return { action: 'fail' };
+    if (!swappableDeath && args.declaredBackup) return { action: 'fail' };
     if (args.declaredBackup && args.declaredBackup.providerId !== args.failedProviderId) {
       return { action: 'swap', target: args.declaredBackup, via: 'declared-backup' };
     }
@@ -198,8 +218,28 @@ export const TRANSCRIPT_REPLAY_MARKER = '[Backend swap — transcript replay]';
  */
 export function buildTranscriptReplayMessages(
   messages: readonly ChatMessage[],
-  info: { fromProvider: string; fromModel: string; toProvider: string; toModel: string; reason: string },
+  info: {
+    fromProvider: string;
+    fromModel: string;
+    toProvider: string;
+    toModel: string;
+    reason: string;
+    /**
+     * Sweep 2026-11-25 (B-7): one-line summaries of tool actions the
+     * DYING backend already executed during this attempt (observed
+     * via onCliToolEvent). They are NOT in the transcript — the
+     * attempt threw before its calls could be appended — so without
+     * this list the backup cannot see work that already happened and
+     * may repeat side-effecting operations (file writes, commands).
+     */
+    priorActions?: string[];
+  },
 ): ChatMessage[] {
+  const prior =
+    info.priorActions && info.priorActions.length > 0
+      ? ` Before it stopped, the previous backend ALREADY EXECUTED these tool actions (their effects ` +
+        `are real and are NOT shown in the transcript): ${info.priorActions.join('; ')}. Do NOT repeat them.`
+      : '';
   const note: ChatMessage = {
     role: 'system',
     content:
@@ -207,7 +247,7 @@ export function buildTranscriptReplayMessages(
       `stopped mid-job: ${info.reason}. The full transcript above (system prompt, prior user and ` +
       `assistant turns, tool results) is replayed into your session so the job continues with ` +
       `context — do not restart from scratch or re-ask what was already answered. You are the ` +
-      `backup backend (${info.toProvider}/${info.toModel}); continue the same job from where it stopped.`,
+      `backup backend (${info.toProvider}/${info.toModel}); continue the same job from where it stopped.${prior}`,
   };
   const out = [...messages];
   let insertAt = out.length;

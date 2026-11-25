@@ -133,6 +133,40 @@ describe('invite + handshake', () => {
   });
 });
 
+describe('D5: two services over ONE store file stay consistent (sweep 2026-11-25)', () => {
+  it('links, policy changes and unlinks via one instance are visible to the other without reconstruction', () => {
+    // The API process builds exactly this pair: the federation
+    // router's service and the fleet coordinator's, same file.
+    const routerSvc = service('Router', 'shared.json');
+    const fleetSvc = service('Fleet', 'shared.json');
+    const b = service('B', 'b.json');
+
+    const { payload } = routerSvc.createInvite();
+    const parsed = b.parseInvitePayload(payload);
+    b.recordPeerFromInvite(parsed);
+    routerSvc.completeHandshake({ inviteCode: parsed.code, remote: b.identity() });
+    const bId = b.identity().instanceId;
+
+    // The fleet instance was constructed BEFORE the link existed —
+    // it must still see the peer (no stale constructor snapshot).
+    expect(fleetSvc.getPeer(bId)?.status).toBe('active');
+    expect(fleetSvc.listPeers().map((p) => p.peerId)).toContain(bId);
+
+    // A policy change through the router surface applies on the fleet side.
+    routerSvc.updatePeerPolicy(bId, { rateCapPerMinute: 7 });
+    expect(fleetSvc.getPeer(bId)?.policy.rateCapPerMinute).toBe(7);
+
+    // A mutation through the fleet instance must not WIPE the router
+    // side's state (reload-before-persist prevents lost updates).
+    fleetSvc.createInvite();
+    expect(routerSvc.getPeer(bId)).toBeDefined();
+
+    // Unlink via one surface unlinks on both.
+    expect(routerSvc.removePeer(bId)).toBe(true);
+    expect(fleetSvc.getPeer(bId)).toBeUndefined();
+  });
+});
+
 describe('signed HTTP requests', () => {
   it('verifies a signed request and rejects replay + forgery', () => {
     const a = service('A');

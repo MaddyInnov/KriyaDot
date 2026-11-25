@@ -242,7 +242,12 @@ export function createBridgeAccountsRouter(deps: BridgeAccountsDeps): Router {
       let configDirDeleted = false;
       if (wantsDelete && removed.createdByUs && removed.configDir) {
         const target = path.resolve(removed.configDir);
-        if (target.startsWith(path.resolve(managedRoot) + path.sep)) {
+        // Sweep 2026-11-25 (B-11): the deletable dir must be EXACTLY
+        // this account's managed leaf dir — a prefix check also
+        // matches ANCESTORS of other accounts' dirs (e.g. an account
+        // created with configDir = <root>/claude), whose recursive
+        // deletion would wipe every sibling account's credentials.
+        if (target === path.resolve(managedAccountConfigDir(deps.dataDir, bridgeId, accountId))) {
           fs.rmSync(target, { recursive: true, force: true });
           configDirDeleted = true;
         }
