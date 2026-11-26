@@ -116,9 +116,17 @@ export interface CliIdentityDeclaration {
  *   A2 manifests carry the same acceptance for pi). The `--help` match
  *   is only a FALLBACK for when the version match fails — it is NOT
  *   corroboration, despite an earlier wording of this comment claiming
- *   otherwise (corrected in the 2026-11-25 sweep, B-3; tightening to
- *   AND semantics is a product decision for a real-binary pass, since
- *   it can false-reject the real CLIs).
+ *   otherwise (corrected in the 2026-11-25 sweep, B-3).
+ *
+ * B-3 close-out (final cut, 2026-11-26): AND-semantics corroboration
+ * now applies to exactly the bridges where a recorded REAL binary
+ * proves both signals are present — pi and kimi (see
+ * HELP_CORROBORATION_BRIDGE_IDS below). OpenCode is deliberately NOT
+ * tightened: no recorded real `--help` output for opencode exists in
+ * the repo, and the shipped tests encode the v0.2.2 bare-semver
+ * acceptance for it, so tightening it would rest on an invented
+ * fixture rather than evidence. Its weakness stays disclosed here
+ * until a real-binary pass records opencode's actual `--help`.
  */
 export const CLI_IDENTITY_DECLARATIONS: Record<CliIdentityBridgeId, CliIdentityDeclaration> = {
   claude: {
@@ -148,6 +156,53 @@ export const CLI_IDENTITY_DECLARATIONS: Record<CliIdentityBridgeId, CliIdentityD
 
 /** Every declared bridge id, in declaration order. */
 export const CLI_IDENTITY_BRIDGE_IDS = Object.keys(CLI_IDENTITY_DECLARATIONS) as CliIdentityBridgeId[];
+
+// ---------------------------------------------------------------------------
+// B-3 scoped help corroboration (final cut, 2026-11-26).
+//
+// Per-bridge identity signals, as declared today:
+// - claude / codex / copilot / grok / hermes: the `--version` match
+//   itself NAMES the tool (first-line contains/prefix on the tool's
+//   name). A single signal, but a content-bearing one — a namesake
+//   must print the tool's own banner to pass. No corroboration needed.
+// - opencode / kimi / pi: the `--version` match is `firstLineSemver`
+//   — content-free. ANY binary whose first `--version` line is a
+//   semver passes it. These are the bridges the B-3 weakness applies
+//   to, and each also declares a `--help` match.
+//
+// The 2026-11-25 sweep reverted a blanket AND-tightening because it
+// could false-reject real CLIs. The 2026-11-26 real-binary pass
+// (hidden_files/final-cut-2026-11-26/A2-REAL-BINARY.md; raw outputs in
+// ~/workspace/scratch/a2-real-binary/outputs/) recorded, from vendor
+// binaries installed from the vendors' own channels:
+// - pi 1.6.1 (`@earendil-works/pi-coding-agent`): `--version` prints
+//   `1.6.1`; `--help` contains the banner line "pi - AI coding
+//   assistant with read, bash, edit, write tools" — the declared help
+//   needle ("coding assistant") IS present in the real output.
+// - kimi 2.8.0 (`@moonshot-ai/kimi-code`): `--version` prints `2.8.0`;
+//   `--help` opens with "Usage: kimi [options] [command]" — the
+//   declared help needle ("kimi") IS present in the real output.
+// For these two bridges both signals are therefore PROVEN present on
+// the real CLI, so probeCliIdentity requires BOTH: a bare semver
+// whose `--help` does not corroborate is now rejected. The recorded
+// outputs are replayed verbatim in test/cli-identity-b3.test.ts.
+//
+// OpenCode is NOT in this set: no recorded real opencode `--help`
+// output exists anywhere in the repo, and shipped tests deliberately
+// encode its v0.2.2 bare-semver acceptance. Tightening it would mean
+// inventing the "real" fixture the tightening is justified by — the
+// exact failure mode the sweep reverted. It stays single-signal,
+// disclosed in the declaration comment above and in its manifest,
+// until a real-binary pass records opencode's actual `--help`.
+// ---------------------------------------------------------------------------
+
+/** Bridges whose bare-semver version match must be help-corroborated. */
+export const HELP_CORROBORATION_BRIDGE_IDS: ReadonlySet<CliIdentityAnyBridgeId> = new Set(['pi', 'kimi']);
+
+/** True when probeCliIdentity must require the declared help match too. */
+export function identityRequiresHelpCorroboration(id: CliIdentityAnyBridgeId): boolean {
+  return HELP_CORROBORATION_BRIDGE_IDS.has(id);
+}
 
 // ---------------------------------------------------------------------------
 // Bounded matching (ReDoS-safe by construction).

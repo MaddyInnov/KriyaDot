@@ -5,8 +5,9 @@
  * Per-bot routines panel (Codync parity: public webhook ingress).
  *
  * Lists the bot's routines. Each routine expands to show its public webhook
- * URL + secret (reveal / regenerate with confirmation / copy) and the recent
- * delivery log (timestamp, status, event type).
+ * URL + secret (regenerate with confirmation / copy — the secret is stored
+ * hashed and is not recoverable, so it is shown only once, at regeneration)
+ * and the recent delivery log (timestamp, status, event type).
  *
  * Reachability note (also in the API): the API binds to 127.0.0.1, so the
  * public URL only works for external senders (GitHub etc.) when a tunnel
@@ -1578,21 +1579,6 @@ function RoutineRow({ routine, botId, onChanged }: { routine: Routine; botId: st
     if (open && !hook) void load();
   }, [open, hook, load]);
 
-  const onReveal = async () => {
-    setBusy(true);
-    setError('');
-    try {
-      const res = await api<{ hook: HookInfo }>(`/api/routines/${encodeURIComponent(routine.id)}/hook/reveal`, {
-        method: 'POST',
-      });
-      setHook(res.hook);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Reveal failed');
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const onRegenerate = async () => {
     setBusy(true);
     setError('');
@@ -1714,9 +1700,9 @@ function RoutineRow({ routine, botId, onChanged }: { routine: Routine; botId: st
                   </>
                 ) : (
                   <>
-                    <code className="url-box secret masked">•••••••• (hidden)</code>
-                    <button type="button" className="btn-ghost" onClick={onReveal} disabled={busy}>
-                      Reveal
+                    <code className="url-box secret masked">•••••••• (hidden — not recoverable)</code>
+                    <button type="button" className="btn-ghost" onClick={() => setConfirmRegen(true)} disabled={busy}>
+                      Rotate to get a new secret
                     </button>
                   </>
                 )}
@@ -1737,7 +1723,8 @@ function RoutineRow({ routine, botId, onChanged }: { routine: Routine; botId: st
               </div>
               <p className="muted small">
                 GitHub: paste the URL as the payload URL, content type{' '}
-                <code>application/json</code>, secret = the key above. The routine also
+                <code>application/json</code>, secret = the key shown once when you rotate
+                (regenerate) — it is stored hashed and cannot be revealed later. The routine also
                 accepts <code>Authorization: Bearer &lt;secret&gt;</code> or an{' '}
                 <code>X-Signature-256</code> HMAC.
               </p>

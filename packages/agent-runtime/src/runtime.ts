@@ -831,6 +831,40 @@ export async function executeWithToolDiscipline<T extends { def: ToolDefinition;
   return results;
 }
 
+/** The live inputs folded into the runtime provider cache key. */
+export interface ProviderCacheKeyParts {
+  /** Non-default bridge account id, when the turn runs under one. */
+  accountId?: string;
+  /** The bridge's live CLI path pin, when one is in effect. */
+  pin?: string;
+  /** The account spawn env the provider is constructed with, when any. */
+  env?: Record<string, string>;
+}
+
+/**
+ * The provider cache key resolveProvider() caches under (B-10).
+ *
+ * Extracted as a pure function at the final cut (2026-11-26) so the
+ * B-10 fix — the key folds in the LIVE CLI path pin and a sorted env
+ * signature, so a re-pin or env change resolves to a fresh provider
+ * instead of the stale cached one — has a direct unit test
+ * (test/provider-cache-key-b10.test.ts). resolveProvider's behaviour
+ * is unchanged: the account segment is present exactly when an
+ * account id AND a non-empty env are, the pin segment when a pin is
+ * in effect, and the env segment serialises entries sorted by key so
+ * insertion order never changes the key.
+ */
+export function buildProviderCacheKey(providerId: string, parts: ProviderCacheKeyParts = {}): string {
+  let key = providerId;
+  const env = parts.env && Object.keys(parts.env).length > 0 ? parts.env : undefined;
+  if (parts.accountId && env) key += `#acct:${parts.accountId}`;
+  if (parts.pin) key += `#pin:${parts.pin}`;
+  if (env) {
+    key += `#env:${JSON.stringify(Object.entries(env).sort(([a], [b]) => a.localeCompare(b)))}`;
+  }
+  return key;
+}
+
 export class AgentRuntime {
   private readonly store: SessionStore;
   private readonly skills: SkillLoader;
@@ -1497,8 +1531,8 @@ ${record.priorContext ?? ''}`;
     // Claude/OpenCode HTTPS lanes read that account's token) and cached
     // under an account-scoped key so two accounts never share a driver.
     // Machine-default resolution is byte-for-byte the old behaviour.
-    let cacheKey = providerId;
     let env: Record<string, string> | undefined;
+    let accountId: string | undefined;
     const bridge = bot ? bridgeIdForProviderId(providerId) : undefined;
     if (bridge && bot) {
       const store = getBridgeAccountStore();
@@ -1509,7 +1543,7 @@ ${record.priorContext ?? ''}`;
         const spawnEnv = bridgeAccountSpawnEnv(account);
         if (Object.keys(spawnEnv).length > 0) {
           env = spawnEnv;
-          cacheKey = `${providerId}#acct:${account.id}`;
+          accountId = account.id;
         }
       }
     }
@@ -1521,13 +1555,13 @@ ${record.priorContext ?? ''}`;
     // host updates on every pin change) and the env contents into the
     // key makes a changed pin/env resolve to a fresh provider on the
     // next turn, while unchanged inputs keep the cached instance.
-    if (bridge) {
-      const pin = getCliPathPin(bridge);
-      if (pin) cacheKey += `#pin:${pin}`;
-    }
-    if (env) {
-      cacheKey += `#env:${JSON.stringify(Object.entries(env).sort(([a], [b]) => a.localeCompare(b)))}`;
-    }
+    // The key itself is computed by buildProviderCacheKey() (pure,
+    // unit-tested — final cut 2026-11-26).
+    const cacheKey = buildProviderCacheKey(providerId, {
+      accountId,
+      pin: bridge ? getCliPathPin(bridge) : undefined,
+      env,
+    });
     let provider = this.providerCache.get(cacheKey);
     if (!provider) {
       provider = createProvider(providerId, env ? { env } : undefined);
@@ -2920,6 +2954,16 @@ ${record.priorContext ?? ''}`;
         // they never reach `messages` (the attempt threw), and the
         // backup must not repeat their side effects.
         const attemptCliActions: string[] = [];
+        // B-7 residual: characters of the CURRENT attempt actually
+        // streamed live to the client in the current segment. Only the
+        // live onToken path counts — tokens buffered under
+        // mayReviseFinal never reached the client, so a swap after a
+        // buffered attempt needs no retraction. A segment ends at a CLI
+        // tool-event boundary (clients close the in-flight bubble
+        // there), so onCliToolEvent resets the count. If the attempt
+        // dies and the turn swaps providers, the swap path emits one
+        // 'retract' event covering exactly this count.
+        let attemptStreamedChars = 0;
         const flushTokens = async (): Promise<void> => {
           const text = tokenBuffer?.join('') ?? '';
           tokenBuffer = null;
@@ -2947,6 +2991,9 @@ ${record.priorContext ?? ''}`;
               if (mayReviseFinal) {
                 (tokenBuffer ??= []).push(t);
               } else {
+                // B-7 residual: track what the client actually saw so a
+                // mid-stream swap can retract exactly this segment.
+                attemptStreamedChars += t.length;
                 void emit({ type: 'token', content: t });
               }
             },
@@ -2978,6 +3025,11 @@ ${record.priorContext ?? ''}`;
             sessionKey: sessionId,
             approvalMode,
             onCliToolEvent: (e) => {
+              // B-7 residual: a CLI tool event is a segment boundary —
+              // clients close the in-flight assistant bubble when it
+              // arrives, so tokens streamed before it are no longer
+              // part of the retractable in-flight segment.
+              attemptStreamedChars = 0;
               if (e.kind === 'tool_call') {
                 attemptCliActions.push(
                   `${e.call.name} ${JSON.stringify(e.call.args ?? {}).slice(0, 200)}`,
@@ -3195,6 +3247,25 @@ ${record.priorContext ?? ''}`;
               message: noticeMsg,
             });
             await emit({ type: 'notice', kind: 'failover', message: noticeMsg });
+          }
+          // B-7 residual: the dying attempt may have already streamed
+          // tokens live — they are on the client's screen and the
+          // backup is about to stream its full replayed answer. Retract
+          // exactly the streamed segment now (after the failover/notice
+          // pair, before the backup's first replayed token) so the
+          // client replaces the fragment instead of showing fragment +
+          // full answer. A buffered attempt (mayReviseFinal) streamed
+          // nothing, so it emits no retraction.
+          if (attemptStreamedChars > 0) {
+            await emit({
+              type: 'retract',
+              scope: 'turn-segment',
+              reason: 'provider-swap',
+              retractedChars: attemptStreamedChars,
+              fromProvider,
+              toProvider: target.providerId,
+            });
+            attemptStreamedChars = 0;
           }
           tokenBuffer = null; // drop any partial tokens from the failed attempt
           // A1 transcript replay: the backup receives the FULL

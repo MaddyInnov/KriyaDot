@@ -26,6 +26,12 @@
 // workflow TriggerStore and thread schedules).
 
 import { randomBytes, randomUUID } from 'node:crypto';
+import {
+  hashLegacySecret,
+  isHashedLegacySecret,
+  migrateLegacyWebhookSecrets,
+  verifyPresentedSecret,
+} from './legacy-webhook-secrets.js';
 import type { DatabaseSync } from 'node:sqlite';
 import express, { type Request, type Response, type Router } from 'express';
 import type { BotConfig } from '@mvp/agent-runtime';
@@ -95,7 +101,13 @@ export interface BotRoutine {
 export interface RoutineWebhookTrigger {
   id: string;
   routineId: string;
-  /** Hex secret, returned once at creation; compared timing-safe on ingress. */
+  /**
+   * On objects returned by create()/rotate(): the PLAINTEXT secret,
+   * shown exactly once. On objects returned by get()/listByRoutine():
+   * the stored form, which since the A-1 hash-at-rest migration is
+   * `sha256:<hex>` — never a usable secret. Ingress verification goes
+   * through verifyPresentedSecret against this stored form.
+   */
   secret: string;
   enabled: boolean;
   createdAt: number;
@@ -238,6 +250,11 @@ function openDb(dataDir: string): DatabaseSync {
   if (!cols.some((c) => c.name === 'anchor')) db.exec('ALTER TABLE bot_routines ADD COLUMN anchor TEXT');
   if (!cols.some((c) => c.name === 'anchor_warning')) db.exec('ALTER TABLE bot_routines ADD COLUMN anchor_warning INTEGER');
   if (!cols.some((c) => c.name === 'reporting')) db.exec('ALTER TABLE bot_routines ADD COLUMN reporting TEXT');
+  // A-1 hash-at-rest migration: any legacy plaintext webhook secret
+  // (routine triggers + per-routine hook secret) still in this DB is
+  // replaced by its SHA-256 hash in place. Idempotent — see
+  // legacy-webhook-secrets.ts.
+  migrateLegacyWebhookSecrets(db);
   return db;
 }
 
@@ -247,9 +264,23 @@ function validSessionId(v: string): boolean {
 
 export class RoutineStore {
   private readonly db: DatabaseSync;
+  /**
+   * Post-deletion hook, fired by remove() ONLY when a row was actually
+   * deleted. registerRoutineRoutes wires the B5 inbound-trigger
+   * cascade here (when the host injects the inbound store) so EVERY
+   * deletion path through this store instance — the CRUD route, the
+   * in-chat cancel_schedule / delete_trigger tools, any future caller —
+   * cascades, not just the HTTP route. Hook failures are logged and
+   * never fail the deletion.
+   */
+  private onRemoved?: (routineId: string) => void;
 
   constructor(dataDir: string) {
     this.db = openDb(dataDir);
+  }
+
+  setOnRemovedHook(hook: (routineId: string) => void): void {
+    this.onRemoved = hook;
   }
 
   create(input: {
@@ -309,7 +340,7 @@ export class RoutineStore {
         schedule ? JSON.stringify(schedule) : null,
         routine.goalMode === true ? 1 : null,
         routine.createdAt,
-        randomBytes(32).toString('hex'),
+        hashLegacySecret(randomBytes(32).toString('hex')),
         routine.timeoutMs ?? null,
         routine.autoRetry === undefined ? null : routine.autoRetry ? 1 : 0,
         routine.usePreviousRunSummary === undefined ? null : routine.usePreviousRunSummary ? 1 : 0,
@@ -363,7 +394,7 @@ export class RoutineStore {
         def.goalMode === true ? 1 : null,
         def.enabled !== false ? 1 : 0,
         typeof def.createdAt === 'number' ? def.createdAt : Date.now(),
-        randomBytes(32).toString('hex'),
+        hashLegacySecret(randomBytes(32).toString('hex')),
         def.timeoutMs ?? null,
         def.autoRetry === undefined ? null : def.autoRetry ? 1 : 0,
         def.usePreviousRunSummary === undefined ? null : def.usePreviousRunSummary ? 1 : 0,
@@ -463,15 +494,26 @@ export class RoutineStore {
   remove(id: string): boolean {
     this.db.prepare('DELETE FROM routine_webhook_triggers WHERE routine_id = ?').run(id);
     const r = this.db.prepare('DELETE FROM bot_routines WHERE id = ?').run(id);
+    if (r.changes > 0 && this.onRemoved) {
+      try {
+        this.onRemoved(id);
+      } catch (err) {
+        console.error('[routines] on-removed hook failed:', err instanceof Error ? err.message : err);
+      }
+    }
     return r.changes > 0;
   }
 
   /**
-   * Per-routine public webhook secret (32 random bytes, hex). Generated at
-   * creation for new routines; backfilled lazily for older ones via
-   * ensureWebhookSecret(). Never exposed in list/get — use the dedicated
-   * reveal/regenerate endpoints.
+   * Per-routine public webhook secret (32 random bytes, hex at mint).
+   * A-1: only its SHA-256 hash (`sha256:<hex>`) is stored — the
+   * plaintext exists exactly once, in the return value of
+   * regenerateWebhookSecret() at rotation time. Generated (hashed) at
+   * creation for new routines; backfilled lazily for older ones.
+   * Never exposed in list/get.
    */
+
+  /** The STORED form of the hook secret (`sha256:<hex>` post-migration). */
   getWebhookSecret(id: string): string | undefined {
     const row = this.db.prepare('SELECT webhook_secret FROM bot_routines WHERE id = ?').get(id) as unknown as
       | { webhook_secret: string | null }
@@ -479,22 +521,54 @@ export class RoutineStore {
     return row?.webhook_secret ?? undefined;
   }
 
-  setWebhookSecret(id: string, secret: string): void {
-    this.db.prepare('UPDATE bot_routines SET webhook_secret = ? WHERE id = ?').run(secret, id);
+  /** Stored hash form, for verification paths (routine-hooks.ts). */
+  getWebhookSecretHash(id: string): string | undefined {
+    return this.getWebhookSecret(id);
   }
 
+  hasWebhookSecret(id: string): boolean {
+    return this.getWebhookSecret(id) !== undefined;
+  }
+
+  /** Store a PLAINTEXT secret (hashed at rest). Internal use. */
+  setWebhookSecret(id: string, secret: string): void {
+    const stored = isHashedLegacySecret(secret) ? secret : hashLegacySecret(secret);
+    this.db.prepare('UPDATE bot_routines SET webhook_secret = ? WHERE id = ?').run(stored, id);
+  }
+
+  /**
+   * Ensure a hook secret EXISTS and return its stored (hashed) form.
+   * When none exists yet, a fresh secret is minted and hashed — its
+   * plaintext is discarded by design: the owner obtains a usable
+   * secret only via regenerateWebhookSecret() (rotation, shown once).
+   */
   ensureWebhookSecret(id: string): string {
     const existing = this.getWebhookSecret(id);
     if (existing) return existing;
-    const secret = randomBytes(32).toString('hex');
-    this.setWebhookSecret(id, secret);
-    return secret;
+    const stored = hashLegacySecret(randomBytes(32).toString('hex'));
+    this.db.prepare('UPDATE bot_routines SET webhook_secret = ? WHERE id = ?').run(stored, id);
+    return stored;
   }
 
+  /** Timing-safe check of a presented hook secret against the stored hash. */
+  verifyWebhookSecret(id: string, presented: string | undefined): boolean {
+    return verifyPresentedSecret(presented, this.getWebhookSecret(id));
+  }
+
+  /**
+   * Rotation: mint a fresh secret, store only its hash, and return the
+   * PLAINTEXT once — this return value is the only place the usable
+   * secret ever appears. The old secret stops working immediately.
+   */
   regenerateWebhookSecret(id: string): string {
     const secret = randomBytes(32).toString('hex');
     this.setWebhookSecret(id, secret);
     return secret;
+  }
+
+  /** Alias with the B5 vocabulary. */
+  rotateWebhookSecret(id: string): string {
+    return this.regenerateWebhookSecret(id);
   }
 
   // --- Scheduling -----------------------------------------------------------
@@ -533,19 +607,47 @@ export class RoutineWebhookTriggerStore {
     this.db = openDb(dataDir);
   }
 
-  /** Create a trigger; the secret is returned once — store it on the sender side. */
+  /**
+   * Create a trigger. A-1: only the SHA-256 hash of the secret is
+   * stored; the returned object's `secret` is the PLAINTEXT, shown
+   * exactly once — store it on the sender side.
+   */
   create(routineId: string): RoutineWebhookTrigger {
+    const plaintext = randomBytes(32).toString('hex');
     const trigger: RoutineWebhookTrigger = {
       id: randomUUID(),
       routineId,
-      secret: randomBytes(32).toString('hex'),
+      secret: plaintext,
       enabled: true,
       createdAt: Date.now(),
     };
     this.db
       .prepare('INSERT INTO routine_webhook_triggers (id, routine_id, secret, enabled, created_at) VALUES (?, ?, ?, 1, ?)')
-      .run(trigger.id, trigger.routineId, trigger.secret, trigger.createdAt);
+      .run(trigger.id, trigger.routineId, hashLegacySecret(plaintext), trigger.createdAt);
     return trigger;
+  }
+
+  /**
+   * Rotation: replace the stored hash with a fresh secret's hash. The
+   * old secret stops working the moment this returns; the new
+   * PLAINTEXT is returned once, on the returned trigger object.
+   */
+  rotate(id: string): RoutineWebhookTrigger | undefined {
+    const cur = this.get(id);
+    if (!cur) return undefined;
+    const plaintext = randomBytes(32).toString('hex');
+    this.db
+      .prepare('UPDATE routine_webhook_triggers SET secret = ? WHERE id = ?')
+      .run(hashLegacySecret(plaintext), id);
+    const next = this.get(id);
+    return next ? { ...next, secret: plaintext } : undefined;
+  }
+
+  /** Timing-safe check of a presented secret against the stored hash. */
+  verifySecret(id: string, presented: string | undefined): boolean {
+    const trigger = this.get(id);
+    if (!trigger) return false;
+    return verifyPresentedSecret(presented, trigger.secret);
   }
 
   get(id: string): RoutineWebhookTrigger | undefined {
@@ -584,6 +686,23 @@ export interface RoutineRouteDeps {
   resumeStore?: LimitResetResumeStore;
   /** Event-trigger state store (W2). When set, event status is exposed and routine deletion cascades to cursors. */
   eventStore?: EventTriggerStore;
+  /**
+   * B5 hardened inbound-webhook store (routine-webhook-inbound.ts).
+   * Injected by the host (same deps-injection idiom as runStore /
+   * resumeStore / eventStore above — a type-only import, so no runtime
+   * import cycle with that module, which itself imports RoutineStore
+   * from here). When set, deleting a routine cascades to its B5
+   * triggers via deleteByRoutine instead of leaving orphaned token
+   * hashes behind.
+   */
+  inboundStore?: import('./routine-webhook-inbound.js').RoutineInboundWebhookStore;
+  /**
+   * Governance audit sink (governance.audit in index.ts). When set,
+   * the B5 cascade on routine deletion emits
+   * `routine.inbound_webhooks_deleted` with the routine id and the
+   * number of triggers deleted.
+   */
+  audit?: (action: string, fields: { actor?: string; detail?: unknown }) => void;
   /**
    * Event-schedule account checker (W2): returns an error message when
    * the schedule's connected account is not usable, null when it is.
@@ -652,6 +771,30 @@ export function registerRoutineRoutes(
 ): { routineStore: RoutineStore; triggerStore: RoutineWebhookTriggerStore } {
   const routineStore = new RoutineStore(deps.dataDir);
   const triggerStore = new RoutineWebhookTriggerStore(deps.dataDir);
+
+  // B5 cascade (all deletion paths): when the host injected the
+  // hardened inbound-webhook store, ANY successful removal through
+  // this store instance — this router's DELETE route, the in-chat
+  // cancel_schedule / delete_trigger tools (which call store.remove
+  // on this same instance in index.ts), or a future caller — also
+  // deletes the routine's B5 triggers (token hashes + delivery rows)
+  // and records the cascade in the governance audit log. Orphaned
+  // triggers were inert (ingress re-resolves the routine per call)
+  // but lingered with token hashes + journal references.
+  if (deps.inboundStore) {
+    const inboundStore = deps.inboundStore;
+    routineStore.setOnRemovedHook((routineId) => {
+      const triggerCount = inboundStore.deleteByRoutine(routineId);
+      try {
+        deps.audit?.('routine.inbound_webhooks_deleted', {
+          actor: 'routines',
+          detail: { routineId, triggerCount },
+        });
+      } catch {
+        // Auditing must never break the deletion path.
+      }
+    });
+  }
 
   /**
    * Event-schedule gate (W2): when the effective schedule is an `event`
@@ -868,7 +1011,10 @@ export function registerRoutineRoutes(
       res.status(404).json(errorBody(`Unknown routine "${id}"`));
       return;
     }
-    // Cascade: the routine's run history goes with it.
+    // Cascade: the routine's run history goes with it. Its B5 inbound
+    // webhook triggers cascade inside routineStore.remove() itself
+    // (the on-removed hook wired in registerRoutineRoutes), so the
+    // in-chat tool deletion paths cascade identically.
     try {
       deps.runStore?.deleteByRoutine(id);
       deps.resumeStore?.deleteByRoutine(id);
@@ -1070,8 +1216,28 @@ export function registerRoutineRoutes(
   router.post('/:id/triggers', (req: Request, res: Response) => {
     const routine = requireRoutine(res, req.params.id);
     if (!routine) return;
+    // The trigger's `secret` here is the plaintext, shown once (A-1:
+    // only its hash is stored).
     const trigger = triggerStore.create(routine.id);
     res.status(201).json({ ok: true, trigger });
+  });
+
+  router.post('/:id/triggers/:triggerId/rotate', (req: Request, res: Response) => {
+    const routine = requireRoutine(res, req.params.id);
+    if (!routine) return;
+    const triggerId = req.params.triggerId;
+    if (!validId(triggerId)) {
+      res.status(400).json(errorBody('Invalid trigger id'));
+      return;
+    }
+    const existing = triggerStore.get(triggerId);
+    if (!existing || existing.routineId !== routine.id) {
+      res.status(404).json(errorBody(`Unknown trigger "${triggerId}" for this routine`));
+      return;
+    }
+    // Rotation returns the new plaintext once; the old secret is dead.
+    const rotated = triggerStore.rotate(triggerId);
+    res.json({ ok: true, trigger: rotated });
   });
 
   router.get('/:id/triggers', (req: Request, res: Response) => {
@@ -1101,10 +1267,21 @@ export function registerRoutineRoutes(
   // Every routine has a public URL + secret: POST /api/hooks/:id/:secret.
   // The secret itself is never returned by GET — use reveal/regenerate.
 
-  const hookInfo = (routine: BotRoutine, opts?: { includeSecret: boolean }) => {
+  // A-1: the hook secret is stored SHA-256-hashed, so after creation /
+  // rotation its plaintext is UNRECOVERABLE — hookInfo can only embed a
+  // real secret in the URLs when one is handed to it at mint time
+  // (opts.secretOnce, from the regenerate route). Otherwise the URLs
+  // carry the `<secret>` placeholder, the canonical header/Bearer auth
+  // forms are documented alongside, and the info says plainly that the
+  // secret is not recoverable and rotation is the way to get a new one.
+  // The path-secret URL form remains only as backwards compatibility
+  // (see the SECURITY NOTE in routine-hooks.ts).
+  const hookInfo = (routine: BotRoutine, opts?: { secretOnce?: string }) => {
     const base = deps.getBaseUrls();
-    const secret = routineStore.ensureWebhookSecret(routine.id);
-    const path = `/api/hooks/${routine.id}/${secret}`;
+    routineStore.ensureWebhookSecret(routine.id);
+    const shown = opts?.secretOnce;
+    const pathSecret = shown ?? '<secret>';
+    const path = `/api/hooks/${routine.id}/${pathSecret}`;
     const publicUrl = base.publicBaseUrl ? `${base.publicBaseUrl}${path}` : null;
     const local = `http://127.0.0.1:${base.localPort}${path}`;
     const deliveries = deps.hookStore.listByRoutine(routine.id, 1);
@@ -1113,18 +1290,26 @@ export function registerRoutineRoutes(
       url: publicUrl,
       localUrl: local,
       hasSecret: true,
+      secretRecoverable: shown !== undefined,
+      ...(shown !== undefined
+        ? { secret: shown }
+        : {
+            secretNote:
+              'Secret is stored hashed and is not recoverable — rotate (regenerate) to get a new secret, shown once.',
+          }),
+      // Canonical auth: header forms are preferred; the URL-path form
+      // above is legacy compatibility only (secrets in URLs leak into
+      // logs/history — see routine-hooks.ts SECURITY NOTE).
+      canonicalAuth: {
+        bearer: 'Authorization: Bearer <secret>',
+        signature:
+          'X-Signature-256: sha256=<hex HMAC-SHA256 of the raw body, key = sha256hex(secret)>',
+        pathForm: 'legacy compatibility only — POST /api/hooks/<routineId>/<secret>',
+      },
       // "connected" only after a real delivery arrived (Codync contract).
       connected: deliveries.some((d) => d.status === 'done'),
       queueDepth: deps.hookStore.countPending(),
     };
-    if (opts?.includeSecret) {
-      info.secret = secret;
-    } else {
-      // Never leak the secret in the info endpoint — redact it from the
-      // URLs; use /hook/reveal for an explicit one-time display.
-      if (typeof info.url === 'string') info.url = (info.url as string).replace(secret, '<secret>');
-      info.localUrl = (info.localUrl as string).replace(secret, '<secret>');
-    }
     return info;
   };
 
@@ -1137,14 +1322,21 @@ export function registerRoutineRoutes(
   router.post('/:id/hook/reveal', (req: Request, res: Response) => {
     const routine = requireRoutine(res, req.params.id);
     if (!routine) return;
-    res.json({ ok: true, hook: hookInfo(routine, { includeSecret: true }) });
+    // A-1: there is nothing to reveal — only the hash is stored. Say so
+    // honestly (410 Gone) instead of fabricating a URL/secret.
+    res.status(410).json({
+      ok: false,
+      error: 'webhook secret is not recoverable — it is stored hashed. Rotate to get a new secret.',
+      hook: hookInfo(routine),
+    });
   });
 
   router.post('/:id/hook/regenerate', (req: Request, res: Response) => {
     const routine = requireRoutine(res, req.params.id);
     if (!routine) return;
-    routineStore.regenerateWebhookSecret(routine.id);
-    res.json({ ok: true, hook: hookInfo(routine, { includeSecret: true }) });
+    // Rotation: the fresh plaintext is shown exactly once, here.
+    const secret = routineStore.regenerateWebhookSecret(routine.id);
+    res.json({ ok: true, hook: hookInfo(routine, { secretOnce: secret }) });
   });
 
   router.get('/:id/deliveries', (req: Request, res: Response) => {

@@ -473,6 +473,17 @@ export interface RouteDeps {
    * settings → provider). Unset → the zero-cost mock TTS is used.
    */
   chatTtsProvider?: (bot: BotConfig) => TTSProvider | undefined;
+  /**
+   * A-5/A-6 follow-up: THE single FederationService for this process,
+   * constructed once by the host (index.ts) over
+   * <dataDir>/federation.json and shared with the federation router
+   * (createFederationRouter's `service` dep). The fleet wiring below
+   * uses this instance so both surfaces share one identity AND one
+   * in-memory replay guard. Optional only so standalone route tests
+   * that never boot the host can omit it — the fleet block then falls
+   * back to constructing its own instance over the same store file.
+   */
+  federationService?: FederationService;
 }
 
 const TERMINAL_RUN_STATUSES: ReadonlySet<WorkflowRun['status']> = new Set(['succeeded', 'failed']);
@@ -2070,6 +2081,17 @@ export function createRouter(deps: RouteDeps): express.Router {
         // W8h: feed the streaming-TTS sentence pipeline (never blocks).
         ttsPipeline?.push(event.content);
       }
+      else if (event.type === 'retract') {
+        // B-7 residual: a mid-stream provider swap retracted the dying
+        // provider's partial segment. The SSE frame itself is forwarded
+        // verbatim below (serializeEvent has no allowlist); here the
+        // accumulated turn text must drop the same segment, so the
+        // tiered-memory ingest and the done-push carry only the
+        // backup's answer — never fragment + full answer. Clamped to
+        // what this turn actually accumulated.
+        const n = Math.min(Math.max(0, event.retractedChars), turnAssistantText.length);
+        if (n > 0) turnAssistantText = turnAssistantText.slice(0, turnAssistantText.length - n);
+      }
       else if (event.type === 'tool_call') turnToolCalls.push(event.call.name);
       // Encrypted push (Codync parity): "needs you" on approval requests,
       // "done"/"failed" on terminal turn outcomes. Best-effort, never blocks.
@@ -3663,6 +3685,12 @@ export function createRouter(deps: RouteDeps): express.Router {
           },
           onEvent: async (event) => {
             if (event.type === 'token') reply += event.content;
+            // B-7 residual: drop a swapped-out provider's partial
+            // segment from the reply that goes back to the channel.
+            else if (event.type === 'retract') {
+              const n = Math.min(Math.max(0, event.retractedChars), reply.length);
+              if (n > 0) reply = reply.slice(0, reply.length - n);
+            }
           },
         });
       } catch (err) {
@@ -3756,19 +3784,24 @@ export function createRouter(deps: RouteDeps): express.Router {
     // so dispatched/transferred missions land on the same board, and the
     // transcript seam is the durable SessionStore. Inbound fleet routes
     // live under /federation/inbound/fleet/* — already loopback-exempt
-    // (signature-authenticated) via loopback-auth.ts. NOTE: this is a
-    // second FederationService over the same store file as index.ts's
-    // federation router. Since the D5 fix (sweep 2026-11-25) the
-    // service re-reads the store file whenever it changes on disk, so
-    // peer links/unlinks and policy changes made through either
-    // surface take effect on both without a restart; each instance
-    // still keeps its own replay guard (per-process safety net, and
-    // the inbound endpoint sets the two guards serve are disjoint).
-    const fleetFederation = new FederationService({
-      storePath: join(config.dataDir, 'federation.json'),
-      name: 'KriyaDot',
-      publicUrl: process.env.KRIYADOT_FEDERATION_URL,
-    });
+    // (signature-authenticated) via loopback-auth.ts. SINGLE INSTANCE:
+    // the host (index.ts) constructs ONE FederationService over
+    // <dataDir>/federation.json and passes it both here (deps.
+    // federationService) and to the federation router, so the two
+    // surfaces share the persisted identity AND the in-memory replay
+    // guard. The guard is keyed by sender instance id + nonce (see
+    // ReplayGuard in agent-runtime federation.ts), so one shared guard
+    // covers the union of both surfaces' endpoints — strictly stronger
+    // than the previous per-instance guards, never weaker. The local
+    // construction below is only a fallback for standalone route tests
+    // that boot createRouter without the host.
+    const fleetFederation =
+      deps.federationService ??
+      new FederationService({
+        storePath: join(config.dataDir, 'federation.json'),
+        name: 'KriyaDot',
+        publicUrl: process.env.KRIYADOT_FEDERATION_URL,
+      });
     const fleetRegistry = new FleetRegistry(config.dataDir);
     const fleetCoordinator = new FleetCoordinator({
       federation: fleetFederation,

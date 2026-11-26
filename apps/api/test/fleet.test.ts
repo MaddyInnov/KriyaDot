@@ -11,7 +11,13 @@
 // blocked mid-flight on A (review rejected, worktree preserved) moves
 // to B as a diff bundle, resumes AT REVIEW on B, lands there, carries
 // the transferred label + reconstructed SessionStore transcript, and
-// A's local copy is closed as transferred. Zero paid APIs.
+// A's local copy is closed as transferred. A second transfer describe
+// (A-11) proves BRANCH mode end-to-end over a shared BARE remote:
+// origin pushes its mission branch, the receiver clones the same
+// remote (branch present only as a remote-tracking ref), and the
+// transfer resumes at review ON that branch — plus the stale-clone
+// guard (receiver's ref behind the origin head → honest diff fallback,
+// never a silent resume from wrong code). Zero paid APIs.
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -408,6 +414,16 @@ describe('resume-by-transfer (proof leg c)', () => {
         botId === 'code-reviewer' ? { provider: 'anthropic', model: 'model-b' } : { provider: 'groq', model: 'model-a' },
     });
     const repoA = makeRepo(root, 'repo-a');
+    // B's clone of the repo (its own path, wired as transferRepoPath)
+    // is taken BEFORE A's mission runs, so the clone never receives
+    // the mission branch in any form — diff is the honest mode for
+    // this leg. (A-11: a clone taken AFTER the branch exists carries
+    // it as a remote-tracking ref at the origin head, and the receiver
+    // then correctly selects branch mode — see the A-11 describe.)
+    const repoB = join(root, 'repo-b');
+    execFileSync('git', ['clone', repoA, repoB], { encoding: 'utf8' });
+    git(repoB, ['config', 'user.email', 'test@kriyadot.local']);
+    git(repoB, ['config', 'user.name', 'Fleet Test']);
     const t = A.taskStore.create({ title: 'Transfer me' });
     const m = rejectingService.createMission({ taskId: t.id, repoPath: repoA, testCommand: 'run-tests' });
     // Seed the durable worker transcript under the REAL mission session id.
@@ -416,12 +432,6 @@ describe('resume-by-transfer (proof leg c)', () => {
     const blocked = await rejectingService.runMission(m.id);
     expect(blocked.stage).toBe('blocked');
     expect(blocked.worktreePath && existsSync(blocked.worktreePath)).toBe(true);
-
-    // B's clone of the repo (its own path, wired as transferRepoPath).
-    const repoB = join(root, 'repo-b');
-    execFileSync('git', ['clone', repoA, repoB], { encoding: 'utf8' });
-    git(repoB, ['config', 'user.email', 'test@kriyadot.local']);
-    git(repoB, ['config', 'user.name', 'Fleet Test']);
 
     const r = await api(A, '/fleet/transfer', {
       method: 'POST',
@@ -458,7 +468,166 @@ describe('resume-by-transfer (proof leg c)', () => {
     expect(msgs[1]!.content).toContain('implemented on A');
     // B's own gate decided the landing.
     expect(B.gate.requests).toBe(1);
-  });
+  }, 120_000);
+});
+
+describe('resume-by-transfer — branch mode over a shared remote (A-11)', () => {
+  // A's harness reviewer approves, so a mission that must arrive
+  // BLOCKED mid-flight runs on a dedicated rejecting service over A's
+  // own stores (same pattern as proof leg c above).
+  function rejectingServiceForA(): MissionService {
+    const rejectingRunner: MissionBotRunner = async (req) => {
+      if (req.role === 'worker') {
+        writeFileSync(join(req.worktreePath, `feature-${req.taskId.slice(0, 8)}.txt`), `work by A for ${req.taskId}\n`);
+        return { text: 'implemented on A', provider: 'groq', model: 'model-a' };
+      }
+      return { text: 'REJECT: not ready', verdict: 'reject' as const, provider: 'anthropic', model: 'model-b' };
+    };
+    return new MissionService({
+      taskStore: A.taskStore,
+      missionStore: A.missionStore,
+      worktreeRoot: join(A.dir, 'worktrees'),
+      botRunner: rejectingRunner,
+      testRunner: async () => ({ exitCode: 0, output: 'green' }),
+      approvalGate: {
+        request: async () => 'approval-a-x',
+        awaitDecision: async () => 'approved' as const,
+      },
+      getBot: (botId) =>
+        botId === 'code-reviewer' ? { provider: 'anthropic', model: 'model-b' } : { provider: 'groq', model: 'model-a' },
+    });
+  }
+
+  /** Bare shared remote + A's clone of it, seeded on main. */
+  function sharedRemoteFixture(): { bare: string; repoA: string } {
+    const bare = join(root, 'remote.git');
+    execFileSync('git', ['init', '--bare', '-b', 'main', bare], { encoding: 'utf8' });
+    const repoA = join(root, 'repo-a-shared');
+    execFileSync('git', ['clone', bare, repoA], { encoding: 'utf8' });
+    git(repoA, ['config', 'user.email', 'test@kriyadot.local']);
+    git(repoA, ['config', 'user.name', 'Fleet Test']);
+    writeFileSync(join(repoA, 'README.md'), '# shared fixture\n');
+    git(repoA, ['add', '-A']);
+    git(repoA, ['commit', '-m', 'init']);
+    git(repoA, ['push', 'origin', 'main']);
+    return { bare, repoA };
+  }
+
+  async function blockedMissionOnA(repoPath: string, title: string) {
+    const svc = rejectingServiceForA();
+    const t = A.taskStore.create({ title });
+    const m = svc.createMission({ taskId: t.id, repoPath, testCommand: 'run-tests' });
+    A.sessions.appendMessage(`mission:${m.id}:worker`, { role: 'user', content: 'implement the thing' });
+    A.sessions.appendMessage(`mission:${m.id}:worker`, { role: 'assistant', content: 'implemented on A' });
+    const blocked = await svc.runMission(m.id);
+    expect(blocked.stage).toBe('blocked');
+    expect(blocked.worktreePath && existsSync(blocked.worktreePath)).toBe(true);
+    return { t, m, blocked };
+  }
+
+  function cloneForB(bare: string): string {
+    const repoB = join(root, 'repo-b'); // B's wired transferRepoPath
+    execFileSync('git', ['clone', bare, repoB], { encoding: 'utf8' });
+    git(repoB, ['config', 'user.email', 'test@kriyadot.local']);
+    git(repoB, ['config', 'user.name', 'Fleet Test']);
+    return repoB;
+  }
+
+  it('branch mode: receiver resumes at review ON the pushed branch from the shared remote', async () => {
+    const { bare, repoA } = sharedRemoteFixture();
+    const { t, m, blocked } = await blockedMissionOnA(repoA, 'Branch transfer me');
+    const branch = blocked.branch;
+    const originHead = git(repoA, ['rev-parse', branch]).trim();
+    // Origin machine publishes its mission branch to the shared remote.
+    git(repoA, ['push', 'origin', branch]);
+
+    // Receiving machine clones the SAME remote: the mission branch is
+    // present ONLY as a remote-tracking ref — no local branch exists.
+    const repoB = cloneForB(bare);
+    expect(git(repoB, ['branch', '--list', branch]).trim()).toBe('');
+    expect(git(repoB, ['rev-parse', `refs/remotes/origin/${branch}`]).trim()).toBe(originHead);
+
+    const r = await api(A, '/fleet/transfer', {
+      method: 'POST',
+      body: JSON.stringify({ missionId: m.id, targetInstanceId: B.federation.identity().instanceId }),
+    });
+    expect(r.status).toBe(200);
+
+    const remote = B.missionStore.list().find((x) => x.transferredFromInstanceId === A.federation.identity().instanceId)!;
+    expect(remote).toBeTruthy();
+    // (1) Resumed in BRANCH mode — not silently degraded to diff/transcript.
+    expect(remote.transferMode).toBe('branch');
+    // (2) Resumed AT REVIEW: worker step skipped, B's reviewer re-reviewed.
+    expect(remote.resumeFromStage).toBe('review');
+    expect(remote.review?.verdict).toBe('approve');
+    expect(remote.stageAtTransfer).toBe('blocked');
+    expect(remote.stage).toBe('landed');
+    // (3) The checked-out branch on B is exactly the origin branch head,
+    // and that very commit is what landed on B's main (history preserved).
+    expect(git(repoB, ['rev-parse', branch]).trim()).toBe(originHead);
+    expect(() => git(repoB, ['merge-base', '--is-ancestor', originHead, 'main'])).not.toThrow();
+    expect(git(repoB, ['log', '--format=%s', 'main'])).toContain('mission: Branch transfer me');
+    // No squashed "transferred work" commit — that is the diff-mode marker.
+    expect(git(repoB, ['log', '--format=%s', '--all'])).not.toContain('transferred work from A');
+    // The worker did NOT re-run on B: no file named for B's task, while
+    // the ORIGIN task's file landed verbatim via the branch.
+    expect(existsSync(join(repoB, `feature-${remote.taskId.slice(0, 8)}.txt`))).toBe(false);
+    expect(existsSync(join(repoB, `feature-${t.id.slice(0, 8)}.txt`))).toBe(true);
+    // (4) Labelled as transferred, transcript reconstructed (fenced), and
+    // B's own gate decided the landing.
+    expect(remote.transferredFromName).toBe('A');
+    expect(remote.transferredTranscriptCount).toBe(2);
+    const msgs = B.sessions.listThreadMessages(`mission:${remote.id}:worker`);
+    expect(msgs).toHaveLength(2);
+    expect(msgs[0]!.content).toContain('UNTRUSTED TRANSFERRED MESSAGE');
+    expect(B.gate.requests).toBe(1);
+    // A's local copy closed as transferred, recording the branch mode.
+    const localAfter = A.missionStore.get(m.id)!;
+    expect(localAfter.stage).toBe('blocked');
+    expect(localAfter.evidence).toMatch(/Transferred to B/);
+    expect(localAfter.evidence).toMatch(/mode: branch/);
+  }, 120_000);
+
+  it('stale clone guard: receiver branch behind the origin head falls back to diff, never resumes from wrong code', async () => {
+    const { bare, repoA } = sharedRemoteFixture();
+    const { blocked } = await blockedMissionOnA(repoA, 'Stale branch me');
+    const branch = blocked.branch;
+    git(repoA, ['push', 'origin', branch]);
+    const staleHead = git(repoA, ['rev-parse', branch]).trim();
+
+    // B clones now — its remote-tracking ref freezes at staleHead.
+    const repoB = cloneForB(bare);
+    expect(git(repoB, ['rev-parse', `refs/remotes/origin/${branch}`]).trim()).toBe(staleHead);
+
+    // Origin advances the branch AFTER B cloned (more committed work in
+    // the preserved worktree) and pushes again.
+    writeFileSync(join(blocked.worktreePath!, 'second.txt'), 'later work\n');
+    git(blocked.worktreePath!, ['add', '-A']);
+    git(blocked.worktreePath!, [
+      '-c', 'user.email=mission@kriyadot.local',
+      '-c', 'user.name=KriyaDot Mission',
+      'commit', '-m', 'second commit',
+    ]);
+    git(repoA, ['push', 'origin', branch]);
+    const freshHead = git(repoA, ['rev-parse', branch]).trim();
+    expect(freshHead).not.toBe(staleHead);
+    expect(git(repoB, ['rev-parse', `refs/remotes/origin/${branch}`]).trim()).toBe(staleHead);
+
+    const r = await api(A, '/fleet/transfer', {
+      method: 'POST',
+      body: JSON.stringify({ missionId: blocked.id, targetInstanceId: B.federation.identity().instanceId }),
+    });
+    expect(r.status).toBe(200);
+    const remote = B.missionStore.list().find((x) => x.transferredFromInstanceId === A.federation.identity().instanceId)!;
+    expect(remote).toBeTruthy();
+    // Honest degradation: diff mode (labelled), still resumed at review,
+    // and the LATEST work — including the post-clone commit — landed.
+    expect(remote.transferMode).toBe('diff');
+    expect(remote.resumeFromStage).toBe('review');
+    expect(remote.stage).toBe('landed');
+    expect(existsSync(join(repoB, 'second.txt'))).toBe(true);
+    expect(git(repoB, ['log', '--format=%s', 'main'])).toContain('transferred work from A');
+  }, 120_000);
 });
 
 describe('sweep 2026-11-25: fleet inbound hardening (D6, D7, D9)', () => {

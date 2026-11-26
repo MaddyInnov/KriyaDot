@@ -13,8 +13,15 @@ export {
   type RunEventCallback,
 } from './runner.js';
 export { WorkflowStore } from './store.js';
-export { Scheduler, TriggerStore } from './triggers.js';
-export type { Trigger, TriggerKind } from './triggers.js';
+export { Scheduler, TriggerStore, publicTrigger } from './triggers.js';
+export type { Trigger, TriggerKind, TriggerPublic } from './triggers.js';
+export {
+  WORKFLOW_SECRET_HASH_PREFIX,
+  hashWorkflowSecret,
+  isHashedWorkflowSecret,
+  migrateWorkflowTriggerSecrets,
+  verifyPresentedWorkflowSecret,
+} from './webhook-secrets.js';
 export {
   evaluateCode,
   evaluateCondition,

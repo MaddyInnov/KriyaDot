@@ -115,6 +115,7 @@ import { getSyncStatus, type TaskPlacement } from '../lib/frontdoor';
 import { THEMES, applyThemeChoice, getStoredThemeChoice } from '../lib/theme';
 import { FinishedSteps, NowCards, StepLine } from '../components/chat/step-line';
 import { applyStepEvent, type StepLineState } from '../components/chat/step-state';
+import { applyRetraction } from '../components/chat/retract-state';
 import { GaplessAudioQueue } from '../components/chat/audio-queue';
 import { reportPlayback, useAssistantSpeaking } from '../lib/playback-signal';
 import { GoalStatusCard } from '../components/chat/goal-card';
@@ -1697,6 +1698,15 @@ function ChatPageInner() {
     }
     if (event.type === 'goal_started') {
       setBlocks((prev) => [...prev, { kind: 'goal', id: nextId(), goalId: event.goal.id, title: event.goal.title }]);
+      return;
+    }
+    if (event.type === 'retract') {
+      // Stream retraction (B-7 residual): a mid-stream provider swap —
+      // discard the dying provider's partial segment from the in-flight
+      // assistant block so the backup's answer replaces it. The
+      // failover notice block (already pushed) stays; completed
+      // messages are never touched (see components/chat/retract-state).
+      setBlocks((prev) => applyRetraction(prev, event.retractedChars));
       return;
     }
     if (event.type === 'step') {

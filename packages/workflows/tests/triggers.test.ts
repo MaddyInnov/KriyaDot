@@ -7,7 +7,8 @@ import { describe, expect, it, beforeEach } from 'vitest';
 import type { AgentRuntime, BotConfig, StreamEvent, TokenUsage, ToolDefinition } from '@mvp/agent-runtime';
 import type { EvalContext, EvaluateResult, GovernanceGateway } from '@mvp/governance';
 import { WorkflowRunner } from '../src/runner.js';
-import { Scheduler, TriggerStore, matchesCron, parseCron } from '../src/triggers.js';
+import { Scheduler, TriggerStore, matchesCron, parseCron, publicTrigger } from '../src/triggers.js';
+import { hashWorkflowSecret, isHashedWorkflowSecret } from '../src/webhook-secrets.js';
 import type { Trigger, WorkflowDefinition } from '../src/triggers.js';
 
 // ---------------------------------------------------------------------------
@@ -84,7 +85,9 @@ describe('TriggerStore', () => {
     expect(cron.id).toBeTruthy();
     expect(cron.enabled).toBe(true);
     expect(store.get(cron.id)).toMatchObject({ workflowId: 'w1', kind: 'cron', cron: '*/5 * * * *' });
-    expect(store.get(wh.id)?.secret).toBe('s3cr3t-s3cr3t-1234');
+    // A-12: create() returns the plaintext once; get() exposes only the hash.
+    expect(wh.secret).toBe('s3cr3t-s3cr3t-1234');
+    expect(store.get(wh.id)?.secret).toBe(hashWorkflowSecret('s3cr3t-s3cr3t-1234'));
     expect(store.list()).toHaveLength(2);
   });
 
@@ -113,6 +116,88 @@ describe('TriggerStore', () => {
     const reopened = new TriggerStore(join(dir, 'triggers.db'));
     expect(reopened.get(t.id)).toMatchObject({ workflowId: 'w9', cron: '0 6 * * *' });
     reopened.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A-12: webhook secret hash-at-rest (mirrors A-1 for routine triggers)
+// ---------------------------------------------------------------------------
+
+describe('TriggerStore webhook secret hash-at-rest (A-12)', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'triggers-hash-'));
+  });
+
+  function rawSecret(store: TriggerStore, id: string): string | null {
+    const db = (store as unknown as { db: { prepare(s: string): { get(...a: unknown[]): unknown } } }).db;
+    const row = db.prepare('SELECT secret FROM triggers WHERE id = ?').get(id) as { secret: string | null };
+    return row.secret;
+  }
+
+  it('creation stores hashed; the plaintext is returned once and still authenticates', () => {
+    const store = new TriggerStore(join(dir, 'triggers.db'));
+    const plain = 'workflow-secret-1234567890';
+    const t = store.create({ workflowId: 'w1', kind: 'webhook', secret: plain });
+    expect(t.secret).toBe(plain); // shown once, at creation
+    expect(rawSecret(store, t.id)).toBe(hashWorkflowSecret(plain));
+    expect(rawSecret(store, t.id)).not.toContain(plain);
+    expect(isHashedWorkflowSecret(store.get(t.id)?.secret)).toBe(true);
+    expect(store.verifySecret(t.id, plain)).toBe(true);
+    expect(store.verifySecret(t.id, 'wrong-secret-value!!')).toBe(false);
+    expect(store.verifySecret(t.id, undefined)).toBe(false);
+    store.close();
+  });
+
+  it('migrates a planted plaintext row at open, idempotently, and the original secret still authenticates', () => {
+    const plain = 'legacy-plaintext-secret-42';
+    const first = new TriggerStore(join(dir, 'triggers.db'));
+    // Plant a PRE-migration plaintext row exactly as a legacy DB held it.
+    const db = (first as unknown as { db: { prepare(s: string): { run(...a: unknown[]): unknown } } }).db;
+    db.prepare(
+      'INSERT INTO triggers (id, workflow_id, kind, cron, secret, enabled, created_at) VALUES (?, ?, ?, NULL, ?, 1, ?)',
+    ).run('t-legacy', 'w-legacy', 'webhook', plain, 1);
+    first.close();
+
+    // Reopen: the constructor migration runs.
+    const migrated = new TriggerStore(join(dir, 'triggers.db'));
+    expect(rawSecret(migrated, 't-legacy')).toBe(hashWorkflowSecret(plain));
+    expect(rawSecret(migrated, 't-legacy')).not.toContain(plain);
+    expect(migrated.verifySecret('t-legacy', plain)).toBe(true);
+    expect(migrated.verifySecret('t-legacy', 'nope-nope-nope-nope')).toBe(false);
+    migrated.close();
+
+    // Idempotent: another open changes nothing.
+    const again = new TriggerStore(join(dir, 'triggers.db'));
+    expect(rawSecret(again, 't-legacy')).toBe(hashWorkflowSecret(plain));
+    expect(again.verifySecret('t-legacy', plain)).toBe(true);
+    again.close();
+  });
+
+  it('listings redact the secret and its hash', () => {
+    const store = new TriggerStore(join(dir, 'triggers.db'));
+    const t = store.create({ workflowId: 'w1', kind: 'webhook', secret: 'listing-secret-123456' });
+    const pub = store.getPublic(t.id)!;
+    expect('secret' in pub).toBe(false);
+    expect(JSON.stringify(pub)).not.toContain('listing-secret-123456');
+    expect(JSON.stringify(pub)).not.toContain(hashWorkflowSecret('listing-secret-123456'));
+    expect(store.listPublic().every((x) => !('secret' in x))).toBe(true);
+    expect(publicTrigger(store.get(t.id)!)).not.toHaveProperty('secret');
+    store.close();
+  });
+
+  it('rotation returns a new plaintext once; the old secret dies immediately', () => {
+    const store = new TriggerStore(join(dir, 'triggers.db'));
+    const t = store.create({ workflowId: 'w1', kind: 'webhook', secret: 'rotate-me-secret-1234' });
+    const rotated = store.rotateSecret(t.id)!;
+    expect(rotated.secret).toBeTruthy();
+    expect(rotated.secret).not.toBe('rotate-me-secret-1234');
+    expect(rawSecret(store, t.id)).toBe(hashWorkflowSecret(rotated.secret!));
+    expect(store.verifySecret(t.id, 'rotate-me-secret-1234')).toBe(false);
+    expect(store.verifySecret(t.id, rotated.secret)).toBe(true);
+    expect(store.rotateSecret('does-not-exist')).toBeUndefined();
+    store.close();
   });
 });
 

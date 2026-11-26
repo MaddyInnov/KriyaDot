@@ -115,15 +115,17 @@ describe('bridge account registry routes', () => {
       expect(b.accounts[0]!.accountId).toBe('default');
       expect(b.accounts[0]!.machineDefault).toBe(true);
     }
-    // The original three (and pi) are isolatable; copilot / grok / kimi
-    // honestly report single-account (no verified config-dir knob).
-    // Hermes joined them in B-9 (sweep 2026-11-25): its HERMES_HOME
+    // The original three (and pi) are isolatable; grok / kimi joined
+    // them in the 2026-11-26 real-binary pass (GROK_HOME / KIMI_CODE_HOME
+    // verified against real binaries). copilot honestly reports
+    // single-account (no verified config-dir knob). Hermes joined the
+    // single-account set in B-9 (sweep 2026-11-25): its HERMES_HOME
     // knob is assumed, not confirmed, and an unconfirmed knob fails
     // open — so it no longer reports isolatable.
-    for (const b of bridges.filter((x) => ['claude', 'codex', 'opencode', 'pi'].includes(x.bridgeId))) {
+    for (const b of bridges.filter((x) => ['claude', 'codex', 'opencode', 'pi', 'grok', 'kimi'].includes(x.bridgeId))) {
       expect(b.isolatable).toBe(true);
     }
-    for (const b of bridges.filter((x) => ['copilot', 'grok', 'kimi', 'hermes'].includes(x.bridgeId))) {
+    for (const b of bridges.filter((x) => ['copilot', 'hermes'].includes(x.bridgeId))) {
       expect(b.isolatable).toBe(false);
     }
     expect(bridges.find((b) => b.bridgeId === 'opencode')!.isolationNote).toMatch(/NOT the login/);

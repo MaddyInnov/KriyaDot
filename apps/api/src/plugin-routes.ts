@@ -18,9 +18,28 @@
 //     approveInstall: async (manifest) => { /* host governance wiring */ },
 //   });
 //   pluginManager.loadAll();
-//   app.use('/api', createPluginRouter({ manager: pluginManager, audit: (a, f) => governance.audit(a, f) }));
-//   void registerPluginChannels(pluginManager); // bridges channel plugins into messaging.ts
-//   registerPluginHooks(pluginManager, hookBus); // when a HookBus is in scope
+//   const pluginLiveSync = createPluginLiveSync({ manager: pluginManager, hookBus });
+//   pluginLiveSync.sync(); // boot-time hook/channel registrations, tracked for live removal
+//   app.use('/api', createPluginRouter({ manager: pluginManager, liveSync: pluginLiveSync, audit: (a, f) => governance.audit(a, f) }));
+//
+// LIVE HOOK/CHANNEL REGISTRATION (A9 residual 3): hook-bus and channel
+// registrations are NOT boot-only anymore. createPluginLiveSync (below)
+// owns every hook/channel registration a plugin makes and diffs them
+// against the manager's CURRENT targets on every sync(): a hot-installed
+// plugin's hooks fire and its channel provider is listed immediately, a
+// hot-uninstalled/disabled plugin's registrations are removed in the
+// same mutation, and install→uninstall→install cycles never double up.
+// The router re-syncs after every mutation when the host hands it a
+// shared handle (`liveSync`) or a `hookBus` to own one for. The trust
+// gate is exactly the boot gate: the desired sets come from
+// manager.hookTargets() / manager.channelProviders(), which only return
+// enabled plugins that are NOT in the manager's broken set — the set
+// loadAll() populates when the C-1 install-baseline digest check fails
+// (sweep 2026-11-25). A drifted plugin therefore registers nothing, and
+// a plugin marked broken after registration is also inert at call time
+// because every hook handler delegates to manager.invokeHook(), whose
+// enabledTarget check throws for broken/disabled plugins (the HookBus
+// collects that error; the hook has no effect).
 //
 // TOOL REGISTRY MERGE (tool-registry.ts — one line inside buildToolRegistry,
 // after the registry Map is created, with pluginManager in scope):
@@ -48,7 +67,7 @@ import {
 } from '@mvp/plugins';
 import { syncPluginProviders } from './plugin-providers.js';
 import type { HookBus, HookEventName, ToolDefinition } from '@mvp/agent-runtime';
-import { registerMessageProvider } from './messaging.js';
+import { registerMessageProvider, unregisterMessageProvider } from './messaging.js';
 import * as hooksConfig from './hooks-config.js';
 
 interface ApiError {
@@ -64,6 +83,21 @@ export interface PluginRouterDeps {
   manager: PluginManager;
   /** A9: the user's publisher trust store, when the host configured one (enables the /plugins/trust routes). */
   trustStore?: PluginTrustStore;
+  /**
+   * A9 residual 3: the shared live hook/channel sync handle (created by
+   * the host at boot via createPluginLiveSync, so boot registrations and
+   * hot registrations are owned by ONE tracker and hot removals can undo
+   * boot registrations). When given, the router re-syncs it after every
+   * mutation. Takes precedence over `hookBus`.
+   */
+  liveSync?: PluginLiveSyncHandle;
+  /**
+   * A9 residual 3: a HookBus for the router to own a live-sync handle
+   * over (used when the host has no boot handle to share, e.g. tests).
+   * The handle syncs once at router creation (plugins already installed
+   * register immediately) and after every mutation.
+   */
+  hookBus?: HookBus;
   /**
    * A9: called after any install/uninstall/enable/disable mutation so the
    * host can re-sync mirrored state (the API's chat tool registry — the
@@ -160,11 +194,30 @@ export function createPluginRouter(deps: PluginRouterDeps): Router {
   // host (tool registry mirror). Both are best-effort mirrors — the
   // manager itself is already live, so a mirror failure must not fail
   // the mutation that already succeeded.
+  // A9 residual 3: live hook/channel registrations. The host's shared
+  // handle wins; otherwise own one over the given HookBus (if any).
+  const liveSync: PluginLiveSyncHandle | undefined =
+    deps.liveSync ?? (deps.hookBus ? createPluginLiveSync({ manager, hookBus: deps.hookBus }) : undefined);
+  if (liveSync && !deps.liveSync) {
+    // Router-owned handle: register whatever is already installed now
+    // (the shared-handle path syncs at boot in the host instead).
+    try {
+      liveSync.sync();
+    } catch (err) {
+      console.warn(`[plugins] live hook/channel sync failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   const afterMutation = async (): Promise<void> => {
     try {
       syncPluginProviders(manager);
     } catch (err) {
       console.warn(`[plugins] provider sync failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    try {
+      liveSync?.sync();
+    } catch (err) {
+      console.warn(`[plugins] live hook/channel sync failed: ${err instanceof Error ? err.message : String(err)}`);
     }
     try {
       await deps.onPluginsChanged?.();
@@ -396,10 +449,146 @@ const HOOK_EVENTS: readonly HookEventName[] = [
   'input.transform',
 ];
 
+// ---------------------------------------------------------------------------
+// Live hook/channel sync (A9 residual 3)
+// ---------------------------------------------------------------------------
+
+export interface PluginLiveSyncResult {
+  /** Plugin ids whose hook handlers were registered by this sync. */
+  hooksAdded: string[];
+  /** Plugin ids whose hook handlers were deregistered by this sync. */
+  hooksRemoved: string[];
+  /** Messaging provider ids registered (or refreshed) by this sync. */
+  channelsAdded: string[];
+  /** Messaging provider ids deregistered by this sync. */
+  channelsRemoved: string[];
+}
+
+/**
+ * Owns every live hook-bus + channel-provider registration made on
+ * behalf of plugins, so they can be diffed, refreshed and removed as
+ * plugins come and go — no restart, no leaked handlers, no doubles.
+ */
+export interface PluginLiveSyncHandle {
+  /**
+   * Diff the manager's current hook/channel targets against the
+   * registrations this handle owns and apply the difference. Idempotent:
+   * syncing twice in a row changes nothing the second time.
+   */
+  sync(): PluginLiveSyncResult;
+  /** Remove every registration this handle owns (host shutdown / tests). */
+  dispose(): void;
+  /** Plugin ids with live hook registrations right now. */
+  hookPluginIds(): string[];
+  /** Messaging provider ids this handle has registered right now. */
+  channelProviderIds(): string[];
+}
+
+/**
+ * Create the live-sync handle. Registration goes through EXACTLY the
+ * boot-time gates: the desired sets are manager.hookTargets() and
+ * manager.channelProviders(), which only surface enabled plugins that
+ * passed the manager's integrity state (the C-1 baseline broken set from
+ * loadAll) — there is no weaker hot path. Executable plugins still run
+ * only through the manager's RPC path (invokeHook / channel provider),
+ * so the OPEN-2 sandbox and the declared-permission model apply to a
+ * hot-registered handler identically to a boot-registered one.
+ */
+export function createPluginLiveSync(deps: { manager: PluginManager; hookBus?: HookBus }): PluginLiveSyncHandle {
+  const { manager } = deps;
+  const bus = deps.hookBus;
+  /** pluginId → HookBus unsubscribe functions (one per event). */
+  const hookUnsubs = new Map<string, Array<() => void>>();
+  /** pluginId → messaging provider id (`plugin-<pluginId>`). */
+  const channelIds = new Map<string, string>();
+
+  function syncHooks(result: PluginLiveSyncResult): void {
+    if (!bus) return;
+    const desired = new Set(manager.hookTargets().map((p) => p.id));
+    for (const [pluginId, unsubs] of [...hookUnsubs]) {
+      if (desired.has(pluginId)) continue;
+      for (const unsub of unsubs) {
+        try {
+          unsub();
+        } catch {
+          // an unsubscribe must never block deregistering the rest
+        }
+      }
+      hookUnsubs.delete(pluginId);
+      result.hooksRemoved.push(pluginId);
+    }
+    for (const pluginId of desired) {
+      if (hookUnsubs.has(pluginId)) continue; // already live — never double-register
+      // The handler resolves the plugin through the manager on EVERY
+      // call (never a captured record), so enable/disable and the C-1
+      // broken gate are re-checked at invocation time too.
+      const unsubs = HOOK_EVENTS.map((event) =>
+        bus.on(event, async (payload: unknown) => manager.invokeHook(pluginId, event, payload)),
+      );
+      hookUnsubs.set(pluginId, unsubs);
+      result.hooksAdded.push(pluginId);
+    }
+  }
+
+  function syncChannels(result: PluginLiveSyncResult): void {
+    const desired = new Map<string, string>();
+    for (const provider of manager.channelProviders()) {
+      desired.set(provider.pluginId, provider.id);
+      // Refresh the factory on every sync: a reinstall replaces the
+      // manager record, and the registry must serve the new instance.
+      // The registry is keyed by provider id, so refreshing can never
+      // create a duplicate entry.
+      registerMessageProvider(provider.id, () => provider);
+      if (!channelIds.has(provider.pluginId)) result.channelsAdded.push(provider.id);
+      channelIds.set(provider.pluginId, provider.id);
+    }
+    for (const [pluginId, providerId] of [...channelIds]) {
+      if (desired.has(pluginId)) continue;
+      unregisterMessageProvider(providerId);
+      channelIds.delete(pluginId);
+      result.channelsRemoved.push(providerId);
+    }
+  }
+
+  return {
+    sync(): PluginLiveSyncResult {
+      const result: PluginLiveSyncResult = { hooksAdded: [], hooksRemoved: [], channelsAdded: [], channelsRemoved: [] };
+      syncHooks(result);
+      syncChannels(result);
+      return result;
+    },
+    dispose(): void {
+      for (const unsubs of hookUnsubs.values()) {
+        for (const unsub of unsubs) {
+          try {
+            unsub();
+          } catch {
+            // best-effort teardown
+          }
+        }
+      }
+      hookUnsubs.clear();
+      for (const providerId of channelIds.values()) unregisterMessageProvider(providerId);
+      channelIds.clear();
+    },
+    hookPluginIds(): string[] {
+      return [...hookUnsubs.keys()];
+    },
+    channelProviderIds(): string[] {
+      return [...channelIds.values()];
+    },
+  };
+}
+
 /**
  * Register every enabled hook plugin on the host HookBus, for every known
  * event (plugins return no result for events they do not handle). Returns
  * unsubscribe functions. Handler errors are collected by the bus itself.
+ *
+ * One-shot boot helper: the registrations are NOT tracked, so a plugin
+ * hot-uninstalled later keeps its (manager-gated, inert) handlers until
+ * restart. Hosts that mutate plugins at runtime should use
+ * createPluginLiveSync instead — index.ts does.
  */
 export function registerPluginHooks(manager: PluginManager, bus: HookBus): Array<() => void> {
   const unsubs: Array<() => void> = [];
@@ -419,6 +608,9 @@ export function registerPluginHooks(manager: PluginManager, bus: HookBus): Array
  * `plugin-<pluginId>`. Returns the registered provider ids. Inbound
  * delivery is pull-based: the host polls provider.poll() (see the poll
  * model documented in @mvp/plugins runtime.ts).
+ *
+ * One-shot boot helper (untracked, like registerPluginHooks): hosts that
+ * mutate plugins at runtime should use createPluginLiveSync instead.
  */
 /**
  * Script-hook host wiring (#67): register `hooks: [{kind:'script', ...}]`

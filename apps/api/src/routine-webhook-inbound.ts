@@ -425,9 +425,16 @@ export class RoutineInboundWebhookStore {
     return r.changes > 0;
   }
 
-  deleteByRoutine(routineId: string): void {
-    this.db.prepare('DELETE FROM routine_inbound_triggers WHERE routine_id = ?').run(routineId);
+  /**
+   * Cascade for routine deletion: remove the routine's hardened
+   * inbound triggers (token hashes included) and their delivery rows.
+   * Returns how many triggers were deleted, so the caller can record
+   * the cascade in the governance audit log.
+   */
+  deleteByRoutine(routineId: string): number {
+    const r = this.db.prepare('DELETE FROM routine_inbound_triggers WHERE routine_id = ?').run(routineId);
     this.db.prepare('DELETE FROM routine_inbound_deliveries WHERE routine_id = ?').run(routineId);
+    return Number(r.changes);
   }
 
   // --- Deliveries / rate limiting / idempotency ---------------------------

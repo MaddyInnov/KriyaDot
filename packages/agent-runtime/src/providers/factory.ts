@@ -135,7 +135,10 @@ export function createProvider(
       if (acpProvider) return acpProvider;
       return (
         createNativeCliDriver(providerId, { command: resolution.path, ...(opts?.env ? { env: opts.env } : {}) }) ??
-        createAgentCliProvider(providerId, { command: resolution.path })
+        // Phase A-8: the one-shot fallback (Pi's lane) takes the
+        // account env too — dropping it here silently ran non-default
+        // Pi accounts under the machine default's agent dir.
+        createAgentCliProvider(providerId, { command: resolution.path, ...(opts?.env ? { env: opts.env } : {}) })
       );
     }
     // ACP engines (W9 + ENGINES fleet): ACP-speaking CLIs (Copilot,
@@ -146,7 +149,7 @@ export function createProvider(
     if (acpProvider) return acpProvider;
     return (
       createNativeCliDriver(providerId, { ...(opts?.env ? { env: opts.env } : {}) }) ??
-      createAgentCliProvider(providerId)
+      createAgentCliProvider(providerId, { ...(opts?.env ? { env: opts.env } : {}) })
     );
   }
 
@@ -200,7 +203,7 @@ export function createProvider(
     const defaultModel = getDefaultModel(preset.id) || 'gpt-5';
     return (
       createNativeCliDriver(`agent/codex/${defaultModel}`, { ...(opts?.env ? { env: opts.env } : {}) }) ??
-      createAgentCliProvider(`agent/codex/${defaultModel}`)
+      createAgentCliProvider(`agent/codex/${defaultModel}`, { ...(opts?.env ? { env: opts.env } : {}) })
     );
   }
 
@@ -234,11 +237,14 @@ export function createProvider(
       if (acp) return acp;
     }
     // agent-cli kind (pi): the one-shot driver with the verified binary.
-    // Residual (same class as A6's opencode ACP note): the one-shot
-    // provider spawns with the inherited process env, so a non-default
-    // account's PI_CODING_AGENT_DIR is not applied on this lane yet.
+    // Phase A-8 (was the A2 residual): the account env resolved by the
+    // runtime (bridgeAccountSpawnEnv — PI_CODING_AGENT_DIR for a
+    // non-default Pi account) is passed through, and AgentCliProvider
+    // merges it over the inherited process env at spawn. Absent/empty
+    // env (machine-default account) leaves the spawn byte-identical.
     return createAgentCliProvider(`agent/${manifest.driver.agentCliId}/${defaultModel}`, {
       command: resolution.path,
+      ...(opts?.env ? { env: opts.env } : {}),
     });
   }
 

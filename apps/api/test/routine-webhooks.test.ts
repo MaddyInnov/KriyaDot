@@ -156,6 +156,22 @@ describe('bot routines', () => {
     expect(turnCalls).toHaveLength(0);
   });
 
+  it('trigger rotation mints a fresh secret shown once; the old secret dies (A-1)', async () => {
+    const id = await makeRoutine();
+    const created = (await api('POST', `/api/routines/${id}/triggers`)).json.trigger;
+    const rotatedRes = await api('POST', `/api/routines/${id}/triggers/${created.id}/rotate`);
+    expect(rotatedRes.status).toBe(200);
+    const rotated = rotatedRes.json.trigger;
+    expect(rotated.secret).toHaveLength(64);
+    expect(rotated.secret).not.toBe(created.secret);
+    // Old secret no longer authenticates; the rotated one does.
+    expect(
+      (await api('POST', `/webhooks/routines/${created.id}`, {}, { 'x-webhook-secret': created.secret })).status,
+    ).toBe(401);
+    const ok = await api('POST', `/webhooks/routines/${created.id}`, { a: 1 }, { 'x-webhook-secret': rotated.secret });
+    expect(ok.status).toBe(202);
+  });
+
   it('renderRoutinePrompt substitutes {{payload}} / {{body}}', () => {
     expect(renderRoutinePrompt('A {{payload}} B', { x: 1 })).toBe('A {"x":1} B');
     expect(renderRoutinePrompt('A {{body}} B', { x: 1 })).toBe('A {"x":1} B');

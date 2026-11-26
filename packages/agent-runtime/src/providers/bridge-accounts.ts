@@ -124,10 +124,11 @@ export const BRIDGE_ISOLATION: Record<CliBridgeId, BridgeIsolationSpec> = {
       'the login (auth.json) follows XDG_DATA_HOME, so isolation sets the whole XDG family at per-account subdirs.',
   },
   // A2 bridges (declared in their provider manifests; kept field-equal
-  // by the A2 tests). copilot / grok / kimi document no per-account
-  // config-dir knob, so they are honestly single-account: accounts may
-  // be registered, but spawns carry no override and every account
-  // resolves to the machine's one login for that CLI.
+  // by the A2 tests). copilot documents no per-account config-dir knob,
+  // so it is honestly single-account: accounts may be registered, but
+  // spawns carry no override and every account resolves to the
+  // machine's one login for that CLI. grok / kimi gained verified knobs
+  // in the 2026-11-26 real-binary pass (GROK_HOME / KIMI_CODE_HOME).
   copilot: {
     bridgeId: 'copilot',
     isolatable: false,
@@ -138,19 +139,19 @@ export const BRIDGE_ISOLATION: Record<CliBridgeId, BridgeIsolationSpec> = {
   },
   grok: {
     bridgeId: 'grok',
-    isolatable: false,
-    envKnobs: [],
+    isolatable: true,
+    envKnobs: ['GROK_HOME'],
     note:
-      'No per-account config-dir environment knob is verified for the Grok Build CLI (login under ~/.grok). ' +
-      'Modelled honestly as single-account until xAI documents one.',
+      'GROK_HOME points the Grok Build CLI at a per-account config dir (credentials at <dir>/auth.json); ' +
+      'the machine default is ~/.grok. Verified 2026-11-26 against the real 1.0.92 binary\'s shipped user guide.',
   },
   kimi: {
     bridgeId: 'kimi',
-    isolatable: false,
-    envKnobs: [],
+    isolatable: true,
+    envKnobs: ['KIMI_CODE_HOME'],
     note:
-      'No per-account config-dir environment knob is verified for the Kimi Code CLI (login under ~/.kimi). ' +
-      'Modelled honestly as single-account until Moonshot documents one.',
+      'KIMI_CODE_HOME points the Kimi Code CLI at a per-account home dir (OAuth token at <dir>/credentials/kimi-code.json); ' +
+      'the machine default is ~/.kimi-code. Verified 2026-11-26 against the real 2.8.0 binary.',
   },
   pi: {
     bridgeId: 'pi',
@@ -278,6 +279,10 @@ export function bridgeAccountSpawnEnv(account: BridgeAccount): Record<string, st
       return { CODEX_HOME: dir };
     case 'pi':
       return { PI_CODING_AGENT_DIR: dir };
+    case 'grok':
+      return { GROK_HOME: dir };
+    case 'kimi':
+      return { KIMI_CODE_HOME: dir };
     case 'hermes':
       return { HERMES_HOME: dir };
     case 'opencode':
@@ -289,8 +294,6 @@ export function bridgeAccountSpawnEnv(account: BridgeAccount): Record<string, st
         OPENCODE_CONFIG_DIR: join(dir, 'config', 'opencode'),
       };
     case 'copilot':
-    case 'grok':
-    case 'kimi':
       return {}; // unreachable: non-isolatable bridges returned above
   }
 }
@@ -315,7 +318,7 @@ export function bridgeAccountCredentialsPath(account: BridgeAccount, homeDir: st
       case 'grok':
         return join(homeDir, '.grok', 'auth.json');
       case 'kimi':
-        return join(homeDir, '.kimi', 'credentials.json');
+        return join(homeDir, '.kimi-code', 'credentials', 'kimi-code.json');
       case 'pi':
         return join(homeDir, '.pi', 'agent', 'auth.json');
       case 'hermes':
@@ -338,11 +341,13 @@ export function bridgeAccountCredentialsPath(account: BridgeAccount, homeDir: st
       return join(dir, 'data', 'opencode', 'auth.json');
     case 'pi':
       return join(dir, 'auth.json');
+    case 'grok':
+      return join(dir, 'auth.json');
+    case 'kimi':
+      return join(dir, 'credentials', 'kimi-code.json');
     case 'hermes':
       return join(dir, 'auth.json');
     case 'copilot':
-    case 'grok':
-    case 'kimi':
       // Unreachable (non-isolatable handled above); kept for exhaustiveness.
       return join(dir, 'auth.json');
   }

@@ -75,7 +75,11 @@
 //   - Transfer code-state modes, strongest first:
 //       'branch' — the receiver already has the mission branch (shared
 //                  remote / cloned repo): it recreates the worktree
-//                  from the branch and resumes at review.
+//                  from the branch and resumes at review. The receiver
+//                  selects this mode itself, and only when its ref for
+//                  the branch (local or remote-tracking) resolves to
+//                  the exact head the bundle records — a stale clone
+//                  falls back to 'diff', never silently to wrong code.
 //       'diff'   — the bundle carries `git diff target...HEAD`; the
 //                  receiver creates a fresh worktree, applies and
 //                  commits the diff, and resumes at review. File
@@ -388,6 +392,11 @@ export interface MissionTransferBundle {
   transcript: TranscriptMessage[];
   /** `git diff <target>...HEAD` from the origin worktree, when captured. */
   diff?: string;
+  /** SHA of the origin worktree's HEAD (the mission branch tip) when
+   * captured. The receiver only takes branch mode when its own ref for
+   * the branch resolves to THIS commit — a stale clone must never
+   * silently resume from the wrong code (it falls back to the diff). */
+  branchHead?: string;
   /** What code state the bundle carries (see header for semantics). */
   mode: 'branch' | 'diff' | 'transcript-only';
 }
@@ -436,6 +445,7 @@ function isTransferBundle(v: unknown): v is MissionTransferBundle {
         typeof (msg as Record<string, unknown>).content === 'string',
     ) &&
     (o.diff === undefined || typeof o.diff === 'string') &&
+    (o.branchHead === undefined || typeof o.branchHead === 'string') &&
     (o.mode === 'branch' || o.mode === 'diff' || o.mode === 'transcript-only')
   );
 }
@@ -497,6 +507,37 @@ function gitOut(cwd: string, args: string[]): string {
   const r = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: 60_000 });
   if (r.status !== 0) throw new Error(`git ${args[0]} failed: ${(r.stderr || r.stdout || '').trim().slice(0, 300)}`);
   return r.stdout ?? '';
+}
+
+/**
+ * The commit a checkout of `branch` in THIS repo would land on, or
+ * undefined when the branch is not present here. A local branch wins
+ * (that is what `git worktree add <branch>` would use); otherwise a
+ * UNIQUE remote-tracking ref (`refs/remotes/<remote>/<branch>`) counts — a
+ * fresh clone of a shared remote holds the branch only in that form,
+ * and git's DWIM checkout creates the local branch from it. Ambiguous
+ * remote matches (same branch name on several remotes) do not count:
+ * guessing a ref would risk resuming from the wrong code.
+ */
+function receiverBranchHead(repoPath: string, branch: string): string | undefined {
+  try {
+    const local = gitOut(repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]).trim();
+    if (local) return local;
+  } catch {
+    // No local branch — fall through to remote-tracking refs.
+  }
+  try {
+    const refs = gitOut(repoPath, ['for-each-ref', '--format=%(refname) %(objectname)', 'refs/remotes'])
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => line.split(' '))
+      .filter(([name]) => name !== undefined && name.endsWith(`/${branch}`) && !name.endsWith('/HEAD'));
+    if (refs.length === 1) return refs[0]![1];
+  } catch {
+    // Not a repo / no remotes — the branch is simply not here.
+  }
+  return undefined;
 }
 
 export class FleetCoordinator {
@@ -760,18 +801,24 @@ export class FleetCoordinator {
     if (!task) throw new FederationError(`mission task no longer exists: ${mission.taskId}`, 'unknown_task', 404);
 
     let diff: string | undefined;
+    let branchHead: string | undefined;
     if (mission.worktreePath && existsSync(mission.worktreePath)) {
       try {
         diff = gitOut(mission.worktreePath, ['diff', `${mission.targetBranch}...HEAD`]) || undefined;
       } catch {
         diff = undefined;
       }
+      try {
+        branchHead = gitOut(mission.worktreePath, ['rev-parse', 'HEAD']).trim() || undefined;
+      } catch {
+        branchHead = undefined;
+      }
     }
-    // Branch mode is only honest when the branch is committed locally —
-    // the receiver still has to HAVE it (shared remote/clone); when it
-    // doesn't, its handler falls back to the diff carried here. So a
-    // bundle with a diff always prefers 'diff' unless the caller knows
-    // the branch is shared; the receiver decides (see handler).
+    // The origin cannot know whether the receiver's clone has the
+    // mission branch, so the bundle always carries the diff (when one
+    // can be captured) AND the branch head SHA; the RECEIVER decides
+    // the honest mode (see handleInboundTransfer): branch when its ref
+    // for the branch resolves to exactly this head, else the diff.
     const transcript: TranscriptMessage[] = [];
     if (this.deps.transcripts) {
       for (const role of ['worker', 'reviewer'] as const) {
@@ -804,6 +851,7 @@ export class FleetCoordinator {
       task: { title: task.title, ...(task.notes ? { notes: task.notes } : {}) },
       transcript,
       ...(diff ? { diff } : {}),
+      ...(branchHead ? { branchHead } : {}),
       mode: diff ? 'diff' : 'transcript-only',
     };
   }
@@ -879,20 +927,28 @@ export class FleetCoordinator {
       notes: `${bundle.task.notes ?? ''}${bundle.mode === 'transcript-only' ? transcriptNote : ''}`.trim() || undefined,
     });
 
-    // Decide the honest code-state mode on THIS machine.
+    // Decide the honest code-state mode on THIS machine. Branch mode
+    // is the receiver's call (the origin cannot know what this clone
+    // holds — its bundle therefore always says 'diff' when a diff was
+    // captured, and branch is SELECTED HERE): the branch counts only
+    // when this repo resolves it — local branch or unique
+    // remote-tracking ref from a shared remote — AND, when the bundle
+    // carries the origin's branch head, to that exact commit. A stale
+    // clone whose branch points at older code must not silently resume
+    // from it; the carried diff is the fallback. (Fix 2026-11-26,
+    // A-11: previously branch mode required bundle.mode === 'branch',
+    // which buildTransferBundle never emits, and the availability probe
+    // used `git branch --list`, which cannot see remote-tracking refs —
+    // branch mode was unreachable on every real transfer path.)
     let mode: MissionTransferBundle['mode'] = bundle.mode;
     let resumeFromStage: 'review' | undefined;
     if (bundle.mode === 'diff' || bundle.mode === 'branch') {
-      let branchAvailable = false;
-      if (existsSync(bundle.mission.repoPath)) {
-        try {
-          branchAvailable =
-            gitOut(bundle.mission.repoPath, ['branch', '--list', bundle.mission.branch]).trim().length > 0;
-        } catch {
-          branchAvailable = false;
-        }
-      }
-      if (bundle.mode === 'branch' && branchAvailable) {
+      const localHead = existsSync(bundle.mission.repoPath)
+        ? receiverBranchHead(bundle.mission.repoPath, bundle.mission.branch)
+        : undefined;
+      const branchHonest =
+        localHead !== undefined && (bundle.branchHead === undefined || bundle.branchHead === localHead);
+      if (branchHonest) {
         mode = 'branch';
         resumeFromStage = 'review';
       } else if (bundle.diff) {
@@ -959,14 +1015,27 @@ export class FleetCoordinator {
           // WorktreeManager.create always passes -b (new branch), so an
           // existing-branch checkout is done with git directly, at the
           // manager's conventional path; execute() then finds the
-          // worktree already registered and reuses it.
+          // worktree already registered and reuses it. When the branch
+          // exists only as a remote-tracking ref, git's DWIM creates
+          // the local branch from it at the same head.
           const target = join(mgr.root, bundle.mission.branch.replace(/\//g, '__'));
-          if (!mgr.list(bundle.mission.repoPath).some((w) => w.path === target)) {
-            gitOut(bundle.mission.repoPath, ['worktree', 'add', target, bundle.mission.branch]);
-            preparedPath = target;
+          try {
+            if (!mgr.list(bundle.mission.repoPath).some((w) => w.path === target)) {
+              gitOut(bundle.mission.repoPath, ['worktree', 'add', target, bundle.mission.branch]);
+              preparedPath = target;
+            }
+            this.deps.missionStore.update(mission.id, { worktreePath: target });
+          } catch (branchErr) {
+            if (!bundle.diff) throw branchErr;
+            // The branch could not be checked out here (e.g. it is
+            // already checked out in another worktree of this repo):
+            // degrade HONESTLY to the carried diff and relabel the
+            // mission — never pretend a branch resume happened.
+            mode = 'diff';
+            this.deps.missionStore.update(mission.id, { transferMode: 'diff' });
           }
-          this.deps.missionStore.update(mission.id, { worktreePath: target });
-        } else if (mode === 'diff' && bundle.diff) {
+        }
+        if (mode === 'diff' && bundle.diff) {
           const info = mgr.create(bundle.mission.repoPath, {
             branch: bundle.mission.branch,
             base: bundle.mission.targetBranch,

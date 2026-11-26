@@ -2,7 +2,10 @@
 // Workflow triggers: cron schedules and webhook entry points.
 //
 // - TriggerStore: SQLite-backed CRUD for triggers (own `triggers.db`, same
-//   node:sqlite loading pattern as store.ts).
+//   node:sqlite loading pattern as store.ts). Webhook secrets are stored
+//   SHA-256-hashed at rest (A-12, mirroring A-1; see webhook-secrets.ts):
+//   plaintext is shown once at create/rotate, listings redact it, and
+//   there is no reveal path — the stored hash is not recoverable.
 // - Cron: self-implemented 5-field cron matcher (minute hour dom month dow),
 //   no new dependencies.
 // - Scheduler: interval tick that fires due cron triggers through the
@@ -10,9 +13,15 @@
 //   idempotency key per (trigger, minute) so a restart/tick overlap never
 //   double-fires the same minute.
 
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import type { WorkflowRunner } from './runner.js';
+import {
+  hashWorkflowSecret,
+  isHashedWorkflowSecret,
+  migrateWorkflowTriggerSecrets,
+  verifyPresentedWorkflowSecret,
+} from './webhook-secrets.js';
 
 // `node:sqlite` cannot be statically imported under vitest's Vite 5 pipeline
 // (see store.ts for the full explanation); load at runtime instead.
@@ -26,10 +35,27 @@ export interface Trigger {
   kind: TriggerKind;
   /** 5-field cron expression; required when kind === 'cron'. */
   cron?: string;
-  /** Shared secret for HMAC-less bearer check; required when kind === 'webhook'. */
+  /**
+   * Shared secret for the `x-webhook-secret` header check; required when
+   * kind === 'webhook'. A-12 hash-at-rest semantics (mirroring A-1): on
+   * objects returned by create()/rotateSecret() this is the PLAINTEXT,
+   * shown exactly once. On objects returned by get()/list()/listEnabled()
+   * it is the stored form, `sha256:<hex>` — never a usable secret.
+   * Verification goes through verifySecret() against that stored form.
+   * Listings for display must use publicTrigger(), which strips it.
+   */
   secret?: string;
   enabled: boolean;
   createdAt: number;
+}
+
+/** Trigger as exposed for display/listing: the secret (and its hash) is never included. */
+export type TriggerPublic = Omit<Trigger, 'secret'>;
+
+export function publicTrigger(t: Trigger): TriggerPublic {
+  const { secret: _secret, ...rest } = t;
+  void _secret;
+  return rest;
 }
 
 interface TriggerRow {
@@ -65,6 +91,10 @@ export class TriggerStore {
       CREATE INDEX IF NOT EXISTS idx_triggers_workflow ON triggers(workflow_id);
       CREATE INDEX IF NOT EXISTS idx_triggers_kind ON triggers(kind);
     `);
+    // A-12 hash-at-rest migration: any legacy plaintext webhook secret
+    // still in this DB is replaced by its SHA-256 hash in place.
+    // Idempotent — see webhook-secrets.ts.
+    migrateWorkflowTriggerSecrets(this.db);
   }
 
   close(): void {
@@ -99,11 +129,52 @@ export class TriggerStore {
         trigger.workflowId,
         trigger.kind,
         trigger.cron ?? null,
-        trigger.secret ?? null,
+        // A-12: only the SHA-256 hash of a webhook secret is stored.
+        // The returned trigger above still carries the plaintext, shown
+        // exactly once (at creation); get()/list() expose only the hash.
+        trigger.secret === undefined
+          ? null
+          : isHashedWorkflowSecret(trigger.secret)
+            ? trigger.secret
+            : hashWorkflowSecret(trigger.secret),
         trigger.enabled ? 1 : 0,
         trigger.createdAt,
       );
     return trigger;
+  }
+
+  /** Timing-safe check of a presented webhook secret against the stored hash. */
+  verifySecret(id: string, presented: string | undefined): boolean {
+    const trigger = this.get(id);
+    if (!trigger?.secret) return false;
+    return verifyPresentedWorkflowSecret(presented, trigger.secret);
+  }
+
+  /**
+   * Rotation: mint a fresh secret, store only its hash, and return the
+   * trigger carrying the PLAINTEXT exactly once. The old secret stops
+   * working immediately. There is deliberately no reveal path: after
+   * creation/rotation only the hash exists, so the secret is not
+   * recoverable — rotation is how a new usable secret is obtained.
+   */
+  rotateSecret(id: string): Trigger | undefined {
+    const cur = this.get(id);
+    if (!cur) return undefined;
+    if (cur.kind !== 'webhook') throw new Error('only webhook triggers have a secret to rotate');
+    const plaintext = randomBytes(32).toString('hex');
+    this.db.prepare('UPDATE triggers SET secret = ? WHERE id = ?').run(hashWorkflowSecret(plaintext), id);
+    const next = this.get(id);
+    return next ? { ...next, secret: plaintext } : undefined;
+  }
+
+  /** Redacted view for listings/display: never includes secret or hash. */
+  getPublic(id: string): TriggerPublic | undefined {
+    const t = this.get(id);
+    return t ? publicTrigger(t) : undefined;
+  }
+
+  listPublic(): TriggerPublic[] {
+    return this.list().map(publicTrigger);
   }
 
   get(id: string): Trigger | undefined {

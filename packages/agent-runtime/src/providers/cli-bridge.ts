@@ -24,6 +24,7 @@ import {
   getCachedIdentity,
   getCliPathPin,
   firstPrintedLine,
+  identityRequiresHelpCorroboration,
   matchIdentity,
   outputMatchesReject,
   redactCliSecrets,
@@ -385,7 +386,28 @@ export function probeCliIdentity(
     };
   } else if (matchIdentity(decl.versionMatch, versionRun.output)) {
     const version = extractSemver(firstPrintedLine(versionRun.output));
-    result = { ok: true, ...(version ? { version } : {}) };
+    // B-3 scoped corroboration (final cut 2026-11-26, see
+    // cli-identity.ts): for pi / kimi the version match is a
+    // content-free bare semver, and a recorded REAL binary proves the
+    // declared help signal is present — so the help probe must ALSO
+    // match before the candidate is accepted. Every other bridge
+    // keeps its shipped single-signal semantics (name-bearing version
+    // banners need no corroboration; opencode's bare-semver
+    // acceptance is the disclosed v0.2.2 residual).
+    if (identityRequiresHelpCorroboration(id) && decl.helpArgs && decl.helpMatch) {
+      const helpRun = runCliSync(executablePath, decl.helpArgs, { platform: opts.platform, timeoutMs });
+      const helpRejected = outputMatchesReject(helpRun.output, decl.rejectIfOutputContains);
+      result =
+        !helpRejected && matchIdentity(decl.helpMatch, helpRun.output)
+          ? { ok: true, ...(version ? { version } : {}) }
+          : {
+              ok: false,
+              looksLike: describeCandidate(executablePath, helpRun.output, helpRejected),
+              firstLine: redactedFirstLine(versionRun.output) || redactedFirstLine(helpRun.output),
+            };
+    } else {
+      result = { ok: true, ...(version ? { version } : {}) };
+    }
   } else if (decl.helpArgs && decl.helpMatch) {
     const helpRun = runCliSync(executablePath, decl.helpArgs, { platform: opts.platform, timeoutMs });
     const helpRejected = outputMatchesReject(helpRun.output, decl.rejectIfOutputContains);

@@ -52,6 +52,16 @@ export function registerMessageProvider(id: string, factory: MessageProviderFact
   providerFactories.set(id, factory);
 }
 
+/**
+ * Remove a previously registered provider (returns true when one was
+ * present). Plugin live-sync (plugin-routes.ts) uses this to deregister a
+ * hot-uninstalled / disabled plugin's channel provider from the running
+ * registry — without it a removed plugin's channel would leak forever.
+ */
+export function unregisterMessageProvider(id: string): boolean {
+  return providerFactories.delete(id);
+}
+
 export function listMessageProviders(): string[] {
   return [...providerFactories.keys()];
 }

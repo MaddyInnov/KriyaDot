@@ -348,6 +348,21 @@ export type StreamEvent =
       reason: string;
       message: string;
     }
+  /**
+   * Stream retraction (B-7 residual): the dying provider had already
+   * streamed `retractedChars` of partial text in the in-flight segment
+   * before the swap. The client discards exactly that many characters
+   * from the tail of the streaming assistant block so the backup's
+   * answer replaces the fragment. Completed messages are never touched.
+   */
+  | {
+      type: 'retract';
+      scope: 'turn-segment';
+      reason: 'provider-swap';
+      retractedChars: number;
+      fromProvider: string;
+      toProvider: string;
+    }
   /** Near-limit warning (W1): observed usage crossed the warning threshold. */
   | {
       type: 'usage_warning';

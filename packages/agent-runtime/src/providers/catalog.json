@@ -480,7 +480,7 @@
           "name": "Grok 4.5"
         }
       ],
-      "notes": "Uses YOUR Grok Build CLI login (~/.grok) — no xAI API key needed. Turns run through the Grok CLI itself (ACP mode); KriyaDot never reads its credential bytes. Shown only when the CLI is detected; requires your explicit Connect consent. No per-account config-dir knob is verified for this CLI, so this bridge is single-account (see the grok provider manifest)."
+      "notes": "Uses YOUR Grok Build CLI login (~/.grok) — no xAI API key needed. Turns run through the Grok CLI itself (ACP mode); KriyaDot never reads its credential bytes. Shown only when the CLI is detected; requires your explicit Connect consent. Per-account logins are supported via the verified GROK_HOME config-dir knob (see the grok provider manifest)."
     },
     "groq": {
       "api": "openai-compatible",
@@ -601,7 +601,7 @@
           "name": "Kimi for Coding Highspeed"
         }
       ],
-      "notes": "Uses YOUR Kimi Code CLI login (~/.kimi) — no Moonshot API key needed. Turns run through the Kimi CLI itself (ACP mode); KriyaDot never reads its credential bytes. Shown only when the CLI is detected; requires your explicit Connect consent. No per-account config-dir knob is verified for this CLI, so this bridge is single-account (see the kimi provider manifest)."
+      "notes": "Uses YOUR Kimi Code CLI login (~/.kimi-code) — no Moonshot API key needed. Turns run through the Kimi CLI itself (ACP mode); KriyaDot never reads its credential bytes. Shown only when the CLI is detected; requires your explicit Connect consent. Per-account logins are supported via the verified KIMI_CODE_HOME home-dir knob (see the kimi provider manifest)."
     },
     "lambda": {
       "api": "openai-compatible",

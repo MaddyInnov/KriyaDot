@@ -229,6 +229,7 @@ import {
 } from '@mvp/agent-runtime';
 import { registerWorktreeRoutes } from './worktrees-routes.js';
 import { createWorktreeTools } from '@mvp/agent-runtime/dist/worktrees.js';
+import { FederationService } from '@mvp/agent-runtime/dist/federation.js';
 import { HookBus, loadPlugins } from '@mvp/agent-runtime/dist/hooks.js';
 import { runAcpCli, runChatCli, runScanCli } from './cli.js';
 // (selectComputerSandbox import removed: per-bot computers (P1 #14) replaced
@@ -1779,7 +1780,7 @@ async function boot(): Promise<void> {
   // channel kinds). Installs are deny-by-default: the approve hook mints a
   // governance approval and only an explicit human approval installs.
   const { PluginManager, PluginTrustStore } = await import('@mvp/plugins');
-  const { buildPluginTools, registerPluginHooks, registerPluginChannels } = await import('./plugin-routes.js');
+  const { buildPluginTools, createPluginLiveSync } = await import('./plugin-routes.js');
   const { syncPluginProviders } = await import('./plugin-providers.js');
   // A9: publisher keys the user has explicitly trusted (durable, in the
   // data dir beside the plugin state). Adding one is a deliberate trust
@@ -1843,8 +1844,17 @@ async function boot(): Promise<void> {
   // re-enter the provider registry at boot (hot installs sync live via
   // the plugin router's mutation hook).
   syncPluginProviders(pluginManager);
-  registerPluginHooks(pluginManager, hookBus);
-  registerPluginChannels(pluginManager);
+  // A9 residual 3: hook/channel registrations are LIVE. This one shared
+  // sync handle registers the boot plugins now and is handed to the
+  // plugin router below, which re-syncs it after every hot
+  // install/uninstall/enable/disable — so a hot-installed plugin's hooks
+  // fire and its channel provider is listed immediately, and a removed
+  // plugin's registrations are deregistered in the same mutation (no
+  // leaked handlers, no doubles on reinstall cycles). Desired sets come
+  // from the manager's gated targets (enabled + not C-1-broken), exactly
+  // the boot gate loadAll() just applied.
+  const pluginLiveSync = createPluginLiveSync({ manager: pluginManager, hookBus });
+  pluginLiveSync.sync();
   // Connector + social tools (OMB §1.20 / Octop §2.x mop-up): X, Postiz,
   // Whop, HighLevel, OpenAlex/TickTick/Obsidian/Dify. All credential-gated
   // at call time (vault/env), deny-by-default under governance like every
@@ -1970,6 +1980,11 @@ async function boot(): Promise<void> {
   // once the routine store exists (below); the executor wrap is applied
   // after registerRoutineRoutes returns — see the self-pause block
   // further down.
+  // B5 store, constructed BEFORE registerRoutineRoutes so the CRUD
+  // router can receive it as a dep: deleting a routine then cascades
+  // to its hardened inbound triggers (deleteByRoutine) with a
+  // governance audit event, instead of orphaning token hashes.
+  const routineInboundWebhookStore = new RoutineInboundWebhookStore(config.dataDir);
   const { routineStore, triggerStore: routineTriggerStore } = registerRoutineRoutes(
     routinesRouter,
     {
@@ -1979,6 +1994,8 @@ async function boot(): Promise<void> {
       getBaseUrls: () => ({ publicBaseUrl: config.publicBaseUrl, localPort: config.port }),
       runStore: routineRunStore,
       resumeStore: limitResetResumeStore,
+      inboundStore: routineInboundWebhookStore,
+      audit: (action, fields) => governance.audit(action, fields),
       eventStore: routineEventStore,
       // Anchor resolution (Part 5): time-based schedules default to the
       // cloud when one is connected. The operative "cloud connected"
@@ -1999,6 +2016,8 @@ async function boot(): Promise<void> {
     agentRuntime,
     getBots: () => seed.bots,
     runExecutor: routineRunExecutor,
+    // A-1: durable failed-auth journal in bot-routines.db.
+    authDataDir: config.dataDir,
   });
   // B5: generic inbound webhook triggers — POST /api/webhooks/routine/<token>
   // starts a routine with the JSON body as its trigger input. Tokens are
@@ -2007,8 +2026,9 @@ async function boot(): Promise<void> {
   // `app` before loopback auth below (the token is its auth, like
   // /api/hooks' HMAC). Webhook starts go through the shared run executor
   // with webhook provenance, so governance approvals still go to the
-  // human — the webhook never bypasses them.
-  const routineInboundWebhookStore = new RoutineInboundWebhookStore(config.dataDir);
+  // human — the webhook never bypasses them. (The store itself is
+  // constructed above, before registerRoutineRoutes, so routine
+  // deletion can cascade into it.)
   registerRoutineInboundWebhookRoutes(routinesRouter, {
     routineStore,
     inboundStore: routineInboundWebhookStore,
@@ -2053,7 +2073,12 @@ async function boot(): Promise<void> {
   // HMAC verification and a queued delivery worker. The router is created
   // here; it mounts on `app` before the global express.json() parser below
   // because it needs the raw request body for signature verification.
-  const routinePublicHookRouter = createPublicHookRouter({ routineStore, hookStore: routineHookStore });
+  const routinePublicHookRouter = createPublicHookRouter({
+    routineStore,
+    hookStore: routineHookStore,
+    // A-1: durable failed-auth journal in bot-routines.db.
+    authDataDir: config.dataDir,
+  });
   const hookDeliveryWorker = new WebhookDeliveryWorker({
     routineStore,
     hookStore: routineHookStore,
@@ -2861,7 +2886,7 @@ async function boot(): Promise<void> {
   });
   const realtimeVoiceUpgrade = createRealtimeVoiceUpgrade({ service: realtimeVoiceService, loopbackToken });
   // Phase 2: workflow webhook triggers (shared-secret authenticated).
-  app.use('/webhooks', createWebhookRouter({ runner: workflowRunner, triggerStore }));
+  app.use('/webhooks', createWebhookRouter({ runner: workflowRunner, triggerStore, authDataDir: config.dataDir }));
   // Encrypted push notifications (Codync parity): FCM fan-out to paired
   // devices, sealed per device. No-op when FCM isn't configured.
   // Built before the router so peer-approval "needs you" pushes
@@ -3698,10 +3723,24 @@ async function boot(): Promise<void> {
     registerMailboxSettingsRoutes(app, { dataDir: config.dataDir, loopbackToken });
   }
 
+  // A-5/A-6 follow-up: ONE FederationService for the whole process,
+  // over <dataDir>/federation.json. It is passed to BOTH the main
+  // router (RouteDeps.federationService → the fleet wiring in
+  // routes.ts) and the federation router below (its `service` dep),
+  // so the federation and fleet surfaces share one persisted identity
+  // and one in-memory replay guard — no second instance, no reliance
+  // on the D5 store-file mtime reload to keep two instances in sync.
+  const federationService = new FederationService({
+    storePath: path.join(config.dataDir, 'federation.json'),
+    name: 'KriyaDot',
+    publicUrl: process.env.KRIYADOT_FEDERATION_URL,
+  });
+
   app.use(
     '/api',
     createRouter({
       config,
+      federationService,
       bots: seed.bots,
       agentRuntime,
       governance,
@@ -4210,6 +4249,7 @@ async function boot(): Promise<void> {
             (bot) => scriptHooksFromConfig({ hooks: (bot as unknown as { hooks?: unknown }).hooks }).entries,
           ),
         secrets: {},
+        authDataDir: config.dataDir,
       }),
     );
 
@@ -5157,6 +5197,9 @@ async function boot(): Promise<void> {
     app.use(
       '/api/federation',
       createFederationRouter({
+        // The single shared instance constructed above (see the
+        // createRouter mount) — NOT a second service over the same file.
+        service: federationService,
         dataDir: config.dataDir,
         publicUrl: process.env.KRIYADOT_FEDERATION_URL,
         getBots: () => seed.bots,
@@ -5252,10 +5295,10 @@ async function boot(): Promise<void> {
         // A9 hot install: when a plugin is installed/uninstalled/toggled
         // on this RUNNING server, refresh the chat tool registry's
         // plugin:* entries so the change is live without a restart (the
-        // router syncs the provider registry itself). Hook/channel
-        // registrations made at boot are NOT re-registered here — a
-        // hot-installed hook/channel plugin joins those buses on the
-        // next boot; its tools and provider are live immediately.
+        // router syncs the provider registry itself, and re-syncs the
+        // shared live hook/channel handle — pluginLiveSync — so hooks
+        // and channels are live immediately too, A9 residual 3).
+        liveSync: pluginLiveSync,
         onPluginsChanged: async () => {
           for (const name of [...toolRegistry.keys()]) {
             if (name.startsWith('plugin:')) toolRegistry.delete(name);

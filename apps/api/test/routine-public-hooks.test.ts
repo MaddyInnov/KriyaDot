@@ -2,7 +2,7 @@
 // Public webhook ingress for routines: HMAC auth, secret-in-URL, delivery
 // queue, idempotency, GitHub mapping, retry/backoff. Mocks only, localhost.
 
-import { createHmac, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -37,7 +37,10 @@ interface Ctx {
 }
 
 function sign(body: Buffer, secret: string): string {
-  return 'sha256=' + createHmac('sha256', secret).update(body).digest('hex');
+  // A-1 migrated HMAC scheme: key = sha256hex(secret), derivable by any
+  // holder of the secret. (Pre-migration the key was the raw secret.)
+  const key = createHash('sha256').update(secret, 'utf8').digest('hex');
+  return 'sha256=' + createHmac('sha256', key).update(body).digest('hex');
 }
 
 async function setup(): Promise<Ctx> {
@@ -67,7 +70,9 @@ async function setup(): Promise<Ctx> {
   app.use('/api/hooks', express.raw({ type: '*/*', limit: '64kb' }), createPublicHookRouter({ routineStore, hookStore }));
 
   const routine = routineStore.create({ name: 'nightly', botId: 'worker', promptTemplate: 'do it: {{payload}}' });
-  const secret = routineStore.ensureWebhookSecret(routine.id);
+  // A-1: the usable plaintext exists only at rotation time (shown once);
+  // the store keeps only its SHA-256 hash.
+  const secret = routineStore.regenerateWebhookSecret(routine.id);
 
   let server: { close(cb: () => void): void } | null = null;
   await new Promise<void>((resolve) => {
@@ -159,12 +164,25 @@ describe('public routine hook ingress', () => {
     expect(res.status).toBe(401);
   });
 
-  it('rejects paused routine with 409', async () => {
+  it('paused routine is indistinguishable from active at the HTTP layer (A-1)', async () => {
+    // Baseline: active routine acceptance shape.
+    const activeRes = await post(`/api/hooks/${ctx.routineId}/${ctx.secret}`, '{}');
+    expect(activeRes.status).toBe(202);
+    const activeBody = (await activeRes.json()) as Record<string, unknown>;
+    // Pause and repeat with the same valid auth: same status, same
+    // shape, no 'paused' tell — but the delivery is journalled
+    // internally as skipped and never queued for execution.
     ctx.routineStore.update(ctx.routineId, { enabled: false });
     const res = await post(`/api/hooks/${ctx.routineId}/${ctx.secret}`, '{}');
-    expect(res.status).toBe(409);
-    const data = (await res.json()) as { error: string };
-    expect(data.error).toContain('paused');
+    expect(res.status).toBe(202);
+    const data = (await res.json()) as Record<string, unknown>;
+    expect(Object.keys(data).sort()).toEqual(Object.keys(activeBody).sort());
+    expect(data.ok).toBe(true);
+    expect(data.accepted).toBe(true);
+    expect(JSON.stringify(data)).not.toContain('paused');
+    const skipped = ctx.hookStore.get(data.deliveryId as string);
+    expect(skipped?.status).toBe('skipped');
+    expect(skipped?.error).toContain('paused'); // internal journal text may say so
   });
 
   it('dedupes on Idempotency-Key within 24h', async () => {
@@ -220,7 +238,7 @@ describe('public routine hook ingress', () => {
     expect(res.status).toBe(413);
   });
 
-  it('hook info endpoint redacts the secret; reveal shows it once', async () => {
+  it('hook info endpoint redacts the secret; reveal is gone post-migration; regenerate shows a fresh secret once', async () => {
     // Management routes need JSON parsing; mount a second app for these.
     const app2 = express();
     app2.use(express.json());
@@ -244,27 +262,42 @@ describe('public routine hook ingress', () => {
     const base = `http://127.0.0.1:${s2.port}`;
 
     const info = (await (await fetch(`${base}/api/routines/${routine.id}/hook`)).json()) as {
-      hook: { url: string; localUrl: string; secret?: string; hasSecret: boolean; connected: boolean };
+      hook: {
+        url: string;
+        localUrl: string;
+        secret?: string;
+        secretNote?: string;
+        secretRecoverable: boolean;
+        hasSecret: boolean;
+        connected: boolean;
+      };
     };
     expect(info.hook.hasSecret).toBe(true);
     expect(info.hook.secret).toBeUndefined();
+    expect(info.hook.secretRecoverable).toBe(false);
+    expect(info.hook.secretNote).toContain('not recoverable');
     expect(info.hook.localUrl).toContain('<secret>');
     expect(info.hook.url).toContain('https://hooks.example.com/api/hooks/');
     expect(info.hook.connected).toBe(false);
 
-    const revealed = (await (
-      await fetch(`${base}/api/routines/${routine.id}/hook/reveal`, { method: 'POST' })
-    ).json()) as { hook: { secret: string; localUrl: string } };
-    expect(revealed.hook.secret).toHaveLength(64);
-    expect(revealed.hook.localUrl).toContain(revealed.hook.secret);
+    // A-1: only the hash is stored, so there is nothing to reveal —
+    // the endpoint says so (410) instead of fabricating a secret.
+    const revealRes = await fetch(`${base}/api/routines/${routine.id}/hook/reveal`, { method: 'POST' });
+    expect(revealRes.status).toBe(410);
+    const revealed = (await revealRes.json()) as { error: string };
+    expect(revealed.error).toContain('not recoverable');
 
     const regen = (await (
       await fetch(`${base}/api/routines/${routine.id}/hook/regenerate`, { method: 'POST' })
-    ).json()) as { hook: { secret: string } };
-    expect(regen.hook.secret).not.toBe(revealed.hook.secret);
+    ).json()) as { hook: { secret: string; localUrl: string; secretRecoverable: boolean } };
+    expect(regen.hook.secret).toHaveLength(64);
+    expect(regen.hook.secretRecoverable).toBe(true);
+    expect(regen.hook.localUrl).toContain(regen.hook.secret);
 
-    // Old secret no longer authenticates (checked via store).
-    expect(rs2.getWebhookSecret(routine.id)).toBe(regen.hook.secret);
+    // The store holds only the SHA-256 hash of the rotated secret.
+    const { hashLegacySecret } = await import('../src/legacy-webhook-secrets.js');
+    expect(rs2.getWebhookSecret(routine.id)).toBe(hashLegacySecret(regen.hook.secret));
+    expect(rs2.verifyWebhookSecret(routine.id, regen.hook.secret)).toBe(true);
 
     const deliveries = (await (await fetch(`${base}/api/routines/${routine.id}/deliveries`)).json()) as {
       deliveries: unknown[];
@@ -371,14 +404,18 @@ describe('helpers', () => {
     expect(secretsEqual('abc', 'abcd')).toBe(false);
   });
 
-  it('verifySignature accepts sha256= prefix and bare hex', () => {
+  it('verifySignature accepts sha256= prefix and bare hex (A-1 key = sha256hex(secret))', () => {
     const body = Buffer.from('hello');
     const secret = randomBytes(32).toString('hex');
-    const hex = createHmac('sha256', secret).update(body).digest('hex');
+    const key = createHash('sha256').update(secret, 'utf8').digest('hex');
+    const hex = createHmac('sha256', key).update(body).digest('hex');
     expect(verifySignature('sha256=' + hex, body, secret)).toBe(true);
     expect(verifySignature(hex, body, secret)).toBe(true);
     expect(verifySignature('sha256=' + hex, body, 'other')).toBe(false);
     expect(verifySignature('nothex', body, secret)).toBe(false);
+    // The pre-migration scheme (key = raw secret) no longer verifies.
+    const oldHex = createHmac('sha256', secret).update(body).digest('hex');
+    expect(verifySignature('sha256=' + oldHex, body, secret)).toBe(false);
   });
 
   it('mapGitHubEvent handles ping/pull_request/issues', () => {

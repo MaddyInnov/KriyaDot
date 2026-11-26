@@ -227,6 +227,18 @@ export interface AgentCliProviderOptions {
   command?: string;
   /** Kill the child after this long (default 180s). */
   timeoutMs?: number;
+  /**
+   * Per-account spawn env (A6/A2 spawn-env helper, wired on this lane
+   * by Phase A-8): the resolved bridge account's config-dir isolation
+   * (e.g. a non-default Pi account's PI_CODING_AGENT_DIR), merged OVER
+   * the inherited process env at spawn — the same merge the native
+   * CLI driver applies. Callers pass ONLY config-dir knobs from
+   * bridgeAccountSpawnEnv (paths/config — never secrets; this provider
+   * reads no API keys and forwards none). Absent/empty = the child
+   * inherits the process env untouched, exactly as before (machine-
+   * default accounts are byte-identical).
+   */
+  env?: Record<string, string>;
 }
 
 /**
@@ -239,12 +251,16 @@ export class AgentCliProvider implements LLMProvider {
   private readonly model: string;
   private readonly command: string;
   private readonly timeoutMs: number;
+  private readonly env?: Record<string, string>;
 
   constructor(opts: AgentCliProviderOptions) {
     this.cliId = opts.cliId;
     this.model = opts.model;
     this.command = opts.command ?? getAgentCliSpec(opts.cliId)?.command ?? opts.cliId;
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    // An empty env map is the machine-default account: normalise it to
+    // "no override" so the spawn inherits the process env untouched.
+    this.env = opts.env && Object.keys(opts.env).length > 0 ? { ...opts.env } : undefined;
     this.providerId = `agent/${this.cliId}/${this.model}`;
   }
 
@@ -258,7 +274,7 @@ export class AgentCliProvider implements LLMProvider {
     // Use the per-request model if provided (bridge mode), else the constructor model.
     const model = opts.model || this.model;
     const args = spec ? spec.buildArgs(model, prompt) : [prompt];
-    const text = await runCli(this.command, args, this.timeoutMs, opts.signal);
+    const text = await runCli(this.command, args, this.timeoutMs, opts.signal, this.env);
     const marked = `${untrustedCliPrefix(this.cliId)}\n${text}`;
     if (opts.onToken && marked) {
       for (const word of marked.split(/(\s+)/)) {
@@ -279,7 +295,21 @@ export class AgentCliProvider implements LLMProvider {
   }
 }
 
-function runCli(command: string, args: string[], timeoutMs: number, signal?: AbortSignal): Promise<string> {
+/** Process env with the caller's overrides merged over it (undefined values dropped). */
+function mergedSpawnEnv(extraEnv: Record<string, string>): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
+  for (const [k, v] of Object.entries(extraEnv)) env[k] = v;
+  return env;
+}
+
+function runCli(
+  command: string,
+  args: string[],
+  timeoutMs: number,
+  signal?: AbortSignal,
+  extraEnv?: Record<string, string>,
+): Promise<string> {
   return new Promise((resolve, reject) => {
     let child;
     try {
@@ -287,8 +317,14 @@ function runCli(command: string, args: string[], timeoutMs: number, signal?: Abo
       // string. spawnCliProcess applies the Windows batch-shim rule for
       // .cmd/.bat targets (through the shell, with Node's own argument
       // escaping). No secrets are added to the child's environment; the
-      // CLI uses its own login. process.env is inherited untouched.
-      child = spawnCliProcess(command, args, { stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs });
+      // CLI uses its own login. Without an account override the process
+      // env is inherited untouched; with one, ONLY the caller's
+      // config-dir knobs are merged over it (Phase A-8).
+      child = spawnCliProcess(command, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: timeoutMs,
+        ...(extraEnv ? { env: mergedSpawnEnv(extraEnv) } : {}),
+      });
     } catch (err) {
       reject(new Error(`agent CLI spawn failed for "${command}": ${(err as Error).message}`));
       return;
@@ -360,7 +396,7 @@ function runCli(command: string, args: string[], timeoutMs: number, signal?: Abo
  */
 export function createAgentCliProvider(
   providerId: string,
-  opts: { command?: string; timeoutMs?: number } = {},
+  opts: { command?: string; timeoutMs?: number; env?: Record<string, string> } = {},
 ): AgentCliProvider {
   const parsed = parseAgentProviderId(providerId);
   if (!parsed) {

@@ -169,6 +169,41 @@ export type StreamEvent =
       message: string;
     }
   /**
+   * Stream retraction (B-7 residual): a provider died MID-STREAM during a
+   * failover swap, after some of its tokens had already been streamed live
+   * to the client. This event tells every consumer to discard exactly
+   * `retractedChars` characters from the tail of the in-flight assistant
+   * segment — the text streamed since the last completed boundary (turn
+   * start, or a CLI tool event, which closes the client's current bubble)
+   * — so the backup's replayed answer replaces the dying provider's
+   * fragment instead of following it. Emitted at most once per swap,
+   * after the `failover`/`notice` pair and before the backup's first
+   * replayed token; never emitted when the dying attempt streamed
+   * nothing (e.g. its tokens were buffered for a revisable final).
+   *
+   * Why this exists: without a protocol-level retraction, streamed
+   * tokens are append-only — a client cannot distinguish "partial text
+   * that will be superseded" from real output, so the user saw a
+   * fragment plus a complete second answer.
+   *
+   * What it must NEVER do: retract completed, persisted, user-visible
+   * history. Scope is strictly the in-flight `turn-segment` of the
+   * current turn — never a prior turn, never a completed message, never
+   * tool calls/results the dying provider already executed (that work
+   * happened; the replay's "ALREADY EXECUTED" note, not retraction, is
+   * what stops the backup repeating it). Consumers clamp the count to
+   * the in-flight segment they actually hold.
+   */
+  | {
+      type: 'retract';
+      scope: 'turn-segment';
+      reason: 'provider-swap';
+      /** Characters of the in-flight segment to discard from its tail. */
+      retractedChars: number;
+      fromProvider: string;
+      toProvider: string;
+    }
+  /**
    * Near-limit warning (W1): observed usage for a provider crossed the
    * warning threshold (rate-limit headers or spend figures). `usedPercent`
    * is only ever set from real observed data — providers that expose no

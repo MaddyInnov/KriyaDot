@@ -30,6 +30,23 @@
  *   also scrubs provider API keys from the child environment.
  * - Agent output is external/untrusted and is prefixed as such.
  * - No credentials are read, logged, or returned by this module.
+ *
+ * Per-account env — lifecycle (Phase A-7, closing the A6 residual):
+ * the ACP protocol itself has NO per-turn env channel (session/new and
+ * prompt carry no environment), and this provider keeps ONE long-lived
+ * ACP process per provider instance, spawned lazily on the first turn.
+ * Process env is therefore necessarily a SPAWN-time property: the
+ * account env (bridgeAccountSpawnEnv — e.g. a non-default OpenCode
+ * account's XDG family) enters via the constructor `env` opt (factory
+ * passes createProvider's opts.env, resolved per turn by the runtime),
+ * is merged over the preset env, and is applied by AcpClient when the
+ * process spawns. Per-account separation works because the runtime
+ * constructs and caches ONE PROVIDER INSTANCE PER RESOLVED ACCOUNT
+ * (resolveProvider's cache key carries the account id + env signature),
+ * so two accounts never share an ACP process. What remains impossible
+ * BY DESIGN: changing the env of an already-spawned ACP process
+ * mid-instance — a different account always means a different provider
+ * instance (and process), never an env mutation on a live one.
  */
 
 import { AcpClient, registerAcpEngineResolver } from '../acp.js';

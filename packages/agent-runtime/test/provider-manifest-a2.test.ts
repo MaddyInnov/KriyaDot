@@ -60,9 +60,25 @@ const NEW_IDS: AnyCliBridgeId[] = ['copilot', 'grok', 'kimi', 'pi', 'hermes'];
 const GENUINE_BANNERS: Record<string, string> = {
   copilot: 'GitHub Copilot CLI 0.0.342',
   grok: 'grok 0.1.0',
-  kimi: 'kimi 1.2.0',
+  kimi: '2.8.0', // real-binary pass 2026-11-26: kimi --version is a bare semver
   pi: '0.30.0',
   hermes: 'Hermes Agent 0.9.0',
+};
+
+/**
+ * Verbatim `--help` lines from the RECORDED real binaries (real-binary
+ * pass 2026-11-26, outputs in ~/workspace/scratch/a2-real-binary/outputs/).
+ * Since the B-3 close-out, pi / kimi identity requires help
+ * corroboration (their --version is a content-free bare semver), so
+ * their genuine shims must answer --help the way the real CLIs do:
+ * kimi 2.8.0 opens with "Usage: kimi [options] [command]"; pi 1.6.1's
+ * banner line is "pi - AI coding assistant with read, bash, edit,
+ * write tools". The other bridges' version banners name the tool, so
+ * no help fixture is needed for them.
+ */
+const GENUINE_HELP_LINES: Record<string, string> = {
+  kimi: 'Usage: kimi [options] [command]',
+  pi: 'pi - AI coding assistant with read, bash, edit, write tools',
 };
 
 let binDir = '';
@@ -79,6 +95,17 @@ function plant(name: string, body: string): string {
   return p;
 }
 function plantGenuine(id: string): string {
+  const helpLine = GENUINE_HELP_LINES[id];
+  if (helpLine) {
+    return plant(
+      id,
+      script([
+        `if [ "$1" = "--help" ]; then echo "${helpLine}"; exit 0; fi`,
+        `echo "${GENUINE_BANNERS[id]}"`,
+        'exit 0',
+      ]),
+    );
+  }
   return plant(id, script([`echo "${GENUINE_BANNERS[id]}"`, 'exit 0']));
 }
 function plantHostile(id: string): string {
@@ -179,9 +206,17 @@ describe('manifest set: loadable, complete, validated', () => {
       expect(preset.models.some((x) => x.default)).toBe(true);
       // getBridgeModels defers to the catalog for static-source bridges.
       expect(getBridgeModels(id)).toEqual([]);
-      // Verified-vs-assumed honesty is on the record.
-      expect(m.verified).toBe(false);
-      expect(m.verificationBasis).toMatch(/ASSUMED|assumed/);
+      // Verified-vs-assumed honesty is on the record. Real-binary pass
+      // 2026-11-26: grok / kimi / pi were verified against real binaries
+      // (and their bases say so); copilot (credential claim) and hermes
+      // (no binary obtainable) stay honestly unverified.
+      if (id === 'grok' || id === 'kimi' || id === 'pi') {
+        expect(m.verified).toBe(true);
+        expect(m.verificationBasis).toMatch(/Real-binary pass 2026-11-26/);
+      } else {
+        expect(m.verified).toBe(false);
+        expect(m.verificationBasis).toMatch(/ASSUMED|assumed/);
+      }
     }
   });
 });
@@ -210,7 +245,9 @@ describe('manifest validation fails closed', () => {
   });
   it('rejects isolatable: false carrying a spawn env kind', () => {
     const problems = validateProviderManifest(
-      mutated((m) => { m.isolation.spawnEnvKind = 'single-dir'; }),
+      // grok (the mutation base) is isolatable since the 2026-11-26
+      // real-binary pass — force the false case explicitly.
+      mutated((m) => { m.isolation = { ...m.isolation, isolatable: false, envKnobs: [], spawnEnvKind: 'single-dir' }; }),
     );
     expect(problems.join(' ')).toMatch(/spawnEnvKind "none"/);
   });
@@ -302,12 +339,17 @@ describe('A6 integration: accounts + isolation from birth', () => {
     }
   });
 
-  it('isolation registry: pi carries a knob; copilot / grok / kimi / hermes are honestly single-account', () => {
+  it('isolation registry: pi / grok / kimi carry verified knobs; copilot / hermes are honestly single-account', () => {
     expect(BRIDGE_ISOLATION.pi).toMatchObject({ isolatable: true, envKnobs: ['PI_CODING_AGENT_DIR'] });
+    // Real-binary pass 2026-11-26: GROK_HOME (grok 1.0.92 shipped docs)
+    // and KIMI_CODE_HOME (kimi 2.8.0 binary) are VERIFIED knobs, so grok
+    // and kimi left the single-account set.
+    expect(BRIDGE_ISOLATION.grok).toMatchObject({ isolatable: true, envKnobs: ['GROK_HOME'] });
+    expect(BRIDGE_ISOLATION.kimi).toMatchObject({ isolatable: true, envKnobs: ['KIMI_CODE_HOME'] });
     // B-9 (sweep 2026-11-25): hermes joined the single-account set —
     // HERMES_HOME is an ASSUMED knob, and an unconfirmed knob fails
     // open (turns would silently run as the machine-default login).
-    for (const id of ['copilot', 'grok', 'kimi', 'hermes'] as const) {
+    for (const id of ['copilot', 'hermes'] as const) {
       expect(BRIDGE_ISOLATION[id].isolatable).toBe(false);
       expect(BRIDGE_ISOLATION[id].envKnobs).toEqual([]);
       expect(BRIDGE_ISOLATION[id].note.length).toBeGreaterThan(20);
@@ -326,9 +368,15 @@ describe('A6 integration: accounts + isolation from birth', () => {
     } as BridgeAccount;
   }
 
-  it('spawn env: a pi account carries its dir; copilot + hermes accounts carry nothing', () => {
+  it('spawn env: pi / grok / kimi accounts carry their dir; copilot + hermes accounts carry nothing', () => {
     expect(bridgeAccountSpawnEnv(account({ id: 'w', configDir: '/a/pi-work' }))).toEqual({
       PI_CODING_AGENT_DIR: '/a/pi-work',
+    });
+    expect(bridgeAccountSpawnEnv(account({ id: 'w', bridgeId: 'grok', configDir: '/a/g-work' }))).toEqual({
+      GROK_HOME: '/a/g-work',
+    });
+    expect(bridgeAccountSpawnEnv(account({ id: 'w', bridgeId: 'kimi', configDir: '/a/k-work' }))).toEqual({
+      KIMI_CODE_HOME: '/a/k-work',
     });
     // Non-isolatable: an account record exists, but the CLI cannot be
     // pointed anywhere — the spawn env is honestly empty. (Hermes
@@ -348,19 +396,29 @@ describe('A6 integration: accounts + isolation from birth', () => {
       join(h, '.config', 'gh', 'hosts.yml'),
     );
     expect(bridgeAccountCredentialsPath(machineDefaultAccount('grok'), h)).toBe(join(h, '.grok', 'auth.json'));
+    // Real-binary pass 2026-11-26: kimi's home is ~/.kimi-code and its
+    // OAuth token is credentials/kimi-code.json inside it.
     expect(bridgeAccountCredentialsPath(machineDefaultAccount('kimi'), h)).toBe(
-      join(h, '.kimi', 'credentials.json'),
+      join(h, '.kimi-code', 'credentials', 'kimi-code.json'),
     );
     expect(bridgeAccountCredentialsPath(machineDefaultAccount('pi'), h)).toBe(join(h, '.pi', 'agent', 'auth.json'));
     expect(bridgeAccountCredentialsPath(machineDefaultAccount('hermes'), h)).toBe(join(h, '.hermes', 'auth.json'));
     expect(bridgeAccountCredentialsPath(account({ id: 'w', configDir: '/a/pi-work' }), h)).toBe(
       join('/a/pi-work', 'auth.json'),
     );
+    // Isolatable (2026-11-26): a named grok / kimi account probes its
+    // OWN dir — GROK_HOME / KIMI_CODE_HOME point the CLI there.
+    expect(
+      bridgeAccountCredentialsPath(account({ id: 'w', bridgeId: 'grok', configDir: '/a/g-work' }), h),
+    ).toBe(join('/a/g-work', 'auth.json'));
+    expect(
+      bridgeAccountCredentialsPath(account({ id: 'w', bridgeId: 'kimi', configDir: '/a/k-work' }), h),
+    ).toBe(join('/a/k-work', 'credentials', 'kimi-code.json'));
     // Non-isolatable: even a named account probes the machine default
     // file — that is the only file the CLI itself will ever read.
     expect(
-      bridgeAccountCredentialsPath(account({ id: 'w', bridgeId: 'grok', configDir: '/a/g-work' }), h),
-    ).toBe(join(h, '.grok', 'auth.json'));
+      bridgeAccountCredentialsPath(account({ id: 'w', bridgeId: 'copilot', configDir: '/a/c-work' }), h),
+    ).toBe(join(h, '.config', 'gh', 'hosts.yml'));
   });
 });
 

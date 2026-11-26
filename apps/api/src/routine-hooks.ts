@@ -6,16 +6,32 @@
 //   POST /api/hooks/:routineId/:secret
 //
 // Authentication (any one suffices):
-//   1. Secret in the URL path (timing-safe compare).
-//   2. `Authorization: Bearer <secret>` (timing-safe compare).
+//   1. Secret in the URL path (timing-safe compare) — LEGACY
+//      COMPATIBILITY ONLY (see the SECURITY NOTE on the router below).
+//   2. `Authorization: Bearer <secret>` (timing-safe compare) — the
+//      preferred direct form.
 //   3. `X-Signature-256` (or GitHub's `X-Hub-Signature-256`):
-//      `sha256=<hex(HMAC-SHA256(rawBody, secret))>` (timing-safe compare).
-//      For GitHub: paste the full URL as the payload URL, content type
-//      `application/json`, and the same secret as the webhook secret.
+//      `sha256=<hex(HMAC-SHA256(rawBody, key))>` (timing-safe compare)
+//      where, since the A-1 migration, `key = sha256hex(secret)` — see
+//      the HMAC note in legacy-webhook-secrets.ts. For GitHub: paste
+//      the full URL as the payload URL, content type `application/json`,
+//      and derive the signing key from the webhook secret as above.
+//
+// A-1 (hash-at-rest migration): the per-routine secret is stored only
+// as its SHA-256 hash (bot-routines.ts / legacy-webhook-secrets.ts).
+// Direct presentations are hashed and digest-compared timing-safe;
+// HMAC verification uses the stored hash hex as the key, which is
+// exactly the key a legitimate sender derives from their secret.
+// Failed auth is journalled and failure-rate-limited (successful auth
+// is never blocked by the limiter — no attacker lockout). A paused
+// routine is indistinguishable from an active one at the HTTP layer:
+// valid auth gets the same 202 acceptance shape, the delivery is
+// journalled internally as skipped-paused, and nothing executes.
 //
 // Behavior (mirrors Codync's webhook delivery contract):
-//   - 404 unknown routine; 401 bad secret/signature; 409 routine paused;
-//     413 body > 64 KB; 202 accepted (delivery queued, not executed inline).
+//   - 404 unknown routine; 401 bad secret/signature (429 once the
+//     per-IP failure budget is exhausted); 413 body > 64 KB;
+//     202 accepted (delivery queued, not executed inline).
 //   - GitHub deliveries (`X-GitHub-Event`) are mapped to
 //     `{source:'github', event:'<event>.<action>', repo, sender, text, url, payload}`.
 //     `ping` events return 200 without running the routine.
@@ -33,6 +49,13 @@
 // built here by design (local-first).
 
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import {
+  LegacyWebhookAuthGuard,
+  hmacKeyForSecret,
+  legacySourceIp,
+  verifyPresentedSecret,
+  verifySignatureAgainstStored,
+} from './legacy-webhook-secrets.js';
 import type { DatabaseSync } from 'node:sqlite';
 import express, { Router, type Request, type Response } from 'express';
 import type { AgentRuntime, BotConfig } from '@mvp/agent-runtime';
@@ -48,7 +71,7 @@ export const HOOK_RETRY_DELAYS_MS = [30_000, 5 * 60_000];
 export const HOOK_IDEMPOTENCY_WINDOW_MS = 24 * 60 * 60_000;
 export const HOOK_RETENTION_MS = 7 * 24 * 60 * 60_000;
 
-export type HookDeliveryStatus = 'pending' | 'processing' | 'done' | 'failed';
+export type HookDeliveryStatus = 'pending' | 'processing' | 'done' | 'failed' | 'skipped';
 
 export interface HookDelivery {
   id: string;
@@ -141,13 +164,25 @@ export function secretsEqual(a: string, b: string): boolean {
   return timingSafeEqual(ab, bb);
 }
 
-/** Verify `sha256=<hex>` (or bare hex) HMAC-SHA256 of body with secret. */
+/**
+ * Verify `sha256=<hex>` (or bare hex) HMAC-SHA256 of body.
+ *
+ * A-1 COMPATIBILITY BREAK: `secret` here is the PLAINTEXT secret the
+ * caller holds, and the HMAC key is derived as sha256hex(secret) —
+ * signatures made with the pre-migration scheme (key = the raw
+ * secret) no longer verify. Senders re-derive the key from their
+ * existing secret; no new secret is needed. The router itself uses
+ * verifySignatureAgainstStored with the stored hash hex as the key
+ * (identical value, without ever holding the plaintext).
+ */
 export function verifySignature(signature: string, body: Buffer, secret: string): boolean {
   const hex = signature.startsWith('sha256=') ? signature.slice('sha256='.length) : signature;
   if (!/^[0-9a-fA-F]{64}$/.test(hex)) return false;
-  const expected = createHmac('sha256', secret).update(body).digest('hex');
+  const expected = createHmac('sha256', hmacKeyForSecret(secret)).update(body).digest('hex');
   return secretsEqual(hex.toLowerCase(), expected);
 }
+
+export { verifySignatureAgainstStored };
 
 export interface QueuedDelivery {
   delivery: HookDelivery;
@@ -287,6 +322,19 @@ export class RoutineHookStore {
   }
 
   /**
+   * A-1: record a delivery as skipped without executing it (routine
+   * paused at ingress). Internal journal only — the HTTP response for
+   * a paused routine is identical to an active one, so senders never
+   * learn the routine's state from this surface.
+   */
+  markSkipped(id: string, reason: string, now?: number): void {
+    const at = now ?? Date.now();
+    this.db
+      .prepare(`UPDATE webhook_deliveries SET status = 'skipped', error = ?, updated_at = ? WHERE id = ?`)
+      .run(reason.slice(0, 2000), at, id);
+  }
+
+  /**
    * Record a failed attempt. Retries while attempts < HOOK_MAX_ATTEMPTS with
    * backoff; otherwise the delivery is terminally failed.
    */
@@ -409,6 +457,13 @@ export function mapGitHubEvent(ghEvent: string, payload: Record<string, unknown>
 export interface PublicHookRouterOptions {
   routineStore: RoutineStore;
   hookStore: RoutineHookStore;
+  /**
+   * Failed-auth journal + failure rate limiter (A-1). Defaults to a
+   * per-router guard persisting its journal into `authDataDir` when
+   * given, in-memory otherwise.
+   */
+  authGuard?: LegacyWebhookAuthGuard;
+  authDataDir?: string;
 }
 
 function parseBody(raw: Buffer): { parsed: unknown; isJson: boolean } {
@@ -426,20 +481,27 @@ function parseBody(raw: Buffer): { parsed: unknown; isJson: boolean } {
  *
  * POST /api/hooks/:routineId/:secret
  *
- * SECURITY NOTE (L2): the `:secret` path segment is a bearer <redacted> embedded
- * in the URL. That keeps GitHub-style webhook configuration working (GitHub
- * only allows a static URL — no custom headers), but URLs leak: they land
- * in access logs, proxy logs, browser history, and Referer headers. For
- * production, prefer one of the header alternatives the handler also
- * accepts — `x-signature-256` / `x-hub-signature-256` HMAC signatures, or
- * `Authorization: Bearer <redacted> — and treat the path form as the
- * compatibility route. The API ships no HTTP access logger, and the
- * routine hook-info endpoints redact the secret from displayed URLs, but
- * any reverse proxy in front of this server should be configured not to
+ * SECURITY NOTE (L2, updated for A-1): the `:secret` path segment is a
+ * bearer <redacted> embedded in the URL. RESIDUAL EXPOSURE, stated plainly:
+ * the path form is kept ONLY as backwards compatibility — existing
+ * senders (notably GitHub-style configurations that allow a static URL
+ * and no custom headers) would break without it — but URLs leak: they
+ * land in access logs, proxy logs, browser history, and Referer
+ * headers. Every generated URL / doc / hook-info surface now presents
+ * the header forms as canonical: `Authorization: Bearer <secret>`, or
+ * the HMAC headers `x-signature-256` / `x-hub-signature-256` with the
+ * migrated key derivation (key = sha256hex(secret); old-scheme
+ * signatures, key = raw secret, stopped verifying at the A-1
+ * migration). The secret itself is stored only as its SHA-256 hash;
+ * it is shown once at rotation and is not recoverable afterwards.
+ * The API ships no HTTP access logger, and the routine hook-info
+ * endpoints never embed a stored secret in displayed URLs, but any
+ * reverse proxy in front of this server should be configured not to
  * log the /api/hooks/* path either.
  */
 export function createPublicHookRouter(opts: PublicHookRouterOptions): Router {
   const router = Router();
+  const authGuard = opts.authGuard ?? new LegacyWebhookAuthGuard({ dataDir: opts.authDataDir });
 
   // L2: one boot-time reminder that the path-secret form is the
   // compatibility route — HMAC headers are the production recommendation.
@@ -454,27 +516,43 @@ export function createPublicHookRouter(opts: PublicHookRouterOptions): Router {
 
   router.post('/:routineId/:secret', (req: Request, res: Response) => {
     const { routineId, secret: urlSecret } = req.params;
+    const sourceIp = legacySourceIp(req);
     const routine: BotRoutine | undefined = opts.routineStore.get(routineId);
     if (!routine) {
+      authGuard.recordFailedAuth({ sourceIp, target: routineId, reason: 'unknown_routine' });
       res.status(404).json({ error: 'unknown routine' });
       return;
     }
+    // Stored form is the secret's SHA-256 hash (A-1) — never plaintext.
     const storedSecret = opts.routineStore.ensureWebhookSecret(routineId);
     const raw: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(String(req.body ?? ''), 'utf8');
 
     // Auth: URL secret, Bearer token, or HMAC signature — any one suffices.
+    // Direct forms hash the presentation and digest-compare against the
+    // stored hash; the HMAC form verifies with the stored hash hex as
+    // the key (== sha256hex(secret), derivable by any legit sender).
     const bearer = (req.header('authorization') ?? '').replace(/^Bearer\s+/i, '');
     const signature = req.header('x-signature-256') ?? req.header('x-hub-signature-256') ?? '';
     const authed =
-      secretsEqual(urlSecret, storedSecret) ||
-      (bearer !== '' && secretsEqual(bearer, storedSecret)) ||
-      (signature !== '' && verifySignature(signature, raw, storedSecret));
+      verifyPresentedSecret(urlSecret, storedSecret) ||
+      (bearer !== '' && verifyPresentedSecret(bearer, storedSecret)) ||
+      (signature !== '' && verifySignatureAgainstStored(signature, raw, storedSecret));
     if (!authed) {
+      // Journal + failure rate limit (B5 discipline). The limiter is
+      // consulted only here, on the failure path: a request that
+      // authenticates is never blocked by it, so bad-secret spraying
+      // cannot lock out the legitimate sender.
+      const { rateLimited } = authGuard.recordFailedAuth({
+        sourceIp,
+        target: routineId,
+        reason: 'bad_secret_or_signature',
+      });
+      if (rateLimited) {
+        res.setHeader('Retry-After', '60');
+        res.status(429).json({ error: 'too many failed authentication attempts' });
+        return;
+      }
       res.status(401).json({ error: 'invalid webhook secret or signature' });
-      return;
-    }
-    if (!routine.enabled) {
-      res.status(409).json({ error: 'routine is paused' });
       return;
     }
     if (raw.length > HOOK_BODY_LIMIT_BYTES) {
@@ -510,6 +588,16 @@ export function createPublicHookRouter(opts: PublicHookRouterOptions): Router {
     });
     if (deduped) {
       res.status(200).json({ ok: true, deduped: true, deliveryId: delivery.id, status: delivery.status });
+      return;
+    }
+    if (!routine.enabled) {
+      // A-1 uniform response: a paused routine must not be
+      // distinguishable from an active one at the HTTP layer (the old
+      // 409 {"error":"routine is paused"} was an oracle for routine
+      // state). Same 202 acceptance shape; the delivery is journalled
+      // internally as skipped-paused and never executed.
+      opts.hookStore.markSkipped(delivery.id, `skipped: routine "${routine.id}" is paused`);
+      res.status(202).json({ ok: true, accepted: true, deliveryId: delivery.id, routineId: routine.id });
       return;
     }
     res.status(202).json({ ok: true, accepted: true, deliveryId: delivery.id, routineId: routine.id });
@@ -662,10 +750,35 @@ export interface HookBaseUrls {
   localPort: number;
 }
 
+/**
+ * Build the path-secret URLs for a routine. A-1: call ONLY with a
+ * freshly minted plaintext secret (create/rotate, shown once) — the
+ * stored hash can never rebuild these URLs, which is why the hook-info
+ * endpoint serves hookUrlTemplates() plus the canonical header forms
+ * instead. The path form itself is legacy compatibility only (see the
+ * SECURITY NOTE above); prefer `Authorization: Bearer <secret>` or an
+ * HMAC signature header, which need no secret in the URL at all:
+ * the header-form endpoint is POST /api/hooks/<routineId>/<anything>
+ * with the auth carried by the header (the path segment is ignored
+ * when a header authenticates).
+ */
 export function hookUrls(base: HookBaseUrls, routineId: string, secret: string): { url: string | null; localUrl: string } {
   const path = `/api/hooks/${routineId}/${secret}`;
   return {
     url: base.publicBaseUrl ? `${base.publicBaseUrl}${path}` : null,
     localUrl: `http://127.0.0.1:${base.localPort}${path}`,
+  };
+}
+
+/** Canonical, secret-free URL templates for info/docs surfaces (A-1). */
+export function hookUrlTemplates(
+  base: HookBaseUrls,
+  routineId: string,
+): { url: string | null; localUrl: string; canonicalAuth: string } {
+  const path = `/api/hooks/${routineId}/<secret>`;
+  return {
+    url: base.publicBaseUrl ? `${base.publicBaseUrl}${path}` : null,
+    localUrl: `http://127.0.0.1:${base.localPort}${path}`,
+    canonicalAuth: 'Authorization: Bearer <secret>',
   };
 }

@@ -7,10 +7,27 @@
 //   - 401 when the `x-webhook-secret` header does not match the stored secret
 //     (compared with crypto.timingSafeEqual over SHA-256 digests)
 //   - otherwise starts a workflow run and returns { runId }
+//   (The workflow TriggerStore lives in @mvp/workflows. A-12 migrated its
+//   storage to the same hash-at-rest scheme as A-1: only `sha256:<hex>`
+//   is stored, plaintext is shown once at create/rotate, and verification
+//   hashes the presentation and digest-compares timing-safe via the
+//   store's verifySecret. Failed auth here is journalled and
+//   failure-rate-limited via the same legacy guard discipline.)
 //
 // Routine: POST /webhooks/routines/:triggerId (separate mount)
-//   - 404 unknown/disabled trigger or routine; 401 bad secret (same
-//     timing-safe secret pattern); 202 enqueues the routine's bot turn.
+//   - 404 unknown/disabled trigger or routine; 401 bad secret; 202
+//     enqueues the routine's bot turn.
+//   - A-1: trigger secrets are stored SHA-256-hashed at rest
+//     (bot-routines.ts / legacy-webhook-secrets.ts; plaintext shown once
+//     at create/rotate). Verification hashes the presented secret and
+//     digest-compares against the stored hash, timing-safe. Failed auth
+//     is journalled (IP + target + reason, writes throttled) and
+//     failure-rate-limited per IP+target; successful auth is never
+//     blocked by the limiter, so spraying bad secrets cannot lock out
+//     the legitimate sender. Unknown / disabled trigger and disabled
+//     routine all return the same 404 (the B5 convention) — the surface
+//     never reveals which case it was, and a missing bot answers a
+//     generic 500 rather than naming internals.
 //
 // Mount at boot, e.g. `app.use('/webhooks', createWebhookRouter({ runner, triggerStore }))`
 // and `app.use('/webhooks/routines', createRoutineWebhookRouter({ routineStore, triggerStore, agentRuntime, getBots }))`.
@@ -28,6 +45,11 @@ import {
   RoutineStore,
   RoutineWebhookTriggerStore,
 } from './bot-routines.js';
+import {
+  LegacyWebhookAuthGuard,
+  legacySourceIp,
+  verifyPresentedSecret,
+} from './legacy-webhook-secrets.js';
 
 export { TriggerStore };
 export { RoutineStore, RoutineWebhookTriggerStore };
@@ -35,6 +57,9 @@ export { RoutineStore, RoutineWebhookTriggerStore };
 export interface WebhookRouterOptions {
   runner: WorkflowRunner;
   triggerStore: TriggerStore;
+  /** Failed-auth journal + limiter (A-1); defaults per-router. */
+  authGuard?: LegacyWebhookAuthGuard;
+  authDataDir?: string;
 }
 
 function secretsMatch(provided: string | undefined, expected: string): boolean {
@@ -58,6 +83,9 @@ export interface RoutineWebhookRouterOptions {
   triggerStore: RoutineWebhookTriggerStore;
   agentRuntime: AgentRuntime;
   getBots: () => BotConfig[];
+  /** Failed-auth journal + limiter (A-1); defaults per-router. */
+  authGuard?: LegacyWebhookAuthGuard;
+  authDataDir?: string;
   /** Override prompt rendering (default: {{payload}} substitution). */
   renderPrompt?: (template: string, body: unknown) => string;
   /**
@@ -75,7 +103,8 @@ export interface RoutineWebhookRouterOptions {
  *   - 404 when the trigger id is unknown, disabled, or its routine is
  *     unknown/disabled
  *   - 401 when the `x-webhook-secret` header does not match the trigger's
- *     stored secret (same timing-safe HMAC pattern as workflow webhooks)
+ *     stored secret HASH (A-1: the presentation is hashed and the digests
+ *     compared timing-safe; the plaintext is never stored)
  *   - 202 otherwise: enqueues the routine's bot turn with the rendered
  *     prompt (fire-and-forget — the turn runs in the background)
  *
@@ -86,16 +115,31 @@ export interface RoutineWebhookRouterOptions {
 export function createRoutineWebhookRouter(opts: RoutineWebhookRouterOptions): Router {
   const router = Router();
   const render = opts.renderPrompt ?? renderRoutinePrompt;
+  const authGuard = opts.authGuard ?? new LegacyWebhookAuthGuard({ dataDir: opts.authDataDir });
 
   router.post('/:triggerId', (req: Request, res: Response) => {
     const triggerId = req.params.triggerId;
+    const sourceIp = legacySourceIp(req);
     const trigger = opts.triggerStore.get(triggerId);
     if (!trigger || !trigger.enabled || !trigger.secret) {
+      authGuard.recordFailedAuth({ sourceIp, target: triggerId, reason: 'unknown_or_disabled_trigger' });
       res.status(404).json({ error: 'unknown routine webhook trigger' });
       return;
     }
     const provided = req.header('x-webhook-secret');
-    if (!secretsMatch(provided, trigger.secret)) {
+    // A-1: trigger.secret is the stored SHA-256 hash form; the
+    // presentation is hashed and digest-compared timing-safe.
+    if (!verifyPresentedSecret(provided, trigger.secret)) {
+      const { rateLimited } = authGuard.recordFailedAuth({
+        sourceIp,
+        target: triggerId,
+        reason: 'bad_secret',
+      });
+      if (rateLimited) {
+        res.setHeader('Retry-After', '60');
+        res.status(429).json({ error: 'too many failed authentication attempts' });
+        return;
+      }
       res.status(401).json({ error: 'invalid webhook secret' });
       return;
     }
@@ -106,7 +150,9 @@ export function createRoutineWebhookRouter(opts: RoutineWebhookRouterOptions): R
     }
     const bot = opts.getBots().find((b) => b.id === routine.botId);
     if (!bot) {
-      res.status(500).json({ error: `routine bot "${routine.botId}" no longer exists` });
+      // Generic on purpose (B5's 'routine cannot run'): naming the
+      // missing bot would leak internal state to an external sender.
+      res.status(500).json({ error: 'routine cannot run' });
       return;
     }
     const sessionId = routine.sessionId ?? `routine_${routine.id}`;
@@ -171,17 +217,29 @@ export function createRoutineWebhookRouter(opts: RoutineWebhookRouterOptions): R
 export interface ScriptWebhookRouterOptions {
   /** Configured script-hook entries (from parseScriptHookConfig). */
   hooks: import('./hooks-config.js').ScriptHookEntry[] | (() => import('./hooks-config.js').ScriptHookEntry[]);
-  /** Optional per-hook shared secret, checked as `x-webhook-secret` (timing-safe). */
+  /**
+   * Optional per-hook shared secret, checked as `x-webhook-secret`
+   * (timing-safe). A-1 storage note: these secrets are CONFIG-supplied
+   * by the host (index.ts passes a record built from bot configuration;
+   * today it passes an empty record, so no secret is enforced) — they
+   * are NOT stored in any database, so there is no at-rest copy to
+   * migrate and their storage is deliberately left alone. The surface
+   * still gains the A-1 failed-auth journal + failure rate limit.
+   */
   secrets?: Record<string, string>;
   /** Injectable runner for tests (defaults to runScriptHookOnce). */
   runHook?: (
     entry: import('./hooks-config.js').ScriptHookEntry,
     payload: unknown,
   ) => Promise<{ injections: string[]; errors: string[] }>;
+  /** Failed-auth journal + limiter (A-1); defaults per-router. */
+  authGuard?: LegacyWebhookAuthGuard;
+  authDataDir?: string;
 }
 
 export function createScriptWebhookRouter(opts: ScriptWebhookRouterOptions): Router {
   const router = Router();
+  const authGuard = opts.authGuard ?? new LegacyWebhookAuthGuard({ dataDir: opts.authDataDir });
   router.post('/script/:name', async (req: Request, res: Response) => {
     const { findScriptHook, runScriptHookOnce } = await import('./hooks-config.js');
     const entries = typeof opts.hooks === 'function' ? opts.hooks() : opts.hooks;
@@ -192,6 +250,16 @@ export function createScriptWebhookRouter(opts: ScriptWebhookRouterOptions): Rou
     }
     const secret = opts.secrets?.[req.params.name];
     if (secret && !secretsMatch(req.header('x-webhook-secret'), secret)) {
+      const { rateLimited } = authGuard.recordFailedAuth({
+        sourceIp: legacySourceIp(req),
+        target: `script:${req.params.name}`,
+        reason: 'bad_secret',
+      });
+      if (rateLimited) {
+        res.setHeader('Retry-After', '60');
+        res.status(429).json({ error: 'too many failed authentication attempts' });
+        return;
+      }
       res.status(401).json({ error: 'invalid webhook secret' });
       return;
     }
@@ -214,6 +282,7 @@ export function createScriptWebhookRouter(opts: ScriptWebhookRouterOptions): Rou
 
 export function createWebhookRouter(opts: WebhookRouterOptions): Router {
   const router = Router();
+  const authGuard = opts.authGuard ?? new LegacyWebhookAuthGuard({ dataDir: opts.authDataDir });
 
   router.post('/:triggerId', async (req: Request, res: Response) => {
     const triggerId = req.params.triggerId;
@@ -223,7 +292,19 @@ export function createWebhookRouter(opts: WebhookRouterOptions): Router {
       return;
     }
     const provided = req.header('x-webhook-secret');
-    if (!secretsMatch(provided, trigger.secret)) {
+    // A-12: trigger.secret is the stored SHA-256 hash form; the store
+    // hashes the presentation and digest-compares timing-safe.
+    if (!opts.triggerStore.verifySecret(triggerId, provided)) {
+      const { rateLimited } = authGuard.recordFailedAuth({
+        sourceIp: legacySourceIp(req),
+        target: triggerId,
+        reason: 'bad_secret',
+      });
+      if (rateLimited) {
+        res.setHeader('Retry-After', '60');
+        res.status(429).json({ error: 'too many failed authentication attempts' });
+        return;
+      }
       res.status(401).json({ error: 'invalid webhook secret' });
       return;
     }
